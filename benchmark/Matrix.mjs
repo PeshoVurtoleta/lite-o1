@@ -12,13 +12,14 @@
  *   - RingDeque vs an Array used as a deque (push + shift)
  *   - UnionFind vs a naive disjoint-set (no compression, no union-by-size)
  *   - MonoDeque vs a naive O(W) window rescan
+ *   - MinStack vs a naive plain-array stack that rescans for the extreme
  */
 
 /** Sentinel for a cell that does not apply. NEVER 0. */
 export const NA = 'n/a';
 
-/** The four shipped members, in build order. */
-export const SUBJECTS = ['SparseSet', 'RingDeque', 'UnionFind', 'MonoDeque'];
+/** The five shipped members, in build order. */
+export const SUBJECTS = ['SparseSet', 'RingDeque', 'UnionFind', 'MonoDeque', 'MinStack'];
 
 /** The eight measurement dimensions (RESEARCH.md section 3). */
 export const DIMENSIONS = ['D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7', 'D8'];
@@ -41,6 +42,7 @@ export const BASELINE = {
     RingDeque: 'Array-deque',
     UnionFind: 'naive-DSU',
     MonoDeque: 'naive-window',
+    MinStack: 'naive-stack',
 };
 
 /**

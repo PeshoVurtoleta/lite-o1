@@ -5,7 +5,7 @@
  * fails `npm run test:types`. Not executed; only type-checked.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, VERSION } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, VERSION } from '../../O1.js';
 
 // VERSION is a string.
 const v: string = VERSION;
@@ -192,3 +192,54 @@ new MonoDeque('1024', 'min');
 new MonoDeque(1024, 'mid');
 // @ts-expect-error -- push takes a number.
 md.push('3');
+
+// --- MinStack --------------------------------------------------------------
+
+// Constructor: capacity + kind ('min' | 'max') required.
+const ms: MinStack = new MinStack(1024, 'min');
+const msMax: MinStack = new MinStack(1024, 'max');
+void msMax;
+
+// Getters: kind is 'min' | 'max'; size / capacity are readonly numbers.
+const mskind: 'min' | 'max' = ms.kind;
+const mssize: number = ms.size;
+const mscap: number = ms.capacity;
+void mskind; void mssize; void mscap;
+
+// @ts-expect-error -- kind is readonly.
+ms.kind = 'max';
+// @ts-expect-error -- size is readonly.
+ms.size = 5;
+// @ts-expect-error -- capacity is readonly.
+ms.capacity = 5;
+
+// push -> this (chainable); pop/peek/extreme -> number | undefined; clear -> void.
+const chainedMs: MinStack = ms.push(1).push(2);
+const mspopped: number | undefined = ms.pop();
+const mspeeked: number | undefined = ms.peek();
+const msext: number | undefined = ms.extreme();
+const mscleared: void = ms.clear();
+void chainedMs; void mspopped; void mspeeked; void msext; void mscleared;
+
+// forEach callback gets (value, index, stack).
+ms.forEach((v, i, stack) => {
+    const vv: number = v;
+    const ii: number = i;
+    const st: MinStack = stack;
+    void vv; void ii; void st;
+});
+
+// Iterable of number (top -> bottom).
+for (const v of ms) {
+    const vv: number = v;
+    void vv;
+}
+const msspread: number[] = [...ms];
+void msspread;
+
+// @ts-expect-error -- capacity must be a number.
+new MinStack('1024', 'min');
+// @ts-expect-error -- kind must be 'min' | 'max'.
+new MinStack(1024, 'mid');
+// @ts-expect-error -- push takes a number.
+ms.push('3');

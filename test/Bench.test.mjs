@@ -94,8 +94,8 @@ for (const member of SUBJECTS) {
 
 test('D5 tree-shaking: single-member bundle is < 40% of all-member (headline + median)', async () => {
     // The falsifiable "< 40%" claim, applied honestly. It holds for the headline
-    // member (SparseSet) and for the median across the four members. MonoDeque is
-    // the ONE exception at ~48% -- not a tree-shaking failure but a size fact: it
+    // member (SparseSet) and for the median across the five members. MonoDeque is
+    // the ONE exception at ~43% -- not a tree-shaking failure but a size fact: it
     // is the single heaviest member (nearly half the library's code), so its lone
     // import is inherently ~half the whole bundle. The claim is asserted where it
     // is true and the exception is stated, never hidden or the budget widened.
@@ -104,7 +104,8 @@ test('D5 tree-shaking: single-member bundle is < 40% of all-member (headline + m
     assert.ok(ratios.SparseSet < 0.4,
         'headline SparseSet single/all ratio ' + ratios.SparseSet.toFixed(3) + ' must be < 0.40');
     const sorted = SUBJECTS.map((m) => ratios[m]).sort((a, b) => a - b);
-    const median = (sorted[1] + sorted[2]) / 2;
+    const mid = sorted.length >> 1;
+    const median = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
     assert.ok(median < 0.4, 'median single/all ratio ' + median.toFixed(3) + ' must be < 0.40');
     // Every member's lone import still drops the majority of the other members.
     for (const m of SUBJECTS) assert.ok(ratios[m] < 0.5, m + ' ratio ' + ratios[m].toFixed(3) + ' < 0.50');

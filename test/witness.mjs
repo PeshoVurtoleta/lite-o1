@@ -48,7 +48,7 @@
  * metric are unchanged; only the measurement is made steadier.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack } from '../O1.js';
 
 const SIZES = [1e3, 1e4, 1e5, 1e6, 1e7];
 const BATCH = 1e6;
@@ -85,6 +85,25 @@ const NAIVE_BATCH = 2e3;  // small: an O(n) naive find at n=1e5 must stay tracta
 const MONO_SIZES = [1e3, 1e4, 1e5];
 const MONO_BATCH = 5e5;      // large: stable timing for the amortized-O(1) push
 const NAIVE_WIN_BATCH = 300; // small: an O(W) window rescan at W=1e5 must stay tractable
+
+// MinStack sweep. n is the stack DEPTH. The foil is a naive plain-array stack that
+// RESCANS all live elements each query to find the extreme (O(depth)/query), so it
+// degrades while MinStack's worst-case-O(1) extreme() (a single running-extreme
+// prefix read) stays flat. The feed is STRICTLY DECREASING so every push takes the
+// carry's rewrite branch -- MinStack's own worst case (there is no pop-storm to
+// expose: unlike MonoDeque, push is worst-case O(1), not merely amortized). ops/ms
+// is a RATE, so the two use DIFFERENT batches yet flatness + ratio compare directly.
+const MIN_SIZES = [1e3, 1e4, 1e5];
+const MIN_BATCH = 5e5;          // large: stable timing for the worst-case-O(1) extreme
+const NAIVE_STACK_BATCH = 300;  // small: an O(depth) rescan at depth=1e5 must stay tractable
+// extreme() is the tiniest hot op in the family (a single prefix read), so the
+// depth=1e3 point is a pure-L1 micro-case that turbo-spikes as the flatness
+// DENOMINATOR (the same effect ADR-0004's amendment pinned for SparseSet). The gate
+// is therefore computed over the steady window depth >= 1e4, where the two columns
+// leave L1 and ops/ms isolates the constant (measured flatness there ~1.0). This is
+// NOT a widened gate: the 0.70 floor is unchanged; only the DOMAIN is pinned. The
+// 1e3 point is still DISPLAYED, tagged as the micro-case.
+const MIN_GATE_MIN = 1e4;
 
 // Global sink: every op feeds it so V8 cannot dead-code-eliminate the batch.
 let SINK = 0;
@@ -267,6 +286,44 @@ function buildNaiveWindowFoil(n) {
         let best = win[0];
         for (let j = 1; j < W; j++) if (win[j] < best) best = win[j]; // O(W) rescan
         SINK += best;
+    };
+    return { op };
+}
+
+// MinStack: a stack of DEPTH n. Each op pushes a strictly-DECREASING value (so the
+// running-extreme carry always takes its rewrite branch -- MinStack's worst case),
+// reads the extreme in O(1), then pops to keep the depth steady. extreme() is a
+// single prefix read regardless of depth, so the whole op streams flat as n grows.
+function buildMinStack(n) {
+    const depth = n;
+    const s = new MinStack(depth + 1, 'min'); // +1 headroom for the transient push
+    for (let k = 0; k < depth; k++) s.push(depth - k); // pre-fill (decreasing)
+    let v = 0;
+    const op = () => {
+        v = (v + 1) | 0;
+        s.push(-v);                        // strictly decreasing -> always rewrites ext
+        if (s.extreme() !== undefined) SINK++;
+        s.pop();
+    };
+    return { op };
+}
+
+// Foil: a naive plain-Float64Array stack that RESCANS every live element each query
+// to find the minimum -- O(depth) per query, so ops/ms collapses as depth grows,
+// the exact trap the running-extreme prefix column exists to kill.
+function buildNaiveRescanFoil(n) {
+    const depth = n;
+    const arr = new Float64Array(depth + 1);
+    for (let k = 0; k < depth; k++) arr[k] = depth - k;
+    let top = depth; // number of live elements
+    let v = 0;
+    const op = () => {
+        v = (v + 1) | 0;
+        arr[top++] = -v;                                        // push
+        let best = arr[0];
+        for (let j = 1; j < top; j++) if (arr[j] < best) best = arr[j]; // O(depth) rescan
+        SINK += best;
+        top--;                                                  // pop
     };
     return { op };
 }
@@ -479,5 +536,56 @@ if (!monoAllOk) {
     if (!monoOk) console.error('  violation MonoDeque flatness ' + fmt(mono.flatness) + ' < 0.70');
     if (!naiveWinOk) console.error('  violation naive foil flatness ' + fmt(naiveWin.flatness) + ' > 0.55');
     if (!monoRatioOk) console.error('  violation min mono ratio ' + fmt(minMonoRatio) + 'x < 1.50x');
+    process.exitCode = 1;
+}
+
+// ===========================================================================
+// MinStack witness -- worst-case-O(1) extreme() vs a naive O(depth)-rescan foil
+// ===========================================================================
+const mstk = witness(buildMinStack, MIN_SIZES, MIN_BATCH, REPS, MIN_GATE_MIN);
+const naiveStack = witness(buildNaiveRescanFoil, MIN_SIZES, NAIVE_STACK_BATCH, REPS, MIN_GATE_MIN);
+
+console.log('');
+console.log('O(1) Witness -- MinStack extreme() vs a naive stack rescan (rate ops/ms, median of ' +
+    REPS + ', gate depth >= ' + nStr(MIN_GATE_MIN) + ')');
+console.log('');
+console.log('  depth     MinStack ops/ms    naive ops/ms   ratio');
+console.log('  --------  ----------------   ------------   -----');
+let minStackRatio = Infinity;
+for (let i = 0; i < MIN_SIZES.length; i++) {
+    const a = mstk.rows[i].opsPerMs;
+    const b = naiveStack.rows[i].opsPerMs;
+    const ratio = b > 0 ? a / b : Infinity;
+    const gated = MIN_SIZES[i] >= MIN_GATE_MIN;
+    if (gated && ratio < minStackRatio) minStackRatio = ratio; // ratio gate: steady window only
+    const tag = MIN_SIZES[i] < MIN_GATE_MIN ? '   <- L1 micro-case (shown, not gated)' : '';
+    console.log('  ' + nStr(MIN_SIZES[i]).padEnd(8) + '  ' +
+        fmt(a).padStart(16) + '   ' + fmt(b).padStart(12) + '   ' + fmt(ratio).padStart(5) + 'x' + tag);
+}
+
+console.log('');
+console.log('  MinStack flatness (depth >= ' + nStr(MIN_GATE_MIN) + '): ' + fmt(mstk.flatness) + '   (gate >= 0.70)');
+console.log('  naive foil flatness (last/first): ' + fmt(naiveStack.flatness) + '   (gate <= 0.55)');
+console.log('  min MinStack/naive ratio:         ' + fmt(minStackRatio) + 'x  (gate >= 1.50x)');
+// NO MAX-single-op line here (unlike MonoDeque): MinStack's push is WORST-CASE O(1)
+// -- it never pops a run, so there is no amortized pop-storm to expose. The feed is
+// strictly decreasing so every push already takes the carry's rewrite branch (the
+// most work a single push can do), and that is still one compare + two writes.
+
+const mstkOk = mstk.flatness >= 0.70;
+const naiveStackOk = naiveStack.flatness <= 0.55;
+const stackRatioOk = minStackRatio >= 1.5;
+const stackAllOk = mstkOk && naiveStackOk && stackRatioOk;
+
+console.log('');
+console.log('WITNESS MinStack ' + (stackAllOk ? 'ok' : 'FAIL') +
+    ' mstk.flatness=' + fmt(mstk.flatness) +
+    ' naive.flatness=' + fmt(naiveStack.flatness) +
+    ' minRatio=' + fmt(minStackRatio) + 'x');
+
+if (!stackAllOk) {
+    if (!mstkOk) console.error('  violation MinStack flatness ' + fmt(mstk.flatness) + ' < 0.70');
+    if (!naiveStackOk) console.error('  violation naive foil flatness ' + fmt(naiveStack.flatness) + ' > 0.55');
+    if (!stackRatioOk) console.error('  violation min stack ratio ' + fmt(minStackRatio) + 'x < 1.50x');
     process.exitCode = 1;
 }

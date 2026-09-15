@@ -14,7 +14,7 @@
  * This file is NEVER imported by O1.js; it imports O1.js the way a consumer does.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack } from '../O1.js';
 import {
     prng, median, warm, gcNow, hasGc, percentile, collect, timeNsPerOp, foldHash,
     DEFAULT_SEED,
@@ -55,6 +55,17 @@ function makeSubject(member, n, rng) {
         let x = 0;
         return { obj: uf, op: () => { x++; if (x >= n) x = 0; if (uf.connected(x, 0)) SINK++; } };
     }
+    if (member === 'MinStack') {
+        // A stack of depth n; push then pop keeps it bounded and reads the extreme.
+        const s = new MinStack(n, 'min');
+        const fill = n - 1 > 0 ? n - 1 : n; // leave one slot for the transient push
+        for (let k = 0; k < fill; k++) s.push(k);
+        let v = 0;
+        return {
+            obj: s,
+            op: () => { v = (v + 1) | 0; s.push(-v); if (s.extreme() !== undefined) SINK++; s.pop(); },
+        };
+    }
     // MonoDeque: a sliding window of width W = n.
     const W = n;
     const d = new MonoDeque(W + 1, 'min');
@@ -89,6 +100,24 @@ function makeBaseline(member, n) {
         let x = 0;
         return { op: () => { x++; if (x >= n) x = 0; if (find(x) === root) SINK++; } }; // O(depth)
     }
+    if (member === 'MinStack') {
+        // naive plain-array stack that RESCANS all live elements for the min each op.
+        const arr = new Float64Array(n);
+        const fill = n - 1 > 0 ? n - 1 : n;
+        for (let k = 0; k < fill; k++) arr[k] = k;
+        let top = fill;
+        let v = 0;
+        return {
+            op: () => {
+                v = (v + 1) | 0;
+                arr[top++] = -v;                                       // push
+                let best = arr[0];
+                for (let j = 1; j < top; j++) if (arr[j] < best) best = arr[j]; // O(depth) rescan
+                SINK += best;
+                top--;                                                 // pop
+            },
+        };
+    }
     // naive window rescan (O(W) per element).
     const W = n;
     const win = new Float64Array(W);
@@ -108,14 +137,15 @@ function makeBaseline(member, n) {
 }
 
 /** True iff a member's baseline op is O(n) per call (so it must be timed gently). */
-const LINEAR_BASELINE = { SparseSet: false, RingDeque: true, UnionFind: true, MonoDeque: true };
+const LINEAR_BASELINE = { SparseSet: false, RingDeque: true, UnionFind: true, MonoDeque: true, MinStack: true };
 
 /** Exact backing-store byte footprint of a member instance (typed-array buffers). */
 function memberBytes(member, obj) {
     if (member === 'SparseSet') return obj._dense.buffer.byteLength + obj._sparse.buffer.byteLength;
     if (member === 'RingDeque') return obj._store.buffer.byteLength;
     if (member === 'UnionFind') return obj._parent.buffer.byteLength + obj._size.buffer.byteLength;
-    return obj._val.buffer.byteLength + obj._seq.buffer.byteLength; // MonoDeque
+    if (member === 'MonoDeque') return obj._val.buffer.byteLength + obj._seq.buffer.byteLength;
+    return obj._val.buffer.byteLength + obj._ext.buffer.byteLength; // MinStack (value + ext)
 }
 
 /** Theoretical minimum bytes per LIVE element for a member (the dense payload). */
@@ -123,7 +153,8 @@ function theoreticalMinPerLive(member) {
     if (member === 'SparseSet') return 4;  // one Uint32 dense slot per live key
     if (member === 'RingDeque') return 8;  // one Float64 slot per live value
     if (member === 'UnionFind') return 8;  // parent + size Uint32 per element
-    return 16;                             // MonoDeque: value + seq Float64 per entry
+    if (member === 'MonoDeque') return 16; // value + seq Float64 per entry
+    return 16;                             // MinStack: value + ext Float64 per element
 }
 
 /** The member's live-element count (its `size`/`count`/`capacity` semantics). */
@@ -224,6 +255,18 @@ function makeMixed(member, cap, rng) {
             i = (i + 1) | 0;
         };
     }
+    if (member === 'MinStack') {
+        const s = new MinStack(cap, 'min');
+        for (let k = 0; k < (cap >> 1); k++) s.push(k);
+        let v = 0;
+        return () => {
+            v = (v + 1) | 0;
+            s.push(-v);
+            if (s.extreme() !== undefined) SINK++;
+            SINK += s.peek();
+            s.pop();
+        };
+    }
     // MonoDeque
     const W = cap >> 1;
     const d = new MonoDeque(cap, 'min');
@@ -291,7 +334,8 @@ export function D3(member, opts = {}) {
     if (member === 'SparseSet') obj = new SparseSet(n, n);
     else if (member === 'RingDeque') obj = new RingDeque(n);
     else if (member === 'UnionFind') obj = new UnionFind(n);
-    else obj = new MonoDeque(n, 'min');
+    else if (member === 'MonoDeque') obj = new MonoDeque(n, 'min');
+    else obj = new MinStack(n, 'min');
 
     gcNow();
     const heapBase = process.memoryUsage().heapUsed;
@@ -583,6 +627,13 @@ function churnNs(member, n, seed) {
         const op = () => { if (uf.count === 1) uf.reset(); uf.union(i % n, (i + 1) % n); i = (i + 1) | 0; };
         return median(collect(op, 4000, 60));
     }
+    if (member === 'MinStack') {
+        const s = new MinStack(n, 'min');
+        for (let k = 0; k < (n >> 1); k++) s.push(k);
+        let v = 0;
+        const op = () => { v = (v + 1) | 0; s.push(-v); s.extreme(); s.pop(); };
+        return median(collect(op, 4000, 60));
+    }
     const d = new MonoDeque(n, 'min');
     const W = n >> 1;
     let v = 0;
@@ -654,7 +705,7 @@ export function traceHash(member, seed = DEFAULT_SEED, length = 100000) {
         const r = rng();
         let x;
         if (member === 'SparseSet' || member === 'UnionFind') x = r % TRACE_UNIVERSE;
-        else if (member === 'RingDeque') x = (r % 2000) - 1000;
+        else if (member === 'RingDeque' || member === 'MinStack') x = (r % 2000) - 1000;
         else x = r % 1000000; // MonoDeque
         h = foldHash(h, x);
         h = foldHash(h, (r >>> 28)); // fold the op-selector too (trace SHAPE, not just values)

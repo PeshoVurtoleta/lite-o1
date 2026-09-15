@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-> Zero-GC, O(1) data structures that PROVE their constant. v0.4.0 ships SparseSet (an integer set with O(1) add / has / delete / iterate and an O(1) clear() that zeroes nothing), RingDeque (a fixed-capacity numeric double-ended queue with O(1) push/pop at both ends), UnionFind (a disjoint-set forest with near-O(1) amortized find / union), and MonoDeque (a monotonic deque for O(1)-amortized sliding-window min / max) -- plus a throughput-invariance witness that shows the flat cost curve while a native Set, Array.prototype.shift, a naive disjoint-set, or a full-window rescan decays.
+> Zero-GC, O(1) data structures that PROVE their constant. v0.5.0 ships SparseSet (an integer set with O(1) add / has / delete / iterate and an O(1) clear() that zeroes nothing), RingDeque (a fixed-capacity numeric double-ended queue with O(1) push/pop at both ends), UnionFind (a disjoint-set forest with near-O(1) amortized find / union), MonoDeque (a monotonic deque for O(1)-amortized sliding-window min / max), and MinStack (a fixed-capacity numeric stack with a worst-case-O(1) running min / max) -- plus a throughput-invariance witness that shows the flat cost curve while a native Set, Array.prototype.shift, a naive disjoint-set, a full-window rescan, or a full-stack rescan decays.
 
 [![npm version](https://img.shields.io/npm/v/@zakkster/lite-o1.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-o1)
 [![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
@@ -17,7 +17,7 @@
 
 Almost no JavaScript data-structure library ships the evidence that its Big-O claim survives contact with a real engine -- megamorphic call sites, GC pauses, cache misses, deopts. `lite-o1` is a curated, tree-shakeable family of the O(1) structures that actually matter, each zero-GC, each written to teach the trick that buys the constant, and each shipped with a harness that DEMONSTRATES the flat cost curve rather than asserting it. The complexity class IS the product.
 
-v0.4.0 ships four members. **SparseSet**, the textbook O(1) integer set (a dense + sparse array pair) whose `clear()` runs in O(1) by resetting a count and zeroing nothing at all. **RingDeque**, a fixed-capacity double-ended queue of numbers over one circular `Float64Array` -- O(1) push/pop at both ends, the zero-GC answer to the `Array.prototype.shift` O(n) trap. **UnionFind**, a disjoint-set forest over two `Uint32Array` columns -- near-O(1) amortized `find` / `union` via path halving + union by size, the family's first amortized-honesty member. And **MonoDeque**, a monotonic deque over two parallel `Float64Array` columns -- O(1)-amortized sliding-window min / max, the zero-GC answer to the full-window-rescan O(W) trap. They share no mutable module state, so a bundler that imports one drops the others.
+v0.5.0 ships five members. **SparseSet**, the textbook O(1) integer set (a dense + sparse array pair) whose `clear()` runs in O(1) by resetting a count and zeroing nothing at all. **RingDeque**, a fixed-capacity double-ended queue of numbers over one circular `Float64Array` -- O(1) push/pop at both ends, the zero-GC answer to the `Array.prototype.shift` O(n) trap. **UnionFind**, a disjoint-set forest over two `Uint32Array` columns -- near-O(1) amortized `find` / `union` via path halving + union by size, the family's first amortized-honesty member. **MonoDeque**, a monotonic deque over two parallel `Float64Array` columns -- O(1)-amortized sliding-window min / max, the zero-GC answer to the full-window-rescan O(W) trap. And **MinStack**, a fixed-capacity numeric stack over two parallel `Float64Array` columns (value + a running-extreme prefix) -- WORST-CASE O(1) push/pop plus a running min / max, no amortization asterisk. They share no mutable module state, so a bundler that imports one drops the others.
 
 ```bash
 npm install @zakkster/lite-o1
@@ -68,6 +68,9 @@ Every op above is O(1) worst-case and allocates zero bytes after construction. T
 - [MonoDeque](#monodeque)
   - [How MonoDeque works](#how-monodeque-works)
   - [MonoDeque API reference](#monodeque-api-reference)
+- [MinStack](#minstack)
+  - [How MinStack works](#how-minstack-works)
+  - [MinStack API reference](#minstack-api-reference)
 - [Composability with the ecosystem](#composability-with-the-ecosystem)
 - [Zero-GC design notes](#zero-gc-design-notes)
 - [Design decisions worth knowing](#design-decisions-worth-knowing)
@@ -120,8 +123,15 @@ Existing options: a native `Set` (arbitrary keys, but a hash table that decays a
   - **`kind` / `size` / `capacity`** -- getters (`kind` is the frozen `'min'`/`'max'`; `capacity` reports the rounded power of two).
   - **`clear()`** -- empty in O(1): resets head + count + the seq counter, zeroes no store.
   - **`forEach(fn)` / `[Symbol.iterator]`** -- iterate live entries front -> back (O(k)); `forEach` is alloc-free, `[Symbol.iterator]` allocates a `[value, seq]` tuple per step by protocol.
+- **`MinStack(capacity, kind)`** -- a zero-GC WORST-CASE O(1) fixed-capacity numeric stack that also reports the running min / max over two parallel `Float64Array` columns (value + a running-extreme prefix). `kind` (`'min'` | `'max'`) is frozen at construction; capacity is EXACT (not rounded). The hot surface is four ops plus three getters:
+  - **`push(v)`** -- push onto the top, carrying the running extreme in one compare. O(1) worst-case. Returns `this`. Throws a `[lite-o1]` error when full (a byte-identical no-op) or on a non-clean value.
+  - **`pop()` / `peek()`** -- remove / read the top value. O(1). Return `undefined` on empty -- never a throw.
+  - **`extreme()`** -- the current min / max (per `kind`) of every live element, a single prefix read. O(1) worst-case. `undefined` on empty.
+  - **`kind` / `size` / `capacity`** -- getters (`kind` is the frozen `'min'`/`'max'`; `capacity` is the exact constructed integer).
+  - **`clear()`** -- empty in O(1): resets the top pointer, zeroes no store.
+  - **`forEach(fn)` / `[Symbol.iterator]`** -- iterate live elements top -> bottom (pop order, O(k)); `forEach` is alloc-free, `[Symbol.iterator]` allocates a `{value, done}` per step by protocol.
 - **`VERSION`** -- the package version string.
-- **The O(1) Witness** (`npm run witness`) -- an offline harness that times a fixed batch of each member's hot op across an n-sweep, reports ops/ms + a flatness ratio (SparseSet vs a native `Set`, RingDeque vs `Array.prototype.shift`, UnionFind vs a naive disjoint-set, MonoDeque vs a full-window rescan), and fails if the constant regressed.
+- **The O(1) Witness** (`npm run witness`) -- an offline harness that times a fixed batch of each member's hot op across an n-sweep, reports ops/ms + a flatness ratio (SparseSet vs a native `Set`, RingDeque vs `Array.prototype.shift`, UnionFind vs a naive disjoint-set, MonoDeque vs a full-window rescan, MinStack vs a full-stack rescan), and fails if the constant regressed.
 
 Full types ship in [`O1.d.ts`](./O1.d.ts). Tree-shakeable named exports (`sideEffects: false`) -- import only what you use.
 
@@ -188,7 +198,7 @@ get capacity: number        // max live members as constructed
 
 | Constant   | Value     | Meaning                                            |
 | ---------- | --------- | -------------------------------------------------- |
-| `VERSION`  | `'0.4.0'` | Package version string.                            |
+| `VERSION`  | `'0.5.0'` | Package version string.                            |
 
 Contract bounds (validated, not exported):
 
@@ -205,6 +215,9 @@ Contract bounds (validated, not exported):
 | MonoDeque `kind`    | `'min'` or `'max'` (frozen at construction)      |
 | MonoDeque value     | `typeof 'number'` and not `NaN` (`+/-Infinity` OK) |
 | MonoDeque seq ceiling | `MAX_SEQ = 2^53` (push past it throws)         |
+| MinStack `capacity` | integer in `[1, 2^31]`, EXACT (NOT rounded)      |
+| MinStack `kind`     | `'min'` or `'max'` (frozen at construction)      |
+| MinStack value      | `typeof 'number'` and not `NaN` (`+/-Infinity` OK) |
 
 ---
 
@@ -513,6 +526,109 @@ get capacity: number                 // max simultaneously-live entries (power-o
 
 ---
 
+## MinStack
+
+The fifth member: a **fixed-capacity numeric stack** that also reports the current **minimum or maximum of every live element in WORST-CASE O(1)** -- no amortization asterisk -- over two parallel `Float64Array` columns (value + a running-extreme prefix). Where MonoDeque answers a moving WINDOW, MinStack answers the whole live STACK, and it does so with a strict per-op bound: `push` never pops a run, so there is no worst-case spike to hide.
+
+```js
+import { MinStack } from '@zakkster/lite-o1';
+
+// A LIFO stack of numbers that always knows its current minimum, in O(1).
+const s = new MinStack(1000, 'min');   // kind frozen; capacity EXACT (stays 1000)
+
+s.push(5);   s.extreme();   // -> 5
+s.push(3);   s.extreme();   // -> 3
+s.push(9);   s.extreme();   // -> 3   (9 does not beat 3)
+s.push(1);   s.extreme();   // -> 1
+
+s.peek();                   // -> 1   (the top value)
+s.pop();     s.extreme();   // -> 3   (popped 1; the prior minimum is restored, O(1))
+s.pop();     s.extreme();   // -> 3   (popped 9)
+
+s.kind;                     // -> 'min'  (frozen at construction)
+s.size;                     // -> 2
+
+// s.push(NaN);             // throws [lite-o1]: NaN is rejected (+/-Infinity accepted)
+// s.push(Symbol());        // throws [lite-o1]: fail-closed, never a raw TypeError
+
+s.clear();                  // O(1): resets the top pointer (touches no store)
+s.extreme();                // -> undefined  (empty never throws)
+```
+
+Every `push` / `pop` / `peek` / `extreme` is WORST-CASE O(1) and zero-allocation after construction; `pop()` / `peek()` / `extreme()` return `undefined` on empty (never throw). A push on a full stack throws a `[lite-o1]` error as a byte-identical no-op -- fail closed, no silent drop. For BOTH the min and the max of the same stack, run two MinStacks (`kind` is frozen per instance). The `witness` harness proves MinStack's `extreme()` holds its ops/ms while a full-stack rescan collapses as the stack grows:
+
+```
+  depth     MinStack ops/ms    naive ops/ms   ratio
+  --------  ----------------   ------------   -----
+  1e3            ~154047.60       ~2458.17   ~62.67x   <- L1 micro-case (shown, not gated)
+  1e4            ~127020.42        ~268.89  ~472.39x
+  1e5            ~126057.05         ~20.83 ~6051.49x
+
+  MinStack flatness (depth >= 1e4): ~1.00   (gate >= 0.70)
+  naive foil flatness (last/first): ~0.10   (gate <= 0.55)
+  min MinStack/naive ratio:         ~425x   (gate >= 1.50x)
+```
+
+MinStack's `extreme()` streams flat across the depth sweep while the naive rescan collapses ~10x per order of magnitude. The feed is strictly DECREASING -- every push rewrites the running extreme, MinStack's own worst case -- and the line still stays flat, because a rewrite is the same one compare + two writes as a carry-forward. There is deliberately NO MAX-single-op line here (unlike MonoDeque): MinStack never pops a run, so there is no amortized pop-storm to expose -- the flat line IS the worst-case claim. The depth=1e3 point is a pure-L1 micro-case that turbo-spikes as the flatness denominator, so it is displayed but excluded from the gate (the same steady-window discipline SparseSet uses; the `0.70` floor is unchanged, only the domain is pinned). (Absolute ops/ms is machine-specific; reproduce on your own hardware.)
+
+### How MinStack works
+
+<details>
+<summary>The running-extreme column, why pop needs no recompute, and why capacity is exact.</summary>
+
+A MinStack holds two parallel `Float64Array`s and a top pointer `n`: a **value** column and an **ext** column, where `ext[i]` is the extreme (min or max, per `kind`) of every element at or below index `i`.
+
+The `ext` column is the whole trick. On `push(v)`, the extreme is carried forward in ONE comparison against the prior prefix:
+
+```
+value[n] = v
+ext[n]   = (n === 0) ? v : (min: v < ext[n-1] ? v : ext[n-1])   // one compare, no loop
+```
+
+So `extreme()` is `ext[n-1]` -- a single read, WORST-CASE O(1) no matter how many elements share the extreme. And `pop()` is just `n--`: the prefix below the new top is already the extreme of what remains, so nothing is recomputed. (`'max'` is the mirror: carry `v > ext[n-1] ? v : ext[n-1]`.)
+
+- **`push(v)`** writes `value[n]` + `ext[n]` and increments `n`. Returns `this`.
+- **`pop()`** decrements `n` and returns `value[n]`; `undefined` on empty.
+- **`peek()` / `extreme()`** read `value[n-1]` / `ext[n-1]`; `undefined` on empty.
+- **`clear()`** is `n = 0`. The store is left byte-identical (numbers retain no references, so there is nothing to zero).
+
+**Capacity is EXACT -- not rounded.** RingDeque and MonoDeque round capacity up to a power of two because a RING wraps by `& MASK`. A stack has a LINEAR top pointer -- no wrap -- so there is no rounding: `new MinStack(1000, 'min').capacity === 1000`.
+
+**Worst-case, not amortized.** The classic "getMin stack" alternative is a compressed second stack that only records a minimum when it changes. It saves memory on friendly inputs but makes `pop` conditional (was the popped value the current min?) and degrades to the same size as the full `ext` column on an adversarial strictly-decreasing feed. The flat `ext` column trades a fixed 2x memory for an UNCONDITIONAL worst-case-O(1) push AND pop with no branch on the value -- the guarantee this member exists to make.
+
+The cost of the constant is the value domain (numbers only, like RingDeque) and memory: the `ext` column DOUBLES the backing store. That makes the `[1, 2^31]` ceiling a TYPE bound (a legal index still fits a `Float64` slot), not a size any host will allocate -- a 2^31 MinStack would be ~32 GiB. The ceiling is a fail-closed guard, stated honestly, not a capacity recommendation.
+
+</details>
+
+### MinStack API reference
+
+```ts
+new MinStack(capacity: number, kind: 'min' | 'max')   // capacity is EXACT (not rounded)
+```
+
+- **`capacity`** -- the maximum number of elements; an integer in `[1, 2^31]`. EXACT: the `capacity` getter returns the constructed integer (a stack has no wrap, so no power-of-two rounding). The constructor throws a `[lite-o1]`-tagged `RangeError` on a non-integer / out-of-range / non-number argument (typeof-guarded before any coercion).
+- **`kind`** -- `'min'` or `'max'`, FROZEN at construction (one extreme per instance; a ctor-cached boolean drives the hot compare, so the push body does no per-call kind-string test). Anything else throws `[lite-o1]`.
+
+```ts
+push(v: number): this                // push onto the top (carry the extreme); worst-case O(1); throws when full / bad value
+pop(): number | undefined            // remove + return the top; undefined on empty
+peek(): number | undefined           // the top value; undefined on empty
+extreme(): number | undefined        // current min / max of every live element; undefined on empty
+clear(): void                        // O(1) empty; resets the top pointer; zeroes no store
+forEach(fn: (value: number, index: number, stack: MinStack) => void): void  // top -> bottom (pop order), alloc-free
+[Symbol.iterator](): IterableIterator<number>                               // top -> bottom (pop order)
+get kind: 'min' | 'max'              // the frozen extreme
+get size: number                     // live element count
+get capacity: number                 // max elements (exact, not rounded)
+```
+
+- **`push(v)`** throws `[lite-o1] MinStack full ...` when the stack is at capacity (a byte-identical no-op -- both columns + the top pointer unchanged) and `[lite-o1] MinStack value must be a number ...` on a value that is not a clean number (`typeof v === 'number'` AND not `NaN`; `+/-Infinity` accepted; the `typeof` guard runs first so a Symbol / BigInt never reaches the compare). It returns `this` for chaining.
+- **`pop()` / `peek()` / `extreme()`** never throw: an empty stack returns `undefined`. Because every stored value is a real number, `undefined` unambiguously means "empty".
+
+**Reach for MinStack when** you push/pop a numeric stack and need the running MIN or MAX of the live elements at strict WORST-CASE O(1) with zero per-op allocation (expression evaluators, span problems, backtracking with a rolling bound, undo stacks with a live extreme). **Avoid it when** your pattern is a queue or a sliding window (reach for RingDeque or MonoDeque), you need BOTH extremes of one stack (run two instances -- `kind` is frozen), or you need order statistics / a SUM (a running-extreme column only answers the extreme). See [`GUIDE.md`](./GUIDE.md) for the full reach-for / avoid / measure-it.
+
+---
+
 ## Composability with the ecosystem
 
 SparseSet is the dense-integer membership primitive under an ECS-style loop. A common pattern: a `SparseSet` per component tracks which entity ids currently have that component; a `@zakkster/lite-arena` `Arena` owns the component payloads by generational handle. Membership and iteration are O(1) and alloc-free; the per-frame `clear()` of a scratch set (visited masks, this-frame-touched ids) is free.
@@ -612,6 +728,20 @@ The value guard is a two-test branchless check on the hot body -- `typeof v !== 
 
 The value guard is the same branchless typeof-first check as RingDeque (`typeof v !== 'number' || v !== v`), with the `_bad` / `_full` / `_seqOverflow` / `_badSeq` throw builders (all using `String(v)`) on the cold path. The dominated-pop loop only decrements `count` -- it touches no store -- which is also why a full-ring push is a byte-identical no-op (a full ring is full of non-dominated entries, so the loop provably ran zero iterations). The torture and perf gates prove MonoDeque at **0 B/op** across push-churn / bulk-evict / value-read scenarios, with a 0-delta on BOTH `Float64Array` columns (fixed capacity -- no resize) and the leak tracker back at `size() = 0`. `forEach` is the alloc-free O(k) scan; `[Symbol.iterator]` is the one op that allocates, by generator protocol.
 
+**MinStack** allocates its two `Float64Array` columns (value + ext) once, at construction:
+
+| Operation                        | Steady-state allocations |
+| -------------------------------- | ------------------------ |
+| `push(v)`                        | **0** (one carry compare, worst-case) |
+| `pop()`                          | **0** (top pointer `n--`) |
+| `peek()` / `extreme()`           | **0** (one prefix read)  |
+| `clear()`                        | **0** (`n = 0`)          |
+| `forEach(fn)`                    | **0** (O(k) scan)        |
+| `[Symbol.iterator]()`            | a `{value,done}` per step (protocol) |
+| `new MinStack(...)`              | once, at construction (both typed arrays) |
+
+The value guard is the same branchless typeof-first check as RingDeque (`typeof v !== 'number' || v !== v`), with the `_bad` / `_full` throw builders (using `String(v)`) on the cold path. The running-extreme carry is a single compare against the prior prefix (no loop), so `push` is WORST-CASE O(1) -- not amortized -- and `pop` recomputes nothing (the prefix below the new top is already correct). The full check precedes every store, so a full-stack push is a byte-identical no-op. The torture and perf gates prove MinStack at **0 B/op** across push-churn / pop-drain / extreme-read scenarios, with a 0-delta on BOTH `Float64Array` columns (fixed capacity -- no resize) and the leak tracker back at `size() = 0`. `forEach` is the alloc-free O(k) scan; `[Symbol.iterator]` is the one op that allocates, by generator protocol.
+
 </details>
 
 ---
@@ -626,15 +756,16 @@ The value guard is the same branchless typeof-first check as RingDeque (`typeof 
 - **RingDeque is fixed-capacity (power-of-two), fail closed on full, and stores numbers only.** A power-of-two capacity buys the single-`& MASK` wrap; head + count makes full / empty single tests; a full push throws (no silent drop / overwrite); the numeric substrate keeps it zero-GC and makes `undefined`-on-empty unambiguous. See [`decisions/0005`](./decisions/0005-ring-capacity-fail-closed.md) and [`decisions/0006`](./decisions/0006-numeric-ring-substrate.md).
 - **UnionFind is amortized, not worst-case, and honest about it.** Path halving (iterative, no stack -- so zero-alloc) plus union by size bound any single op at O(alpha(n)) amortized; a single `find` is O(depth) worst-case, and the witness proves the amortized line against a naive-disjoint-set foil. `reset()` and `forEachRoots()` are the O(n) exceptions (named `reset()`, not `clear()`, to flag the cost); `roots()` is the one allocating op. See [`decisions/0007`](./decisions/0007-unionfind-path-halving-union-by-size.md).
 - **MonoDeque is a caller-driven windowing primitive, amortized and honest about it.** The monotone invariant lives in the deque (`push` pops dominated back entries -- amortized O(1), a single push is O(k) worst-case); the window rule lives in the caller (`push` returns a seq, `evictOlderThan(seq)` slides). `kind` is frozen per instance (one invariant, no per-op mode branch). Two numeric `Float64Array` columns keep it zero-GC and `undefined`-on-empty unambiguous; the seq ceiling is `MAX_SEQ = 2^53` (fail closed past it). The witness prints the MAX single-op time beside the flat amortized curve. See [`decisions/0008`](./decisions/0008-monodeque-monotonic-amortized.md).
+- **MinStack is worst-case O(1), not amortized -- and its capacity is exact.** A second `Float64Array` column carries the running extreme forward in one compare per push (`ext[n] = min-or-max(v, ext[n-1])`), so `extreme()` is a single prefix read and `pop()` recomputes nothing -- both worst-case O(1), no spike. Capacity is EXACT (a stack has a linear top pointer, no `& MASK` wrap, so no power-of-two rounding), a deliberate departure from RingDeque / MonoDeque. `kind` is frozen per instance. The rejected compressed-second-stack alternative would make `pop` conditional and degrade to the same size on an adversarial feed; the honest cost of the flat column is 2x memory (so the 2^31 ceiling is a TYPE bound, not a practical size). See [`decisions/0010`](./decisions/0010-minstack.md).
 
 ---
 
 ## Testing
 
-**119 deterministic `node:test` cases**, plus a torture gate, a hard perf gate, and the O(1) witness gate.
+**215 deterministic `node:test` cases**, plus a torture gate, a hard perf gate, and the O(1) witness gate.
 
 ```bash
-npm test           # 119 node:test cases (contract + boundary + differential fuzz)
+npm test           # 215 node:test cases (contract + boundary + differential fuzz)
 npm run test:types # tsc --noEmit against O1.d.ts
 npm run torture    # @zakkster/lite-leak + lite-gc-profiler: 0 B/op + leak-free
 npm run witness    # the O(1) throughput-invariance harness + foils + flatness gate
@@ -642,7 +773,7 @@ npm run test:perf  # @zakkster/lite-perf-gate: hard zero-alloc scavenge-scaling 
 npm run verify     # all five, the publish gate
 ```
 
-For SparseSet the suite covers: constructor validation (every bad `universe` / `capacity`), the add/has/delete/clear/iterate surface, the delete-swap back-pointer, idempotent add, insertion-order iteration, the full fail-closed key surface (`add` throws `/^\[lite-o1\]/`, `has` never throws), `null is not zero`, a **byte-identical** proof that `clear()` leaves the dense + sparse `ArrayBuffer`s untouched, and a **1,000,000-op differential fuzz** of mixed add/delete/has against a native `Set` oracle. For RingDeque: power-of-two capacity rounding, push/pop/peek at both ends, wrap-around across the `& MASK` seam, the fail-closed surface (full push throws as a byte-identical no-op; a non-number or NaN throws; a Symbol / BigInt fails closed, not raw; `+/-Infinity` accepted; empty pop/peek returns `undefined`), a byte-identical `clear()` proof, and a **1,000,000-op both-ends differential fuzz** against a plain-`Array` reference deque (0 divergences, with the full-throw and empty-undefined edges both exercised). For UnionFind: constructor validation (every bad `n`), the find/union/connected/componentSize/count/reset/forEachRoots/roots surface, `count` decrementing exactly once per true merge, a **path-halving depth-shrink proof** (a test-only peek at `_parent`), the full fail-closed element surface (a bad element -- including a Symbol / BigInt -- throws `/^\[lite-o1\]/`, never raw; `null is not zero`), and a **>= 100,000-op mixed union/find/connected differential fuzz** against a trivial no-compression / no-union-by-size oracle (0 divergences on connectivity, component size, and live count). For MonoDeque: power-of-two capacity rounding, seq assignment + dominated-pop for both `'min'` and `'max'`, `evictOlderThan` window slides, the fail-closed surface (ctor rejects a bad capacity + a bad kind; push throws on a non-number / NaN / Symbol / BigInt / object-with-valueOf, `+/-Infinity` accepted; a full push throws as a byte-identical no-op; `value` / `frontSeq` on empty return `undefined`), a byte-identical `clear()` proof, and a **>= 1,000,000-op push/evictOlderThan/value differential fuzz (both kinds)** against a brute-force sliding-window-extreme oracle (0 divergences), which also proves the monotone invariant and the amortized bound (total pops `<=` total pushes). No gate output is a FAIL.
+For SparseSet the suite covers: constructor validation (every bad `universe` / `capacity`), the add/has/delete/clear/iterate surface, the delete-swap back-pointer, idempotent add, insertion-order iteration, the full fail-closed key surface (`add` throws `/^\[lite-o1\]/`, `has` never throws), `null is not zero`, a **byte-identical** proof that `clear()` leaves the dense + sparse `ArrayBuffer`s untouched, and a **1,000,000-op differential fuzz** of mixed add/delete/has against a native `Set` oracle. For RingDeque: power-of-two capacity rounding, push/pop/peek at both ends, wrap-around across the `& MASK` seam, the fail-closed surface (full push throws as a byte-identical no-op; a non-number or NaN throws; a Symbol / BigInt fails closed, not raw; `+/-Infinity` accepted; empty pop/peek returns `undefined`), a byte-identical `clear()` proof, and a **1,000,000-op both-ends differential fuzz** against a plain-`Array` reference deque (0 divergences, with the full-throw and empty-undefined edges both exercised). For UnionFind: constructor validation (every bad `n`), the find/union/connected/componentSize/count/reset/forEachRoots/roots surface, `count` decrementing exactly once per true merge, a **path-halving depth-shrink proof** (a test-only peek at `_parent`), the full fail-closed element surface (a bad element -- including a Symbol / BigInt -- throws `/^\[lite-o1\]/`, never raw; `null is not zero`), and a **>= 100,000-op mixed union/find/connected differential fuzz** against a trivial no-compression / no-union-by-size oracle (0 divergences on connectivity, component size, and live count). For MonoDeque: power-of-two capacity rounding, seq assignment + dominated-pop for both `'min'` and `'max'`, `evictOlderThan` window slides, the fail-closed surface (ctor rejects a bad capacity + a bad kind; push throws on a non-number / NaN / Symbol / BigInt / object-with-valueOf, `+/-Infinity` accepted; a full push throws as a byte-identical no-op; `value` / `frontSeq` on empty return `undefined`), a byte-identical `clear()` proof, and a **>= 1,000,000-op push/evictOlderThan/value differential fuzz (both kinds)** against a brute-force sliding-window-extreme oracle (0 divergences), which also proves the monotone invariant and the amortized bound (total pops `<=` total pushes). For MinStack: exact capacity (NOT rounded), the push/pop/peek/extreme/clear surface for both `'min'` and `'max'`, the running-extreme carry + the exact restore of the prior extreme after each pop, the fail-closed surface (ctor rejects a bad capacity + a bad kind; push throws on a non-number / NaN / Symbol / BigInt / object-with-valueOf, `+/-Infinity` accepted; a full push throws as a byte-identical no-op; `pop` / `peek` / `extreme` on empty return `undefined`), a byte-identical `clear()` proof (same buffer identity), and a **>= 1,000,000-op interleaved push/pop differential fuzz (both kinds)** against a brute-force `Math.min` / `Math.max` oracle over the live array (0 divergences). No gate output is a FAIL.
 
 ---
 
@@ -650,7 +781,7 @@ For SparseSet the suite covers: constructor validation (every bad `universe` / `
 
 The **eight-dimension benchmark suite** -- the ecosystem MVP of the research notes --
 lives in `benchmark/` as repo-only dev infra (it is NOT in the published tarball and
-NOT a data-structure member). It profiles all four members against the JS built-in
+NOT a data-structure member). It profiles all five members against the JS built-in
 each one replaces, across eight axes that a single ops/ms number hides: D1 latency
 distribution (p50..max, with + without forced GC), D2 amortized drift, D3 memory,
 D4 cache behaviour (a labelled PORTABLE PROXY -- no native perf counters), D5 bundle
@@ -658,7 +789,7 @@ size + tree-shaking, D6 GC pressure + allocation curve, D7 key-type + load-facto
 scaling, and D8 workload micro-benches.
 
 ```bash
-npm run bench          # run all 32 (member x dimension) cells, one child process each
+npm run bench          # run all 40 (member x dimension) cells, one child process each
 npm run bench:report   # the above, then render a zero-dep HTML report (hand-rolled SVG)
                        #   -> benchmark/report.html (open it for the full charts + tables)
 ```
@@ -667,19 +798,20 @@ Key deterministic results (machine-independent; latency / throughput numbers var
 host and live in the report):
 
 **D5 -- bundle size + tree-shaking** (esbuild minify + gzip). A single-member import
-drops the other three; the all-member import is ~1.7 KB gzipped:
+drops the other four; the all-member import is ~1.9 KB gzipped:
 
 | import        | gzip (single) | gzip (all) | single / all |
 |---------------|---------------|------------|--------------|
-| SparseSet     | ~577 B        | ~1703 B    | ~0.34        |
-| RingDeque     | ~646 B        | ~1703 B    | ~0.38        |
-| UnionFind     | ~594 B        | ~1703 B    | ~0.35        |
-| MonoDeque     | ~817 B        | ~1703 B    | ~0.48        |
+| SparseSet     | ~577 B        | ~1906 B    | ~0.30        |
+| RingDeque     | ~646 B        | ~1906 B    | ~0.34        |
+| UnionFind     | ~594 B        | ~1906 B    | ~0.31        |
+| MonoDeque     | ~817 B        | ~1906 B    | ~0.43        |
+| MinStack      | ~604 B        | ~1906 B    | ~0.32        |
 
 Tree-shaking works for every member (each lone import is smaller than the whole).
-The "< 40% of all" claim holds for SparseSet / RingDeque / UnionFind; MonoDeque is
-the honest exception (~0.48) because it is the single heaviest member -- nearly half
-the library's code -- so its lone import is inherently ~half the bundle.
+The "< 40% of all" claim holds for SparseSet / RingDeque / UnionFind / MinStack;
+MonoDeque is the honest exception (~0.43) because it is the single heaviest member --
+nearly half the library's code -- so its lone import is inherently ~half the bundle.
 
 **D6 -- GC pressure curve** (n = 1e3 .. 1e6, the 0 B/op gate as a measured line):
 
@@ -689,6 +821,7 @@ the library's code -- so its lone import is inherently ~half the bundle.
 | RingDeque | yes        | 0            | <= 1                     |
 | UnionFind | yes        | 0            | <= 1                     |
 | MonoDeque | yes        | 0            | <= 1                     |
+| MinStack  | yes        | 0            | <= 1                     |
 
 **D3 -- memory footprint** (bytes per live element vs the theoretical minimum):
 
@@ -698,8 +831,9 @@ the library's code -- so its lone import is inherently ~half the bundle.
 | RingDeque | 8            | 8 (one f64)     | 1.0x     |
 | UnionFind | 8            | 8 (parent+size) | 1.0x     |
 | MonoDeque | sized for worst case | 16 (value+seq) | fixed-capacity: sized for a fully-monotone window, so few survivors after dominated pops |
+| MinStack  | 16           | 16 (value+ext)  | 1.0x per live element; the running-extreme column doubles a plain numeric stack |
 
-All four are fixed-capacity by design: they reuse one backing store, so `clear()`
+All five are fixed-capacity by design: they reuse one backing store, so `clear()`
 retains the buffer (stated, not implicit). The suite's applicability matrix emits the
 string `n/a` -- never `0` -- for cells that do not apply (fail closed). D4 is labelled
 a PROXY (dense-iteration vs random-lookup + a working-set stride sweep) because a true
@@ -714,9 +848,10 @@ ADR [`0009`](./decisions/0009-benchmark-suite.md) for the design and the settled
 - **Not a general-purpose queue.** RingDeque stores numbers only. To queue objects / strings, queue their integer handles and keep the payloads in a parallel column or `@zakkster/lite-arena`.
 - **Not a splittable disjoint-set.** UnionFind is merge-only: there is no per-element un-merge / undo. `reset()` re-singletons the whole forest in O(n); rollback means keeping your own edge log and rebuilding. It also eagerly allocates two `n`-sized `Uint32Array` columns at construction, so it is not for a huge / unbounded or non-integer element domain -- and a single `find` is amortized alpha(n), not worst-case O(1).
 - **Not a general-purpose window aggregator.** MonoDeque answers only the window MIN or MAX (one, frozen at construction -- run two instances for both), not the median, k-th, or SUM of the window. It stores numbers only, is caller-driven (it does not evict on its own -- you call `evictOlderThan`), and a single `push` is amortized O(1) (O(k) worst-case).
-- **Not a growable collection.** All four members are fixed-capacity: a SparseSet key past capacity, or a RingDeque / MonoDeque push on a full ring, throws; UnionFind's element universe `n` is fixed at construction. This is deliberate (worst-case / amortized bounds, fail closed -- no hidden resize), not a missing feature. An overwrite-oldest RingDeque preset (RingLog) is a deferred future variant, not the current default.
-- **Not a payload store.** SparseSet holds membership, RingDeque holds numbers, UnionFind holds connectivity, MonoDeque holds numeric window extremes -- none holds object payloads. Store component data in a parallel SoA column or `@zakkster/lite-arena` keyed by the same ids / handles.
-- **Not the full family yet.** v0.4.0 is SparseSet + RingDeque + UnionFind + MonoDeque. SlotPool is on the roadmap, not in this release.
+- **Not a general-purpose stack aggregator.** MinStack answers only the running MIN or MAX of the live stack (one, frozen at construction -- run two instances for both), not the median, k-th, or SUM. It stores numbers only, is a STACK (LIFO -- not a queue or a sliding window; reach for RingDeque or MonoDeque for those), and its running-extreme column doubles the backing memory (so its 2^31 ceiling is a TYPE bound, not a practical size).
+- **Not a growable collection.** All five members are fixed-capacity: a SparseSet key past capacity, or a RingDeque / MonoDeque / MinStack push on a full store, throws; UnionFind's element universe `n` is fixed at construction. This is deliberate (worst-case / amortized bounds, fail closed -- no hidden resize), not a missing feature. An overwrite-oldest RingDeque preset (RingLog) is a deferred future variant, not the current default.
+- **Not a payload store.** SparseSet holds membership, RingDeque holds numbers, UnionFind holds connectivity, MonoDeque holds numeric window extremes, MinStack holds numeric stack values + their running extreme -- none holds object payloads. Store component data in a parallel SoA column or `@zakkster/lite-arena` keyed by the same ids / handles.
+- **Not the full family yet.** v0.5.0 is SparseSet + RingDeque + UnionFind + MonoDeque + MinStack. SlotPool is on the roadmap, not in this release.
 - **Not itself a benchmark suite.** The witness proves throughput invariance (one axis); the full eight-dimension latency/memory/cache/GC suite lives in `benchmark/` as repo-only dev infra (`npm run bench:report`), NOT shipped in the published package.
 
 ---

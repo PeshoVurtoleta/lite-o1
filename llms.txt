@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-Version: 0.4.0
+Version: 0.5.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -13,9 +13,9 @@ op is O(1) worst-case (or O(1)-amortized where stated) and allocates zero bytes
 after construction, and a shipped witness harness demonstrates the flat
 throughput curve against a built-in foil.
 
-v0.4.0 ships four members: SparseSet, RingDeque, UnionFind, and MonoDeque. They
-share no mutable module state, so a bundler that imports one drops the others
-(tree-shakeable).
+v0.5.0 ships five members: SparseSet, RingDeque, UnionFind, MonoDeque, and
+MinStack. They share no mutable module state, so a bundler that imports one drops
+the others (tree-shakeable).
 
 ## Exports (from the single main file O1.js)
 
@@ -24,7 +24,9 @@ share no mutable module state, so a bundler that imports one drops the others
 - `UnionFind` -- class. A zero-GC near-O(1) amortized disjoint-set forest.
 - `MonoDeque` -- class. A zero-GC O(1)-amortized monotonic deque for
   sliding-window min / max.
-- `VERSION` -- string, '0.4.0'.
+- `MinStack` -- class. A zero-GC WORST-CASE O(1) fixed-capacity numeric stack with
+  a running min / max.
+- `VERSION` -- string, '0.5.0'.
 
 ## SparseSet
 
@@ -197,6 +199,62 @@ so a hidden worst-case spike shows as a tall bar. MAX_SEQ = 2^53 is the seq
 ceiling (seqs live in a Float64 slot; past 2^53 push throws rather than lose
 integer precision -- call clear() to reuse).
 
+## MinStack
+
+    new MinStack(capacity, kind)
+
+- capacity: max elements; integer in [1, 2^31]. EXACT -- NOT rounded to a power of
+  two (a stack has a linear top pointer, no wrap, no & MASK). The capacity getter
+  reports the constructed integer verbatim.
+- kind: 'min' or 'max', FROZEN at construction (one extreme per instance).
+  Validated fail-closed (anything else throws [lite-o1]). A ctor-cached boolean
+  drives the hot compare, so the push body does NO per-call kind-string test.
+- Constructor throws a [lite-o1] RangeError on a bad capacity (non-integer /
+  out-of-range / non-number, typeof-guarded before coercion) or a bad kind.
+- Substrate: TWO parallel Float64Arrays -- value[] (the stack) and ext[] (the
+  running extreme of everything at/below each index). On push:
+  ext[n] = (n===0) ? v : (min: v<ext[n-1]?v:ext[n-1]) (max: v>ext[n-1]?v:ext[n-1]).
+
+Hot surface (all WORST-CASE O(1), zero allocation):
+
+- push(v) -> this         Push v onto the top, carrying the running extreme in ONE
+                          compare. Fail closed: a non-clean value throws [lite-o1]
+                          (typeof guard FIRST); a FULL stack throws a byte-identical
+                          no-op.
+- pop() -> number|undefined   Remove+return the TOP; undefined on empty (never
+                          throws). Just decrements the top pointer -- the prefix
+                          below is already correct, no recompute.
+- peek() -> number|undefined  The TOP value without removing it; undefined on empty.
+- extreme() -> number|undefined  The current min/max (per the frozen kind) of every
+                          live element -- a single running-extreme prefix read.
+                          O(1) WORST-CASE. undefined on empty, NEVER throws. Named
+                          extreme() (parallels MonoDeque.value()).
+- kind (getter)          The frozen 'min' | 'max' extreme.
+- size (getter)          Live element count.
+- capacity (getter)      Max elements (EXACT, not rounded).
+- clear() -> void        O(1): resets the top pointer, touches NO store.
+- forEach(fn) -> void    O(k) alloc-free scan TOP -> BOTTOM (pop order); fn is
+                          (value, index, stack). A documented exception, EXCLUDED
+                          from the zero-alloc-per-op claims.
+- [Symbol.iterator]()    O(k) scan TOP -> BOTTOM; ALLOCATES a {value, done} per step
+                          by protocol -- OUT of the zero-alloc claims. Use forEach
+                          for the alloc-free scan.
+
+Value contract (LOCKED, IDENTICAL to RingDeque / MonoDeque): a pushed value must be
+typeof 'number' AND not NaN. Rejected (throws [lite-o1]): null, undefined, string,
+Symbol, BigInt, object (incl. one with a numeric valueOf), NaN. Accepted: any
+finite number, and +Infinity / -Infinity. The typeof guard runs FIRST so a Symbol
+/ BigInt never reaches the compare.
+
+Worst-case honesty: unlike MonoDeque (amortized), MinStack push is WORST-CASE O(1)
+-- it never pops a run, so there is no per-op spike to expose. The witness shows a
+FLAT extreme() line on a strictly-decreasing feed (its worst case, every push
+rewriting ext) with NO MAX-single-op line, because there is nothing to expose.
+
+Memory honesty: the ext[] column DOUBLES the backing memory, so a 2^31 MinStack is
+~32 GiB -- the ceiling is a TYPE bound (a legal index fits a Float64 slot), not a
+size any host allocates. The throw stays; the note is the disclosure.
+
 ## Design bounds
 
 - SparseSet valid key: integer in [0, universe).
@@ -211,10 +269,15 @@ integer precision -- call clear() to reuse).
   push past full throws (fail closed). Value: typeof 'number' and not NaN
   (+/-Infinity accepted). kind frozen at construction. seq ceiling 2^53.
   forEach / [Symbol.iterator] are the O(k) scan exceptions (iterator allocates).
+- MinStack capacity (EXACT, NOT rounded): max elements; push past full throws
+  (fail closed). Value: typeof 'number' and not NaN (+/-Infinity accepted). kind
+  frozen at construction. WORST-CASE O(1) push/pop/peek/extreme. The ext[] column
+  doubles memory, so the 2^31 ceiling is a TYPE bound (see the memory note).
+  forEach / [Symbol.iterator] scan TOP -> BOTTOM (iterator allocates).
 
 ## Scripts
 
-- npm test           -- 119 node:test cases (contract + boundary + differential fuzz).
+- npm test           -- 215 node:test cases (contract + boundary + differential fuzz).
 - npm run test:types -- tsc --noEmit against O1.d.ts.
 - npm run torture    -- lite-leak + lite-gc-profiler: 0 B/op, 0 major GC, leak-free.
 - npm run witness    -- O(1) throughput-invariance harness + foils + flatness gate.
@@ -245,6 +308,14 @@ integer precision -- call clear() to reuse).
   flatness >= 0.70; naive foil flatness <= 0.55; MonoDeque/naive ratio >= 1.5x.
   The witness also prints the MAX single-op time (an O(W) pop-storm) beside a
   typical O(1) push -- the amortized-honesty bar.
+- MinStack: depth-sweep [1e3, 1e4, 1e5], WORST-CASE-O(1) extreme() on a strictly-
+  DECREASING feed (every push rewrites ext) vs a NAIVE plain-array stack that
+  RESCANS all live elements each query (O(depth)). ops/ms is a rate (mstk batch
+  5e5, naive batch 300). Gated over the steady window depth >= 1e4 (the 1e3 point
+  is a pure-L1 micro-case shown but not gated; the 0.70 floor is unchanged, only
+  the domain is pinned). MinStack flatness >= 0.70; naive foil flatness <= 0.55;
+  MinStack/naive ratio >= 1.5x. NO MAX-single-op line: push is worst-case O(1), so
+  there is no amortized spike to expose.
 
 ## Not yet shipped
 
@@ -253,4 +324,5 @@ release. A RingLog / overwrite-oldest RingDeque preset is a deferred future
 variant. SparseSet holds membership, not payloads (store values in a parallel SoA
 column or @zakkster/lite-arena); RingDeque holds numbers only; UnionFind holds
 disjoint-set connectivity over [0, n), not payloads; MonoDeque holds numeric
-window extremes only (queue integer handles for object payloads).
+window extremes only, and MinStack holds numeric stack values + their running
+extreme only (queue integer handles for object payloads).

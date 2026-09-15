@@ -22,7 +22,7 @@
  */
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { SparseSet, RingDeque, UnionFind, MonoDeque } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack } from '../../O1.js';
 
 const U = 1 << 16;      // universe 65536
 const CAP = 1 << 14;    // capacity 16384
@@ -404,11 +404,122 @@ const monoValueRead = {
     statsOf(s) { return { grows: monoGrows(s) }; },
 };
 
+// ===========================================================================
+// MinStack scenarios -- two fixed Float64Array columns, all WORST-CASE O(1)
+// zero-alloc (push / pop / peek / extreme).
+// ===========================================================================
+
+const MIN_CAP = 1 << 14;  // 16384 (EXACT capacity -- MinStack does NOT round)
+const MIN_W = 1 << 12;    // 4096 resident window -> steady state, never full/empty
+
+/**
+ * The zero-alloc counter for MinStack scenarios: BOTH backing Float64Arrays'
+ * ArrayBuffer byte lengths (value + ext columns). Capacity is fixed and EXACT at
+ * construction, so this NEVER grows -- the delta across the window must be 0
+ * (the `minGrows` 0-delta case; mirrors grows / ringGrows / ufGrows / monoGrows).
+ */
+function minGrows(s) {
+    return s.min._val.buffer.byteLength + s.min._ext.buffer.byteLength;
+}
+
+/** A MinStack primed with a bounded resident window (steady-state churn). */
+function minFill(kind) {
+    const min = new MinStack(MIN_CAP, kind);
+    for (let i = 0; i < MIN_W; i++) min.push((i * 2654435761) & 0x7fffffff);
+    return min;
+}
+
+/**
+ * push-churn: push a scrambled value (the running-extreme carry runs a real
+ * compare) then pop it, so the stack stays at MIN_W (< MIN_CAP) and no op touches
+ * the full/empty edge. Values are SMI ints -> no coercion, no heap double.
+ */
+const minPushChurn = {
+    name: 'MinStack push-churn (push + pop)',
+    setup() { return { min: minFill('min'), v: 0 }; },
+    hot(s, n) {
+        const min = s.min;
+        let v = s.v | 0;
+        for (let i = 0; i < n; i++) {
+            v = (v + 1) | 0;
+            min.push((v * 2654435761) & 0x7fffffff);
+            min.pop();
+        }
+        s.v = v | 0;
+    },
+    statsOf(s) { return { grows: minGrows(s) }; },
+};
+
+/**
+ * pop-drain: refill the whole resident window in one burst the instant the stack
+ * empties, then pop one per op -- so the measured window is dominated by REAL pops
+ * (the top-pointer decrement + value read). The stack oscillates 0 -> MIN_W
+ * (< MIN_CAP), never full, and every op is zero-alloc.
+ */
+const minPopDrain = {
+    name: 'MinStack pop-drain (bulk fill then drain)',
+    setup() { return { min: new MinStack(MIN_CAP, 'min'), v: 0 }; },
+    hot(s, n) {
+        const min = s.min;
+        let v = s.v | 0;
+        for (let i = 0; i < n; i++) {
+            if (min.size === 0) {
+                for (let k = 0; k < MIN_W; k++) {
+                    v = (v + 1) | 0;
+                    min.push((v * 2654435761) & 0x7fffffff);
+                }
+            }
+            min.pop();
+        }
+        s.v = v | 0;
+    },
+    statsOf(s) { return { grows: minGrows(s) }; },
+};
+
+/** extreme-read: a primed stack; every op a front-only extreme() + peek() read, int32 acc. */
+const minExtremeRead = {
+    name: 'MinStack extreme + peek read',
+    setup() { return { min: minFill('max'), acc: 0 }; },
+    hot(s, n) {
+        const min = s.min;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) {
+            acc = (acc + min.extreme() + min.peek()) | 0;
+        }
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: minGrows(s) }; },
+};
+
+/**
+ * MinStack forEach-drain: a primed stack drained each op through a HOISTED
+ * module-scope callback (never re-created per op). Mirrors SparseSet's
+ * forEachDrain -- proves forEach itself (the alloc-free scan; the ONE
+ * documented per-protocol allocator is [Symbol.iterator], gated separately
+ * by minMustFailAlloc below) allocates nothing over its own dedicated window.
+ */
+let minDrainAcc = 0;
+function minDrainInto(v) { minDrainAcc = (minDrainAcc + v) | 0; }
+const minForEachDrain = {
+    name: 'MinStack forEach-drain',
+    setup() {
+        const min = new MinStack(MIN_CAP, 'min');
+        for (let i = 0; i < 256; i++) min.push((i * 2654435761) & 0x7fffffff); // bounded resident window to drain (mirrors SparseSet forEach-drain)
+        return { min };
+    },
+    hot(s, n) {
+        const min = s.min;
+        for (let i = 0; i < n; i++) min.forEach(minDrainInto);
+    },
+    statsOf(s) { return { grows: minGrows(s) }; },
+};
+
 const scenarios = [
     addChurn, hasHit, deleteChurn, clearRefill, forEachDrain,
     ringFifo, ringLifo, ringInterleave,
     ufFindHeavy, ufUnionChurn, ufConnected, ufComponentSize,
     monoPushChurn, monoEvict, monoValueRead,
+    minPushChurn, minPopDrain, minExtremeRead, minForEachDrain,
 ];
 
 /**
@@ -486,6 +597,33 @@ const monoMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/**
+ * The MinStack teeth: a per-op `[Symbol.iterator]` spread into a FRESH [] each op
+ * -- the generator + its per-step {value, done} wrappers + the array MUST trip the
+ * gate (scavenges scale with n), proving the instrument has teeth on the MinStack
+ * surface too (its iterator is the ONE documented per-protocol allocator; forEach
+ * is the alloc-free scan). statsOf returns a constant so the failure is the
+ * allocation lanes, not a missing-counter artifact.
+ */
+const minMustFailAlloc = {
+    name: 'MinStack [Symbol.iterator] spread into fresh array (MUST allocate)',
+    setup() {
+        const min = new MinStack(256, 'min');
+        for (let i = 0; i < 64; i++) min.push((i * 2654435761) & 0x7fffffff);
+        return { min };
+    },
+    hot(s, n) {
+        const min = s.min;
+        let sink = 0;
+        for (let i = 0; i < n; i++) {
+            const arr = [...min]; // fresh generator + array per op -> heap churn
+            sink += arr.length;
+        }
+        s.sink = sink;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -495,5 +633,5 @@ zgcSuite({
     counters: { grows: 0 },
     maxRetainedKB: 64,
     scenarios,
-    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc],
+    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc],
 });

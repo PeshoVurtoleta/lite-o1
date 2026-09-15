@@ -164,6 +164,47 @@ O(1) violation.
 
 ---
 
+### MinStack (v0.5.0)
+
+Fixed-capacity numeric stack that also reports the current MIN or MAX of every
+live element in WORST-CASE O(1), over two parallel `Float64Array` columns (value +
+a running-extreme prefix). `kind` ('min' | 'max') is frozen at construction.
+Capacity is EXACT (a stack has a linear top pointer -- no wrap, no rounding).
+
+**Reach for it when:**
+
+- You push/pop a numeric stack (LIFO) and need the running MIN or MAX of the live
+  elements at each step, at strict WORST-CASE O(1) -- expression evaluators, span
+  problems, backtracking with a rolling bound, undo stacks with a live extreme.
+- You want a HARD per-op budget (no amortized spike): unlike MonoDeque, MinStack
+  never pops a run, so both `push` and `extreme()` are worst-case O(1), not merely
+  amortized.
+- The values are numbers (or integer handles into a parallel store), and you know
+  a capacity bound up front.
+- You need zero per-op allocation on a per-frame / per-tick hot path.
+
+**Avoid it when:**
+
+- Your access pattern is a QUEUE or a sliding WINDOW, not a stack -- reach for
+  MonoDeque (window min/max) or RingDeque (FIFO/LIFO of numbers) instead. MinStack
+  answers the extreme of the WHOLE live stack, not a moving window.
+- You need BOTH the min AND the max of the same stack -- run TWO MinStacks (`kind`
+  is frozen per instance).
+- You need arbitrary order statistics (median, k-th) or the stack's SUM -- MinStack
+  only answers the extreme.
+- You cannot bound the capacity, or would need to queue non-numbers (queue handles
+  instead). Note the honest memory cost: the running-extreme column DOUBLES the
+  backing memory, so the 2^31 ceiling is a TYPE bound, not a practical size.
+
+**Measure it:** `npm run witness` -- MinStack `extreme()` flatness `>= 0.70` across
+the depth sweep `[1e4..1e5]` (the 1e3 point is a pure-L1 micro-case, shown but not
+gated) while a naive plain-array rescan foil collapses (`<= 0.55`), ratio `>= 1.5x`.
+The feed is strictly decreasing (every push rewrites the extreme -- MinStack's own
+worst case) and the line still stays flat. There is deliberately NO MAX-single-op
+line: push is worst-case O(1), so there is no amortized pop-storm to expose.
+
+---
+
 ## Roadmap members (not yet shipped)
 
 Placeholders so the decision axes are visible early; each fills in on release.
@@ -192,7 +233,7 @@ amortized drift, memory, cache proxy, bundle size, GC pressure, key-type / load-
 scaling, and workload micro-benches:
 
 ```bash
-npm run bench          # all 32 (member x dimension) cells, one child process each
+npm run bench          # all 40 (member x dimension) cells, one child process each
 npm run bench:report   # renders a zero-dep HTML report -> benchmark/report.html
 ```
 
@@ -200,10 +241,10 @@ Decision-relevant highlights (full charts + tables in `benchmark/report.html`):
 
 | axis | what to read | what the members show |
 |------|--------------|-----------------------|
-| D5 bundle | single-member gzip vs all-member (~1.7 KB) | each lone import drops the other three; SparseSet / RingDeque / UnionFind < 40% of all, MonoDeque ~48% (it is the heaviest member) |
-| D6 GC | zero-alloc + max major GC over n=1e3..1e6 | 0 B/op, 0 major GC, sub-ms pause for all four -- the 0 B/op gate as a curve |
-| D3 memory | bytes/live vs theoretical min | SparseSet 2.0x (sparse index), RingDeque + UnionFind 1.0x; all fixed-capacity (clear() keeps the buffer) |
-| D1 latency | p99 / max ns/op (with + without GC) | flat tails; amortized members (UnionFind, MonoDeque) show their worst single op vs the typical one |
+| D5 bundle | single-member gzip vs all-member (~1.9 KB) | each lone import drops the other four; SparseSet / RingDeque / UnionFind / MinStack < 40% of all, MonoDeque ~43% (it is the heaviest member) |
+| D6 GC | zero-alloc + max major GC over n=1e3..1e6 | 0 B/op, 0 major GC, sub-ms pause for all five -- the 0 B/op gate as a curve |
+| D3 memory | bytes/live vs theoretical min | SparseSet 2.0x (sparse index), RingDeque + UnionFind 1.0x, MinStack 2.0x (running-extreme column); all fixed-capacity (clear() keeps the buffer) |
+| D1 latency | p99 / max ns/op (with + without GC) | flat tails; amortized members (UnionFind, MonoDeque) show their worst single op vs the typical one, while MinStack is worst-case O(1) |
 
 D4 is a labelled PORTABLE PROXY (dense-iteration vs random-lookup + a working-set
 stride sweep) -- no native perf counters. The applicability matrix prints `n/a`

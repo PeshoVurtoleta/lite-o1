@@ -10,8 +10,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **8-dimension benchmark suite (`benchmark/`, repo-only -- NOT part of the
   published surface, NO version bump).** The ecosystem MVP of RESEARCH.md section 3:
-  it profiles the four shipped members (SparseSet, RingDeque, UnionFind, MonoDeque)
-  against the JS built-ins across eight axes -- D1 latency distribution
+  it profiles the five shipped members (SparseSet, RingDeque, UnionFind, MonoDeque,
+  MinStack) against the JS built-ins across eight axes -- D1 latency distribution
   (p50/p90/p99/p99.9/max, with + without forced GC), D2 amortized drift over long
   mixed traces, D3 memory footprint + stability, D4 cache behaviour (a labelled
   PORTABLE PROXY: dense-iteration vs random-lookup + a working-set stride sweep; no
@@ -31,6 +31,82 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   impossible 0 fails) + FIXED-SEED DETERMINISM (two runs at seed `0x9e3779b1`
   produce byte-identical workload trace hashes, using the repo's own Numerical
   Recipes LCG -- no new PRNG introduced).
+
+## [0.5.0] - 2026-09-16
+
+The fifth member of the O(1) family: a fixed-capacity numeric stack that reports
+the current minimum OR maximum of every live element in WORST-CASE O(1) (no
+amortization asterisk). Tree-shakeable alongside SparseSet, RingDeque, UnionFind,
+and MonoDeque (the five share no mutable module state).
+
+### Added
+
+- **`MinStack(capacity, kind)`** -- a zero-GC, WORST-CASE O(1) fixed-capacity
+  numeric stack that also reports the running min / max, over TWO parallel
+  `Float64Array` columns (value + a running-extreme prefix):
+  - `push(v) -> this` -- push v onto the top, carrying the running extreme forward
+    in ONE compare (`ext[n] = (n===0) ? v : min-or-max(v, ext[n-1])`). WORST-CASE
+    O(1) -- it never pops a run, so there is no amortized spike.
+  - `pop() -> number|undefined` / `peek() -> number|undefined` -- remove / read the
+    TOP value. O(1); `undefined` on empty, NEVER throw. `pop` just decrements the
+    top pointer (the prefix below is already correct -- no recompute).
+  - `extreme() -> number|undefined` -- the current min / max (per the frozen kind)
+    of every live element, a single running-extreme prefix read. O(1) WORST-CASE;
+    `undefined` on empty. Named `extreme()` (it parallels `MonoDeque.value()`).
+  - `kind` getter (frozen 'min' | 'max'), `size` getter (live elements), `capacity`
+    getter. `clear()` is O(1): resets the top pointer, touches NO store.
+  - Capacity is EXACT -- NO power-of-two rounding (a stack has a linear top pointer,
+    no `& MASK` wrap): `new MinStack(1000, 'min').capacity === 1000`. This is a
+    deliberate departure from RingDeque / MonoDeque.
+  - `forEach(fn)` -- an O(k) alloc-free scan TOP -> BOTTOM (pop order; fn is
+    (value, index, stack)), the documented exception excluded from the
+    zero-alloc-per-op claims. `[Symbol.iterator]` -- an O(k) TOP -> BOTTOM scan that
+    ALLOCATES a `{value, done}` per step by protocol, kept out of the zero-alloc claims.
+  - Ceiling: capacity in `[1, 2^31]`. HONEST NOTE: the `ext[]` column DOUBLES the
+    backing memory, so a 2^31 MinStack is ~32 GiB -- the ceiling is a TYPE bound
+    (a legal index fits a Float64 slot), not a size any host allocates. Fail closed:
+    a non-clean value (non-number or NaN; `+/-Infinity` accepted) throws `[lite-o1]`
+    (typeof-guarded FIRST, so a Symbol / BigInt never triggers a raw `TypeError`);
+    a FULL stack push throws a byte-identical no-op; a bad capacity / kind throws
+    `[lite-o1]`. `null` is not zero.
+- **`O1.d.ts`** -- MinStack ambient types added.
+- **The O(1) Witness** (`test/witness.mjs`) -- a MinStack `extreme()` depth-sweep
+  `[1e3, 1e4, 1e5]` on a strictly-DECREASING feed (every push rewrites `ext` -- the
+  worst case) vs a NAIVE plain-array stack that RESCANS all live elements each query
+  (O(depth)); MinStack flatness `>= 0.70`, naive foil `<= 0.55`, ratio `>= 1.5x`.
+  Gated over the steady window depth `>= 1e4` (the 1e3 point is a pure-L1 micro-case
+  that turbo-spikes as the flatness denominator -- shown, not gated; the 0.70 floor
+  is unchanged, only the DOMAIN is pinned, mirroring the ADR-0004 amendment). There
+  is NO MAX-single-op line (unlike MonoDeque): push is worst-case O(1), so there is
+  no amortized pop-storm to expose -- the flat line IS the worst-case claim.
+- **Torture gate** -- MinStack push / pop / peek / extreme cycles at 0 B/op (a
+  `minBpc` metric alongside the four prior per-op figures), 0 major GC, tracker size
+  0, arrayBuffers delta 0. The run proves 0 B/op across ALL FIVE members.
+- **Perf gate** (`test/perf/PerfGate.test.mjs`) -- MinStack push-churn, pop-drain
+  (bulk fill then drain), and extreme + peek read scenarios at 0 scavenges / 0
+  old-gen / 0 arrayBuffers and a 0-delta `minGrows` counter on BOTH `Float64Array`
+  columns, plus a `[Symbol.iterator]`-into-fresh-array must-fail teeth case.
+- **MinStack `node:test` cases** -- contract + boundary (reject Symbol / BigInt /
+  object-with-valueOf / NaN / non-number / null / undefined; ctor rejects a bad
+  capacity + a bad kind; capacity is EXACT, not rounded) + empty-undefined edges + a
+  byte-identical full-throw no-op + a byte-identical `clear()` (same buffer identity)
+  + a >= 1e6-op interleaved push / pop differential fuzz (both 'min' and 'max')
+  against a brute-force `Math.min` / `Math.max` oracle over the live array (0
+  divergences), proving after each pop that `extreme()` equals the pre-push extreme
+  exactly.
+- ADR [`0010`](./decisions/0010-minstack.md) (the worst-case-O(1) running-extreme
+  substrate, the exact-capacity-no-rounding departure, the REJECTED compressed
+  second-stack alternative, and the 2^31 / memory honesty note).
+
+### Changed
+
+- `VERSION` bumped to `'0.5.0'` (synced across `package.json`, the `VERSION` const
+  in `O1.js`, and `llms.txt`). New keywords: min-stack, min-max-stack, stack,
+  running-minimum. The SparseSet / RingDeque / UnionFind / MonoDeque class bodies
+  are BYTE-IDENTICAL -- only the O1.js header comment, the `VERSION` const, and their
+  `VERSION` test assertions changed.
+
+[0.5.0]: https://www.npmjs.com/package/@zakkster/lite-o1/v/0.5.0
 
 ## [0.4.0] - 2026-09-15
 

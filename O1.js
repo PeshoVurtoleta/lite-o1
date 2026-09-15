@@ -3,9 +3,9 @@
  * that doubles as a teachable textbook: each member solves a real problem AND
  * proves its constant is real (the O(1) Witness -- see test/witness.mjs).
  *
- * v0.4.0 ships four members -- SparseSet, RingDeque, UnionFind, and MonoDeque --
- * plus its `VERSION` const. The four are independent (no shared mutable module
- * state), so a bundler that imports one drops the others (`sideEffects: false`).
+ * v0.5.0 ships five members -- SparseSet, RingDeque, UnionFind, MonoDeque, and
+ * MinStack -- plus its `VERSION` const. The five are independent (no shared mutable
+ * module state), so a bundler that imports one drops the others (`sideEffects: false`).
  *
  * The complexity class IS the product: every hot op below is O(1) worst-case and
  * allocates ZERO bytes after construction. The witness harness (never imported
@@ -16,7 +16,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '0.4.0';
+export const VERSION = '0.5.0';
 
 /** Largest universe the Uint32 substrate + the (k >>> 0) key check can honor. */
 const MAX_UNIVERSE = 0x100000000; // 2^32
@@ -755,5 +755,191 @@ export class MonoDeque {
     _badSeq(seq) {
         throw new TypeError(
             '[lite-o1] MonoDeque evictOlderThan seq must be a number and not NaN, got ' + String(seq));
+    }
+}
+
+/**
+ * MinStack -- a zero-GC, WORST-CASE O(1) fixed-capacity numeric stack that also
+ * reports the current minimum OR maximum of every live element in O(1), over TWO
+ * parallel `Float64Array` columns (value + a running-extreme prefix).
+ *
+ * push / pop / peek / extreme / clear / iterate are ALL O(1) WORST-CASE (no
+ * amortization asterisk, no per-op spike) and allocate ZERO bytes after
+ * construction. The trick is the second column: `ext[i]` holds the extreme of
+ * everything at or below index `i`, so it is carried forward on every push in a
+ * single comparison and read straight off the top on every query:
+ *
+ *     value[n] = v
+ *     ext[n]   = (n === 0) ? v : min-or-max(v, ext[n-1])   // one compare, no loop
+ *
+ * `extreme()` is then `ext[n-1]` -- a pure pointer read, unaffected by how many
+ * elements share the extreme (unlike a MonoDeque, whose push is only AMORTIZED
+ * O(1): a MinStack never pops a run, so there is no worst-case pop-storm to expose).
+ * `pop()` just decrements the top pointer; the prefix below it is already correct.
+ *
+ * `kind` ('min' | 'max') is FROZEN at construction (a ctor-cached `_min` boolean
+ * drives the hot compare, so the body does NO per-call kind-string test) -- one
+ * extreme per instance. Capacity is EXACT: a stack has a linear top pointer, no
+ * wrap and no `& MASK`, so there is no power-of-two rounding -- `capacity` is the
+ * integer you constructed with.
+ *
+ * Numeric-only value policy IDENTICAL to RingDeque / MonoDeque: a pushed value must
+ * be `typeof 'number'` AND not NaN (`+/-Infinity` accepted); everything else --
+ * null, undefined, string, Symbol, BigInt, object (incl. one with a numeric
+ * `valueOf`) -- is rejected fail-closed. The typeof guard runs FIRST so a Symbol /
+ * BigInt never reaches arithmetic (`<`/`>`/template literals THROW on those); the
+ * cold `_bad` builder names the value via `String(v)`, which is Symbol/BigInt-safe.
+ *
+ * Fail closed, mirroring the suite: `push` on a FULL stack throws `[lite-o1]` as a
+ * BYTE-IDENTICAL no-op (the full check precedes every store), and a non-clean value
+ * throws `[lite-o1]`. `pop()` / `peek()` / `extreme()` on an EMPTY stack return
+ * `undefined`, NEVER throw (unambiguous: every stored value is a real number).
+ *
+ * `forEach(fn)` (TOP -> BOTTOM, i.e. pop order, alloc-free, fn is
+ * (value, index, stack)) and `[Symbol.iterator]()` (TOP -> BOTTOM, the ONE
+ * documented per-protocol allocator -- yields a `{value, done}` per step) are the
+ * O(k) scan exceptions, EXCLUDED from the zero-alloc-per-op claims.
+ *
+ * HONEST RISK: the `ext[]` column DOUBLES the backing memory. The [1, 2^31]
+ * ceiling is honest only as a TYPE bound (a legal index still fits a Float64 slot);
+ * a 2^31 MinStack is ~32 GiB of typed array (two 16 GiB columns), not a size any
+ * host will actually allocate. The ceiling is a fail-closed guard, not a promise.
+ */
+export class MinStack {
+    /**
+     * @param {number} capacity  EXACT max elements; an integer in [1, 2^31]. NOT
+     *                           rounded (a stack has no wrap, so no power-of-two).
+     * @param {'min'|'max'} kind the frozen extreme this instance reports.
+     */
+    constructor(capacity, kind) {
+        // typeof guard BEFORE any coercion (Number.isInteger never coerces; false
+        // on a Symbol / BigInt), and String(x) in the cold message is Symbol-safe.
+        if (typeof capacity !== 'number' || !Number.isInteger(capacity) ||
+            capacity < 1 || capacity > MAX_CAPACITY) {
+            throw new RangeError(
+                '[lite-o1] MinStack capacity must be an integer in [1, 2^31], got ' + String(capacity));
+        }
+        if (kind !== 'min' && kind !== 'max') {
+            throw new RangeError(
+                '[lite-o1] MinStack kind must be "min" or "max", got ' + String(kind));
+        }
+        this._val = new Float64Array(capacity); // value column (the stack)
+        this._ext = new Float64Array(capacity); // running extreme at/below each index
+        this._cap = capacity;                   // EXACT capacity (no power-of-two rounding)
+        this._n = 0;                            // live count == the top pointer
+        this._min = kind === 'min';             // hot-path branch (min vs max), ctor-frozen
+        this._kind = kind;                      // frozen kind ('min' | 'max')
+    }
+
+    /** The frozen extreme this instance reports, 'min' or 'max'. O(1). */
+    get kind() { return this._kind; }
+
+    /** Number of live elements. O(1). */
+    get size() { return this._n; }
+
+    /** Max elements this stack was sized for (EXACT, not rounded). O(1). */
+    get capacity() { return this._cap; }
+
+    /**
+     * Push v onto the top, carrying the running extreme forward in ONE compare.
+     * O(1) WORST-CASE. Guard typeof FIRST so a Symbol / BigInt never reaches the
+     * arithmetic below. Fails closed: a non-clean value throws via _bad; a FULL
+     * stack throws via _full as a byte-identical no-op (the full check precedes
+     * every store). `_min` is the ctor-frozen kind flag, so no kind-string compare
+     * runs per call.
+     * @param {number} v  a clean number (not NaN; +/-Infinity accepted)
+     * @returns {MinStack} this
+     */
+    push(v) {
+        if (typeof v !== 'number' || v !== v) return this._bad(v); // v !== v -> NaN
+        const n = this._n;
+        if (n === this._cap) return this._full();
+        this._val[n] = v;
+        // ext[n] = extreme of everything at/below n: one compare against the prior
+        // prefix (or v itself at the base). No loop -> worst-case O(1).
+        const ext = this._ext;
+        ext[n] = n === 0 ? v
+            : (this._min ? (v < ext[n - 1] ? v : ext[n - 1])
+                         : (v > ext[n - 1] ? v : ext[n - 1]));
+        this._n = n + 1;
+        return this;
+    }
+
+    /**
+     * Remove and return the TOP element. O(1) worst-case. Returns `undefined` on an
+     * empty stack (never throws) -- the prefix below the new top is already correct,
+     * so no extreme recompute is needed.
+     * @returns {number|undefined}
+     */
+    pop() {
+        const n = this._n;
+        if (n === 0) return undefined;
+        this._n = n - 1;
+        return this._val[n - 1];
+    }
+
+    /** Peek the TOP value without removing it. O(1). `undefined` on empty. */
+    peek() {
+        const n = this._n;
+        if (n === 0) return undefined;
+        return this._val[n - 1];
+    }
+
+    /**
+     * The current extreme (min or max, per the frozen kind) of every live element.
+     * O(1) WORST-CASE -- a single read of the running-extreme prefix at the top.
+     * `undefined` on an empty stack, NEVER throws.
+     * @returns {number|undefined}
+     */
+    extreme() {
+        const n = this._n;
+        if (n === 0) return undefined;
+        return this._ext[n - 1];
+    }
+
+    /**
+     * Empty the stack in O(1): resets the top pointer only, touches NO store. The
+     * stale numbers are unreachable (reads are bounded by count) and retain no
+     * references, so there is nothing to zero (mirrors RingDeque / MonoDeque).
+     */
+    clear() { this._n = 0; }
+
+    /**
+     * Iterate live elements TOP -> BOTTOM (pop order), alloc-free. O(k) -- the
+     * documented exception, EXCLUDED from the zero-alloc-per-op claims. A HOISTED
+     * callback keeps it allocation-free. `index` is the position in pop order
+     * (0 == the top).
+     * @param {(value:number, index:number, stack:MinStack)=>void} fn
+     */
+    forEach(fn) {
+        const val = this._val;
+        const n = this._n;
+        let idx = 0;
+        for (let i = n - 1; i >= 0; i--) fn(val[i], idx++, this);
+    }
+
+    /**
+     * Iterate live elements TOP -> BOTTOM (pop order). O(k). The ONE documented
+     * per-protocol ALLOCATOR (a {value, done} per step) -- kept OUT of the
+     * zero-alloc claims (use forEach for the alloc-free scan).
+     */
+    *[Symbol.iterator]() {
+        const val = this._val;
+        for (let i = this._n - 1; i >= 0; i--) yield val[i];
+    }
+
+    // ---- cold path only: throw builders (string concat lives here, off the hot body) ----
+
+    /** @private */
+    _bad(v) {
+        // String(v) -- NOT '+ v' / a template literal: those THROW on a Symbol or
+        // BigInt, which would turn a fail-closed reject into a different crash.
+        throw new TypeError(
+            '[lite-o1] MinStack value must be a number and not NaN, got ' + String(v));
+    }
+
+    /** @private */
+    _full() {
+        throw new RangeError('[lite-o1] MinStack full (capacity ' + this._cap + ')');
     }
 }

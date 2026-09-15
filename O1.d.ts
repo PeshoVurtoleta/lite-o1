@@ -202,3 +202,55 @@ export class MonoDeque {
     /** Iterate live entries front -> back as [value, seq] tuples (O(k); allocates per protocol). */
     [Symbol.iterator](): IterableIterator<[number, number]>;
 }
+
+/**
+ * A zero-GC, WORST-CASE O(1) fixed-capacity numeric stack that also reports the
+ * current minimum OR maximum of every live element in O(1), over TWO parallel
+ * Float64Array columns (value + a running-extreme prefix). push / pop / peek /
+ * extreme / clear / iterate are all O(1) worst-case (no amortization) and allocate
+ * nothing after construction. `kind` ('min' | 'max') is frozen at construction.
+ * Capacity is EXACT (a stack has a linear top pointer, no wrap) -- no power-of-two
+ * rounding. Fail closed: a full push or a non-clean value (non-number or NaN;
+ * +/-Infinity accepted) throws a [lite-o1] error (a full push is a byte-identical
+ * no-op); pop / peek / extreme on an empty stack return `undefined` and never
+ * throw. `forEach` (alloc-free) and `[Symbol.iterator]` (allocates per protocol)
+ * scan TOP -> BOTTOM (pop order). NOTE: the `ext[]` column doubles the backing
+ * memory, so the 2^31 ceiling is a TYPE bound, not a size any host allocates.
+ */
+export class MinStack {
+    /**
+     * @param capacity  EXACT max elements; an integer in [1, 2^31] (NOT rounded).
+     * @param kind      the frozen extreme this instance reports: 'min' or 'max'.
+     */
+    constructor(capacity: number, kind: 'min' | 'max');
+
+    /** The frozen extreme this instance reports. */
+    readonly kind: 'min' | 'max';
+
+    /** Number of live elements. */
+    readonly size: number;
+
+    /** Max elements this stack was sized for (exact, not rounded). */
+    readonly capacity: number;
+
+    /** Push v onto the top (carrying the running extreme). Throws when full or on a bad value. */
+    push(v: number): this;
+
+    /** Remove and return the top element, or `undefined` when empty. Never throws. */
+    pop(): number | undefined;
+
+    /** Peek the top value, or `undefined` when empty. Never throws. */
+    peek(): number | undefined;
+
+    /** The current extreme (min or max, per kind) of every live element, or `undefined` when empty. Never throws. */
+    extreme(): number | undefined;
+
+    /** Empty the stack in O(1) (resets the top pointer; zeroes no store). */
+    clear(): void;
+
+    /** Iterate live elements top -> bottom (pop order), alloc-free. fn is (value, index, stack). */
+    forEach(fn: (value: number, index: number, stack: MinStack) => void): void;
+
+    /** Iterate live elements top -> bottom (pop order). Allocates a {value, done} per step by protocol. */
+    [Symbol.iterator](): IterableIterator<number>;
+}

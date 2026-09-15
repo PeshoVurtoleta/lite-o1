@@ -39,7 +39,7 @@ async function main() {
     const { GcProfiler, checkNoGc, measureAllocs } =
         await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { SparseSet, RingDeque, UnionFind, MonoDeque } = await import('../O1.js');
+    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack } = await import('../O1.js');
 
     const U = 1 << 16;      // universe 65536
     const CAP = 1 << 14;    // capacity 16384
@@ -102,6 +102,16 @@ async function main() {
             m.value();
             m.evictOlderThan(mSeq);
             tracker.track(m, noop, 'monodeque', { audit: true });
+            // MinStack owns only its two Float64Arrays; nothing external to
+            // release. Its columns hold numbers, so a reclaimed instance is the
+            // desired outcome, proven by size()->0. Exercise push/peek/extreme/pop.
+            const ms = new MinStack(256, (i & 1) ? 'min' : 'max');
+            ms.push(i & 255);
+            ms.push((i + 1) & 255);
+            ms.peek();
+            ms.extreme();
+            ms.pop();
+            tracker.track(ms, noop, 'minstack', { audit: true });
         }
         return tracker.size();
     }
@@ -193,6 +203,25 @@ async function main() {
     const monoBpc = monoAllocRes.bytesPerCall === null ? 0 : monoAllocRes.bytesPerCall;
     const monoAllocBytes = Math.max(0, Math.round(monoBpc));
     const monoAllocOk = monoAllocBytes === 0;
+
+    // MinStack hot path: a bounded resident stack. Each step pushes one value, then
+    // peeks + reads the extreme + pops it -- every op is O(1) WORST-CASE, zero-alloc,
+    // and push-then-pop keeps size steady (never touches the full/empty edge). A
+    // scramble feeds SMI ints so the running-extreme carry runs a real compare.
+    const minStack = new MinStack(CAP, 'min');
+    for (let i = 0; i < 64; i++) minStack.push(i); // bounded resident window
+    let minv = 0;
+    const minStep = () => {
+        minv = (minv + 1) | 0;
+        minStack.push((minv * 2654435761) & 0x7fffffff);
+        minStack.peek();
+        minStack.extreme();
+        minStack.pop();
+    };
+    const minAllocRes = measureAllocs(minStep, { iterations: 100000, batches: 8 });
+    const minBpc = minAllocRes.bytesPerCall === null ? 0 : minAllocRes.bytesPerCall;
+    const minAllocBytes = Math.max(0, Math.round(minBpc));
+    const minAllocOk = minAllocBytes === 0;
     // "0 B/op" resolved at the sampling floor: heapUsed deltas are quantized and
     // noisy, so a truly non-allocating op reads a sub-byte figure (a lone blip
     // in one batch / iterations). Round to the nearest byte -- any per-op
@@ -210,6 +239,7 @@ async function main() {
         ringStep();
         ufStep();
         monoStep();
+        minStep();
         if ((i & 8191) === 0) {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
         }
@@ -241,6 +271,13 @@ async function main() {
         mono.forEach(monoCb);
         mono.clear();
     }
+    // MinStack fill (with running-extreme carry) + forEach (top->bottom) + O(1)
+    // clear cycles -- exercises the carry compare, the alloc-free scan, and clear.
+    for (let f = 0; f < 1024; f++) {
+        for (let k = 0; k < 512; k++) minStack.push((k * 2654435761) & 0x7fffffff);
+        minStack.forEach(cb);
+        minStack.clear();
+    }
     await new Promise((r) => setTimeout(r, 50));
     const s2 = gc.summary();
     const report = checkNoGc(s2, { maxMajor: 0, maxPauseMs: 2 });
@@ -264,6 +301,8 @@ async function main() {
         for (let k = 1; k < CAP; k++) uf.union(0, k);
         for (let k = 0; k < CAP; k++) mono.push((k * 2654435761) & 0x7fffffff);
         mono.clear();
+        for (let k = 0; k < CAP; k++) minStack.push((k * 2654435761) & 0x7fffffff);
+        minStack.clear();
     }
     globalThis.gc();
     const abAfter = process.memoryUsage().arrayBuffers;
@@ -272,7 +311,8 @@ async function main() {
 
     // ---- verdict + GATE line ----------------------------------------------
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
-        findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && monoAllocOk && abOk;
+        findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && monoAllocOk &&
+        minAllocOk && abOk;
 
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
@@ -280,7 +320,8 @@ async function main() {
         ' | gc major=' + s2.gc.major + ' minor=' + s2.gc.minor +
         ' maxMs=' + s2.gc.maxMs.toFixed(2) +
         ' | alloc=' + allocBytes + ' B/op (SparseSet) ' + ringAllocBytes + ' B/op (RingDeque) ' +
-        ufAllocBytes + ' B/op (UnionFind) ' + monoAllocBytes + ' B/op (MonoDeque)' +
+        ufAllocBytes + ' B/op (UnionFind) ' + monoAllocBytes + ' B/op (MonoDeque) ' +
+        minAllocBytes + ' B/op (MinStack)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
         ' (tracked=' + trackedMid + ' sink=' + SINK + ' abGrowth=' + abDelta + ')');
 
@@ -295,6 +336,7 @@ async function main() {
         if (!ringAllocOk) console.error('  alloc ' + ringAllocBytes + ' B/op RingDeque (raw bytesPerCall ' + ringBpc + ')');
         if (!ufAllocOk) console.error('  alloc ' + ufAllocBytes + ' B/op UnionFind (raw bytesPerCall ' + ufBpc + ')');
         if (!monoAllocOk) console.error('  alloc ' + monoAllocBytes + ' B/op MonoDeque (raw bytesPerCall ' + monoBpc + ')');
+        if (!minAllocOk) console.error('  alloc ' + minAllocBytes + ' B/op MinStack (raw bytesPerCall ' + minBpc + ')');
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;
     }

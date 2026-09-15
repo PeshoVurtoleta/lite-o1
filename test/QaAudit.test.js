@@ -10,7 +10,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SparseSet, RingDeque, UnionFind, MonoDeque } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack } from '../O1.js';
 
 const litO1 = (e) => e instanceof Error && /^\[lite-o1]/.test(e.message);
 
@@ -564,4 +564,140 @@ test('equal-value run interleaved with distinct values: ties broken newest, inva
     assert.equal(d.size, 1);
     assert.equal(d.frontSeq(), 4);
     assert.equal(d.value(), 5);
+});
+
+// ===========================================================================
+// MinStack boundary audits (same style: exact boundaries + adversarial types)
+// ===========================================================================
+
+// --- capacity boundary: the smallest legal stack (capacity 1) --------------
+
+test('MinStack capacity=1: holds exactly one element; full after one push', () => {
+    const s = new MinStack(1, 'min');
+    assert.equal(s.capacity, 1);
+    assert.equal(s.size, 0);
+    s.push(5);
+    assert.equal(s.size, 1);
+    assert.equal(s.peek(), 5);
+    assert.equal(s.extreme(), 5);
+    assert.throws(() => s.push(7), litO1); // full
+    assert.equal(s.size, 1);
+    assert.equal(s.pop(), 5);
+    assert.equal(s.pop(), undefined); // empty -> undefined
+});
+
+// --- capacity is EXACT (the departure from RingDeque / MonoDeque rounding) --
+
+test('MinStack capacity is EXACT: 1000 stays 1000, and the 1001st push throws', () => {
+    const s = new MinStack(1000, 'min');
+    assert.equal(s.capacity, 1000); // NOT rounded to 1024
+    for (let k = 0; k < 1000; k++) s.push(k);
+    assert.equal(s.size, 1000);
+    assert.throws(() => s.push(1000), litO1);
+});
+
+// --- every entry point on a freshly constructed (empty) stack --------------
+
+test('every entry point on a freshly constructed (empty) MinStack is well-defined', () => {
+    const s = new MinStack(50, 'max');
+    assert.equal(s.capacity, 50); // exact
+    assert.equal(s.kind, 'max');
+    assert.equal(s.size, 0);
+    assert.equal(s.pop(), undefined);
+    assert.equal(s.peek(), undefined);
+    assert.equal(s.extreme(), undefined);
+    assert.doesNotThrow(() => s.clear());
+    let seen = 0;
+    s.forEach(() => { seen++; });
+    assert.equal(seen, 0);
+    assert.deepEqual([...s], []);
+});
+
+// --- +/-Infinity accepted; NaN rejected (the value-class boundary) ---------
+
+test('MinStack value boundary: +/-Infinity ACCEPTED, NaN REJECTED', () => {
+    const s = new MinStack(4, 'max');
+    assert.doesNotThrow(() => s.push(-Infinity));
+    assert.doesNotThrow(() => s.push(Infinity));
+    assert.equal(s.extreme(), Infinity); // max of {-Inf, +Inf}
+    assert.throws(() => s.push(NaN), litO1);
+});
+
+// --- adversarial: a Symbol / BigInt value must fail closed, not raw-crash --
+
+test('ADVERSARIAL: MinStack push must not throw a raw TypeError on a Symbol / BigInt', () => {
+    const s = new MinStack(8, 'min');
+    assert.throws(() => s.push(Symbol('v')), litO1, 'push(Symbol) must be [lite-o1]');
+    assert.throws(() => s.push(5n), litO1, 'push(BigInt) must be [lite-o1]');
+    assert.equal(s.size, 0);
+});
+
+// --- adversarial: an object with a numeric valueOf is rejected, not coerced -
+
+test('ADVERSARIAL: MinStack rejects an object with a numeric valueOf, never coerces it', () => {
+    const s = new MinStack(8, 'min');
+    const fakeFive = { valueOf: () => 5, toString: () => '5' };
+    assert.throws(() => s.push(fakeFive), litO1, 'push(object-with-valueOf)');
+    assert.equal(s.size, 0);
+});
+
+// --- duplicate "dispose": clear() called twice back-to-back ----------------
+
+test('duplicate clear() is idempotent and leaves the MinStack usable', () => {
+    const s = new MinStack(8, 'min');
+    s.push(3); s.push(1);
+    s.clear();
+    assert.doesNotThrow(() => s.clear());
+    assert.equal(s.size, 0);
+    s.push(9);
+    assert.equal(s.extreme(), 9);
+});
+
+// --- mutation during iteration (documents the snapshot-count semantics) -----
+
+test('MinStack forEach uses the count captured at entry (documents semantics)', () => {
+    const s = new MinStack(8, 'min');
+    s.push(1); s.push(2); s.push(3); s.push(4); // bottom -> top
+    const seen = [];
+    s.forEach((v) => {
+        seen.push(v);
+        if (v === 3) s.pop(); // mutate mid-iteration (3 is at index 1 in pop order)
+    });
+    // forEach captured count=4 at entry, so it walks the original window top->bottom.
+    assert.deepEqual(seen, [4, 3, 2, 1]);
+    // post-state stays internally consistent after the mutation.
+    assert.equal(s.size, 3);
+    assert.equal(s.peek(), 3);
+    assert.equal(s.extreme(), 1);
+});
+
+// --- re-entrant push() from inside forEach ---------------------------------
+
+test('re-entrant push() from inside forEach does not corrupt state or throw', () => {
+    const s = new MinStack(16, 'min');
+    s.push(5); s.push(9); s.push(2); // bottom -> top: 5,9,2; min 2
+    const seen = [];
+    assert.doesNotThrow(() => {
+        s.forEach((v) => {
+            seen.push(v);
+            if (v === 9) s.push(20); // append beyond the entry-time count
+        });
+    });
+    // forEach walks the count captured AT ENTRY (3), so the re-entrant push is not
+    // observed mid-scan -- it must not corrupt state.
+    assert.deepEqual(seen, [2, 9, 5]); // top -> bottom
+    assert.equal(s.size, 4);
+    assert.equal(s.peek(), 20);
+    assert.equal(s.extreme(), 2); // min unchanged by an appended larger value
+});
+
+// --- equal-value runs: extreme() ties are stable (min) ---------------------
+
+test('equal-value run: extreme() stays the tied value across the whole run', () => {
+    const s = new MinStack(8, 'min');
+    for (let i = 0; i < 8; i++) s.push(7);
+    assert.equal(s.size, 8);
+    assert.equal(s.extreme(), 7);
+    for (let i = 0; i < 8; i++) { assert.equal(s.extreme(), 7); s.pop(); }
+    assert.equal(s.extreme(), undefined);
 });
