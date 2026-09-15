@@ -646,6 +646,68 @@ For SparseSet the suite covers: constructor validation (every bad `universe` / `
 
 ---
 
+## Benchmark suite (repo-only)
+
+The **eight-dimension benchmark suite** -- the ecosystem MVP of the research notes --
+lives in `benchmark/` as repo-only dev infra (it is NOT in the published tarball and
+NOT a data-structure member). It profiles all four members against the JS built-in
+each one replaces, across eight axes that a single ops/ms number hides: D1 latency
+distribution (p50..max, with + without forced GC), D2 amortized drift, D3 memory,
+D4 cache behaviour (a labelled PORTABLE PROXY -- no native perf counters), D5 bundle
+size + tree-shaking, D6 GC pressure + allocation curve, D7 key-type + load-factor
+scaling, and D8 workload micro-benches.
+
+```bash
+npm run bench          # run all 32 (member x dimension) cells, one child process each
+npm run bench:report   # the above, then render a zero-dep HTML report (hand-rolled SVG)
+                       #   -> benchmark/report.html (open it for the full charts + tables)
+```
+
+Key deterministic results (machine-independent; latency / throughput numbers vary by
+host and live in the report):
+
+**D5 -- bundle size + tree-shaking** (esbuild minify + gzip). A single-member import
+drops the other three; the all-member import is ~1.7 KB gzipped:
+
+| import        | gzip (single) | gzip (all) | single / all |
+|---------------|---------------|------------|--------------|
+| SparseSet     | ~577 B        | ~1703 B    | ~0.34        |
+| RingDeque     | ~646 B        | ~1703 B    | ~0.38        |
+| UnionFind     | ~594 B        | ~1703 B    | ~0.35        |
+| MonoDeque     | ~817 B        | ~1703 B    | ~0.48        |
+
+Tree-shaking works for every member (each lone import is smaller than the whole).
+The "< 40% of all" claim holds for SparseSet / RingDeque / UnionFind; MonoDeque is
+the honest exception (~0.48) because it is the single heaviest member -- nearly half
+the library's code -- so its lone import is inherently ~half the bundle.
+
+**D6 -- GC pressure curve** (n = 1e3 .. 1e6, the 0 B/op gate as a measured line):
+
+| member    | zero-alloc | max major GC | max pause (ms / 1e6 ops) |
+|-----------|------------|--------------|--------------------------|
+| SparseSet | yes        | 0            | <= 1                     |
+| RingDeque | yes        | 0            | <= 1                     |
+| UnionFind | yes        | 0            | <= 1                     |
+| MonoDeque | yes        | 0            | <= 1                     |
+
+**D3 -- memory footprint** (bytes per live element vs the theoretical minimum):
+
+| member    | bytes / live | theoretical min | overhead |
+|-----------|--------------|-----------------|----------|
+| SparseSet | 8            | 4 (dense slot)  | 2.0x (the sparse index doubles it) |
+| RingDeque | 8            | 8 (one f64)     | 1.0x     |
+| UnionFind | 8            | 8 (parent+size) | 1.0x     |
+| MonoDeque | sized for worst case | 16 (value+seq) | fixed-capacity: sized for a fully-monotone window, so few survivors after dominated pops |
+
+All four are fixed-capacity by design: they reuse one backing store, so `clear()`
+retains the buffer (stated, not implicit). The suite's applicability matrix emits the
+string `n/a` -- never `0` -- for cells that do not apply (fail closed). D4 is labelled
+a PROXY (dense-iteration vs random-lookup + a working-set stride sweep) because a true
+cache-miss rate needs native counters this zero-dep suite deliberately avoids. See
+ADR [`0009`](./decisions/0009-benchmark-suite.md) for the design and the settled calls.
+
+---
+
 ## What this is not
 
 - **Not a general-purpose set.** SparseSet keys are integers in a known, bounded `[0, universe)`. For arbitrary keys (strings, objects, huge sparse integer domains), use a native `Set` / `Map` -- SparseSet trades universe-sized memory for the flat constant and the O(1) clear.
@@ -654,8 +716,8 @@ For SparseSet the suite covers: constructor validation (every bad `universe` / `
 - **Not a general-purpose window aggregator.** MonoDeque answers only the window MIN or MAX (one, frozen at construction -- run two instances for both), not the median, k-th, or SUM of the window. It stores numbers only, is caller-driven (it does not evict on its own -- you call `evictOlderThan`), and a single `push` is amortized O(1) (O(k) worst-case).
 - **Not a growable collection.** All four members are fixed-capacity: a SparseSet key past capacity, or a RingDeque / MonoDeque push on a full ring, throws; UnionFind's element universe `n` is fixed at construction. This is deliberate (worst-case / amortized bounds, fail closed -- no hidden resize), not a missing feature. An overwrite-oldest RingDeque preset (RingLog) is a deferred future variant, not the current default.
 - **Not a payload store.** SparseSet holds membership, RingDeque holds numbers, UnionFind holds connectivity, MonoDeque holds numeric window extremes -- none holds object payloads. Store component data in a parallel SoA column or `@zakkster/lite-arena` keyed by the same ids / handles.
-- **Not the full family yet.** v0.4.0 is SparseSet + RingDeque + UnionFind + MonoDeque. SlotPool and the eight-dimension benchmark suite are on the roadmap, not in this release.
-- **Not a benchmark suite.** The witness proves throughput invariance (one axis); the full latency/memory/cache/GC benchmark suite is a separate, planned deliverable.
+- **Not the full family yet.** v0.4.0 is SparseSet + RingDeque + UnionFind + MonoDeque. SlotPool is on the roadmap, not in this release.
+- **Not itself a benchmark suite.** The witness proves throughput invariance (one axis); the full eight-dimension latency/memory/cache/GC suite lives in `benchmark/` as repo-only dev infra (`npm run bench:report`), NOT shipped in the published package.
 
 ---
 

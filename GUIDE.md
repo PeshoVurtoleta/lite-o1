@@ -182,3 +182,30 @@ Placeholders so the decision axes are visible early; each fills in on release.
 - **Steep decay (flatness -> 0):** the constant is NOT holding on this engine /
   workload -- the structure is behaving like O(log n) or O(n). Do not ship it as
   O(1); pick a different member or a different layout.
+
+## Measure it yourself (the benchmark suite)
+
+The witness is one axis (throughput invariance). The repo-only **eight-dimension
+benchmark suite** (`benchmark/`, not in the published tarball) profiles every member
+against its JS built-in on the axes a single ops/ms number hides -- latency tails,
+amortized drift, memory, cache proxy, bundle size, GC pressure, key-type / load-factor
+scaling, and workload micro-benches:
+
+```bash
+npm run bench          # all 32 (member x dimension) cells, one child process each
+npm run bench:report   # renders a zero-dep HTML report -> benchmark/report.html
+```
+
+Decision-relevant highlights (full charts + tables in `benchmark/report.html`):
+
+| axis | what to read | what the members show |
+|------|--------------|-----------------------|
+| D5 bundle | single-member gzip vs all-member (~1.7 KB) | each lone import drops the other three; SparseSet / RingDeque / UnionFind < 40% of all, MonoDeque ~48% (it is the heaviest member) |
+| D6 GC | zero-alloc + max major GC over n=1e3..1e6 | 0 B/op, 0 major GC, sub-ms pause for all four -- the 0 B/op gate as a curve |
+| D3 memory | bytes/live vs theoretical min | SparseSet 2.0x (sparse index), RingDeque + UnionFind 1.0x; all fixed-capacity (clear() keeps the buffer) |
+| D1 latency | p99 / max ns/op (with + without GC) | flat tails; amortized members (UnionFind, MonoDeque) show their worst single op vs the typical one |
+
+D4 is a labelled PORTABLE PROXY (dense-iteration vs random-lookup + a working-set
+stride sweep) -- no native perf counters. The applicability matrix prints `n/a`
+(never `0`) for cells that do not apply. See ADR
+[`0009`](./decisions/0009-benchmark-suite.md) for the design.

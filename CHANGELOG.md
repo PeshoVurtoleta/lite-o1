@@ -4,6 +4,34 @@ All notable changes to `@zakkster/lite-o1` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Internal
+
+- **8-dimension benchmark suite (`benchmark/`, repo-only -- NOT part of the
+  published surface, NO version bump).** The ecosystem MVP of RESEARCH.md section 3:
+  it profiles the four shipped members (SparseSet, RingDeque, UnionFind, MonoDeque)
+  against the JS built-ins across eight axes -- D1 latency distribution
+  (p50/p90/p99/p99.9/max, with + without forced GC), D2 amortized drift over long
+  mixed traces, D3 memory footprint + stability, D4 cache behaviour (a labelled
+  PORTABLE PROXY: dense-iteration vs random-lookup + a working-set stride sweep; no
+  native perf counters), D5 bundle size + tree-shaking (esbuild min + gzip), D6 GC
+  pressure + allocation-rate CURVE (the 0 B/op gate turned into a measured line over
+  n=1e3..1e6), D7 scalability across key types + load factors, and D8 workload
+  micro-benches (ECS / cache-hot-subset / churn). Run via `npm run bench` and
+  `npm run bench:report` (a self-contained, zero-dep HTML report with hand-rolled
+  inline SVG charts -> `benchmark/report.html`); NOT in `verify` (too slow). An
+  applicability matrix emits the string `n/a` -- never 0 -- for cells that do not
+  apply (fail closed; null is not zero). `esbuild` added as a DEV dependency only
+  (the D5 bundler); zero RUNTIME deps preserved. `O1.js` / `O1.d.ts` / `files[]`
+  BYTE-IDENTICAL, `npm pack` unchanged at seven files. See ADR
+  [`0009`](./decisions/0009-benchmark-suite.md).
+- **`test/Bench.test.mjs`** -- the suite gate (in `npm test`): ANTI-VACUITY (every
+  dimension returns positive, non-degenerate numbers; an empty array or an
+  impossible 0 fails) + FIXED-SEED DETERMINISM (two runs at seed `0x9e3779b1`
+  produce byte-identical workload trace hashes, using the repo's own Numerical
+  Recipes LCG -- no new PRNG introduced).
+
 ## [0.4.0] - 2026-09-15
 
 The fourth member of the O(1) family: a monotonic deque for O(1)-amortized
