@@ -5,7 +5,7 @@
  * fails `npm run test:types`. Not executed; only type-checked.
  */
 
-import { SparseSet, VERSION } from '../../O1.js';
+import { SparseSet, RingDeque, VERSION } from '../../O1.js';
 
 // VERSION is a string.
 const v: string = VERSION;
@@ -52,3 +52,48 @@ void spread;
 new SparseSet('1000');
 // @ts-expect-error -- has takes a number.
 a.has('3');
+
+// --- RingDeque -------------------------------------------------------------
+
+// Constructor: capacity required.
+const rd: RingDeque = new RingDeque(1024);
+
+// Getters are readonly numbers.
+const rsize: number = rd.size;
+const rcap: number = rd.capacity;
+void rsize; void rcap;
+
+// @ts-expect-error -- size is readonly.
+rd.size = 5;
+// @ts-expect-error -- capacity is readonly.
+rd.capacity = 5;
+
+// push* -> this (chainable); pop*/peek* -> number | undefined; clear -> void.
+const chainedRd: RingDeque = rd.pushBack(1).pushFront(2);
+const popped: number | undefined = rd.popFront();
+const poppedB: number | undefined = rd.popBack();
+const peeked: number | undefined = rd.peekFront();
+const peekedB: number | undefined = rd.peekBack();
+const rcleared: void = rd.clear();
+void chainedRd; void popped; void poppedB; void peeked; void peekedB; void rcleared;
+
+// forEach callback gets (number, number, RingDeque).
+rd.forEach((v, i, deque) => {
+    const vv: number = v;
+    const ii: number = i;
+    const dd: RingDeque = deque;
+    void vv; void ii; void dd;
+});
+
+// Iterable of number.
+for (const v of rd) {
+    const vv: number = v;
+    void vv;
+}
+const rspread: number[] = [...rd];
+void rspread;
+
+// @ts-expect-error -- capacity must be a number.
+new RingDeque('1024');
+// @ts-expect-error -- pushBack takes a number.
+rd.pushBack('3');

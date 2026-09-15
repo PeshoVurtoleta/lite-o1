@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-> Zero-GC, O(1) data structures that PROVE their constant. v0.1.0 ships SparseSet: an integer set with O(1) add / has / delete / iterate and an O(1) clear() that zeroes nothing -- plus a throughput-invariance witness that shows the flat cost curve while a native Set decays.
+> Zero-GC, O(1) data structures that PROVE their constant. v0.2.0 ships SparseSet (an integer set with O(1) add / has / delete / iterate and an O(1) clear() that zeroes nothing) and RingDeque (a fixed-capacity numeric double-ended queue with O(1) push/pop at both ends) -- plus a throughput-invariance witness that shows the flat cost curve while a native Set (or Array.prototype.shift) decays.
 
 [![npm version](https://img.shields.io/npm/v/@zakkster/lite-o1.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-o1)
 [![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
@@ -17,7 +17,7 @@
 
 Almost no JavaScript data-structure library ships the evidence that its Big-O claim survives contact with a real engine -- megamorphic call sites, GC pauses, cache misses, deopts. `lite-o1` is a curated, tree-shakeable family of the O(1) structures that actually matter, each zero-GC, each written to teach the trick that buys the constant, and each shipped with a harness that DEMONSTRATES the flat cost curve rather than asserting it. The complexity class IS the product.
 
-v0.1.0 is the headline member: **SparseSet**, the textbook O(1) integer set (a dense + sparse array pair) whose `clear()` runs in O(1) by resetting a count and zeroing nothing at all.
+v0.2.0 ships two members. **SparseSet**, the textbook O(1) integer set (a dense + sparse array pair) whose `clear()` runs in O(1) by resetting a count and zeroing nothing at all. And **RingDeque**, a fixed-capacity double-ended queue of numbers over one circular `Float64Array` -- O(1) push/pop at both ends, the zero-GC answer to the `Array.prototype.shift` O(n) trap. They share no mutable module state, so a bundler that imports one drops the other.
 
 ```bash
 npm install @zakkster/lite-o1
@@ -59,6 +59,9 @@ Every op above is O(1) worst-case and allocates zero bytes after construction. T
   - [SparseSet](#sparseset)
   - [Constants](#constants)
 - [The O(1) Witness](#the-o1-witness)
+- [RingDeque](#ringdeque)
+  - [How RingDeque works](#how-ringdeque-works)
+  - [RingDeque API reference](#ringdeque-api-reference)
 - [Composability with the ecosystem](#composability-with-the-ecosystem)
 - [Zero-GC design notes](#zero-gc-design-notes)
 - [Design decisions worth knowing](#design-decisions-worth-knowing)
@@ -90,8 +93,15 @@ Existing options: a native `Set` (arbitrary keys, but a hash table that decays a
   - **`clear()`** -- empty in O(1): resets the live count, zeroes no store.
   - **`forEach(fn)` / `[Symbol.iterator]`** -- iterate present keys in insertion order, alloc-free.
   - **`size` / `capacity`** -- getters.
+- **`RingDeque(capacity)`** -- a zero-GC O(1) fixed-capacity double-ended queue of numbers over one circular `Float64Array`. Capacity rounds up to the next power of two. The hot surface is eight ops plus two getters:
+  - **`pushFront(v)` / `pushBack(v)`** -- push at either end. O(1). Throw a `[lite-o1]` error when full (a byte-identical no-op) or on a non-clean value.
+  - **`popFront()` / `popBack()`** -- remove + return from either end. O(1). Return `undefined` on empty -- never a throw.
+  - **`peekFront()` / `peekBack()`** -- read either end without removing. O(1). `undefined` on empty.
+  - **`clear()`** -- empty in O(1): resets head + count, zeroes no store.
+  - **`forEach(fn)` / `[Symbol.iterator]`** -- iterate live elements front -> back, alloc-free.
+  - **`size` / `capacity`** -- getters (`capacity` reports the rounded power of two).
 - **`VERSION`** -- the package version string.
-- **The O(1) Witness** (`npm run witness`) -- an offline harness that times a fixed batch of the membership op across an n-sweep, reports ops/ms + a flatness ratio for SparseSet against a native `Set` foil, and fails if the constant regressed.
+- **The O(1) Witness** (`npm run witness`) -- an offline harness that times a fixed batch of each member's hot op across an n-sweep, reports ops/ms + a flatness ratio (SparseSet vs a native `Set`, RingDeque vs `Array.prototype.shift`), and fails if the constant regressed.
 
 Full types ship in [`O1.d.ts`](./O1.d.ts). Tree-shakeable named exports (`sideEffects: false`) -- import only what you use.
 
@@ -158,15 +168,17 @@ get capacity: number        // max live members as constructed
 
 | Constant   | Value     | Meaning                                            |
 | ---------- | --------- | -------------------------------------------------- |
-| `VERSION`  | `'0.1.0'` | Package version string.                            |
+| `VERSION`  | `'0.2.0'` | Package version string.                            |
 
 Contract bounds (validated, not exported):
 
-| Bound      | Rule                                             |
-| ---------- | ------------------------------------------------ |
-| `universe` | integer in `[1, 2^32]`                           |
-| `capacity` | integer in `[1, universe]`, default `universe`   |
-| valid key  | integer in `[0, universe)`                       |
+| Bound               | Rule                                             |
+| ------------------- | ------------------------------------------------ |
+| SparseSet `universe`| integer in `[1, 2^32]`                           |
+| SparseSet `capacity`| integer in `[1, universe]`, default `universe`   |
+| SparseSet valid key | integer in `[0, universe)`                       |
+| RingDeque `capacity`| integer in `[1, 2^31]`, rounded up to a power of two |
+| RingDeque value     | `typeof 'number'` and not `NaN` (`+/-Infinity` OK) |
 
 ---
 
@@ -186,6 +198,95 @@ The analytical anchor: **ops/ms that stays flat as n grows is the proof of O(1).
 ```
 
 SparseSet's contiguous typed-array layout streams flat; the `Set`'s hash table scatters across an ever-larger backing store until each lookup is a cache miss, so its ops/ms falls ~11x across the sweep. The gate fails the build if SparseSet flatness drops below `0.70`, the foil fails to decay below `0.55`, or the ratio falls under `1.5x` at any size -- so a regression that quietly ruins the constant fails as loudly as a broken test. (Absolute ops/ms is machine-specific; reproduce on your own hardware.)
+
+---
+
+## RingDeque
+
+The second member: a **fixed-capacity double-ended queue of numbers** over one circular `Float64Array`. Push and pop at BOTH ends are O(1) worst-case and allocate zero bytes -- the zero-GC answer to the `Array.prototype.shift` / `unshift` O(n) trap, where every element re-indexes on each end operation.
+
+```js
+import { RingDeque } from '@zakkster/lite-o1';
+
+// Requested 1000 -> capacity rounds UP to the next power of two (1024).
+const q = new RingDeque(1000);
+q.capacity;              // -> 1024
+
+q.pushBack(1);
+q.pushBack(2);
+q.pushFront(0);         // [0, 1, 2]
+
+q.peekFront();          // -> 0
+q.peekBack();           // -> 2
+
+q.popFront();           // -> 0  (FIFO with pushBack)
+q.popBack();            // -> 2  (LIFO with pushBack)
+q.size;                 // -> 1
+
+for (const v of q) console.log(v);   // 1   (front -> back, alloc-free)
+
+q.pushBack(Infinity);   // OK: +/-Infinity are clean numbers
+// q.pushBack(NaN);     // throws [lite-o1]: NaN is rejected
+// q.pushBack('3');     // throws [lite-o1]: not a number
+
+q.clear();              // O(1): resets head + count, touches NO store
+q.popFront();           // -> undefined  (empty never throws)
+```
+
+Every op is O(1) worst-case and zero-allocation after construction. `pop*` / `peek*` on an empty ring return `undefined` (never throw); the sentinel is unambiguous because every stored value is a real number. A push on a full ring throws a `[lite-o1]` error as a byte-identical no-op -- fail closed, no silent drop or overwrite. The `witness` harness proves RingDeque's FIFO churn holds its ops/ms while `Array.prototype.shift` collapses as `n` grows.
+
+### How RingDeque works
+
+<details>
+<summary>The circular buffer, head + count, and why clear() is free.</summary>
+
+A RingDeque holds one `Float64Array` (the ring), a `head` (the index of the front element), and a `count` (how many elements are live). The physical slot for logical offset `i` from the front is:
+
+```
+store[(head + i) & MASK]      MASK = capacity - 1
+```
+
+Because `capacity` is a power of two, the modulo that wraps the index is a single bitwise `& MASK` -- no branch, no division. The requested capacity rounds UP to the next power of two (so `new RingDeque(1000)` gives capacity 1024), and the `capacity` getter reports that rounded value.
+
+- **`pushBack(v)`** writes `store[(head + count) & MASK] = v; count++`.
+- **`pushFront(v)`** moves the head back one slot (`head = (head - 1) & MASK`, where int32 `-1 & MASK === MASK` wraps off slot 0 to the top), writes `store[head] = v`, then `count++`.
+- **`popFront()`** reads `store[head]`, advances `head = (head + 1) & MASK`, `count--`.
+- **`popBack()`** does `count--` and reads `store[(head + count) & MASK]`.
+
+Using **head + count** (not a head/tail pair) makes "full" a single test (`count === capacity`) and "empty" a single test (`count === 0`), with no ambiguous `head === tail` state to disambiguate.
+
+- **`clear()`** is `head = 0; count = 0`. The store is left byte-identical. The stale numbers are unreachable (every read is bounded by `count`) and retain no references (they are numbers), so there is nothing to zero -- clearing a full ring costs the same as clearing an empty one. This is the same teachable gem as SparseSet's cross-checked clear.
+
+The cost of the constant is the value domain: a `Float64Array` holds numbers only. To queue objects, queue their integer handles / indices and keep the payloads in a parallel column or `@zakkster/lite-arena`.
+
+</details>
+
+### RingDeque API reference
+
+```ts
+new RingDeque(capacity: number)   // capacity rounds up to the next power of two
+```
+
+- **`capacity`** -- the requested maximum number of live elements; an integer in `[1, 2^31]`. Rounded UP to the next power of two (`>= requested`); the `capacity` getter reports the rounded value. The constructor throws a `[lite-o1]`-tagged `RangeError` on a non-integer, out-of-range, or non-number argument (typeof-guarded before any coercion, so a Symbol / BigInt fails closed rather than crashing raw).
+
+```ts
+pushFront(v: number): this        // push at the front; throws when full / on a bad value
+pushBack(v: number): this         // push at the back;  throws when full / on a bad value
+popFront(): number | undefined    // remove + return the front; undefined on empty
+popBack(): number | undefined     // remove + return the back;  undefined on empty
+peekFront(): number | undefined   // read the front; undefined on empty
+peekBack(): number | undefined    // read the back;  undefined on empty
+clear(): void                     // O(1) empty; zeroes no store
+forEach(fn: (value: number, index: number, deque: RingDeque) => void): void  // front -> back
+[Symbol.iterator](): IterableIterator<number>                                 // front -> back
+get size: number                  // live element count
+get capacity: number              // max elements (power-of-two, rounded up)
+```
+
+- **`pushFront(v)` / `pushBack(v)`** throw `[lite-o1] RingDeque full ...` when the ring is at capacity (a byte-identical no-op -- store + head + count unchanged), and `[lite-o1] RingDeque value must be a number ...` on a value that is not a clean number. A value is clean iff `typeof v === 'number'` AND it is not `NaN`; `+Infinity` / `-Infinity` are accepted, while `null`, `undefined`, strings, Symbols, BigInts, objects, and `NaN` are rejected. The `typeof` guard runs first so a Symbol / BigInt never reaches arithmetic.
+- **`popFront()` / `popBack()` / `peekFront()` / `peekBack()`** never throw: an empty ring returns `undefined`. Because every stored value is a real number, `undefined` unambiguously means "empty".
+
+**Reach for RingDeque when** you need FIFO / LIFO / sliding-window push-pop at O(1) with zero per-op allocation over a bounded numeric domain (ring buffers, bounded work queues, rolling windows). **Avoid it when** you need to queue non-numbers (queue their handles instead), or need the queue to grow past a bound you cannot set up front (it fails closed on a full push rather than resizing). See [`GUIDE.md`](./GUIDE.md) for the full reach-for / avoid / measure-it.
 
 ---
 
@@ -246,6 +347,19 @@ The only cold branches are constructor validation and the `_oob` / `_full` throw
 
 The torture gate (`@zakkster/lite-leak` + `@zakkster/lite-gc-profiler`, run under `--expose-gc`) proves it: **0 B/op** on the add/has/delete hot path (per-call allocation measured to the sampling floor), **0 major GCs** and a max pause `<= 2ms` across a 2,000,000-op run, and 100 fill/clear cycles that leave the leak tracker at `size() = 0` (every tracked instance reclaimed -- proven non-vacuously by asserting the tracker held them first) with zero arrayBuffers growth (`clear()` allocates nothing; the reused set grows no backing store). `[Symbol.iterator]` is the one op that allocates -- a single iterator object per `for...of`, not per element -- so a per-frame hot loop uses `forEach`, which is allocation-free.
 
+**RingDeque** allocates its single `Float64Array` once, at construction:
+
+| Operation                        | Steady-state allocations |
+| -------------------------------- | ------------------------ |
+| `pushFront(v)` / `pushBack(v)`   | **0**                    |
+| `popFront()` / `popBack()`       | **0**                    |
+| `peekFront()` / `peekBack()`     | **0**                    |
+| `clear()`                        | **0** (head + count = 0) |
+| `forEach(fn)`                    | **0**                    |
+| `new RingDeque(...)`             | once, at construction (one typed array) |
+
+The value guard is a two-test branchless check on the hot body -- `typeof v !== 'number' || v !== v` (the second catches NaN once the type is known) -- with the message-building `_bad` / `_full` throw builders on the cold path (again using `String(v)`, never a template literal, so a Symbol / BigInt value fails closed rather than crashing raw). The torture and perf gates prove RingDeque at **0 B/op** across FIFO / LIFO / both-ends interleave churn, with a 0-delta on the `Float64Array` backing (fixed capacity -- no resize) and the leak tracker back at `size() = 0`.
+
 </details>
 
 ---
@@ -257,31 +371,34 @@ The torture gate (`@zakkster/lite-leak` + `@zakkster/lite-gc-profiler`, run unde
 - **Fail closed on add, absent on query.** A bad key to `add` throws (you asked to store something invalid -- a bug). A bad key to `has` / `delete` is simply absent (a query about a non-member is a legitimate `false`). `null` is never coerced to `0`.
 - **Fixed capacity, no silent growth.** A new key past `capacity` throws rather than reallocating. A structure that advertises worst-case O(1) must not hide an amortized O(n) resize; growth, if ever offered, will be opt-in and labeled. See [`decisions/0003`](./decisions/0003-slotpool-deferred.md).
 - **The witness is a first-class deliverable, with a gated floor.** SparseSet flatness `>= 0.70`, the `Set` foil `<= 0.55`, ratio `>= 1.5x` -- a regression in the constant fails the build. See [`decisions/0004`](./decisions/0004-witness-flatness-gate.md).
+- **RingDeque is fixed-capacity (power-of-two), fail closed on full, and stores numbers only.** A power-of-two capacity buys the single-`& MASK` wrap; head + count makes full / empty single tests; a full push throws (no silent drop / overwrite); the numeric substrate keeps it zero-GC and makes `undefined`-on-empty unambiguous. See [`decisions/0005`](./decisions/0005-ring-capacity-fail-closed.md) and [`decisions/0006`](./decisions/0006-numeric-ring-substrate.md).
 
 ---
 
 ## Testing
 
-**19 deterministic `node:test` cases**, plus a torture gate and the O(1) witness gate.
+**58 deterministic `node:test` cases**, plus a torture gate, a hard perf gate, and the O(1) witness gate.
 
 ```bash
-npm test           # 19 node:test cases (contract + boundary + differential fuzz)
+npm test           # 58 node:test cases (contract + boundary + differential fuzz)
 npm run test:types # tsc --noEmit against O1.d.ts
 npm run torture    # @zakkster/lite-leak + lite-gc-profiler: 0 B/op + leak-free
-npm run witness    # the O(1) throughput-invariance harness + Set foil + flatness gate
-npm run verify     # all four, the publish gate
+npm run witness    # the O(1) throughput-invariance harness + foils + flatness gate
+npm run test:perf  # @zakkster/lite-perf-gate: hard zero-alloc scavenge-scaling gate
+npm run verify     # all five, the publish gate
 ```
 
-The suite covers: constructor validation (every bad `universe` / `capacity`), the add/has/delete/clear/iterate surface, the delete-swap back-pointer, idempotent add, insertion-order iteration, the full fail-closed key surface (`add` throws `/^\[lite-o1\]/`, `has` never throws), `null is not zero`, a **byte-identical** proof that `clear()` leaves the dense + sparse `ArrayBuffer`s untouched (snapshot the raw bytes, clear, assert equality, confirm every prior key is absent and a stale pointer cannot masquerade as present), and a **1,000,000-op differential fuzz** of mixed add/delete/has against a native `Set` oracle with zero divergences. No gate output is a FAIL.
+For SparseSet the suite covers: constructor validation (every bad `universe` / `capacity`), the add/has/delete/clear/iterate surface, the delete-swap back-pointer, idempotent add, insertion-order iteration, the full fail-closed key surface (`add` throws `/^\[lite-o1\]/`, `has` never throws), `null is not zero`, a **byte-identical** proof that `clear()` leaves the dense + sparse `ArrayBuffer`s untouched, and a **1,000,000-op differential fuzz** of mixed add/delete/has against a native `Set` oracle. For RingDeque: power-of-two capacity rounding, push/pop/peek at both ends, wrap-around across the `& MASK` seam, the fail-closed surface (full push throws as a byte-identical no-op; a non-number or NaN throws; a Symbol / BigInt fails closed, not raw; `+/-Infinity` accepted; empty pop/peek returns `undefined`), a byte-identical `clear()` proof, and a **1,000,000-op both-ends differential fuzz** against a plain-`Array` reference deque (0 divergences, with the full-throw and empty-undefined edges both exercised). No gate output is a FAIL.
 
 ---
 
 ## What this is not
 
-- **Not a general-purpose set.** Keys are integers in a known, bounded `[0, universe)`. For arbitrary keys (strings, objects, huge sparse integer domains), use a native `Set` / `Map` -- SparseSet trades universe-sized memory for the flat constant and the O(1) clear.
-- **Not a growable collection.** Capacity is fixed at construction; a new key past it throws. This is deliberate (worst-case O(1), fail closed), not a missing feature.
-- **Not a payload store.** SparseSet holds membership, not values. Store component data in a parallel SoA column or `@zakkster/lite-arena` keyed by the same ids.
-- **Not the full family yet.** v0.1.0 is SparseSet only. RingDeque, SlotPool, UnionFind, and the eight-dimension benchmark suite are on the roadmap, not in this release.
+- **Not a general-purpose set.** SparseSet keys are integers in a known, bounded `[0, universe)`. For arbitrary keys (strings, objects, huge sparse integer domains), use a native `Set` / `Map` -- SparseSet trades universe-sized memory for the flat constant and the O(1) clear.
+- **Not a general-purpose queue.** RingDeque stores numbers only. To queue objects / strings, queue their integer handles and keep the payloads in a parallel column or `@zakkster/lite-arena`.
+- **Not a growable collection.** Both members are fixed-capacity: a SparseSet key past capacity, or a RingDeque push on a full ring, throws. This is deliberate (worst-case O(1), fail closed -- no hidden amortized resize), not a missing feature. An overwrite-oldest RingDeque preset (RingLog) is a deferred future variant, not the current default.
+- **Not a payload store.** SparseSet holds membership, RingDeque holds numbers -- neither holds object payloads. Store component data in a parallel SoA column or `@zakkster/lite-arena` keyed by the same ids / handles.
+- **Not the full family yet.** v0.2.0 is SparseSet + RingDeque. SlotPool, UnionFind, MonoDeque, and the eight-dimension benchmark suite are on the roadmap, not in this release.
 - **Not a benchmark suite.** The witness proves throughput invariance (one axis); the full latency/memory/cache/GC benchmark suite is a separate, planned deliverable.
 
 ---

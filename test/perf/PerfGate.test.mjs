@@ -22,7 +22,7 @@
  */
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { SparseSet } from '../../O1.js';
+import { SparseSet, RingDeque } from '../../O1.js';
 
 const U = 1 << 16;      // universe 65536
 const CAP = 1 << 14;    // capacity 16384
@@ -150,7 +150,94 @@ const forEachDrain = {
     statsOf(s) { return { grows: grows(s) }; },
 };
 
-const scenarios = [addChurn, hasHit, deleteChurn, clearRefill, forEachDrain];
+// ===========================================================================
+// RingDeque scenarios -- fixed-capacity Float64Array ring, all O(1) zero-alloc.
+// ===========================================================================
+
+const RING_CAP = 1 << 14; // 16384 (power of two, so capacity getter == this)
+const RING_FILL = 1 << 13; // 8192 resident window -> steady state, never full/empty
+
+/**
+ * The zero-alloc counter for RingDeque scenarios: the single backing Float64Array's
+ * ArrayBuffer byte length. Capacity is fixed at construction, so this NEVER grows --
+ * the delta across the window must be 0.
+ */
+function ringGrows(s) {
+    return s.ring._store.buffer.byteLength;
+}
+
+/** A RingDeque pre-filled to a bounded resident window (steady-state churn). */
+function ringFill() {
+    const ring = new RingDeque(RING_CAP);
+    for (let i = 0; i < RING_FILL; i++) ring.pushBack(i);
+    return ring;
+}
+
+/**
+ * FIFO churn: pushBack then popFront at steady state. The resident window stays at
+ * RING_FILL (< RING_CAP), so no op touches the full or empty edge. Values are SMI
+ * ints (int32-wrapped counter), so no coercion and no heap double in the window.
+ */
+const ringFifo = {
+    name: 'RingDeque FIFO (pushBack + popFront)',
+    setup() { return { ring: ringFill(), v: 0 }; },
+    hot(s, n) {
+        const ring = s.ring;
+        let v = s.v | 0;
+        for (let i = 0; i < n; i++) {
+            ring.pushBack(v);
+            ring.popFront();
+            v = (v + 1) | 0;
+        }
+        s.v = v | 0;
+    },
+    statsOf(s) { return { grows: ringGrows(s) }; },
+};
+
+/** LIFO churn: pushFront then popBack at steady state (the other end pair). */
+const ringLifo = {
+    name: 'RingDeque LIFO (pushFront + popBack)',
+    setup() { return { ring: ringFill(), v: 0 }; },
+    hot(s, n) {
+        const ring = s.ring;
+        let v = s.v | 0;
+        for (let i = 0; i < n; i++) {
+            ring.pushFront(v);
+            ring.popBack();
+            v = (v + 1) | 0;
+        }
+        s.v = v | 0;
+    },
+    statsOf(s) { return { grows: ringGrows(s) }; },
+};
+
+/**
+ * Both-ends interleave: pushBack + popFront + pushFront + popBack -- exercises the
+ * & MASK wrap in both directions each op. Net size change is 0, so the ring stays
+ * bounded and every op is a real read/write across the seam.
+ */
+const ringInterleave = {
+    name: 'RingDeque both-ends interleave',
+    setup() { return { ring: ringFill(), v: 0 }; },
+    hot(s, n) {
+        const ring = s.ring;
+        let v = s.v | 0;
+        for (let i = 0; i < n; i++) {
+            ring.pushBack(v);
+            ring.popFront();
+            ring.pushFront(v);
+            ring.popBack();
+            v = (v + 1) | 0;
+        }
+        s.v = v | 0;
+    },
+    statsOf(s) { return { grows: ringGrows(s) }; },
+};
+
+const scenarios = [
+    addChurn, hasHit, deleteChurn, clearRefill, forEachDrain,
+    ringFifo, ringLifo, ringInterleave,
+];
 
 /**
  * The teeth: a per-op forEach that pushes every key into a FRESH [] allocated each

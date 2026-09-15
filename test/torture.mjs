@@ -39,7 +39,7 @@ async function main() {
     const { GcProfiler, checkNoGc, measureAllocs } =
         await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { SparseSet } = await import('../O1.js');
+    const { SparseSet, RingDeque } = await import('../O1.js');
 
     const U = 1 << 16;      // universe 65536
     const CAP = 1 << 14;    // capacity 16384
@@ -75,6 +75,15 @@ async function main() {
             s.has(i & 1023);
             s.delete(i & 1023);
             tracker.track(s, noop, 'sparseset', { audit: true });
+            // RingDeque owns only its Float64Array; nothing external to release.
+            // Its store holds numbers, so it retains no references either -- a
+            // reclaimed instance is the desired outcome, proven by size()->0.
+            const d = new RingDeque(256);
+            d.pushBack(i & 255);
+            d.pushFront(i & 127);
+            d.popFront();
+            d.popBack();
+            tracker.track(d, noop, 'ringdeque', { audit: true });
         }
         return tracker.size();
     }
@@ -107,6 +116,24 @@ async function main() {
     };
     const allocRes = measureAllocs(step, { iterations: 100000, batches: 8 });
     const bpc = allocRes.bytesPerCall === null ? 0 : allocRes.bytesPerCall;
+
+    // RingDeque hot path: a both-ends interleave that keeps the ring bounded.
+    // pushBack + popFront (FIFO) then pushFront + popBack (LIFO) -- every op is
+    // O(1), zero-alloc, and the size oscillates without ever hitting full/empty.
+    const ring = new RingDeque(CAP);
+    for (let i = 0; i < 64; i++) ring.pushBack(i); // bounded resident window
+    let rv = 0;
+    const ringStep = () => {
+        rv = (rv + 1) | 0;
+        ring.pushBack(rv);
+        ring.popFront();
+        ring.pushFront(rv);
+        ring.popBack();
+    };
+    const ringAllocRes = measureAllocs(ringStep, { iterations: 100000, batches: 8 });
+    const ringBpc = ringAllocRes.bytesPerCall === null ? 0 : ringAllocRes.bytesPerCall;
+    const ringAllocBytes = Math.max(0, Math.round(ringBpc));
+    const ringAllocOk = ringAllocBytes === 0;
     // "0 B/op" resolved at the sampling floor: heapUsed deltas are quantized and
     // noisy, so a truly non-allocating op reads a sub-byte figure (a lone blip
     // in one batch / iterations). Round to the nearest byte -- any per-op
@@ -121,6 +148,7 @@ async function main() {
     let SINK = 0;
     for (let i = 0; i < HOT; i++) {
         step();
+        ringStep();
         if ((i & 8191) === 0) {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
         }
@@ -130,6 +158,12 @@ async function main() {
         for (let k = 0; k < 512; k++) inst.add(k);
         inst.forEach(cb);
         inst.clear();
+    }
+    // RingDeque fill/drain + forEach + O(1) clear cycles.
+    for (let f = 0; f < 1024; f++) {
+        for (let k = 0; k < 512; k++) ring.pushBack(k);
+        ring.forEach(cb);
+        ring.clear();
     }
     await new Promise((r) => setTimeout(r, 50));
     const s2 = gc.summary();
@@ -148,6 +182,8 @@ async function main() {
     for (let c = 0; c < 100; c++) {
         for (let k = 0; k < CAP; k++) inst.add(k);
         inst.clear();
+        for (let k = 0; k < CAP; k++) ring.pushBack(k);
+        ring.clear();
     }
     globalThis.gc();
     const abAfter = process.memoryUsage().arrayBuffers;
@@ -156,14 +192,14 @@ async function main() {
 
     // ---- verdict + GATE line ----------------------------------------------
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
-        findings.length === 0 && allocOk && abOk;
+        findings.length === 0 && allocOk && ringAllocOk && abOk;
 
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
         ' warnings=' + warns.length +
         ' | gc major=' + s2.gc.major + ' minor=' + s2.gc.minor +
         ' maxMs=' + s2.gc.maxMs.toFixed(2) +
-        ' | alloc=' + allocBytes + ' B/op' +
+        ' | alloc=' + allocBytes + ' B/op (SparseSet) ' + ringAllocBytes + ' B/op (RingDeque)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
         ' (tracked=' + trackedMid + ' sink=' + SINK + ' abGrowth=' + abDelta + ')');
 
@@ -174,7 +210,8 @@ async function main() {
         }
         for (const f of findings) console.error('  finding ' + f.kind + ':' + f.reason);
         for (const l of leaks) console.error('  leak ' + l);
-        if (!allocOk) console.error('  alloc ' + allocBytes + ' B/op (raw bytesPerCall ' + bpc + ')');
+        if (!allocOk) console.error('  alloc ' + allocBytes + ' B/op SparseSet (raw bytesPerCall ' + bpc + ')');
+        if (!ringAllocOk) console.error('  alloc ' + ringAllocBytes + ' B/op RingDeque (raw bytesPerCall ' + ringBpc + ')');
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;
     }

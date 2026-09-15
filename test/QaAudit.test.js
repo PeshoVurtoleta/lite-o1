@@ -10,7 +10,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SparseSet } from '../O1.js';
+import { SparseSet, RingDeque } from '../O1.js';
 
 const litO1 = (e) => e instanceof Error && /^\[lite-o1]/.test(e.message);
 
@@ -150,4 +150,105 @@ test('ADVERSARIAL: has()/delete() must not throw on a BigInt key', () => {
     assert.equal(s.has(5n), false);
     assert.doesNotThrow(() => s.delete(5n), 'delete(BigInt) must return false, not throw');
     assert.equal(s.delete(5n), false);
+});
+
+// ===========================================================================
+// RingDeque boundary audits (same style: exact boundaries + adversarial types)
+// ===========================================================================
+
+// --- capacity boundary: the smallest legal ring (capacity 1) ---------------
+
+test('RingDeque capacity=1: holds exactly one element; full after one push', () => {
+    const d = new RingDeque(1);
+    assert.equal(d.capacity, 1);
+    assert.equal(d.size, 0);
+    d.pushBack(42);
+    assert.equal(d.size, 1);
+    assert.throws(() => d.pushBack(43), litO1);   // full
+    assert.throws(() => d.pushFront(43), litO1);  // full from the other end too
+    assert.equal(d.popBack(), 42);
+    assert.equal(d.size, 0);
+    assert.equal(d.popBack(), undefined);         // empty -> undefined
+    // with mask 0, every index maps to slot 0 -- both ends still coherent.
+    d.pushFront(7);
+    assert.equal(d.peekFront(), 7);
+    assert.equal(d.peekBack(), 7);
+});
+
+// --- every entry point on a freshly constructed (empty) deque --------------
+
+test('every entry point on a freshly constructed (empty) RingDeque is well-defined', () => {
+    const d = new RingDeque(50); // rounds to 64
+    assert.equal(d.capacity, 64);
+    assert.equal(d.size, 0);
+    assert.equal(d.popFront(), undefined);
+    assert.equal(d.popBack(), undefined);
+    assert.equal(d.peekFront(), undefined);
+    assert.equal(d.peekBack(), undefined);
+    assert.doesNotThrow(() => d.clear());
+    let seen = 0;
+    d.forEach(() => { seen++; });
+    assert.equal(seen, 0);
+    assert.deepEqual([...d], []);
+});
+
+// --- full <-> empty transition at the exact seam ---------------------------
+
+test('RingDeque fill-to-full then drain-to-empty, exactly at the capacity edge', () => {
+    const CAP = 8;
+    const d = new RingDeque(CAP);
+    for (let i = 0; i < CAP; i++) d.pushBack(i);
+    assert.equal(d.size, CAP);
+    assert.throws(() => d.pushBack(99), litO1);   // exactly at capacity -> full
+    for (let i = 0; i < CAP; i++) assert.equal(d.popFront(), i);
+    assert.equal(d.size, 0);
+    assert.equal(d.popFront(), undefined);        // exactly at empty -> undefined
+});
+
+// --- +/-Infinity accepted; NaN rejected (the value-class boundary) ---------
+
+test('RingDeque value boundary: +/-Infinity ACCEPTED, NaN REJECTED', () => {
+    const d = new RingDeque(4);
+    assert.doesNotThrow(() => d.pushBack(Infinity));
+    assert.doesNotThrow(() => d.pushBack(-Infinity));
+    assert.throws(() => d.pushBack(NaN), litO1);
+    assert.throws(() => d.pushFront(NaN), litO1);
+    assert.equal(d.size, 2);
+    assert.equal(d.popFront(), Infinity);
+    assert.equal(d.popFront(), -Infinity);
+});
+
+// --- adversarial: a Symbol / BigInt value must fail closed, not raw-crash --
+
+test('ADVERSARIAL: RingDeque push must not throw a raw TypeError on a Symbol value', () => {
+    const d = new RingDeque(8);
+    // A [lite-o1] throw is the contract; a raw TypeError from coercing the Symbol
+    // in a message template would be a different, wrong crash.
+    assert.throws(() => d.pushBack(Symbol('v')), litO1, 'pushBack(Symbol) must be [lite-o1]');
+    assert.throws(() => d.pushFront(Symbol('v')), litO1, 'pushFront(Symbol) must be [lite-o1]');
+    assert.equal(d.size, 0);
+});
+
+test('ADVERSARIAL: RingDeque push must not throw a raw TypeError on a BigInt value', () => {
+    const d = new RingDeque(8);
+    assert.throws(() => d.pushBack(5n), litO1, 'pushBack(BigInt) must be [lite-o1]');
+    assert.throws(() => d.pushFront(5n), litO1, 'pushFront(BigInt) must be [lite-o1]');
+    assert.equal(d.size, 0);
+});
+
+// --- mutation during iteration (documents the snapshot-count semantics) -----
+
+test('RingDeque forEach uses the head/count captured at entry (documents semantics)', () => {
+    const d = new RingDeque(8);
+    for (const v of [10, 20, 30, 40]) d.pushBack(v);
+    const seen = [];
+    d.forEach((v) => {
+        seen.push(v);
+        if (v === 20) d.popFront(); // mutate mid-iteration
+    });
+    // forEach captured count=4 and head at entry, so it walks the original window.
+    assert.deepEqual(seen, [10, 20, 30, 40]);
+    // post-state stays internally consistent after the mutation.
+    assert.equal(d.size, 3);
+    assert.equal(d.peekFront(), 20);
 });

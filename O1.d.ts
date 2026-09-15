@@ -49,3 +49,54 @@ export class SparseSet {
     /** Iterate present keys in insertion order. */
     [Symbol.iterator](): IterableIterator<number>;
 }
+
+/**
+ * A zero-GC O(1) fixed-capacity double-ended queue over ONE Float64Array
+ * (numeric values only). pushFront / pushBack / popFront / popBack / peekFront /
+ * peekBack / clear / iterate are all O(1) worst-case and allocate nothing after
+ * construction. The requested capacity rounds UP to the next power of two, so the
+ * ring wraps by a single `& (capacity - 1)`. Fail closed: push* on a full deque
+ * or of a non-clean number (non-number or NaN; +/-Infinity accepted) throws a
+ * [lite-o1] error; pop* / peek* on an empty deque return `undefined` and never
+ * throw. `clear()` is O(1) and touches no store.
+ */
+export class RingDeque {
+    /**
+     * @param capacity  requested max elements; an integer in [1, 2^31]. Rounded
+     *                  UP to the next power of two.
+     */
+    constructor(capacity: number);
+
+    /** Number of live elements. */
+    readonly size: number;
+
+    /** Max elements this ring holds (power-of-two, rounded up from requested). */
+    readonly capacity: number;
+
+    /** Push v onto the front. Throws a [lite-o1] error when full or on a bad value. */
+    pushFront(v: number): this;
+
+    /** Push v onto the back. Throws a [lite-o1] error when full or on a bad value. */
+    pushBack(v: number): this;
+
+    /** Remove and return the front element, or `undefined` when empty. Never throws. */
+    popFront(): number | undefined;
+
+    /** Remove and return the back element, or `undefined` when empty. Never throws. */
+    popBack(): number | undefined;
+
+    /** Peek the front element, or `undefined` when empty. Never throws. */
+    peekFront(): number | undefined;
+
+    /** Peek the back element, or `undefined` when empty. Never throws. */
+    peekBack(): number | undefined;
+
+    /** Empty the deque in O(1) (resets head + count; zeroes no store). */
+    clear(): void;
+
+    /** Iterate live elements front -> back, alloc-free. */
+    forEach(fn: (value: number, index: number, deque: RingDeque) => void): void;
+
+    /** Iterate live elements front -> back. */
+    [Symbol.iterator](): IterableIterator<number>;
+}
