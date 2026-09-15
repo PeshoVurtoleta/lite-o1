@@ -53,8 +53,21 @@
     "@zakkster/lite-leak": "^1.10.0",
     "typescript": "^7.0.2"
   },
+  "homepage": "https://github.com/PeshoVurtoleta/lite-o1#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PeshoVurtoleta/lite-o1.git"
+  },
+  "bugs": {
+    "url": "https://github.com/PeshoVurtoleta/lite-o1/issues",
+    "email": "shinikchiev@yahoo.com"
+  },
   "engines": {
     "node": ">=18"
+  },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/PeshoVurtoleta"
   },
   "sideEffects": false
 }
