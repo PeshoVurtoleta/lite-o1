@@ -39,7 +39,7 @@ async function main() {
     const { GcProfiler, checkNoGc, measureAllocs } =
         await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { SparseSet, RingDeque } = await import('../O1.js');
+    const { SparseSet, RingDeque, UnionFind } = await import('../O1.js');
 
     const U = 1 << 16;      // universe 65536
     const CAP = 1 << 14;    // capacity 16384
@@ -84,6 +84,15 @@ async function main() {
             d.popFront();
             d.popBack();
             tracker.track(d, noop, 'ringdeque', { audit: true });
+            // UnionFind owns only its two Uint32Arrays; nothing external to
+            // release. A reclaimed instance is the desired outcome, proven by
+            // size()->0. Exercise the mutating + query surface before tracking.
+            const u = new UnionFind(256);
+            u.union(i & 255, (i + 1) & 255);
+            u.find(i & 255);
+            u.connected(i & 255, (i + 1) & 255);
+            u.componentSize(i & 255);
+            tracker.track(u, noop, 'unionfind', { audit: true });
         }
         return tracker.size();
     }
@@ -134,6 +143,27 @@ async function main() {
     const ringBpc = ringAllocRes.bytesPerCall === null ? 0 : ringAllocRes.bytesPerCall;
     const ringAllocBytes = Math.max(0, Math.round(ringBpc));
     const ringAllocOk = ringAllocBytes === 0;
+
+    // UnionFind hot path: a fully-coalesced, path-halving-flattened forest, then
+    // find / union(already-connected) / connected / componentSize over a walking
+    // element -- every op is O(1)-amortized at steady state and zero-alloc. The
+    // union here hits the ra===rb early-return branch (no structural change), so
+    // the resident forest stays bounded across the measurement.
+    const uf = new UnionFind(CAP);
+    for (let k = 1; k < CAP; k++) uf.union(0, k);
+    for (let k = 0; k < CAP; k++) uf.find(k); // flatten to the amortized steady state
+    let ufKey = 0;
+    const ufStep = () => {
+        ufKey = (ufKey + 1) & (CAP - 1);
+        uf.find(ufKey);
+        uf.union(ufKey, 0);        // already connected -> false; exercises two finds
+        uf.connected(ufKey, 0);
+        uf.componentSize(ufKey);
+    };
+    const ufAllocRes = measureAllocs(ufStep, { iterations: 100000, batches: 8 });
+    const ufBpc = ufAllocRes.bytesPerCall === null ? 0 : ufAllocRes.bytesPerCall;
+    const ufAllocBytes = Math.max(0, Math.round(ufBpc));
+    const ufAllocOk = ufAllocBytes === 0;
     // "0 B/op" resolved at the sampling floor: heapUsed deltas are quantized and
     // noisy, so a truly non-allocating op reads a sub-byte figure (a lone blip
     // in one batch / iterations). Round to the nearest byte -- any per-op
@@ -149,6 +179,7 @@ async function main() {
     for (let i = 0; i < HOT; i++) {
         step();
         ringStep();
+        ufStep();
         if ((i & 8191) === 0) {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
         }
@@ -164,6 +195,13 @@ async function main() {
         for (let k = 0; k < 512; k++) ring.pushBack(k);
         ring.forEach(cb);
         ring.clear();
+    }
+    // UnionFind reset (O(n)) + real-merge + forEachRoots (O(n)) cycles -- exercises
+    // the merge branch and the O(n) bulk primitives; all allocate nothing.
+    for (let f = 0; f < 512; f++) {
+        uf.reset();
+        for (let k = 1; k < 512; k++) uf.union(0, k);
+        uf.forEachRoots(cb);
     }
     await new Promise((r) => setTimeout(r, 50));
     const s2 = gc.summary();
@@ -184,6 +222,8 @@ async function main() {
         inst.clear();
         for (let k = 0; k < CAP; k++) ring.pushBack(k);
         ring.clear();
+        uf.reset();
+        for (let k = 1; k < CAP; k++) uf.union(0, k);
     }
     globalThis.gc();
     const abAfter = process.memoryUsage().arrayBuffers;
@@ -192,14 +232,15 @@ async function main() {
 
     // ---- verdict + GATE line ----------------------------------------------
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
-        findings.length === 0 && allocOk && ringAllocOk && abOk;
+        findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && abOk;
 
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
         ' warnings=' + warns.length +
         ' | gc major=' + s2.gc.major + ' minor=' + s2.gc.minor +
         ' maxMs=' + s2.gc.maxMs.toFixed(2) +
-        ' | alloc=' + allocBytes + ' B/op (SparseSet) ' + ringAllocBytes + ' B/op (RingDeque)' +
+        ' | alloc=' + allocBytes + ' B/op (SparseSet) ' + ringAllocBytes + ' B/op (RingDeque) ' +
+        ufAllocBytes + ' B/op (UnionFind)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
         ' (tracked=' + trackedMid + ' sink=' + SINK + ' abGrowth=' + abDelta + ')');
 
@@ -212,6 +253,7 @@ async function main() {
         for (const l of leaks) console.error('  leak ' + l);
         if (!allocOk) console.error('  alloc ' + allocBytes + ' B/op SparseSet (raw bytesPerCall ' + bpc + ')');
         if (!ringAllocOk) console.error('  alloc ' + ringAllocBytes + ' B/op RingDeque (raw bytesPerCall ' + ringBpc + ')');
+        if (!ufAllocOk) console.error('  alloc ' + ufAllocBytes + ' B/op UnionFind (raw bytesPerCall ' + ufBpc + ')');
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;
     }

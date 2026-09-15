@@ -10,7 +10,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SparseSet, RingDeque } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind } from '../O1.js';
 
 const litO1 = (e) => e instanceof Error && /^\[lite-o1]/.test(e.message);
 
@@ -251,4 +251,98 @@ test('RingDeque forEach uses the head/count captured at entry (documents semanti
     // post-state stays internally consistent after the mutation.
     assert.equal(d.size, 3);
     assert.equal(d.peekFront(), 20);
+});
+
+// ===========================================================================
+// UnionFind boundary audits (same style: exact boundaries + adversarial types)
+// ===========================================================================
+
+// --- element boundary matrix: -1, 0, n-1, n, n+1 on a small universe --------
+
+test('UnionFind element boundary matrix -1 / 0 / n-1 / n / n+1 on n=10', () => {
+    const n = 10;
+    const uf = new UnionFind(n);
+    // 0 and n-1: the extreme legal elements.
+    assert.equal(uf.find(0), 0);
+    assert.equal(uf.find(n - 1), n - 1);
+    // -1: below the range -> [lite-o1] (also proves null-is-not-zero style reject).
+    assert.throws(() => uf.find(-1), litO1);
+    // n and n+1: at and past the ceiling -> [lite-o1].
+    assert.throws(() => uf.find(n), litO1);
+    assert.throws(() => uf.find(n + 1), litO1);
+    // union with either endpoint bad also throws.
+    assert.throws(() => uf.union(0, n), litO1);
+    assert.throws(() => uf.union(n, 0), litO1);
+});
+
+// --- every entry point on a freshly constructed (all-singleton) forest ------
+
+test('every entry point on a freshly constructed UnionFind is well-defined', () => {
+    const uf = new UnionFind(4);
+    assert.equal(uf.count, 4);
+    assert.equal(uf.capacity, 4);
+    for (let i = 0; i < 4; i++) {
+        assert.equal(uf.find(i), i);
+        assert.equal(uf.componentSize(i), 1);
+    }
+    assert.equal(uf.connected(1, 2), false);
+    assert.doesNotThrow(() => uf.reset());
+    let roots = 0;
+    uf.forEachRoots(() => { roots++; });
+    assert.equal(roots, 4);
+    assert.deepEqual([...uf.roots()].sort((a, b) => a - b), [0, 1, 2, 3]);
+});
+
+// --- self-union: union(x, x) is a no-op (already connected) ------------------
+
+test('union(x, x) is a redundant no-op: returns false, count unchanged', () => {
+    const uf = new UnionFind(8);
+    assert.equal(uf.union(3, 3), false);
+    assert.equal(uf.count, 8);
+    assert.equal(uf.componentSize(3), 1);
+});
+
+// --- duplicate "dispose": reset() called twice back-to-back -----------------
+
+test('duplicate reset() is idempotent and leaves the forest usable', () => {
+    const uf = new UnionFind(8);
+    for (const [a, b] of [[0, 1], [2, 3], [0, 2]]) uf.union(a, b);
+    uf.reset();
+    assert.doesNotThrow(() => uf.reset()); // second reset on an already-singleton forest
+    assert.equal(uf.count, 8);
+    for (let i = 0; i < 8; i++) assert.equal(uf.componentSize(i), 1);
+    uf.union(5, 6);
+    assert.equal(uf.connected(5, 6), true);
+});
+
+// --- mutation during forEachRoots (documents the live-scan semantics) -------
+
+test('union() from inside forEachRoots does not corrupt state or throw', () => {
+    const uf = new UnionFind(6);
+    const seen = [];
+    assert.doesNotThrow(() => {
+        uf.forEachRoots((r) => {
+            seen.push(r);
+            if (r === 0) uf.union(2, 4); // mutate mid-scan
+        });
+    });
+    // post-state stays internally consistent after the mutation.
+    assert.equal(uf.connected(2, 4), true);
+    for (let i = 0; i < 6; i++) assert.equal(uf.find(uf.find(i)), uf.find(i));
+});
+
+// --- adversarial: a Symbol / BigInt element must fail closed, not raw-crash --
+
+test('ADVERSARIAL: UnionFind ops must not throw a raw TypeError on a Symbol element', () => {
+    const uf = new UnionFind(8);
+    assert.throws(() => uf.find(Symbol('x')), litO1, 'find(Symbol) must be [lite-o1]');
+    assert.throws(() => uf.union(0, Symbol('x')), litO1, 'union(0,Symbol) must be [lite-o1]');
+    assert.throws(() => uf.componentSize(Symbol('x')), litO1, 'componentSize(Symbol) must be [lite-o1]');
+});
+
+test('ADVERSARIAL: UnionFind ops must not throw a raw TypeError on a BigInt element', () => {
+    const uf = new UnionFind(8);
+    assert.throws(() => uf.find(5n), litO1, 'find(BigInt) must be [lite-o1]');
+    assert.throws(() => uf.union(5n, 0), litO1, 'union(BigInt,0) must be [lite-o1]');
+    assert.throws(() => uf.connected(0, 5n), litO1, 'connected(0,BigInt) must be [lite-o1]');
 });

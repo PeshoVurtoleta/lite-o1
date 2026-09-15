@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-> Zero-GC, O(1) data structures that PROVE their constant. v0.2.0 ships SparseSet (an integer set with O(1) add / has / delete / iterate and an O(1) clear() that zeroes nothing) and RingDeque (a fixed-capacity numeric double-ended queue with O(1) push/pop at both ends) -- plus a throughput-invariance witness that shows the flat cost curve while a native Set (or Array.prototype.shift) decays.
+> Zero-GC, O(1) data structures that PROVE their constant. v0.3.0 ships SparseSet (an integer set with O(1) add / has / delete / iterate and an O(1) clear() that zeroes nothing), RingDeque (a fixed-capacity numeric double-ended queue with O(1) push/pop at both ends), and UnionFind (a disjoint-set forest with near-O(1) amortized find / union) -- plus a throughput-invariance witness that shows the flat cost curve while a native Set, Array.prototype.shift, or a naive disjoint-set decays.
 
 [![npm version](https://img.shields.io/npm/v/@zakkster/lite-o1.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-o1)
 [![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
@@ -17,7 +17,7 @@
 
 Almost no JavaScript data-structure library ships the evidence that its Big-O claim survives contact with a real engine -- megamorphic call sites, GC pauses, cache misses, deopts. `lite-o1` is a curated, tree-shakeable family of the O(1) structures that actually matter, each zero-GC, each written to teach the trick that buys the constant, and each shipped with a harness that DEMONSTRATES the flat cost curve rather than asserting it. The complexity class IS the product.
 
-v0.2.0 ships two members. **SparseSet**, the textbook O(1) integer set (a dense + sparse array pair) whose `clear()` runs in O(1) by resetting a count and zeroing nothing at all. And **RingDeque**, a fixed-capacity double-ended queue of numbers over one circular `Float64Array` -- O(1) push/pop at both ends, the zero-GC answer to the `Array.prototype.shift` O(n) trap. They share no mutable module state, so a bundler that imports one drops the other.
+v0.3.0 ships three members. **SparseSet**, the textbook O(1) integer set (a dense + sparse array pair) whose `clear()` runs in O(1) by resetting a count and zeroing nothing at all. **RingDeque**, a fixed-capacity double-ended queue of numbers over one circular `Float64Array` -- O(1) push/pop at both ends, the zero-GC answer to the `Array.prototype.shift` O(n) trap. And **UnionFind**, a disjoint-set forest over two `Uint32Array` columns -- near-O(1) amortized `find` / `union` via path halving + union by size, the family's amortized-honesty member. They share no mutable module state, so a bundler that imports one drops the others.
 
 ```bash
 npm install @zakkster/lite-o1
@@ -62,6 +62,9 @@ Every op above is O(1) worst-case and allocates zero bytes after construction. T
 - [RingDeque](#ringdeque)
   - [How RingDeque works](#how-ringdeque-works)
   - [RingDeque API reference](#ringdeque-api-reference)
+- [UnionFind](#unionfind)
+  - [How UnionFind works](#how-unionfind-works)
+  - [UnionFind API reference](#unionfind-api-reference)
 - [Composability with the ecosystem](#composability-with-the-ecosystem)
 - [Zero-GC design notes](#zero-gc-design-notes)
 - [Design decisions worth knowing](#design-decisions-worth-knowing)
@@ -100,8 +103,15 @@ Existing options: a native `Set` (arbitrary keys, but a hash table that decays a
   - **`clear()`** -- empty in O(1): resets head + count, zeroes no store.
   - **`forEach(fn)` / `[Symbol.iterator]`** -- iterate live elements front -> back, alloc-free.
   - **`size` / `capacity`** -- getters (`capacity` reports the rounded power of two).
+- **`UnionFind(n)`** -- a zero-GC near-O(1) (amortized alpha(n)) disjoint-set forest over two `Uint32Array` columns (parent + subtree size), fixed element count `n` (elements are `[0, n)`). The hot surface is four ops plus two getters and two O(n) scan primitives:
+  - **`find(x)`** -- the root of x's component. O(1)-amortized. Path halving flattens the walk in place. Throws a `[lite-o1]` error on a bad element.
+  - **`union(a, b)`** -- merge two components (union by size). O(1)-amortized. Returns `true` iff a real merge happened.
+  - **`connected(a, b)` / `componentSize(x)`** -- same-component test / component size. O(1)-amortized.
+  - **`count` / `capacity`** -- getters (`count` is the live component count, maintained in O(1); `capacity` is the fixed `n`).
+  - **`reset()`** -- re-singleton every element. O(n) (the honest exception; allocates nothing, but is a bulk op, not a per-op hot path).
+  - **`forEachRoots(fn)` / `roots()`** -- visit the current roots; `forEachRoots` is an O(n) alloc-free scan, `roots()` is an allocating generator.
 - **`VERSION`** -- the package version string.
-- **The O(1) Witness** (`npm run witness`) -- an offline harness that times a fixed batch of each member's hot op across an n-sweep, reports ops/ms + a flatness ratio (SparseSet vs a native `Set`, RingDeque vs `Array.prototype.shift`), and fails if the constant regressed.
+- **The O(1) Witness** (`npm run witness`) -- an offline harness that times a fixed batch of each member's hot op across an n-sweep, reports ops/ms + a flatness ratio (SparseSet vs a native `Set`, RingDeque vs `Array.prototype.shift`, UnionFind vs a naive disjoint-set), and fails if the constant regressed.
 
 Full types ship in [`O1.d.ts`](./O1.d.ts). Tree-shakeable named exports (`sideEffects: false`) -- import only what you use.
 
@@ -168,7 +178,7 @@ get capacity: number        // max live members as constructed
 
 | Constant   | Value     | Meaning                                            |
 | ---------- | --------- | -------------------------------------------------- |
-| `VERSION`  | `'0.2.0'` | Package version string.                            |
+| `VERSION`  | `'0.3.0'` | Package version string.                            |
 
 Contract bounds (validated, not exported):
 
@@ -179,25 +189,29 @@ Contract bounds (validated, not exported):
 | SparseSet valid key | integer in `[0, universe)`                       |
 | RingDeque `capacity`| integer in `[1, 2^31]`, rounded up to a power of two |
 | RingDeque value     | `typeof 'number'` and not `NaN` (`+/-Infinity` OK) |
+| UnionFind `n`       | integer in `[1, 2^32-1]`                          |
+| UnionFind element   | integer in `[0, n)`                               |
 
 ---
 
 ## The O(1) Witness
 
-The analytical anchor: **ops/ms that stays flat as n grows is the proof of O(1).** `npm run witness` fills a SparseSet of size `n` and times a fixed batch (1e6) of the membership op at each `n` in a geometric sweep `[1e3, 1e4, 1e5, 1e6, 1e7]`, with a warm-up and the median of 5 reps to reject a loaded-runner stall. It runs a native `Set` foil on the identical key sweep -- the thing a working programmer reaches for by default -- and reports both curves plus a flatness ratio (`opsPerMs(n_max) / opsPerMs(n_min)`):
+The analytical anchor: **ops/ms that stays flat as n grows is the proof of O(1).** `npm run witness` fills a SparseSet of size `n` and times a fixed batch (1e6) of the membership op at each `n` in a geometric sweep `[1e3, 1e4, 1e5, 1e6, 1e7]`, with two warm-ups and the median of 9 reps to reject a loaded-runner stall. It runs a native `Set` foil on the identical key sweep -- the thing a working programmer reaches for by default -- and reports both curves plus a flatness ratio (`opsPerMs(last) / opsPerMs(first)`):
 
 ```
   n         SparseSet ops/ms   Set ops/ms   ratio
   --------  ----------------   ----------   -----
-  1e3             ~552753.40    ~178964.22   ~3.09x
-  1e7             ~443852.64     ~15834.00  ~28.03x
+  1e3             ~378483.23    ~169062.91   ~2.24x   <- L1 micro-case (shown, not gated)
+  1e4             ~401472.12    ~114038.09   ~3.52x
+  1e6             ~404626.17     ~44210.86   ~9.15x
+  1e7             ~402030.25     ~19032.79  ~21.12x   <- memory wall (shown, not gated)
 
-  SparseSet flatness (last/first):  ~0.80   (gate >= 0.70)
-  Set foil  flatness (last/first):  ~0.09   (gate <= 0.55)
-  min SparseSet/Set ratio:          ~3.09x  (gate >= 1.50x)
+  SparseSet flatness (n=1e4..1e6):  ~1.00   (gate >= 0.70)
+  Set foil  flatness (n=1e4..1e6):  ~0.39   (gate <= 0.55)
+  min SparseSet/Set ratio (n=1e4..1e6): ~3.5x   (gate >= 1.50x)
 ```
 
-SparseSet's contiguous typed-array layout streams flat; the `Set`'s hash table scatters across an ever-larger backing store until each lookup is a cache miss, so its ops/ms falls ~11x across the sweep. The gate fails the build if SparseSet flatness drops below `0.70`, the foil fails to decay below `0.55`, or the ratio falls under `1.5x` at any size -- so a regression that quietly ruins the constant fails as loudly as a broken test. (Absolute ops/ms is machine-specific; reproduce on your own hardware.)
+SparseSet's contiguous typed-array layout streams flat -- its ops/ms barely moves from n=1e3 to n=1e7 -- while the `Set`'s hash table scatters across an ever-larger backing store until each lookup is a cache miss, so its ops/ms falls ~9x across the sweep and SparseSet's lead *grows* with n (2x to 21x). **Honest gate domain:** ops/ms is a hardware signal, so the two unrepresentative endpoints are displayed but excluded from the gate -- n=1e3 is a pure-L1 micro-case that turbo-spikes (an unstable flatness denominator), and n=1e7 is the memory wall, where the 8*n-byte arrays exceed cache and you measure DRAM latency rather than the algorithm. The gate is computed over the steady, cache-resident window `1e4 <= n <= 1e6` and fails the build if SparseSet flatness drops below `0.70`, the foil fails to decay below `0.55`, or the ratio falls under `1.5x` at any gated size -- so a regression that quietly ruins the constant fails as loudly as a broken test. (Absolute ops/ms is machine-specific; reproduce on your own hardware.)
 
 ---
 
@@ -290,6 +304,96 @@ get capacity: number              // max elements (power-of-two, rounded up)
 
 ---
 
+## UnionFind
+
+The third member: a **disjoint-set (union-find) forest** over two `Uint32Array` columns (parent + subtree size), fixed element count `n`. `find` / `union` / `connected` / `componentSize` are near-O(1) **amortized** (inverse Ackermann alpha(n) <= ~4) and allocate zero bytes -- the family's amortized-honesty member, and the zero-GC answer to a naive disjoint-set whose `find` degrades to O(n) as its trees deepen.
+
+```js
+import { UnionFind } from '@zakkster/lite-o1';
+
+// A forest of 10 singletons: elements 0..9, each its own component.
+const uf = new UnionFind(10);
+uf.count;               // -> 10  (live component count, maintained in O(1))
+uf.capacity;            // -> 10  (the fixed universe n)
+
+uf.union(0, 1);         // -> true  (a real merge)
+uf.union(1, 2);         // -> true  (2 joins {0,1})
+uf.union(0, 2);         // -> false (already connected -- no-op)
+uf.count;               // -> 8
+
+uf.connected(0, 2);     // -> true
+uf.connected(0, 5);     // -> false
+uf.componentSize(1);    // -> 3   ({0,1,2})
+uf.find(2);             // -> the component root (path-halved on the way)
+
+// uf.find(10);         // throws [lite-o1]: element out of [0, 10)
+// uf.find(1.5);        // throws [lite-o1]: not an integer element
+// uf.union(0, Symbol());// throws [lite-o1]: fail-closed, never a raw TypeError
+
+uf.reset();             // O(n): re-singleton every element (the honest exception)
+uf.count;               // -> 10
+```
+
+Every query / merge above is O(1)-amortized and zero-allocation after construction. Fail closed: a bad element (non-integer, out of `[0, n)`, `NaN`, `null`, a Symbol, a BigInt) throws a `[lite-o1]` error -- never a raw `TypeError`, and `null` is never coerced to element `0`. The `witness` harness proves UnionFind's amortized `find` holds its ops/ms while a naive disjoint-set (no path compression, no union-by-size) collapses as `n` grows.
+
+### How UnionFind works
+
+<details>
+<summary>Path halving, union by size, and why a single find is amortized -- not worst-case -- O(1).</summary>
+
+A UnionFind holds two `Uint32Array`s and a live component count:
+
+- **`parent`** -- `parent[i]` is `i`'s parent in its tree; `i` is a ROOT iff `parent[i] === i`. Two elements are in the same component iff they reach the same root.
+- **`size`** -- `size[root]` is the number of elements in that tree. It drives union-by-size AND answers `componentSize` for free.
+
+The two near-constant tricks are both applied:
+
+- **Path halving on `find`.** Walking `x` up to its root, every other node is repointed at its grandparent:
+
+  ```
+  while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+  ```
+
+  The tree flattens as a side effect of querying it. This is ITERATIVE -- no recursion, no stack array -- so the hot body allocates nothing (full compression would need a second pass or a stack; halving gets the same amortized bound in one alloc-free pass).
+
+- **Union by size.** `union` attaches the smaller-rooted tree under the larger (`if (size[ra] < size[rb]) swap; parent[rb] = ra; size[ra] += size[rb]`), so a tree never grows taller than log n before halving flattens it. `count` is decremented exactly once per REAL merge (never a scan), and `union` returns `true` iff it actually merged.
+
+Together these bound any single op at O(alpha(n)) AMORTIZED. **Honesty:** a single `find` is NOT worst-case O(1) -- an adversarial chain that has not yet been halved is O(depth). The guarantee is amortized alpha(n) (effectively a small constant), and the [witness](#the-o1-witness) proves the amortized throughput stays flat while a naive disjoint-set foil (no compression, no union-by-size -> a degenerate chain) decays toward O(n).
+
+`reset()` (re-singleton everything) and `forEachRoots(fn)` (visit every root) are the O(n) exceptions: there is no cross-check trick to make them O(1) because every element's parent must actually be read / rewritten. They still allocate nothing (a single bulk pass over the existing arrays), but they are bulk ops, not per-op hot paths -- `reset()` is named `reset()`, not `clear()`, precisely to flag that different cost class.
+
+The cost of the constant is memory: two `n`-sized `Uint32Array` columns, allocated eagerly at construction. UnionFind is the right tool when elements are a known, bounded integer range and you merge groups incrementally -- not for a huge / unbounded or non-integer element domain.
+
+</details>
+
+### UnionFind API reference
+
+```ts
+new UnionFind(n: number)   // n elements [0, n); n an integer in [1, 2^32-1]
+```
+
+- **`n`** -- the fixed element count; valid elements are integers in `[0, n)`. An integer in `[1, 2^32-1]`. Sizes both `Uint32Array` columns. The constructor throws a `[lite-o1]`-tagged `RangeError` on a non-integer / out-of-range / non-number argument (`Number.isInteger` never coerces, so a Symbol / BigInt fails closed rather than crashing raw). All scratch is allocated here; every method afterward allocates nothing (except `roots()`).
+
+```ts
+find(x: number): number              // component root; O(1)-amortized (path halving)
+union(a: number, b: number): boolean // merge (union by size); true iff a real merge
+connected(a: number, b: number): boolean // same-component test; O(1)-amortized
+componentSize(x: number): number     // size of x's component; O(1)-amortized
+reset(): void                        // O(n): re-singleton every element (allocates nothing)
+forEachRoots(fn: (root: number, uf: UnionFind) => void): void  // O(n) alloc-free scan
+roots(): IterableIterator<number>    // O(n) scan; ALLOCATES a generator per protocol
+get count: number                    // live component count (maintained in O(1))
+get capacity: number                 // the fixed element universe n
+```
+
+- **`find` / `union` / `connected` / `componentSize`** throw `[lite-o1] node out of range [0, n): ...` for an element that is not an integer in `[0, n)` (this includes `-1`, `1.5`, `NaN`, `null`, `x === n`, a Symbol, and a BigInt). The `typeof` guard runs BEFORE the coercing `>>>`, so a Symbol / BigInt never reaches arithmetic. `null` is rejected as `null`, never coerced to element `0`.
+- **`union(a, b)`** returns `true` iff a and b were in DIFFERENT components (a real merge, `count` drops by one); `false` if already joined (a no-op). `union(x, x)` is always `false`.
+- **`reset()` / `forEachRoots()` / `roots()`** are O(n), NOT per-op hot paths. `reset()` and `forEachRoots()` allocate nothing; `roots()` allocates a generator + a `{value, done}` per step by protocol -- use `forEachRoots` for the alloc-free scan. There is no public `size` getter (it would collide with the live-element-count meaning `size` has on the other members); use `count` (live components) and `capacity` (fixed universe).
+
+**Reach for UnionFind when** you track "which things are in the same group" over a fixed integer element set and merge groups incrementally (connected components, Kruskal MST, percolation, cycle detection, equivalence classes) at near-constant amortized cost with zero per-op allocation. **Avoid it when** you need to SPLIT / un-merge (union-find is merge-only; `reset()` re-singletons everything in O(n)), your elements are not a bounded integer range, or you are on a strict per-op WORST-CASE budget (a single `find` is amortized alpha(n), not worst-case O(1)). See [`GUIDE.md`](./GUIDE.md) for the full reach-for / avoid / measure-it.
+
+---
+
 ## Composability with the ecosystem
 
 SparseSet is the dense-integer membership primitive under an ECS-style loop. A common pattern: a `SparseSet` per component tracks which entity ids currently have that component; a `@zakkster/lite-arena` `Arena` owns the component payloads by generational handle. Membership and iteration are O(1) and alloc-free; the per-frame `clear()` of a scratch set (visited masks, this-frame-touched ids) is free.
@@ -360,6 +464,21 @@ The torture gate (`@zakkster/lite-leak` + `@zakkster/lite-gc-profiler`, run unde
 
 The value guard is a two-test branchless check on the hot body -- `typeof v !== 'number' || v !== v` (the second catches NaN once the type is known) -- with the message-building `_bad` / `_full` throw builders on the cold path (again using `String(v)`, never a template literal, so a Symbol / BigInt value fails closed rather than crashing raw). The torture and perf gates prove RingDeque at **0 B/op** across FIFO / LIFO / both-ends interleave churn, with a 0-delta on the `Float64Array` backing (fixed capacity -- no resize) and the leak tracker back at `size() = 0`.
 
+**UnionFind** allocates its two `Uint32Array` columns once, at construction:
+
+| Operation                        | Steady-state allocations |
+| -------------------------------- | ------------------------ |
+| `find(x)`                        | **0** (path halving, iterative) |
+| `union(a, b)`                    | **0**                    |
+| `connected(a, b)`                | **0**                    |
+| `componentSize(x)`               | **0**                    |
+| `reset()`                        | **0** (O(n) bulk pass, no new store) |
+| `forEachRoots(fn)`               | **0** (O(n) scan)        |
+| `roots()`                        | a generator + `{value,done}` per step (protocol) |
+| `new UnionFind(...)`             | once, at construction (both typed arrays) |
+
+`find` is path-halving and ITERATIVE -- no recursion and no stack array -- so the flattening that buys the amortized constant costs zero allocation. The element guard is the same branchless typeof-first check as the other members (`typeof x !== 'number' || (x >>> 0) !== x || x >= n`), with the `_oob` throw builder (using `String(x)`) on the cold path. The torture gate proves UnionFind at **0 B/op** across `find` / `union` / `connected` / `componentSize` churn (with real merges and O(n) `reset` / `forEachRoots` cycles exercised), 0 major GCs, a 0-delta on the two-column backing, and the leak tracker back at `size() = 0`. `reset()` and `forEachRoots()` are O(n) bulk primitives (still alloc-free) and are excluded from the zero-alloc-**per-op** claim; `roots()` is the one op that allocates, by generator protocol.
+
 </details>
 
 ---
@@ -372,15 +491,16 @@ The value guard is a two-test branchless check on the hot body -- `typeof v !== 
 - **Fixed capacity, no silent growth.** A new key past `capacity` throws rather than reallocating. A structure that advertises worst-case O(1) must not hide an amortized O(n) resize; growth, if ever offered, will be opt-in and labeled. See [`decisions/0003`](./decisions/0003-slotpool-deferred.md).
 - **The witness is a first-class deliverable, with a gated floor.** SparseSet flatness `>= 0.70`, the `Set` foil `<= 0.55`, ratio `>= 1.5x` -- a regression in the constant fails the build. See [`decisions/0004`](./decisions/0004-witness-flatness-gate.md).
 - **RingDeque is fixed-capacity (power-of-two), fail closed on full, and stores numbers only.** A power-of-two capacity buys the single-`& MASK` wrap; head + count makes full / empty single tests; a full push throws (no silent drop / overwrite); the numeric substrate keeps it zero-GC and makes `undefined`-on-empty unambiguous. See [`decisions/0005`](./decisions/0005-ring-capacity-fail-closed.md) and [`decisions/0006`](./decisions/0006-numeric-ring-substrate.md).
+- **UnionFind is amortized, not worst-case, and honest about it.** Path halving (iterative, no stack -- so zero-alloc) plus union by size bound any single op at O(alpha(n)) amortized; a single `find` is O(depth) worst-case, and the witness proves the amortized line against a naive-disjoint-set foil. `reset()` and `forEachRoots()` are the O(n) exceptions (named `reset()`, not `clear()`, to flag the cost); `roots()` is the one allocating op. See [`decisions/0007`](./decisions/0007-unionfind-path-halving-union-by-size.md).
 
 ---
 
 ## Testing
 
-**58 deterministic `node:test` cases**, plus a torture gate, a hard perf gate, and the O(1) witness gate.
+**83 deterministic `node:test` cases**, plus a torture gate, a hard perf gate, and the O(1) witness gate.
 
 ```bash
-npm test           # 58 node:test cases (contract + boundary + differential fuzz)
+npm test           # 83 node:test cases (contract + boundary + differential fuzz)
 npm run test:types # tsc --noEmit against O1.d.ts
 npm run torture    # @zakkster/lite-leak + lite-gc-profiler: 0 B/op + leak-free
 npm run witness    # the O(1) throughput-invariance harness + foils + flatness gate
@@ -388,7 +508,7 @@ npm run test:perf  # @zakkster/lite-perf-gate: hard zero-alloc scavenge-scaling 
 npm run verify     # all five, the publish gate
 ```
 
-For SparseSet the suite covers: constructor validation (every bad `universe` / `capacity`), the add/has/delete/clear/iterate surface, the delete-swap back-pointer, idempotent add, insertion-order iteration, the full fail-closed key surface (`add` throws `/^\[lite-o1\]/`, `has` never throws), `null is not zero`, a **byte-identical** proof that `clear()` leaves the dense + sparse `ArrayBuffer`s untouched, and a **1,000,000-op differential fuzz** of mixed add/delete/has against a native `Set` oracle. For RingDeque: power-of-two capacity rounding, push/pop/peek at both ends, wrap-around across the `& MASK` seam, the fail-closed surface (full push throws as a byte-identical no-op; a non-number or NaN throws; a Symbol / BigInt fails closed, not raw; `+/-Infinity` accepted; empty pop/peek returns `undefined`), a byte-identical `clear()` proof, and a **1,000,000-op both-ends differential fuzz** against a plain-`Array` reference deque (0 divergences, with the full-throw and empty-undefined edges both exercised). No gate output is a FAIL.
+For SparseSet the suite covers: constructor validation (every bad `universe` / `capacity`), the add/has/delete/clear/iterate surface, the delete-swap back-pointer, idempotent add, insertion-order iteration, the full fail-closed key surface (`add` throws `/^\[lite-o1\]/`, `has` never throws), `null is not zero`, a **byte-identical** proof that `clear()` leaves the dense + sparse `ArrayBuffer`s untouched, and a **1,000,000-op differential fuzz** of mixed add/delete/has against a native `Set` oracle. For RingDeque: power-of-two capacity rounding, push/pop/peek at both ends, wrap-around across the `& MASK` seam, the fail-closed surface (full push throws as a byte-identical no-op; a non-number or NaN throws; a Symbol / BigInt fails closed, not raw; `+/-Infinity` accepted; empty pop/peek returns `undefined`), a byte-identical `clear()` proof, and a **1,000,000-op both-ends differential fuzz** against a plain-`Array` reference deque (0 divergences, with the full-throw and empty-undefined edges both exercised). For UnionFind: constructor validation (every bad `n`), the find/union/connected/componentSize/count/reset/forEachRoots/roots surface, `count` decrementing exactly once per true merge, a **path-halving depth-shrink proof** (a test-only peek at `_parent`), the full fail-closed element surface (a bad element -- including a Symbol / BigInt -- throws `/^\[lite-o1\]/`, never raw; `null is not zero`), and a **>= 100,000-op mixed union/find/connected differential fuzz** against a trivial no-compression / no-union-by-size oracle (0 divergences on connectivity, component size, and live count). No gate output is a FAIL.
 
 ---
 
@@ -396,9 +516,10 @@ For SparseSet the suite covers: constructor validation (every bad `universe` / `
 
 - **Not a general-purpose set.** SparseSet keys are integers in a known, bounded `[0, universe)`. For arbitrary keys (strings, objects, huge sparse integer domains), use a native `Set` / `Map` -- SparseSet trades universe-sized memory for the flat constant and the O(1) clear.
 - **Not a general-purpose queue.** RingDeque stores numbers only. To queue objects / strings, queue their integer handles and keep the payloads in a parallel column or `@zakkster/lite-arena`.
-- **Not a growable collection.** Both members are fixed-capacity: a SparseSet key past capacity, or a RingDeque push on a full ring, throws. This is deliberate (worst-case O(1), fail closed -- no hidden amortized resize), not a missing feature. An overwrite-oldest RingDeque preset (RingLog) is a deferred future variant, not the current default.
-- **Not a payload store.** SparseSet holds membership, RingDeque holds numbers -- neither holds object payloads. Store component data in a parallel SoA column or `@zakkster/lite-arena` keyed by the same ids / handles.
-- **Not the full family yet.** v0.2.0 is SparseSet + RingDeque. SlotPool, UnionFind, MonoDeque, and the eight-dimension benchmark suite are on the roadmap, not in this release.
+- **Not a splittable disjoint-set.** UnionFind is merge-only: there is no per-element un-merge / undo. `reset()` re-singletons the whole forest in O(n); rollback means keeping your own edge log and rebuilding. It also eagerly allocates two `n`-sized `Uint32Array` columns at construction, so it is not for a huge / unbounded or non-integer element domain -- and a single `find` is amortized alpha(n), not worst-case O(1).
+- **Not a growable collection.** All three members are fixed-capacity: a SparseSet key past capacity, or a RingDeque push on a full ring, throws; UnionFind's element universe `n` is fixed at construction. This is deliberate (worst-case / amortized bounds, fail closed -- no hidden resize), not a missing feature. An overwrite-oldest RingDeque preset (RingLog) is a deferred future variant, not the current default.
+- **Not a payload store.** SparseSet holds membership, RingDeque holds numbers, UnionFind holds connectivity -- none holds object payloads. Store component data in a parallel SoA column or `@zakkster/lite-arena` keyed by the same ids / handles.
+- **Not the full family yet.** v0.3.0 is SparseSet + RingDeque + UnionFind. SlotPool, MonoDeque, and the eight-dimension benchmark suite are on the roadmap, not in this release.
 - **Not a benchmark suite.** The witness proves throughput invariance (one axis); the full latency/memory/cache/GC benchmark suite is a separate, planned deliverable.
 
 ---

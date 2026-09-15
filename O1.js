@@ -3,9 +3,9 @@
  * that doubles as a teachable textbook: each member solves a real problem AND
  * proves its constant is real (the O(1) Witness -- see test/witness.mjs).
  *
- * v0.2.0 ships two members -- SparseSet and RingDeque -- plus its `VERSION`
- * const. The two are independent (no shared mutable module state), so a bundler
- * that imports one drops the other (`sideEffects: false`).
+ * v0.3.0 ships three members -- SparseSet, RingDeque, and UnionFind -- plus its
+ * `VERSION` const. The three are independent (no shared mutable module state), so
+ * a bundler that imports one drops the others (`sideEffects: false`).
  *
  * The complexity class IS the product: every hot op below is O(1) worst-case and
  * allocates ZERO bytes after construction. The witness harness (never imported
@@ -16,7 +16,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '0.2.0';
+export const VERSION = '0.3.0';
 
 /** Largest universe the Uint32 substrate + the (k >>> 0) key check can honor. */
 const MAX_UNIVERSE = 0x100000000; // 2^32
@@ -339,5 +339,184 @@ export class RingDeque {
     /** @private */
     _full() {
         throw new RangeError('[lite-o1] RingDeque full (capacity ' + this._cap + ')');
+    }
+}
+
+/**
+ * Largest disjoint-set universe UnionFind can honor. Every parent / root index
+ * is stored in a Uint32Array slot, so an element must fit a uint32; the fixed
+ * count `n` is an integer in [1, 2^32-1] (0xFFFFFFFF), leaving every legal
+ * element in [0, n) inside the uint32 range.
+ */
+const MAX_NODES = 0xFFFFFFFF; // 2^32 - 1
+
+/**
+ * UnionFind -- a zero-GC near-O(1) disjoint-set forest over TWO flat
+ * `Uint32Array` columns (parent + subtree size), with a fixed element count `n`.
+ *
+ * find / union / connected / componentSize are ALL O(1)-AMORTIZED (inverse
+ * Ackermann alpha(n) <= 4 for any n that fits this universe -- effectively a
+ * small constant) and allocate ZERO bytes after construction. The two classic
+ * near-constant tricks are both applied:
+ *
+ *   - PATH HALVING on find: every other node on the walk to the root is
+ *     re-pointed at its grandparent (`parent[x] = parent[parent[x]]`), so the
+ *     tree flattens as a side effect of querying it -- iterative, NO recursion
+ *     and NO stack array, so the hot body allocates nothing.
+ *   - UNION BY SIZE: the smaller-rooted tree is attached under the larger, so
+ *     the forest never grows taller than log n before halving flattens it.
+ *
+ * Together these bound any single op at O(alpha(n)) amortized. HONESTY: a single
+ * find is NOT worst-case O(1) -- an adversarial pre-halving chain is O(depth);
+ * the guarantee is amortized. The witness reports the amortized throughput
+ * staying flat while a no-compression / no-union-by-size foil degrades.
+ *
+ * Elements are [0, n); `count` is the live component count, maintained in O(1)
+ * (decremented once per real merge -- NO scan). Fail closed, mirroring the other
+ * members: a non-integer / out-of-range / non-number element throws a
+ * [lite-o1]-tagged error via _oob (typeof-guarded BEFORE the coercing `>>>`, so a
+ * Symbol / BigInt never reaches arithmetic). `null` is not zero --
+ * `(null >>> 0) === null` is false, so null is rejected.
+ *
+ * `reset()` and `forEachRoots(fn)` are the documented O(n) full-scan exceptions
+ * (a single bulk pass over the existing arrays -- they still allocate NOTHING but
+ * are NOT per-op hot paths); `roots()` is a convenience generator that ALLOCATES
+ * per protocol (like `[Symbol.iterator]`) and is kept OUT of the zero-alloc claim.
+ */
+export class UnionFind {
+    /**
+     * @param {number} n  fixed element count; an integer in [1, 2^32-1].
+     *                    Elements are [0, n).
+     */
+    constructor(n) {
+        // Number.isInteger never coerces (false on a Symbol / BigInt), and
+        // String(n) in the cold message is Symbol/BigInt-safe -- so a bad type
+        // fails closed with a [lite-o1] error, never a raw TypeError.
+        if (!Number.isInteger(n) || n < 1 || n > MAX_NODES) {
+            throw new RangeError(
+                '[lite-o1] UnionFind n must be an integer in [1, 2^32-1], got ' + String(n));
+        }
+        const parent = new Uint32Array(n); // parent[i] = i's parent (i itself iff root)
+        for (let i = 0; i < n; i++) parent[i] = i;
+        this._parent = parent;
+        this._size = new Uint32Array(n).fill(1); // size[root] = elements in that tree
+        this._count = n;                          // live component count (O(1)-maintained)
+        this._n = n;                              // fixed universe (the capacity getter)
+    }
+
+    /** Live component count. O(1) -- maintained, never scanned. */
+    get count() { return this._count; }
+
+    /** Fixed element universe [0, n). O(1). (No `size` getter -- would collide
+     *  with the "live element count" meaning the other members give `size`.) */
+    get capacity() { return this._n; }
+
+    /**
+     * Return the root of x's component. O(1)-AMORTIZED. Path-halving flattens the
+     * walk in place (no recursion, no stack array -- zero allocation). Fails
+     * closed: a bad element throws via _oob. The `typeof` short-circuits BEFORE
+     * `>>>` runs, because `>>>` coerces its operand first and that coercion THROWS
+     * on a Symbol or BigInt; `(x >>> 0) !== x` then rejects every non-uint32
+     * number, and `x >= n` rejects an in-range uint32 past the universe.
+     * @param {number} x
+     * @returns {number} the component root
+     */
+    find(x) {
+        if (typeof x !== 'number' || (x >>> 0) !== x || x >= this._n) return this._oob(x);
+        const parent = this._parent;
+        while (parent[x] !== x) {
+            parent[x] = parent[parent[x]]; // path halving: point x at its grandparent
+            x = parent[x];
+        }
+        return x;
+    }
+
+    /**
+     * Merge the components of a and b. O(1)-AMORTIZED. Returns `true` iff a real
+     * merge happened (they were in different components), `false` if already
+     * joined. Union by size: the smaller-rooted tree is attached under the larger.
+     * Fails closed on either bad element (typeof-guarded before any coercion).
+     * @param {number} a
+     * @param {number} b
+     * @returns {boolean} true iff a and b were merged this call
+     */
+    union(a, b) {
+        if (typeof a !== 'number' || (a >>> 0) !== a || a >= this._n) return this._oob(a);
+        if (typeof b !== 'number' || (b >>> 0) !== b || b >= this._n) return this._oob(b);
+        let ra = this.find(a);
+        let rb = this.find(b);
+        if (ra === rb) return false;
+        const size = this._size;
+        if (size[ra] < size[rb]) { const t = ra; ra = rb; rb = t; } // attach smaller under larger
+        this._parent[rb] = ra;
+        size[ra] += size[rb];
+        this._count--; // exactly one component disappears per real merge
+        return true;
+    }
+
+    /**
+     * True iff a and b are in the same component. O(1)-AMORTIZED. Both elements
+     * are guarded via find (a bad element throws [lite-o1]).
+     * @param {number} a
+     * @param {number} b
+     * @returns {boolean}
+     */
+    connected(a, b) {
+        return this.find(a) === this.find(b);
+    }
+
+    /**
+     * Size of the component containing x. O(1)-AMORTIZED. x is guarded via find.
+     * @param {number} x
+     * @returns {number}
+     */
+    componentSize(x) {
+        return this._size[this.find(x)];
+    }
+
+    /**
+     * Re-singleton every element: parent[i] = i, size[i] = 1, count = n. This is
+     * the HONEST O(n) exception -- a single bulk pass over the existing arrays. It
+     * allocates NOTHING (no new store), but it is O(n), NOT a zero-alloc-per-op
+     * hot path; named reset() (not clear()) to flag that cost.
+     */
+    reset() {
+        const parent = this._parent;
+        const size = this._size;
+        const n = this._n;
+        for (let i = 0; i < n; i++) { parent[i] = i; size[i] = 1; }
+        this._count = n;
+    }
+
+    /**
+     * Invoke fn(root, uf) for every current root, alloc-free. O(n) FULL SCAN --
+     * a documented exception, EXCLUDED from the zero-alloc-per-op claims (it is a
+     * bulk primitive, not a hot op). A HOISTED callback keeps it allocation-free.
+     * @param {(root:number, uf:UnionFind)=>void} fn
+     */
+    forEachRoots(fn) {
+        const parent = this._parent;
+        const n = this._n;
+        for (let i = 0; i < n; i++) if (parent[i] === i) fn(i, this);
+    }
+
+    /**
+     * Yield every current root. O(n) scan. ALLOCATES a generator + a {value,done}
+     * object per step by protocol -- kept OUT of the zero-alloc claims (use
+     * forEachRoots for the alloc-free scan).
+     */
+    *roots() {
+        const parent = this._parent;
+        const n = this._n;
+        for (let i = 0; i < n; i++) if (parent[i] === i) yield i;
+    }
+
+    // ---- cold path only: throw builder (string concat lives here, off the hot body) ----
+
+    /** @private */
+    _oob(x) {
+        // String(x) -- NOT '+ x' / a template literal: those THROW on a Symbol or
+        // BigInt, which would turn a fail-closed reject into a different crash.
+        throw new RangeError('[lite-o1] node out of range [0, ' + this._n + '): ' + String(x));
     }
 }

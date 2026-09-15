@@ -22,7 +22,7 @@
  */
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { SparseSet, RingDeque } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind } from '../../O1.js';
 
 const U = 1 << 16;      // universe 65536
 const CAP = 1 << 14;    // capacity 16384
@@ -234,9 +234,93 @@ const ringInterleave = {
     statsOf(s) { return { grows: ringGrows(s) }; },
 };
 
+// ===========================================================================
+// UnionFind scenarios -- two fixed Uint32Array columns, all near-O(1) zero-alloc.
+// ===========================================================================
+
+const UF_N = 1 << 14;      // 16384 elements
+const UF_MASK = UF_N - 1;  // power-of-2 mask: element & MASK is always in [0, UF_N)
+
+/**
+ * The zero-alloc counter for UnionFind scenarios: the two backing Uint32Arrays'
+ * ArrayBuffer byte lengths (parent + size). The element count is fixed at
+ * construction, so this NEVER grows -- the delta across the window must be 0.
+ * Reported under the shared `grows` counter key (mirrors grows / ringGrows).
+ */
+function ufGrows(s) {
+    return s.uf._parent.buffer.byteLength + s.uf._size.buffer.byteLength;
+}
+
+/** A UnionFind coalesced into ONE component and path-halving-flattened. */
+function ufFill() {
+    const uf = new UnionFind(UF_N);
+    for (let k = 1; k < UF_N; k++) uf.union(0, k);
+    for (let k = 0; k < UF_N; k++) uf.find(k); // flatten to the amortized steady state
+    return uf;
+}
+
+/** find-heavy: a flattened forest; every op an amortized-O(1) find, int32 acc. */
+const ufFindHeavy = {
+    name: 'UnionFind find-heavy',
+    setup() { return { uf: ufFill(), acc: 0 }; },
+    hot(s, n) {
+        const uf = s.uf;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) acc = (acc + uf.find(i & UF_MASK)) | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: ufGrows(s) }; },
+};
+
+/**
+ * union-churn: reset (O(n), zero-alloc) the instant the forest fully coalesces,
+ * then union consecutive elements -- so the measured window is dominated by REAL
+ * merges (the size-update + count-- branch), not just the already-connected early
+ * return. Every op is zero-alloc and no backing store grows.
+ */
+const ufUnionChurn = {
+    name: 'UnionFind union-churn (real merges)',
+    setup() { return { uf: new UnionFind(UF_N) }; },
+    hot(s, n) {
+        const uf = s.uf;
+        for (let i = 0; i < n; i++) {
+            if (uf.count === 1) uf.reset(); // O(n) bulk re-singleton, allocates nothing
+            uf.union(i & UF_MASK, (i + 1) & UF_MASK);
+        }
+    },
+    statsOf(s) { return { grows: ufGrows(s) }; },
+};
+
+/** connected: a flattened forest; every op two amortized-O(1) finds, int32 acc. */
+const ufConnected = {
+    name: 'UnionFind connected',
+    setup() { return { uf: ufFill(), acc: 0 }; },
+    hot(s, n) {
+        const uf = s.uf;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) acc = (acc + (uf.connected(i & UF_MASK, 0) ? 1 : 0)) | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: ufGrows(s) }; },
+};
+
+/** componentSize: a flattened forest; every op a find + one array read, int32 acc. */
+const ufComponentSize = {
+    name: 'UnionFind componentSize',
+    setup() { return { uf: ufFill(), acc: 0 }; },
+    hot(s, n) {
+        const uf = s.uf;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) acc = (acc + uf.componentSize(i & UF_MASK)) | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: ufGrows(s) }; },
+};
+
 const scenarios = [
     addChurn, hasHit, deleteChurn, clearRefill, forEachDrain,
     ringFifo, ringLifo, ringInterleave,
+    ufFindHeavy, ufUnionChurn, ufConnected, ufComponentSize,
 ];
 
 /**
@@ -261,6 +345,32 @@ const mustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/**
+ * The UnionFind teeth: a per-op `roots()` generator drain spread into a FRESH []
+ * each op -- the generator + its per-step {value, done} objects + the array MUST
+ * trip the gate (scavenges scale with n), proving the instrument has teeth on the
+ * UnionFind surface too. statsOf returns a constant so the failure is the
+ * allocation lanes, not a missing-counter artifact.
+ */
+const ufMustFailAlloc = {
+    name: 'UnionFind roots() spread into fresh array (MUST allocate)',
+    setup() {
+        const uf = new UnionFind(256);
+        for (let k = 1; k < 128; k++) uf.union(0, k); // some roots + singletons to yield
+        return { uf };
+    },
+    hot(s, n) {
+        const uf = s.uf;
+        let sink = 0;
+        for (let i = 0; i < n; i++) {
+            const arr = [...uf.roots()]; // fresh generator + array per op -> heap churn
+            sink += arr.length;
+        }
+        s.sink = sink;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -270,5 +380,5 @@ zgcSuite({
     counters: { grows: 0 },
     maxRetainedKB: 64,
     scenarios,
-    mustFail: [mustFailAlloc],
+    mustFail: [mustFailAlloc, ufMustFailAlloc],
 });

@@ -46,9 +46,11 @@ Integer set over a known, bounded `[0, universe)`. Dense + sparse array pair.
 - You need to store values, not just membership (pair it with a parallel SoA
   column or `@zakkster/lite-arena`).
 
-**Measure it:** `npm run witness` -- SparseSet flatness `>= 0.70` and it beats a
-native `Set` by `>= 1.5x` across `[1e3..1e7]`. If your universe is much larger
-than your live set, watch the memory axis, not just ops/ms.
+**Measure it:** `npm run witness` -- SparseSet flatness `>= 0.70` over the steady
+cache-resident window `[1e4..1e6]` (the sweep is displayed through `1e7` to show
+the memory wall, and `1e3` as an L1 micro-case; both are excluded from the gate),
+and it beats a native `Set` by `>= 1.5x` at every size on the sweep. If your
+universe is much larger than your live set, watch the memory axis, not just ops/ms.
 
 ---
 
@@ -86,6 +88,40 @@ O(n), the ring is O(1).
 
 ---
 
+### UnionFind (v0.3.0)
+
+Disjoint-set forest over a fixed `[0, n)` (two `Uint32Array` columns: parent +
+subtree size). Path halving + union by size => near-O(1) AMORTIZED `find` /
+`union` / `connected` / `componentSize`. The amortized-honesty member.
+
+**Reach for it when:**
+
+- You track "which things are in the same group" over a fixed integer element set
+  and merge groups incrementally (connected components, Kruskal MST, percolation,
+  cycle detection in a union-of-edges, equivalence classes).
+- You need `find` / `union` / `connected` at near-constant amortized cost with
+  zero per-op allocation.
+- The live component count matters -- `count` is maintained in O(1) (never a scan).
+
+**Avoid it when:**
+
+- You need to SPLIT / un-merge components -- union-find is merge-only; `reset()`
+  re-singletons everything (O(n)) but there is no per-element undo.
+- Your elements are not integers in a fixed, bounded `[0, n)` -- it eagerly
+  allocates two `n`-sized `Uint32Array` columns at construction (watch the memory
+  axis for very large `n`).
+- You are on a strict per-op WORST-CASE budget: a single `find` is O(depth) worst
+  case (amortized alpha(n), not worst-case O(1)). Read the amortized bar, and note
+  that `reset()` and `forEachRoots()` / `roots()` are O(n) full-scan primitives,
+  not per-op hot paths.
+
+**Measure it:** `npm run witness` -- UnionFind amortized-find flatness `>= 0.70`
+across `[1e3..1e5]` while a naive disjoint-set foil (no path compression, no
+union-by-size -> a degenerate chain) collapses (`<= 0.55`), ratio `>= 1.5x`. The
+foil is the honest "what you get without the two tricks" baseline.
+
+---
+
 ## Roadmap members (not yet shipped)
 
 Placeholders so the decision axes are visible early; each fills in on release.
@@ -93,9 +129,6 @@ Placeholders so the decision axes are visible early; each fills in on release.
 - **SlotPool** -- free-list slot allocator with generational (ABA-safe) handles.
   Reach for it as the SoA substrate; reconcile against `@zakkster/lite-arena`
   before picking one.
-- **UnionFind** -- disjoint-set, `find` / `union` in near-O(1) amortized
-  (inverse Ackermann). The amortized-honesty member: read its max single-op bar,
-  not just the mean.
 - **MonoDeque** -- monotonic deque for O(1)-amortized sliding-window min / max.
 
 ---

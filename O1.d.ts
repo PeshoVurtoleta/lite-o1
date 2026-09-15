@@ -100,3 +100,49 @@ export class RingDeque {
     /** Iterate live elements front -> back. */
     [Symbol.iterator](): IterableIterator<number>;
 }
+
+/**
+ * A zero-GC near-O(1) (amortized alpha(n)) disjoint-set forest over TWO
+ * Uint32Array columns (parent + subtree size), with a fixed element count `n`
+ * (elements are [0, n)). find / union / connected / componentSize are
+ * O(1)-amortized (path halving + union by size) and allocate nothing after
+ * construction. `count` is the live component count, maintained in O(1).
+ * `reset()` and `forEachRoots(fn)` are O(n) full-scan primitives (alloc-free but
+ * NOT per-op hot paths); `roots()` allocates a generator per protocol. Fail
+ * closed: a bad element (non-integer, NaN, null, negative, >= n, Symbol, BigInt)
+ * throws a [lite-o1] error.
+ */
+export class UnionFind {
+    /**
+     * @param n  fixed element count; an integer in [1, 2^32-1]. Elements are [0, n).
+     */
+    constructor(n: number);
+
+    /** Live component count (maintained in O(1); never scanned). */
+    readonly count: number;
+
+    /** Fixed element universe [0, n). (No `size` getter -- it would collide with
+     *  the live-count meaning `size` has on SparseSet / RingDeque.) */
+    readonly capacity: number;
+
+    /** Return the root of x's component. O(1)-amortized. Throws on a bad element. */
+    find(x: number): number;
+
+    /** Merge a and b. Returns true iff they were merged this call. Throws on a bad element. */
+    union(a: number, b: number): boolean;
+
+    /** True iff a and b share a component. O(1)-amortized. Throws on a bad element. */
+    connected(a: number, b: number): boolean;
+
+    /** Size of x's component. O(1)-amortized. Throws on a bad element. */
+    componentSize(x: number): number;
+
+    /** Re-singleton every element (O(n) bulk pass; allocates nothing). */
+    reset(): void;
+
+    /** Invoke fn for every current root, alloc-free (O(n) full scan). */
+    forEachRoots(fn: (root: number, uf: UnionFind) => void): void;
+
+    /** Yield every current root (O(n) scan; allocates a generator per protocol). */
+    roots(): IterableIterator<number>;
+}

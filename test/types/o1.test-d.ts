@@ -5,7 +5,7 @@
  * fails `npm run test:types`. Not executed; only type-checked.
  */
 
-import { SparseSet, RingDeque, VERSION } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, VERSION } from '../../O1.js';
 
 // VERSION is a string.
 const v: string = VERSION;
@@ -97,3 +97,46 @@ void rspread;
 new RingDeque('1024');
 // @ts-expect-error -- pushBack takes a number.
 rd.pushBack('3');
+
+// --- UnionFind -------------------------------------------------------------
+
+// Constructor: n required.
+const uf: UnionFind = new UnionFind(1000);
+
+// Getters are readonly numbers.
+const ucount: number = uf.count;
+const ucap: number = uf.capacity;
+void ucount; void ucap;
+
+// @ts-expect-error -- count is readonly.
+uf.count = 5;
+// @ts-expect-error -- capacity is readonly.
+uf.capacity = 5;
+
+// find -> number; union/connected -> boolean; componentSize -> number.
+const root: number = uf.find(3);
+const merged: boolean = uf.union(3, 4);
+const conn: boolean = uf.connected(3, 4);
+const csize: number = uf.componentSize(3);
+const ureset: void = uf.reset();
+void root; void merged; void conn; void csize; void ureset;
+
+// forEachRoots callback gets (number, UnionFind).
+uf.forEachRoots((r, u) => {
+    const rr: number = r;
+    const uu: UnionFind = u;
+    void rr; void uu;
+});
+
+// roots() is an iterable of number.
+for (const r of uf.roots()) {
+    const rr: number = r;
+    void rr;
+}
+const uroots: number[] = [...uf.roots()];
+void uroots;
+
+// @ts-expect-error -- n must be a number.
+new UnionFind('1000');
+// @ts-expect-error -- find takes a number.
+uf.find('3');

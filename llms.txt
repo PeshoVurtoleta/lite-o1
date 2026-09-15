@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-Version: 0.2.0
+Version: 0.3.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -12,14 +12,15 @@ constant instead of asserting it. The complexity class is the product: every hot
 op is O(1) worst-case and allocates zero bytes after construction, and a shipped
 witness harness demonstrates the flat throughput curve against a built-in foil.
 
-v0.2.0 ships two members: SparseSet and RingDeque. They share no mutable module
-state, so a bundler that imports one drops the other (tree-shakeable).
+v0.3.0 ships three members: SparseSet, RingDeque, and UnionFind. They share no
+mutable module state, so a bundler that imports one drops the others (tree-shakeable).
 
 ## Exports (from the single main file O1.js)
 
 - `SparseSet` -- class. A zero-GC O(1) integer set over [0, universe).
 - `RingDeque` -- class. A zero-GC O(1) fixed-capacity numeric double-ended queue.
-- `VERSION` -- string, '0.2.0'.
+- `UnionFind` -- class. A zero-GC near-O(1) amortized disjoint-set forest.
+- `VERSION` -- string, '0.3.0'.
 
 ## SparseSet
 
@@ -89,6 +90,46 @@ Rejected (throws [lite-o1]): null, undefined, string, Symbol, BigInt, object, Na
 Accepted: any finite number, and +Infinity / -Infinity (typeof number, not NaN).
 The typeof guard runs FIRST so a Symbol / BigInt never reaches arithmetic.
 
+## UnionFind
+
+    new UnionFind(n)
+
+- n: fixed element count; integer in [1, 2^32-1]. Elements are [0, n).
+- Constructor throws a [lite-o1] RangeError on a non-integer / out-of-range arg
+  (Number.isInteger never coerces; message via String(n), Symbol/BigInt-safe).
+- Substrate: TWO flat Uint32Array columns -- parent[i] (i's parent; i itself iff
+  root) and size[root] (elements in that tree). Path halving on find + union by
+  size bound any single op at O(alpha(n)) amortized (inverse Ackermann, <= ~4).
+
+Hot surface (all O(1)-AMORTIZED, zero allocation):
+
+- find(x) -> number      Root of x's component. Path halving flattens the walk in
+                         place (no recursion, no stack array). Throws [lite-o1] on
+                         a bad element (typeof-guarded before the coercing >>>).
+- union(a,b) -> boolean  Merge a and b. true iff a real merge happened (they were
+                         separate); false if already joined. Union by size. Guards
+                         both endpoints. count-- exactly once per true merge.
+- connected(a,b) -> boolean  find(a) === find(b). Both guarded via find.
+- componentSize(x) -> number size[find(x)]. Guarded via find.
+- count (getter)         Live component count. O(1), maintained (never scanned).
+- capacity (getter)      Fixed element universe n. (No `size` getter -- it would
+                         collide with the live-count meaning size has elsewhere.)
+- reset() -> void        O(n) HONEST EXCEPTION: re-singleton every element
+                         (parent[i]=i, size[i]=1, count=n). A single bulk pass over
+                         the existing arrays -- allocates NOTHING, but is O(n), NOT
+                         a zero-alloc-per-op hot path. Named reset(), not clear().
+- forEachRoots(fn) -> void  O(n) FULL SCAN, alloc-free: fn(root, uf) per current
+                         root. Documented exception, EXCLUDED from the
+                         zero-alloc-per-op claims. fn is hoisted for zero alloc.
+- roots() -> generator   O(n) scan; ALLOCATES a generator + {value,done} per step
+                         by protocol (like [Symbol.iterator]) -- OUT of zero-alloc
+                         claims. Use forEachRoots for the alloc-free scan.
+
+Amortized honesty: a single find is NOT worst-case O(1) -- an adversarial
+pre-halving chain is O(depth). The guarantee is AMORTIZED alpha(n); the witness
+reports amortized throughput staying flat while a no-compression / no-union-by-size
+foil (a degenerate chain) collapses.
+
 ## Design bounds
 
 - SparseSet valid key: integer in [0, universe).
@@ -97,10 +138,12 @@ The typeof guard runs FIRST so a Symbol / BigInt never reaches arithmetic.
 - RingDeque fixed capacity (power-of-two, rounded up): push past full throws
   (fail closed); pop/peek on empty returns undefined. Numeric values only.
 - RingDeque value: typeof 'number' and not NaN (+/-Infinity accepted).
+- UnionFind element: integer in [0, n); fixed n, no growth. Fail closed on a bad
+  element (throws [lite-o1]); reset() and forEachRoots() are the O(n) exceptions.
 
 ## Scripts
 
-- npm test           -- 58 node:test cases (contract + boundary + differential fuzz).
+- npm test           -- 83 node:test cases (contract + boundary + differential fuzz).
 - npm run test:types -- tsc --noEmit against O1.d.ts.
 - npm run torture    -- lite-leak + lite-gc-profiler: 0 B/op, 0 major GC, leak-free.
 - npm run witness    -- O(1) throughput-invariance harness + foils + flatness gate.
@@ -109,17 +152,27 @@ The typeof guard runs FIRST so a Symbol / BigInt never reaches arithmetic.
 
 ## Witness gate (locked)
 
-- SparseSet: n-sweep [1e3..1e7], batch 1e6, warm-up + median of 5. SparseSet
-  flatness (opsPerMs last/first) >= 0.70; native Set foil flatness <= 0.55 AND
-  SparseSet/Set ops-per-ms ratio >= 1.5x.
+- SparseSet: n-sweep [1e3..1e7] DISPLAYED, batch 1e6, two warm-ups + median of 9.
+  The gate is computed over the STEADY window 1e4 <= n <= 1e6: below it (n=1e3) is
+  an L1 micro-case that turbo-spikes, above it (n=1e7) is the memory wall where the
+  8*n-byte arrays exceed cache and ops/ms measures DRAM, not the algorithm -- both
+  are shown but excluded from the gate. SparseSet flatness (opsPerMs last/first over
+  the window) >= 0.70; native Set foil flatness <= 0.55 AND SparseSet/Set ops-per-ms
+  ratio >= 1.5x at every gated size. (The 0.70 floor is unchanged; only the gate's
+  domain is pinned to where ops/ms means O(1).)
 - RingDeque: n-sweep [1e3, 1e4, 1e5], FIFO churn vs Array.prototype.shift foil
   (O(n)); ops/ms is a rate, so the ring (batch 5e5) and foil (batch 2e3) use
   different batches yet compare directly. RingDeque flatness >= 0.70; shift foil
   flatness <= 0.55; RingDeque/shift ratio >= 1.5x.
+- UnionFind: n-sweep [1e3, 1e4, 1e5], amortized find (coalesced + flattened) vs a
+  NAIVE disjoint-set foil (no path compression, no union-by-size -> a degenerate
+  chain, O(n) find). ops/ms is a rate (uf batch 5e5, naive batch 2e3). UnionFind
+  flatness >= 0.70; naive foil flatness <= 0.55; UnionFind/naive ratio >= 1.5x.
 
 ## Not yet shipped
 
-SlotPool, UnionFind, MonoDeque, and the eight-dimension benchmark suite are on
-the roadmap, not this release. A RingLog / overwrite-oldest RingDeque preset is a
-deferred future variant. SparseSet holds membership, not payloads (store values
-in a parallel SoA column or @zakkster/lite-arena); RingDeque holds numbers only.
+SlotPool, MonoDeque, and the eight-dimension benchmark suite are on the roadmap,
+not this release. A RingLog / overwrite-oldest RingDeque preset is a deferred
+future variant. SparseSet holds membership, not payloads (store values in a
+parallel SoA column or @zakkster/lite-arena); RingDeque holds numbers only;
+UnionFind holds disjoint-set connectivity over [0, n), not payloads.
