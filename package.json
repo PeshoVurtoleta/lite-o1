@@ -28,7 +28,8 @@
     "test:types": "tsc -p test/types/tsconfig.json",
     "torture": "node --expose-gc test/torture.mjs",
     "witness": "node test/witness.mjs",
-    "verify": "npm test && npm run test:types && npm run torture && npm run witness"
+    "test:perf": "node --expose-gc --max-semi-space-size=4 --test test/perf/PerfGate.test.mjs",
+    "verify": "npm test && npm run test:types && npm run torture && npm run witness && npm run test:perf"
   },
   "keywords": [
     "o1",
@@ -51,6 +52,7 @@
   "devDependencies": {
     "@zakkster/lite-gc-profiler": "^1.16.0",
     "@zakkster/lite-leak": "^1.10.0",
+    "@zakkster/lite-perf-gate": "^1.4.2",
     "typescript": "^7.0.2"
   },
   "homepage": "https://github.com/PeshoVurtoleta/lite-o1#readme",
