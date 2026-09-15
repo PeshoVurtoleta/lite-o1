@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-Version: 0.3.0
+Version: 0.4.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -9,18 +9,22 @@ Node: >= 18.
 
 A tree-shakeable, zero-GC family of O(1) data structures that PROVES its
 constant instead of asserting it. The complexity class is the product: every hot
-op is O(1) worst-case and allocates zero bytes after construction, and a shipped
-witness harness demonstrates the flat throughput curve against a built-in foil.
+op is O(1) worst-case (or O(1)-amortized where stated) and allocates zero bytes
+after construction, and a shipped witness harness demonstrates the flat
+throughput curve against a built-in foil.
 
-v0.3.0 ships three members: SparseSet, RingDeque, and UnionFind. They share no
-mutable module state, so a bundler that imports one drops the others (tree-shakeable).
+v0.4.0 ships four members: SparseSet, RingDeque, UnionFind, and MonoDeque. They
+share no mutable module state, so a bundler that imports one drops the others
+(tree-shakeable).
 
 ## Exports (from the single main file O1.js)
 
 - `SparseSet` -- class. A zero-GC O(1) integer set over [0, universe).
 - `RingDeque` -- class. A zero-GC O(1) fixed-capacity numeric double-ended queue.
 - `UnionFind` -- class. A zero-GC near-O(1) amortized disjoint-set forest.
-- `VERSION` -- string, '0.3.0'.
+- `MonoDeque` -- class. A zero-GC O(1)-amortized monotonic deque for
+  sliding-window min / max.
+- `VERSION` -- string, '0.4.0'.
 
 ## SparseSet
 
@@ -130,6 +134,69 @@ pre-halving chain is O(depth). The guarantee is AMORTIZED alpha(n); the witness
 reports amortized throughput staying flat while a no-compression / no-union-by-size
 foil (a degenerate chain) collapses.
 
+## MonoDeque
+
+    new MonoDeque(capacity, kind)
+
+- capacity: max simultaneously-live entries; integer in [1, 2^31]. ROUNDS UP to
+  the next power of two; the capacity getter reports the rounded value.
+- kind: 'min' or 'max', FROZEN at construction (one monotone invariant per
+  instance). Validated fail-closed (anything else throws [lite-o1]).
+- Constructor throws a [lite-o1] RangeError on a bad capacity (non-integer /
+  out-of-range / non-number, typeof-guarded before coercion) or a bad kind.
+- Substrate: TWO parallel Float64Arrays (value + monotonic seq) inside a
+  head + count power-of-two ring; wrap is a single & (capacity - 1). For 'min' the
+  stored values are STRICTLY INCREASING front -> back (front is the window
+  minimum); for 'max' strictly decreasing (front is the maximum). Seqs are always
+  strictly increasing front -> back (FIFO insertion order).
+
+Hot surface (push / evictOlderThan are O(1)-AMORTIZED; the reads are O(1)
+worst-case; all zero allocation):
+
+- push(v) -> seq          Assign the next monotonic seq, pop all DOMINATED back
+                          entries (min: back.value >= v; max: back.value <= v),
+                          then append. Returns the assigned seq. Each element is
+                          pushed and popped at most once (amortized O(1); a single
+                          push is O(k) worst-case). Fail closed: a non-clean value
+                          throws [lite-o1] (typeof guard FIRST); a FULL ring throws
+                          a byte-identical no-op; a seq past MAX_SEQ (2^53) throws.
+- evictOlderThan(seq) -> void  Drop front entries whose stored seq <= seq (the
+                          caller's window slide). O(1)-amortized. Validates the seq
+                          arg fail-closed (typeof-number guard, NaN rejected).
+- value() -> number|undefined   The current window extreme (front value). O(1).
+                          undefined on empty, NEVER throws.
+- frontSeq() -> number|undefined The seq of the current extreme. O(1). undefined
+                          on empty.
+- kind (getter)          The frozen 'min' | 'max' invariant.
+- size (getter)          Live entry count.
+- capacity (getter)      Max simultaneously-live entries (power-of-two, rounded up).
+- clear() -> void        O(1): reset head + count + the seq counter, touch NO store
+                          (numbers retain no references). The seq counter restarts at 0.
+- forEach(fn) -> void    O(k) alloc-free scan front -> back; fn is (value, seq,
+                          deque). A documented exception, EXCLUDED from the
+                          zero-alloc-per-op claims.
+- [Symbol.iterator]()    O(k) scan; the ONE per-protocol ALLOCATOR (yields a
+                          [value, seq] tuple + a {value, done} per step) -- OUT of
+                          the zero-alloc claims. Use forEach for the alloc-free scan.
+
+Value contract (LOCKED, IDENTICAL to RingDeque): a pushed value must be
+typeof 'number' AND not NaN. Rejected (throws [lite-o1]): null, undefined, string,
+Symbol, BigInt, object (incl. one with a numeric valueOf), NaN. Accepted: any
+finite number, and +Infinity / -Infinity. The typeof guard runs FIRST so a Symbol
+/ BigInt never reaches arithmetic.
+
+Windowing model: MonoDeque is a caller-driven PRIMITIVE, not a policy. push
+appends and evictOlderThan drops what the caller has slid past, so one MonoDeque
+serves any window rule (count-based, time-based, event-based): the deque owns the
+monotone invariant, the caller owns which seqs are still in the window.
+
+Amortized honesty: push is O(1) AMORTIZED, not worst-case -- a single push can pop
+O(k) dominated back entries. The witness shows the amortized ops/ms staying flat
+while a naive O(W)-window-rescan foil collapses, and reports the MAX single-op time
+so a hidden worst-case spike shows as a tall bar. MAX_SEQ = 2^53 is the seq
+ceiling (seqs live in a Float64 slot; past 2^53 push throws rather than lose
+integer precision -- call clear() to reuse).
+
 ## Design bounds
 
 - SparseSet valid key: integer in [0, universe).
@@ -140,10 +207,14 @@ foil (a degenerate chain) collapses.
 - RingDeque value: typeof 'number' and not NaN (+/-Infinity accepted).
 - UnionFind element: integer in [0, n); fixed n, no growth. Fail closed on a bad
   element (throws [lite-o1]); reset() and forEachRoots() are the O(n) exceptions.
+- MonoDeque capacity (power-of-two, rounded up): max simultaneously-live entries;
+  push past full throws (fail closed). Value: typeof 'number' and not NaN
+  (+/-Infinity accepted). kind frozen at construction. seq ceiling 2^53.
+  forEach / [Symbol.iterator] are the O(k) scan exceptions (iterator allocates).
 
 ## Scripts
 
-- npm test           -- 83 node:test cases (contract + boundary + differential fuzz).
+- npm test           -- 119 node:test cases (contract + boundary + differential fuzz).
 - npm run test:types -- tsc --noEmit against O1.d.ts.
 - npm run torture    -- lite-leak + lite-gc-profiler: 0 B/op, 0 major GC, leak-free.
 - npm run witness    -- O(1) throughput-invariance harness + foils + flatness gate.
@@ -168,11 +239,18 @@ foil (a degenerate chain) collapses.
   NAIVE disjoint-set foil (no path compression, no union-by-size -> a degenerate
   chain, O(n) find). ops/ms is a rate (uf batch 5e5, naive batch 2e3). UnionFind
   flatness >= 0.70; naive foil flatness <= 0.55; UnionFind/naive ratio >= 1.5x.
+- MonoDeque: W-sweep [1e3, 1e4, 1e5] (W is the sliding-window width), amortized
+  push + slide vs a NAIVE window-min that RESCANS the whole window each step
+  (O(W)/element). ops/ms is a rate (mono batch 5e5, naive batch 300). MonoDeque
+  flatness >= 0.70; naive foil flatness <= 0.55; MonoDeque/naive ratio >= 1.5x.
+  The witness also prints the MAX single-op time (an O(W) pop-storm) beside a
+  typical O(1) push -- the amortized-honesty bar.
 
 ## Not yet shipped
 
-SlotPool, MonoDeque, and the eight-dimension benchmark suite are on the roadmap,
-not this release. A RingLog / overwrite-oldest RingDeque preset is a deferred
-future variant. SparseSet holds membership, not payloads (store values in a
-parallel SoA column or @zakkster/lite-arena); RingDeque holds numbers only;
-UnionFind holds disjoint-set connectivity over [0, n), not payloads.
+SlotPool and the eight-dimension benchmark suite are on the roadmap, not this
+release. A RingLog / overwrite-oldest RingDeque preset is a deferred future
+variant. SparseSet holds membership, not payloads (store values in a parallel SoA
+column or @zakkster/lite-arena); RingDeque holds numbers only; UnionFind holds
+disjoint-set connectivity over [0, n), not payloads; MonoDeque holds numeric
+window extremes only (queue integer handles for object payloads).

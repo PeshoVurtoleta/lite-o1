@@ -29,8 +29,9 @@
  * (measured flatness there stays >= 0.94 across fresh processes). This is not a
  * widened gate: the 0.70 floor is unchanged; only the gate's DOMAIN is pinned to
  * the sizes where ops/ms actually means O(1). The full 1e3..1e7 sweep is still
- * printed so both boundaries are visible. (The RingDeque + UnionFind sweeps top
- * out at 1e5, inside the steady band, so they gate over their whole sweep.)
+ * printed so both boundaries are visible. (The RingDeque + UnionFind + MonoDeque
+ * sweeps top out at 1e5, inside the steady band, so they gate over their whole
+ * sweep.)
  *
  * This file is an OFFLINE measurement tool. It is NEVER imported by O1.js.
  *
@@ -47,7 +48,7 @@
  * metric are unchanged; only the measurement is made steadier.
  */
 
-import { SparseSet, RingDeque, UnionFind } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque } from '../O1.js';
 
 const SIZES = [1e3, 1e4, 1e5, 1e6, 1e7];
 const BATCH = 1e6;
@@ -75,6 +76,15 @@ const SHIFT_BATCH = 2e3;  // small: an O(n) shift at n=1e5 must stay tractable
 const UF_SIZES = [1e3, 1e4, 1e5];
 const UF_BATCH = 5e5;     // large: stable timing for the amortized-O(1) find
 const NAIVE_BATCH = 2e3;  // small: an O(n) naive find at n=1e5 must stay tractable
+
+// MonoDeque sweep. n is the sliding-WINDOW width W. The foil is a naive
+// window-min that RESCANS the whole window each step (O(W)/element), so it
+// degrades while MonoDeque's amortized push (each element popped at most once)
+// stays flat. ops/ms is a RATE, so the two use DIFFERENT batches (an O(W) rescan
+// at W=1e5 must stay tractable) yet their flatness and ratio compare directly.
+const MONO_SIZES = [1e3, 1e4, 1e5];
+const MONO_BATCH = 5e5;      // large: stable timing for the amortized-O(1) push
+const NAIVE_WIN_BATCH = 300; // small: an O(W) window rescan at W=1e5 must stay tractable
 
 // Global sink: every op feeds it so V8 cannot dead-code-eliminate the batch.
 let SINK = 0;
@@ -217,6 +227,70 @@ function buildNaiveUfFoil(n) {
     return { op };
 }
 
+// MonoDeque: a sliding window of width W = n. Each op pushes one value, slides the
+// window by one (evictOlderThan), and reads the extreme. Every element is pushed
+// and popped at most once, so push is amortized O(1) and value()/evict are O(1) --
+// the whole op streams flat as W grows.
+function buildMonoDeque(n) {
+    const W = n;
+    const d = new MonoDeque(W + 1, 'min'); // cap rounds up above W -> never full
+    let v = 0;
+    const op = () => {
+        v = (v * 1103515245 + 12345) & 0x7fffffff; // LCG value stream (up + down runs)
+        const seq = d.push(v % 1000000);
+        d.evictOlderThan(seq - W); // keep only the last W seqs live
+        if (d.value() !== undefined) SINK++;
+    };
+    return { op };
+}
+
+// Foil: a naive sliding-window min that RESCANS the whole window each step. A
+// Float64Array ring holds the last W values; every op overwrites the oldest and
+// then linearly scans all W to find the minimum -- O(W) per element, so ops/ms
+// collapses as W grows, the exact trap the monotone invariant exists to kill.
+function buildNaiveWindowFoil(n) {
+    const W = n;
+    const win = new Float64Array(W);
+    let v = 0;
+    // Pre-fill the whole window so EVERY op rescans W elements from the first call
+    // (a small timed batch must not leave the window partly empty, which would hide
+    // the O(W) cost -- the whole point of the foil).
+    for (let k = 0; k < W; k++) {
+        v = (v * 1103515245 + 12345) & 0x7fffffff;
+        win[k] = v % 1000000;
+    }
+    let head = 0;
+    const op = () => {
+        v = (v * 1103515245 + 12345) & 0x7fffffff;
+        win[head] = v % 1000000;
+        head = head + 1; if (head === W) head = 0;
+        let best = win[0];
+        for (let j = 1; j < W; j++) if (win[j] < best) best = win[j]; // O(W) rescan
+        SINK += best;
+    };
+    return { op };
+}
+
+// MonoDeque amortized honesty: a single push is O(1) AMORTIZED, not worst-case.
+// A push whose value dominates a full strictly-increasing deque pops all W back
+// entries -- the O(W) worst case -- while a typical push pops nothing. Timing both
+// makes the hidden spike visible: the worst single op is a tall bar, the typical
+// one is a flat sliver. (Measured separately so it never perturbs the batch timing.)
+function monoMaxSingleOpMs(W) {
+    const d = new MonoDeque(W + 1, 'min');
+    for (let k = 0; k < W; k++) d.push(k); // strictly increasing -> W live entries
+    const t0 = performance.now();
+    d.push(-1);                            // dominates all W -> pops all W (O(W))
+    const worst = performance.now() - t0;
+
+    const d2 = new MonoDeque(W + 1, 'min');
+    d2.push(0);
+    const t1 = performance.now();
+    d2.push(1);                            // non-dominated -> no pop (O(1))
+    const typical = performance.now() - t1;
+    return { worst, typical };
+}
+
 function fmt(x) { return x.toFixed(2); }
 function nStr(n) { return n.toExponential(0).replace('e+', 'e'); }
 
@@ -352,5 +426,58 @@ if (!ufAllOk) {
     if (!ufOk) console.error('  violation UnionFind flatness ' + fmt(uf.flatness) + ' < 0.70');
     if (!naiveOk) console.error('  violation naive foil flatness ' + fmt(naive.flatness) + ' > 0.55');
     if (!ufRatioOk) console.error('  violation min uf ratio ' + fmt(minUfRatio) + 'x < 1.50x');
+    process.exitCode = 1;
+}
+
+// ===========================================================================
+// MonoDeque witness -- amortized sliding-window push vs a naive O(W)-rescan foil
+// ===========================================================================
+const mono = witness(buildMonoDeque, MONO_SIZES, MONO_BATCH, REPS);
+const naiveWin = witness(buildNaiveWindowFoil, MONO_SIZES, NAIVE_WIN_BATCH, REPS);
+
+console.log('');
+console.log('O(1) Witness -- MonoDeque amortized push vs a naive window rescan (rate ops/ms, median of ' +
+    REPS + ')');
+console.log('');
+console.log('  W         MonoDeque ops/ms   naive ops/ms   ratio');
+console.log('  --------  ----------------   ------------   -----');
+let minMonoRatio = Infinity;
+for (let i = 0; i < MONO_SIZES.length; i++) {
+    const a = mono.rows[i].opsPerMs;
+    const b = naiveWin.rows[i].opsPerMs;
+    const ratio = b > 0 ? a / b : Infinity;
+    if (ratio < minMonoRatio) minMonoRatio = ratio;
+    console.log('  ' + nStr(MONO_SIZES[i]).padEnd(8) + '  ' +
+        fmt(a).padStart(16) + '   ' + fmt(b).padStart(12) + '   ' + fmt(ratio).padStart(5) + 'x');
+}
+
+// Amortized-honesty: report the MAX single-op time (an O(W) pop-storm) beside a
+// typical O(1) push, measured at the largest window. A hidden worst-case spike
+// shows here as a tall bar even though the amortized ops/ms line stays flat.
+const monoSpike = monoMaxSingleOpMs(MONO_SIZES[MONO_SIZES.length - 1] | 0);
+
+console.log('');
+console.log('  MonoDeque flatness (last/first): ' + fmt(mono.flatness) + '   (gate >= 0.70)');
+console.log('  naive foil flatness (last/first): ' + fmt(naiveWin.flatness) + '   (gate <= 0.55)');
+console.log('  min MonoDeque/naive ratio:        ' + fmt(minMonoRatio) + 'x  (gate >= 1.50x)');
+console.log('  MAX single push (O(W) pop-storm, W=' + nStr(MONO_SIZES[MONO_SIZES.length - 1]) +
+    '): ' + monoSpike.worst.toFixed(4) + ' ms   vs typical O(1) push: ' +
+    monoSpike.typical.toFixed(4) + ' ms   (amortized, not worst-case)');
+
+const monoOk = mono.flatness >= 0.70;
+const naiveWinOk = naiveWin.flatness <= 0.55;
+const monoRatioOk = minMonoRatio >= 1.5;
+const monoAllOk = monoOk && naiveWinOk && monoRatioOk;
+
+console.log('');
+console.log('WITNESS MonoDeque ' + (monoAllOk ? 'ok' : 'FAIL') +
+    ' mono.flatness=' + fmt(mono.flatness) +
+    ' naive.flatness=' + fmt(naiveWin.flatness) +
+    ' minRatio=' + fmt(minMonoRatio) + 'x');
+
+if (!monoAllOk) {
+    if (!monoOk) console.error('  violation MonoDeque flatness ' + fmt(mono.flatness) + ' < 0.70');
+    if (!naiveWinOk) console.error('  violation naive foil flatness ' + fmt(naiveWin.flatness) + ' > 0.55');
+    if (!monoRatioOk) console.error('  violation min mono ratio ' + fmt(minMonoRatio) + 'x < 1.50x');
     process.exitCode = 1;
 }

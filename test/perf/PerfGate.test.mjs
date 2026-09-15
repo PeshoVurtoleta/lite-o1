@@ -22,7 +22,7 @@
  */
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { SparseSet, RingDeque, UnionFind } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque } from '../../O1.js';
 
 const U = 1 << 16;      // universe 65536
 const CAP = 1 << 14;    // capacity 16384
@@ -317,10 +317,98 @@ const ufComponentSize = {
     statsOf(s) { return { grows: ufGrows(s) }; },
 };
 
+// ===========================================================================
+// MonoDeque scenarios -- two fixed Float64Array columns, all amortized-O(1)
+// zero-alloc (push / evictOlderThan / value / frontSeq).
+// ===========================================================================
+
+const MONO_CAP = 1 << 14;  // 16384 (power of two, so capacity getter == this)
+const MONO_W = 1 << 12;    // 4096-wide sliding window -> steady state, never full
+
+/**
+ * The zero-alloc counter for MonoDeque scenarios: BOTH backing Float64Arrays'
+ * ArrayBuffer byte lengths (value + seq columns). Capacity is fixed at
+ * construction, so this NEVER grows -- the delta across the window must be 0.
+ * Reported under the shared `grows` counter key (mirrors grows / ringGrows / ufGrows).
+ */
+function monoGrows(s) {
+    return s.mono._val.buffer.byteLength + s.mono._seq.buffer.byteLength;
+}
+
+/** A MonoDeque primed with a bounded resident sliding window (steady-state churn). */
+function monoFill(kind) {
+    const mono = new MonoDeque(MONO_CAP, kind);
+    for (let i = 0; i < MONO_W; i++) mono.push((i * 2654435761) & 0x7fffffff);
+    return mono;
+}
+
+/**
+ * push-churn: push a scrambled value then slide the window by one. Values are
+ * scrambled (a Knuth-multiplicative hash of an int32 counter) so the dominated-pop
+ * loop actually runs; the window stays at MONO_W (< MONO_CAP), so no op touches the
+ * full edge, and every value is a SMI int -> no coercion, no heap double.
+ */
+const monoPushChurn = {
+    name: 'MonoDeque push-churn (slide by one)',
+    setup() { return { mono: monoFill('min'), v: 0 }; },
+    hot(s, n) {
+        const mono = s.mono;
+        let v = s.v | 0;
+        for (let i = 0; i < n; i++) {
+            v = (v + 1) | 0;
+            const seq = mono.push((v * 2654435761) & 0x7fffffff);
+            mono.evictOlderThan(seq - MONO_W);
+        }
+        s.v = v | 0;
+    },
+    statsOf(s) { return { grows: monoGrows(s) }; },
+};
+
+/**
+ * evict-heavy: push a strictly-INCREASING run (min-deque keeps every entry, so the
+ * deque grows to the window) then, once it reaches the window width, BULK-evict the
+ * whole live front in one call -- driving the evictOlderThan front-drop loop
+ * MONO_W iterations deep. The deque oscillates 0 -> MONO_W (< MONO_CAP), never full,
+ * and every op is zero-alloc.
+ */
+const monoEvict = {
+    name: 'MonoDeque evict-heavy (bulk front drop)',
+    setup() { return { mono: new MonoDeque(MONO_CAP, 'min'), base: 0, lastSeq: -1 }; },
+    hot(s, n) {
+        const mono = s.mono;
+        let base = s.base | 0;
+        let lastSeq = s.lastSeq;
+        for (let i = 0; i < n; i++) {
+            if (mono.size >= MONO_W) mono.evictOlderThan(lastSeq); // drop all live in one call
+            lastSeq = mono.push(base);        // strictly increasing -> no pop, deque grows
+            base = (base + 1) | 0;
+        }
+        s.base = base | 0;
+        s.lastSeq = lastSeq;
+    },
+    statsOf(s) { return { grows: monoGrows(s) }; },
+};
+
+/** value-read: a primed window; every op a front-only value() + frontSeq() read, int32 acc. */
+const monoValueRead = {
+    name: 'MonoDeque value + frontSeq read',
+    setup() { return { mono: monoFill('max'), acc: 0 }; },
+    hot(s, n) {
+        const mono = s.mono;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) {
+            acc = (acc + mono.value() + mono.frontSeq()) | 0;
+        }
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: monoGrows(s) }; },
+};
+
 const scenarios = [
     addChurn, hasHit, deleteChurn, clearRefill, forEachDrain,
     ringFifo, ringLifo, ringInterleave,
     ufFindHeavy, ufUnionChurn, ufConnected, ufComponentSize,
+    monoPushChurn, monoEvict, monoValueRead,
 ];
 
 /**
@@ -371,6 +459,33 @@ const ufMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/**
+ * The MonoDeque teeth: a per-op `[Symbol.iterator]` spread into a FRESH [] each op
+ * -- the generator + its per-step `[value, seq]` tuple objects + the {value, done}
+ * wrappers + the array MUST trip the gate (scavenges scale with n), proving the
+ * instrument has teeth on the MonoDeque surface too (its iterator is the ONE
+ * documented per-protocol allocator; forEach is the alloc-free scan). statsOf
+ * returns a constant so the failure is the allocation lanes, not a missing counter.
+ */
+const monoMustFailAlloc = {
+    name: 'MonoDeque [Symbol.iterator] spread into fresh array (MUST allocate)',
+    setup() {
+        const mono = new MonoDeque(256, 'min');
+        for (let i = 0; i < 64; i++) mono.push((i * 2654435761) & 0x7fffffff);
+        return { mono };
+    },
+    hot(s, n) {
+        const mono = s.mono;
+        let sink = 0;
+        for (let i = 0; i < n; i++) {
+            const arr = [...mono]; // fresh generator + tuples + array per op -> heap churn
+            sink += arr.length;
+        }
+        s.sink = sink;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -380,5 +495,5 @@ zgcSuite({
     counters: { grows: 0 },
     maxRetainedKB: 64,
     scenarios,
-    mustFail: [mustFailAlloc, ufMustFailAlloc],
+    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc],
 });

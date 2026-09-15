@@ -122,6 +122,48 @@ foil is the honest "what you get without the two tricks" baseline.
 
 ---
 
+### MonoDeque (v0.4.0)
+
+Monotonic deque for O(1)-AMORTIZED sliding-window minimum / maximum, over two
+parallel `Float64Array` columns (value + monotonic seq) in a power-of-two ring.
+`kind` ('min' | 'max') is frozen at construction. The second amortized-honesty
+member. The window is caller-driven: `push(v)` appends (and returns a seq),
+`evictOlderThan(seq)` drops what you have slid past.
+
+**Reach for it when:**
+
+- You need the MIN or MAX of a sliding window over a numeric stream at O(1)
+  amortized -- and you were about to rescan the window each step (O(W)/element:
+  the exact trap this kills). Rolling extrema, envelope / peak detection,
+  "largest rectangle"-style scans, stock-span, bounded-window statistics.
+- The window rule is yours to drive: count-based (`evictOlderThan(seq - W)`),
+  time-based (evict by a timestamp seq), or event-based -- one MonoDeque serves
+  any of them.
+- The values are numbers (or integer handles into a parallel store), and you know
+  a capacity bound (the max simultaneously-live entries) up front.
+- You need zero per-op allocation on a per-frame / per-tick hot path.
+
+**Avoid it when:**
+
+- You need BOTH the min AND the max of the same window -- run TWO MonoDeques (one
+  'min', one 'max'); `kind` is frozen per instance on purpose (one monotone
+  invariant, no per-op mode branch).
+- You need arbitrary order statistics (median, k-th) or the window's SUM -- a
+  monotonic deque only answers the extreme; reach for a different structure.
+- You are on a strict per-op WORST-CASE budget: a single `push` is O(k) worst case
+  (it can pop a whole dominated run), amortized O(1) -- read the amortized bar AND
+  the MAX single-op line the witness prints.
+- You cannot bound the capacity, need to queue non-numbers (queue handles instead),
+  or would exceed the 2^53 seq ceiling without ever calling `clear()`.
+
+**Measure it:** `npm run witness` -- MonoDeque amortized-push flatness `>= 0.70`
+across the window sweep `[1e3..1e5]` while a naive O(W)-window-rescan foil
+collapses (`<= 0.55`), ratio `>= 1.5x`. Read the MAX-single-op line beside the
+flat amortized curve: a tall bar there is the honest worst-case pop-storm, not an
+O(1) violation.
+
+---
+
 ## Roadmap members (not yet shipped)
 
 Placeholders so the decision axes are visible early; each fills in on release.
@@ -129,7 +171,6 @@ Placeholders so the decision axes are visible early; each fills in on release.
 - **SlotPool** -- free-list slot allocator with generational (ABA-safe) handles.
   Reach for it as the SoA substrate; reconcile against `@zakkster/lite-arena`
   before picking one.
-- **MonoDeque** -- monotonic deque for O(1)-amortized sliding-window min / max.
 
 ---
 

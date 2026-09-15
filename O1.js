@@ -3,9 +3,9 @@
  * that doubles as a teachable textbook: each member solves a real problem AND
  * proves its constant is real (the O(1) Witness -- see test/witness.mjs).
  *
- * v0.3.0 ships three members -- SparseSet, RingDeque, and UnionFind -- plus its
- * `VERSION` const. The three are independent (no shared mutable module state), so
- * a bundler that imports one drops the others (`sideEffects: false`).
+ * v0.4.0 ships four members -- SparseSet, RingDeque, UnionFind, and MonoDeque --
+ * plus its `VERSION` const. The four are independent (no shared mutable module
+ * state), so a bundler that imports one drops the others (`sideEffects: false`).
  *
  * The complexity class IS the product: every hot op below is O(1) worst-case and
  * allocates ZERO bytes after construction. The witness harness (never imported
@@ -16,7 +16,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '0.3.0';
+export const VERSION = '0.4.0';
 
 /** Largest universe the Uint32 substrate + the (k >>> 0) key check can honor. */
 const MAX_UNIVERSE = 0x100000000; // 2^32
@@ -518,5 +518,242 @@ export class UnionFind {
         // String(x) -- NOT '+ x' / a template literal: those THROW on a Symbol or
         // BigInt, which would turn a fail-closed reject into a different crash.
         throw new RangeError('[lite-o1] node out of range [0, ' + this._n + '): ' + String(x));
+    }
+}
+
+/**
+ * Largest monotonic sequence number a MonoDeque can assign. Sequence numbers are
+ * stored in a `Float64Array` slot, so they must stay integer-exact: 2^53 is the
+ * last integer with no larger integer sharing its double, so once the counter
+ * would pass it, push THROWS rather than silently alias two windows to one seq.
+ */
+const MAX_SEQ = 2 ** 53; // 2^53 (Number.MAX_SAFE_INTEGER + 1)
+
+/**
+ * MonoDeque -- a zero-GC, O(1)-AMORTIZED monotonic deque for sliding-window
+ * minimum / maximum, over TWO parallel `Float64Array` columns (value + monotonic
+ * seq) inside RingDeque's head + count power-of-two ring (wrap by `& MASK`).
+ *
+ * The window is CALLER-DRIVEN, a primitive, not a policy: `push(v)` appends the
+ * next element (assigning it a monotonically increasing seq) and `evictOlderThan(seq)`
+ * drops the front elements the caller has slid past. That split lets one MonoDeque
+ * serve any windowing rule (count-based, time-based, event-based) -- the deque
+ * owns the monotone invariant, the caller owns which seqs are still in the window.
+ *
+ * `kind` ('min' | 'max') is FROZEN at construction: one monotone invariant per
+ * instance. For 'min' the stored values are STRICTLY INCREASING front -> back, so
+ * `value()` (the front) is the window minimum; for 'max' they are strictly
+ * decreasing and the front is the maximum. The seqs are always strictly increasing
+ * front -> back (FIFO insertion order).
+ *
+ * push is O(1) AMORTIZED, NOT worst-case: a single push can pop O(k) dominated back
+ * entries (its worst case), but every element is pushed once and popped at most
+ * once, so the pops charged across a run of pushes total at most that run's length.
+ * The witness proves the amortized ops/ms stays FLAT while a naive window-rescan
+ * foil (O(W) per element) collapses, and it reports the MAX single-op time so a
+ * hidden worst-case spike would show as a tall bar. `value()` / `frontSeq()` /
+ * `evictOlderThan()` are cheap (front-only) reads/writes.
+ *
+ * Numeric-only value policy IDENTICAL to RingDeque: a pushed value must be
+ * `typeof 'number'` AND not NaN (`+/-Infinity` accepted); everything else is
+ * rejected fail-closed. The typeof guard runs FIRST so a Symbol / BigInt never
+ * reaches the arithmetic (`>>>` / `+` / template literals THROW on those); the cold
+ * builders name the value via `String(v)`, which is Symbol/BigInt-safe.
+ *
+ * Fail closed, mirroring the suite: `push` on a FULL ring throws `[lite-o1]` as a
+ * byte-identical no-op (a full ring can only be full of NON-dominated entries, so
+ * the dominated-pop loop wrote nothing before the throw); a value that is not a
+ * clean number throws `[lite-o1]`; a seq that would pass MAX_SEQ (2^53) THROWS
+ * rather than lose integer precision. `value()` / `frontSeq()` on an EMPTY deque
+ * return `undefined`, NEVER throw. `evictOlderThan(seq)` validates its seq arg
+ * fail-closed (typeof-number guard, NaN rejected).
+ *
+ * `forEach(fn)` (front -> back, alloc-free, fn is (value, seq, deque)) and
+ * `[Symbol.iterator]()` (the ONE documented per-protocol allocator -- yields a
+ * `[value, seq]` tuple + a `{value, done}` per step) are the O(k) exceptions,
+ * EXCLUDED from the zero-alloc-per-op claims, the witness, and the perf gate.
+ */
+export class MonoDeque {
+    /**
+     * @param {number} capacity  max simultaneously-live elements; an integer in
+     *                           [1, 2^31], rounded UP to the next power of two.
+     * @param {'min'|'max'} kind the frozen monotone invariant.
+     */
+    constructor(capacity, kind) {
+        // typeof guard BEFORE any coercion (Number.isInteger never coerces; false
+        // on a Symbol / BigInt), and String(x) in the cold message is Symbol-safe.
+        if (typeof capacity !== 'number' || !Number.isInteger(capacity) ||
+            capacity < 1 || capacity > MAX_CAPACITY) {
+            throw new RangeError(
+                '[lite-o1] MonoDeque capacity must be an integer in [1, 2^31], got ' + String(capacity));
+        }
+        if (kind !== 'min' && kind !== 'max') {
+            throw new RangeError(
+                '[lite-o1] MonoDeque kind must be "min" or "max", got ' + String(kind));
+        }
+        const cap = _roundPow2(capacity);
+        this._val = new Float64Array(cap);   // value column (the ring)
+        this._seq = new Float64Array(cap);   // parallel monotonic-seq column
+        this._cap = cap;                     // power-of-two capacity (rounded)
+        this._mask = cap - 1;                // wrap mask: (i & MASK) is the physical slot
+        this._head = 0;                      // index of the front (the extreme)
+        this._count = 0;                     // number of live entries
+        this._min = kind === 'min';          // hot-path branch (min vs max invariant)
+        this._kind = kind;                   // frozen kind ('min' | 'max')
+        this._nextSeq = 0;                   // next seq to assign
+    }
+
+    /** The frozen monotone invariant, 'min' or 'max'. O(1). */
+    get kind() { return this._kind; }
+
+    /** Number of live entries. O(1). */
+    get size() { return this._count; }
+
+    /** Max simultaneously-live entries (power-of-two, rounded up). O(1). */
+    get capacity() { return this._cap; }
+
+    /**
+     * Append v with the next monotonic seq, after popping every DOMINATED back
+     * entry (for 'min': back.value >= v; for 'max': back.value <= v) so the front
+     * stays the window extreme. O(1) AMORTIZED (each element pushed and popped at
+     * most once). Guard typeof FIRST so a Symbol / BigInt never reaches arithmetic.
+     * Fails closed: a non-clean value throws via _bad; a seq past MAX_SEQ throws via
+     * _seqOverflow; a FULL ring throws via _full as a byte-identical no-op.
+     * @param {number} v  a clean number (not NaN; +/-Infinity accepted)
+     * @returns {number} the seq assigned to this element
+     */
+    push(v) {
+        if (typeof v !== 'number' || v !== v) return this._bad(v); // v !== v -> NaN
+        // >= (not >): `_nextSeq++` SATURATES at 2^53 (2^53 + 1 === 2^53 as a double),
+        // so once the counter reaches MAX_SEQ it can never grow past it -- a `>` test
+        // would be dead code that re-hands the DUPLICATE seq 2^53 forever. Throwing
+        // AT 2^53 keeps the last assigned seq 2^53-1: every seq stays exact + distinct.
+        // The guard precedes every store / counter write, so the throw is a no-op.
+        if (this._nextSeq >= MAX_SEQ) return this._seqOverflow();
+        const val = this._val;
+        const mask = this._mask;
+        const head = this._head;
+        let count = this._count;
+        // Pop dominated back entries. Only count shrinks -- no store is touched --
+        // so a rejected (full) push below is byte-identical: count === cap can only
+        // hold when the loop popped nothing (any pop would leave count < cap).
+        if (this._min) {
+            while (count > 0 && val[(head + count - 1) & mask] >= v) count--;
+        } else {
+            while (count > 0 && val[(head + count - 1) & mask] <= v) count--;
+        }
+        if (count === this._cap) return this._full(); // byte-identical: no pop ran
+        const i = (head + count) & mask;
+        val[i] = v;
+        this._seq[i] = this._nextSeq;
+        this._count = count + 1;
+        return this._nextSeq++; // return the assigned seq, then advance
+    }
+
+    /**
+     * Drop every FRONT entry whose stored seq is <= the given seq (the caller's
+     * window slide). O(1) AMORTIZED (each element evicted at most once). Fails
+     * closed: a non-number / NaN seq throws via _badSeq (typeof-guarded FIRST).
+     * @param {number} seq  the caller's slide threshold
+     */
+    evictOlderThan(seq) {
+        if (typeof seq !== 'number' || seq !== seq) return this._badSeq(seq); // seq !== seq -> NaN
+        const seqs = this._seq;
+        const mask = this._mask;
+        let head = this._head;
+        let count = this._count;
+        while (count > 0 && seqs[head] <= seq) { head = (head + 1) & mask; count--; }
+        this._head = head;
+        this._count = count;
+    }
+
+    /**
+     * The current window extreme (the front value). O(1) worst-case. `undefined`
+     * on an empty deque -- NEVER throws (unambiguous: every stored value is a real
+     * number, never undefined).
+     * @returns {number|undefined}
+     */
+    value() {
+        if (this._count === 0) return undefined;
+        return this._val[this._head];
+    }
+
+    /**
+     * The seq of the current extreme (the front seq). O(1) worst-case. `undefined`
+     * on an empty deque.
+     * @returns {number|undefined}
+     */
+    frontSeq() {
+        if (this._count === 0) return undefined;
+        return this._seq[this._head];
+    }
+
+    /**
+     * Empty the deque in O(1): resets head + count + the seq counter, touches NO
+     * store. The stale numbers are unreachable (reads are bounded by count) and
+     * retain no references, so there is nothing to zero (mirrors RingDeque). After
+     * clear() the seq counter restarts at 0.
+     */
+    clear() { this._head = 0; this._count = 0; this._nextSeq = 0; }
+
+    /**
+     * Iterate live entries FRONT -> BACK, alloc-free. O(k) -- the documented
+     * exception, EXCLUDED from the zero-alloc-per-op claims. A HOISTED callback
+     * keeps it allocation-free.
+     * @param {(value:number, seq:number, deque:MonoDeque)=>void} fn
+     */
+    forEach(fn) {
+        const val = this._val;
+        const seqs = this._seq;
+        const mask = this._mask;
+        const head = this._head;
+        const count = this._count;
+        for (let i = 0; i < count; i++) {
+            const j = (head + i) & mask;
+            fn(val[j], seqs[j], this);
+        }
+    }
+
+    /**
+     * Iterate live entries FRONT -> BACK as [value, seq] tuples. O(k). The ONE
+     * documented per-protocol ALLOCATOR (a tuple + a {value, done} per step) --
+     * kept OUT of the zero-alloc claims (use forEach for the alloc-free scan).
+     */
+    *[Symbol.iterator]() {
+        const val = this._val;
+        const seqs = this._seq;
+        const mask = this._mask;
+        const head = this._head;
+        const count = this._count;
+        for (let i = 0; i < count; i++) {
+            const j = (head + i) & mask;
+            yield [val[j], seqs[j]];
+        }
+    }
+
+    // ---- cold path only: throw builders (string concat lives here, off the hot body) ----
+
+    /** @private */
+    _bad(v) {
+        // String(v) -- NOT '+ v' / a template literal: those THROW on a Symbol or
+        // BigInt, which would turn a fail-closed reject into a different crash.
+        throw new TypeError(
+            '[lite-o1] MonoDeque value must be a number and not NaN, got ' + String(v));
+    }
+
+    /** @private */
+    _full() {
+        throw new RangeError('[lite-o1] MonoDeque full (capacity ' + this._cap + ')');
+    }
+
+    /** @private */
+    _seqOverflow() {
+        throw new RangeError('[lite-o1] MonoDeque seq ceiling 2^53 reached; call clear() to reuse');
+    }
+
+    /** @private */
+    _badSeq(seq) {
+        throw new TypeError(
+            '[lite-o1] MonoDeque evictOlderThan seq must be a number and not NaN, got ' + String(seq));
     }
 }

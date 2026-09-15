@@ -39,7 +39,7 @@ async function main() {
     const { GcProfiler, checkNoGc, measureAllocs } =
         await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { SparseSet, RingDeque, UnionFind } = await import('../O1.js');
+    const { SparseSet, RingDeque, UnionFind, MonoDeque } = await import('../O1.js');
 
     const U = 1 << 16;      // universe 65536
     const CAP = 1 << 14;    // capacity 16384
@@ -93,6 +93,15 @@ async function main() {
             u.connected(i & 255, (i + 1) & 255);
             u.componentSize(i & 255);
             tracker.track(u, noop, 'unionfind', { audit: true });
+            // MonoDeque owns only its two Float64Arrays; nothing external to
+            // release. Its columns hold numbers, so a reclaimed instance is the
+            // desired outcome, proven by size()->0. Exercise push/evict/value.
+            const m = new MonoDeque(256, (i & 1) ? 'min' : 'max');
+            const mSeq = m.push(i & 255);
+            m.push((i + 1) & 255);
+            m.value();
+            m.evictOlderThan(mSeq);
+            tracker.track(m, noop, 'monodeque', { audit: true });
         }
         return tracker.size();
     }
@@ -164,6 +173,26 @@ async function main() {
     const ufBpc = ufAllocRes.bytesPerCall === null ? 0 : ufAllocRes.bytesPerCall;
     const ufAllocBytes = Math.max(0, Math.round(ufBpc));
     const ufAllocOk = ufAllocBytes === 0;
+
+    // MonoDeque hot path: a bounded sliding window. Each step pushes one value,
+    // slides by one (evictOlderThan) and reads value() + frontSeq() -- every op is
+    // O(1)-amortized at steady state, zero-alloc, and the window stays well under
+    // capacity so no op touches the full edge. A wrapping counter feeds SMI ints.
+    const MONO_W = 1 << 12;              // 4096-wide window, < CAP so never full
+    const mono = new MonoDeque(CAP, 'min');
+    for (let k = 0; k < MONO_W; k++) mono.push(k); // prime a bounded resident window
+    let mv = 0;
+    const monoStep = () => {
+        mv = (mv + 1) | 0;
+        const seq = mono.push((mv * 2654435761) & 0x7fffffff); // scramble -> real pops
+        mono.evictOlderThan(seq - MONO_W);                     // keep the window bounded
+        mono.value();
+        mono.frontSeq();
+    };
+    const monoAllocRes = measureAllocs(monoStep, { iterations: 100000, batches: 8 });
+    const monoBpc = monoAllocRes.bytesPerCall === null ? 0 : monoAllocRes.bytesPerCall;
+    const monoAllocBytes = Math.max(0, Math.round(monoBpc));
+    const monoAllocOk = monoAllocBytes === 0;
     // "0 B/op" resolved at the sampling floor: heapUsed deltas are quantized and
     // noisy, so a truly non-allocating op reads a sub-byte figure (a lone blip
     // in one batch / iterations). Round to the nearest byte -- any per-op
@@ -180,6 +209,7 @@ async function main() {
         step();
         ringStep();
         ufStep();
+        monoStep();
         if ((i & 8191) === 0) {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
         }
@@ -203,6 +233,14 @@ async function main() {
         for (let k = 1; k < 512; k++) uf.union(0, k);
         uf.forEachRoots(cb);
     }
+    // MonoDeque fill (with dominated-pop churn) + forEach + O(1) clear cycles --
+    // exercises the pop-loop, the front-only reads, the alloc-free scan, and clear.
+    const monoCb = (v) => { SINK += v === v ? 1 : 0; };
+    for (let f = 0; f < 1024; f++) {
+        for (let k = 0; k < 512; k++) mono.push((k * 2654435761) & 0x7fffffff);
+        mono.forEach(monoCb);
+        mono.clear();
+    }
     await new Promise((r) => setTimeout(r, 50));
     const s2 = gc.summary();
     const report = checkNoGc(s2, { maxMajor: 0, maxPauseMs: 2 });
@@ -224,6 +262,8 @@ async function main() {
         ring.clear();
         uf.reset();
         for (let k = 1; k < CAP; k++) uf.union(0, k);
+        for (let k = 0; k < CAP; k++) mono.push((k * 2654435761) & 0x7fffffff);
+        mono.clear();
     }
     globalThis.gc();
     const abAfter = process.memoryUsage().arrayBuffers;
@@ -232,7 +272,7 @@ async function main() {
 
     // ---- verdict + GATE line ----------------------------------------------
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
-        findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && abOk;
+        findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && monoAllocOk && abOk;
 
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
@@ -240,7 +280,7 @@ async function main() {
         ' | gc major=' + s2.gc.major + ' minor=' + s2.gc.minor +
         ' maxMs=' + s2.gc.maxMs.toFixed(2) +
         ' | alloc=' + allocBytes + ' B/op (SparseSet) ' + ringAllocBytes + ' B/op (RingDeque) ' +
-        ufAllocBytes + ' B/op (UnionFind)' +
+        ufAllocBytes + ' B/op (UnionFind) ' + monoAllocBytes + ' B/op (MonoDeque)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
         ' (tracked=' + trackedMid + ' sink=' + SINK + ' abGrowth=' + abDelta + ')');
 
@@ -254,6 +294,7 @@ async function main() {
         if (!allocOk) console.error('  alloc ' + allocBytes + ' B/op SparseSet (raw bytesPerCall ' + bpc + ')');
         if (!ringAllocOk) console.error('  alloc ' + ringAllocBytes + ' B/op RingDeque (raw bytesPerCall ' + ringBpc + ')');
         if (!ufAllocOk) console.error('  alloc ' + ufAllocBytes + ' B/op UnionFind (raw bytesPerCall ' + ufBpc + ')');
+        if (!monoAllocOk) console.error('  alloc ' + monoAllocBytes + ' B/op MonoDeque (raw bytesPerCall ' + monoBpc + ')');
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;
     }

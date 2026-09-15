@@ -146,3 +146,59 @@ export class UnionFind {
     /** Yield every current root (O(n) scan; allocates a generator per protocol). */
     roots(): IterableIterator<number>;
 }
+
+/**
+ * A zero-GC, O(1)-amortized monotonic deque for sliding-window minimum / maximum,
+ * over TWO parallel Float64Array columns (value + monotonic seq) inside a
+ * power-of-two ring. `kind` ('min' | 'max') is frozen at construction: for 'min'
+ * the front is the window minimum, for 'max' the window maximum. `push(v)` assigns
+ * the next monotonic seq, pops dominated back entries, and returns the assigned
+ * seq (O(1)-amortized). `evictOlderThan(seq)` drops front entries the caller has
+ * slid past (O(1)-amortized). `value()` / `frontSeq()` are O(1) front reads,
+ * `undefined` on empty (never throw). Fail closed: a full ring push, a non-number
+ * or NaN value, and a seq past 2^53 throw a [lite-o1] error; `evictOlderThan`
+ * rejects a non-number / NaN seq. `forEach` (alloc-free) and `[Symbol.iterator]`
+ * (allocates a [value, seq] tuple per step) are the O(k) scan exceptions.
+ */
+export class MonoDeque {
+    /**
+     * @param capacity  max simultaneously-live elements; an integer in [1, 2^31].
+     *                  Rounded UP to the next power of two.
+     * @param kind      the frozen monotone invariant: 'min' or 'max'.
+     */
+    constructor(capacity: number, kind: 'min' | 'max');
+
+    /** The frozen monotone invariant. */
+    readonly kind: 'min' | 'max';
+
+    /** Number of live entries. */
+    readonly size: number;
+
+    /** Max simultaneously-live entries (power-of-two, rounded up). */
+    readonly capacity: number;
+
+    /**
+     * Append v (assigning the next monotonic seq) after popping dominated back
+     * entries. Returns the assigned seq. Throws a [lite-o1] error when full, on a
+     * non-clean value (non-number or NaN; +/-Infinity accepted), or past seq 2^53.
+     */
+    push(v: number): number;
+
+    /** Drop every front entry whose stored seq <= the given seq. Throws on a non-number / NaN seq. */
+    evictOlderThan(seq: number): void;
+
+    /** The current window extreme (front value), or `undefined` when empty. Never throws. */
+    value(): number | undefined;
+
+    /** The seq of the current extreme (front seq), or `undefined` when empty. Never throws. */
+    frontSeq(): number | undefined;
+
+    /** Empty the deque in O(1) (resets head + count + the seq counter; zeroes no store). */
+    clear(): void;
+
+    /** Iterate live entries front -> back, alloc-free (O(k)). fn is (value, seq, deque). */
+    forEach(fn: (value: number, seq: number, deque: MonoDeque) => void): void;
+
+    /** Iterate live entries front -> back as [value, seq] tuples (O(k); allocates per protocol). */
+    [Symbol.iterator](): IterableIterator<[number, number]>;
+}

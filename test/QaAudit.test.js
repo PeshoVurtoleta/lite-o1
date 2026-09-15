@@ -10,7 +10,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SparseSet, RingDeque, UnionFind } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque } from '../O1.js';
 
 const litO1 = (e) => e instanceof Error && /^\[lite-o1]/.test(e.message);
 
@@ -345,4 +345,223 @@ test('ADVERSARIAL: UnionFind ops must not throw a raw TypeError on a BigInt elem
     assert.throws(() => uf.find(5n), litO1, 'find(BigInt) must be [lite-o1]');
     assert.throws(() => uf.union(5n, 0), litO1, 'union(BigInt,0) must be [lite-o1]');
     assert.throws(() => uf.connected(0, 5n), litO1, 'connected(0,BigInt) must be [lite-o1]');
+});
+
+// ===========================================================================
+// MonoDeque boundary audits (same style: exact boundaries + adversarial types)
+// ===========================================================================
+
+// --- capacity boundary: the smallest legal deque (capacity 1) --------------
+
+test('MonoDeque capacity=1: holds exactly one entry; full after one non-dominated push', () => {
+    const d = new MonoDeque(1, 'min');
+    assert.equal(d.capacity, 1);
+    assert.equal(d.size, 0);
+    d.push(5);
+    assert.equal(d.size, 1);
+    assert.equal(d.value(), 5);
+    // 7 does not dominate 5 (min: 5 >= 7 is false) -> no pop -> full -> throw.
+    assert.throws(() => d.push(7), litO1);
+    assert.equal(d.size, 1);
+    // 3 dominates 5 (5 >= 3) -> pop 5, append 3 -> still one entry.
+    assert.equal(d.push(3), 1);
+    assert.equal(d.value(), 3);
+    assert.equal(d.size, 1);
+});
+
+// --- every entry point on a freshly constructed (empty) deque --------------
+
+test('every entry point on a freshly constructed (empty) MonoDeque is well-defined', () => {
+    const d = new MonoDeque(50, 'max'); // rounds to 64
+    assert.equal(d.capacity, 64);
+    assert.equal(d.kind, 'max');
+    assert.equal(d.size, 0);
+    assert.equal(d.value(), undefined);
+    assert.equal(d.frontSeq(), undefined);
+    assert.doesNotThrow(() => d.clear());
+    assert.doesNotThrow(() => d.evictOlderThan(0)); // evict on empty is a no-op
+    let seen = 0;
+    d.forEach(() => { seen++; });
+    assert.equal(seen, 0);
+    assert.deepEqual([...d], []);
+});
+
+// --- kind is frozen: 'min' and 'max' are independent invariants ------------
+
+test('kind is frozen per instance: a min-deque and a max-deque disagree on the same trace', () => {
+    const lo = new MonoDeque(16, 'min');
+    const hi = new MonoDeque(16, 'max');
+    for (const v of [4, 8, 2, 6]) { lo.push(v); hi.push(v); }
+    assert.equal(lo.value(), 2); // window min
+    assert.equal(hi.value(), 8); // window max
+    assert.equal(lo.kind, 'min');
+    assert.equal(hi.kind, 'max');
+});
+
+// --- +/-Infinity accepted; NaN rejected (the value-class boundary) ---------
+
+test('MonoDeque value boundary: +/-Infinity ACCEPTED, NaN REJECTED', () => {
+    const d = new MonoDeque(4, 'max');
+    assert.doesNotThrow(() => d.push(-Infinity));
+    assert.doesNotThrow(() => d.push(Infinity)); // pops -Infinity (max) -> [+Inf]
+    assert.equal(d.value(), Infinity);
+    assert.throws(() => d.push(NaN), litO1);
+});
+
+// --- adversarial: a Symbol / BigInt value must fail closed, not raw-crash --
+
+test('ADVERSARIAL: MonoDeque push must not throw a raw TypeError on a Symbol / BigInt', () => {
+    const d = new MonoDeque(8, 'min');
+    assert.throws(() => d.push(Symbol('v')), litO1, 'push(Symbol) must be [lite-o1]');
+    assert.throws(() => d.push(5n), litO1, 'push(BigInt) must be [lite-o1]');
+    assert.equal(d.size, 0);
+});
+
+// --- adversarial: an object with a numeric valueOf is rejected, not coerced -
+
+test('ADVERSARIAL: MonoDeque rejects an object with a numeric valueOf, never coerces it', () => {
+    const d = new MonoDeque(8, 'min');
+    const fakeFive = { valueOf: () => 5, toString: () => '5' };
+    assert.throws(() => d.push(fakeFive), litO1, 'push(object-with-valueOf)');
+    assert.throws(() => d.evictOlderThan(fakeFive), litO1, 'evictOlderThan(object-with-valueOf)');
+    assert.equal(d.size, 0);
+});
+
+// --- duplicate "dispose": clear() called twice back-to-back ----------------
+
+test('duplicate clear() is idempotent and leaves the MonoDeque usable', () => {
+    const d = new MonoDeque(8, 'min');
+    d.push(3); d.push(1);
+    d.clear();
+    assert.doesNotThrow(() => d.clear());
+    assert.equal(d.size, 0);
+    assert.equal(d.push(9), 0); // seq restarted
+    assert.equal(d.value(), 9);
+});
+
+// --- mutation during iteration (documents the snapshot-count semantics) -----
+
+test('MonoDeque forEach uses the head/count captured at entry (documents semantics)', () => {
+    const d = new MonoDeque(8, 'min');
+    d.push(1); d.push(2); d.push(3); d.push(4); // min-deque strictly increasing
+    const seen = [];
+    d.forEach((v) => {
+        seen.push(v);
+        if (v === 2) d.evictOlderThan(0); // drop the front mid-iteration
+    });
+    // forEach captured count + head at entry, so it walks the original window.
+    assert.deepEqual(seen, [1, 2, 3, 4]);
+    // post-state stays internally consistent after the mutation.
+    assert.equal(d.value(), 2);
+    assert.equal(d.size, 3);
+});
+
+// --- re-entrant push() from inside forEach (same style as the SparseSet /
+// UnionFind re-entrant-write audits above) -----------------------------------
+
+test('re-entrant push() from inside forEach does not corrupt state or throw', () => {
+    const d = new MonoDeque(16, 'min');
+    d.push(5); d.push(9); d.push(20); // strictly increasing: [5, 9, 20]
+    const seen = [];
+    assert.doesNotThrow(() => {
+        d.forEach((v) => {
+            seen.push(v);
+            // 30 does not dominate the current back (20) -> appends without
+            // touching any slot forEach already captured (writes at a fresh
+            // physical slot beyond the entry-time count).
+            if (v === 9) d.push(30);
+        });
+    });
+    // forEach walks the count/head captured AT ENTRY (3 live entries then), so
+    // the re-entrant push (visible only as a 4th live entry afterward) is not
+    // observed mid-scan -- it must not silently disappear or corrupt state.
+    assert.deepEqual(seen, [5, 9, 20]);
+    assert.equal(d.size, 4);
+    assert.equal(d.value(), 5); // front (min) unchanged by an appended larger value
+    assert.deepEqual([...d].map((t) => t[0]), [5, 9, 20, 30]);
+});
+
+// --- equal-value runs: ties are popped (strict monotonicity), so pop<=push
+// amortization is never violated even on a constant stream ------------------
+
+test('equal-value run: every push after the first pops the prior tie (min), size stays 1', () => {
+    const d = new MonoDeque(8, 'min');
+    const N = 20;
+    let pops = 0;
+    for (let i = 0; i < N; i++) {
+        const before = d.size;
+        d.push(7); // 7 >= 7 is true -> pops any prior equal entry
+        pops += before + 1 - d.size;
+        assert.equal(d.size, 1, 'a constant stream never grows past 1 live entry');
+    }
+    assert.equal(d.value(), 7);
+    assert.equal(d.frontSeq(), N - 1); // the NEWEST of the tied entries survives
+    assert.ok(pops <= N, 'amortized bound violated on a constant stream');
+    assert.equal(pops, N - 1); // every push but the first pops exactly one tie
+});
+
+test('equal-value run (max): ties are popped the same way, newest survives', () => {
+    const d = new MonoDeque(8, 'max');
+    for (let i = 0; i < 10; i++) d.push(3);
+    assert.equal(d.size, 1);
+    assert.equal(d.value(), 3);
+    assert.equal(d.frontSeq(), 9);
+});
+
+// --- ADVERSARIAL (not anticipated by the planner's boundary matrix): a
+// re-entrant clear()+refill from inside forEach reuses the SAME live typed
+// arrays, so a still-in-flight forEach pass can observe values from a brand
+// new post-clear "generation" under seq numbers that ALIAS the old generation
+// (clear() always restarts the seq counter at 0). This is the same live-scan
+// contract the sibling members already document (RingDeque/SparseSet:
+// "forEach uses head/count captured at entry"), extended one step further --
+// the post-clear deque's OWN invariant must still hold even though the
+// in-flight forEach's reported trace is a stitched-together artifact.
+
+test('ADVERSARIAL: re-entrant clear()+push() from inside forEach never corrupts the POST-STATE invariant', () => {
+    const d = new MonoDeque(8, 'min');
+    d.push(1); d.push(2); d.push(3); d.push(4); // [1s0, 2s1, 3s2, 4s3]
+    const seen = [];
+    assert.doesNotThrow(() => {
+        d.forEach((v, s) => {
+            seen.push([v, s]);
+            if (v === 1) {
+                d.clear();                 // resets head/count/seq counter to 0
+                d.push(100); d.push(200); d.push(300); d.push(400); // strictly increasing -> all live
+            }
+        });
+    });
+    // forEach walked the live store using the head/count SNAPSHOT taken at
+    // entry, so it still produced 4 rows -- but past the re-entrant clear, the
+    // physical slots it reads have been overwritten by the new generation
+    // (documented consequence of a zero-copy, alloc-free live scan).
+    assert.equal(seen.length, 4);
+    assert.deepEqual(seen[0], [1, 0]); // the triggering element itself is read pre-mutation
+    // The deque's OWN post-state must be a fully self-consistent, single
+    // coherent generation regardless of what the in-flight forEach observed:
+    // strictly increasing values + seqs (the min invariant), never mixed state.
+    assert.equal(d.size, 4);
+    assert.equal(d.value(), 100);
+    assert.equal(d.frontSeq(), 0);
+    const rows = [...d];
+    assert.deepEqual(rows, [[100, 0], [200, 1], [300, 2], [400, 3]]);
+    for (let i = 1; i < rows.length; i++) {
+        assert.ok(rows[i][0] > rows[i - 1][0], 'min invariant: strictly increasing values');
+        assert.ok(rows[i][1] > rows[i - 1][1], 'seqs strictly increasing front->back');
+    }
+});
+
+test('equal-value run interleaved with distinct values: ties broken newest, invariant holds', () => {
+    const d = new MonoDeque(16, 'min');
+    d.push(5);  // seq 0 -> [5s0]
+    d.push(5);  // 5 >= 5 -> pop 5s0; [5s1]
+    d.push(5);  // 5 >= 5 -> pop 5s1; [5s2]
+    assert.equal(d.size, 1);
+    assert.equal(d.frontSeq(), 2); // newest tie wins
+    d.push(9);  // 5 >= 9? no -> append; [5s2, 9s3]
+    assert.equal(d.size, 2);
+    d.push(5);  // 9 >= 5 -> pop 9s3; 5 >= 5 -> pop 5s2; [5s4]
+    assert.equal(d.size, 1);
+    assert.equal(d.frontSeq(), 4);
+    assert.equal(d.value(), 5);
 });

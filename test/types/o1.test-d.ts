@@ -5,7 +5,7 @@
  * fails `npm run test:types`. Not executed; only type-checked.
  */
 
-import { SparseSet, RingDeque, UnionFind, VERSION } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, VERSION } from '../../O1.js';
 
 // VERSION is a string.
 const v: string = VERSION;
@@ -140,3 +140,55 @@ void uroots;
 new UnionFind('1000');
 // @ts-expect-error -- find takes a number.
 uf.find('3');
+
+// --- MonoDeque -------------------------------------------------------------
+
+// Constructor: capacity + kind ('min' | 'max') required.
+const md: MonoDeque = new MonoDeque(1024, 'min');
+const mdMax: MonoDeque = new MonoDeque(1024, 'max');
+void mdMax;
+
+// Getters: kind is 'min' | 'max'; size / capacity are readonly numbers.
+const mkind: 'min' | 'max' = md.kind;
+const msize: number = md.size;
+const mcap: number = md.capacity;
+void mkind; void msize; void mcap;
+
+// @ts-expect-error -- kind is readonly.
+md.kind = 'max';
+// @ts-expect-error -- size is readonly.
+md.size = 5;
+// @ts-expect-error -- capacity is readonly.
+md.capacity = 5;
+
+// push -> number (the seq); evictOlderThan -> void; value/frontSeq -> number | undefined.
+const seq: number = md.push(42);
+const evicted: void = md.evictOlderThan(seq);
+const ext: number | undefined = md.value();
+const fseq: number | undefined = md.frontSeq();
+const mcleared: void = md.clear();
+void seq; void evicted; void ext; void fseq; void mcleared;
+
+// forEach callback gets (value, seq, deque).
+md.forEach((v, s, deque) => {
+    const vv: number = v;
+    const ss: number = s;
+    const dd: MonoDeque = deque;
+    void vv; void ss; void dd;
+});
+
+// Iterable of [value, seq] tuples.
+for (const [v, s] of md) {
+    const vv: number = v;
+    const ss: number = s;
+    void vv; void ss;
+}
+const mspread: [number, number][] = [...md];
+void mspread;
+
+// @ts-expect-error -- capacity must be a number.
+new MonoDeque('1024', 'min');
+// @ts-expect-error -- kind must be 'min' | 'max'.
+new MonoDeque(1024, 'mid');
+// @ts-expect-error -- push takes a number.
+md.push('3');

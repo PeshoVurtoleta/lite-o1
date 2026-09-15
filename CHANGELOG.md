@@ -4,6 +4,78 @@ All notable changes to `@zakkster/lite-o1` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-09-15
+
+The fourth member of the O(1) family: a monotonic deque for O(1)-amortized
+sliding-window minimum / maximum. Tree-shakeable alongside SparseSet, RingDeque,
+and UnionFind (the four share no mutable module state).
+
+### Added
+
+- **`MonoDeque(capacity, kind)`** -- a zero-GC, O(1)-amortized monotonic deque for
+  sliding-window min / max, over TWO parallel `Float64Array` columns (value +
+  monotonic seq) inside a head + count power-of-two ring (`& MASK` wrap, capacity
+  rounded UP to the next power of two):
+  - `push(v) -> seq` -- assign the next monotonic seq, pop all DOMINATED back
+    entries (min: `back.value >= v`; max: `back.value <= v`), then append; returns
+    the assigned seq. O(1)-AMORTIZED (each element pushed and popped at most once).
+  - `evictOlderThan(seq) -> void` -- drop front entries whose stored seq <= the
+    given seq (the caller's window slide). O(1)-amortized.
+  - `value() -> number|undefined` / `frontSeq() -> number|undefined` -- the current
+    window extreme and its seq (front reads). O(1) worst-case; `undefined` on
+    empty, NEVER throw.
+  - `kind` getter (frozen 'min' | 'max'), `size` getter (live entries), `capacity`
+    getter (power-of-two, rounded up). `clear()` is O(1): resets head + count + the
+    seq counter, touches NO store (numbers retain no references; seq restarts at 0).
+  - The window is CALLER-DRIVEN (a primitive, not a policy): push appends,
+    evictOlderThan drops what the caller slid past -- one instance serves any
+    windowing rule (count / time / event based).
+  - `forEach(fn)` -- an O(k) alloc-free scan front -> back (fn is (value, seq,
+    deque)), the documented exception excluded from the zero-alloc-per-op claims.
+    `[Symbol.iterator]` -- an O(k) scan that ALLOCATES a `[value, seq]` tuple per
+    step by protocol, kept out of the zero-alloc claims.
+  - Ceilings: capacity in `[1, 2^31]`; `MAX_SEQ = 2^53` (seqs live in a Float64
+    slot -- a push past 2^53 throws rather than lose integer precision; `clear()` to
+    reuse). Fail closed: a non-clean value (non-number or NaN; `+/-Infinity`
+    accepted) throws `[lite-o1]` (typeof-guarded FIRST, so a Symbol / BigInt never
+    triggers a raw `TypeError`); a FULL ring push throws a byte-identical no-op; a
+    bad capacity / kind / evict-seq throws `[lite-o1]`. `null` is not zero.
+- **`O1.d.ts`** -- MonoDeque ambient types added.
+- **The O(1) Witness** (`test/witness.mjs`) -- a MonoDeque amortized-push W-sweep
+  `[1e3, 1e4, 1e5]` vs a NAIVE window-min foil that RESCANS the whole window each
+  step (O(W)/element); MonoDeque flatness `>= 0.70`, naive foil `<= 0.55`, ratio
+  `>= 1.5x`. Also prints the MAX single-op time (an O(W) pop-storm) beside a
+  typical O(1) push -- the amortized-honesty bar (measured ~0.04 ms vs ~0.0002 ms
+  at W=1e5).
+- **Torture gate** -- MonoDeque push / evict / value cycles at 0 B/op (a `monoBpc`
+  metric alongside the three prior per-op figures), 0 major GC, tracker size 0,
+  arrayBuffers delta 0. The run proves 0 B/op across ALL FOUR members.
+- **Perf gate** (`test/perf/PerfGate.test.mjs`) -- MonoDeque push-churn,
+  evict-heavy (bulk front drop), and value + frontSeq read scenarios at 0
+  scavenges / 0 old-gen / 0 arrayBuffers and a 0-delta `monoGrows` counter on BOTH
+  `Float64Array` columns, plus a `[Symbol.iterator]`-into-fresh-array must-fail
+  teeth case.
+- **MonoDeque `node:test` cases** -- contract + boundary (reject Symbol / BigInt /
+  object-with-valueOf / NaN / non-number / null / undefined; ctor rejects a bad
+  capacity + a bad kind) + empty-undefined edges + a byte-identical full-throw
+  no-op + a >= 1e6-op push / evictOlderThan / value differential fuzz (both 'min'
+  and 'max') against a brute-force sliding-window-extreme oracle (0 divergences),
+  proving the monotone invariant and the amortized bound (total pops <= total
+  pushes) in one trace.
+- ADR [`0008`](./decisions/0008-monodeque-monotonic-amortized.md) (monotonic
+  invariant, amortized-honesty hook, caller-driven windowing, the two-column
+  numeric ring substrate, and the MAX_SEQ 2^53 ceiling).
+
+### Changed
+
+- `VERSION` bumped to `'0.4.0'` (synced across `package.json`, the `VERSION` const
+  in `O1.js`, and `llms.txt`). New keywords: monotonic-deque, monotonic-queue,
+  sliding-window, min, max. The SparseSet / RingDeque / UnionFind class bodies are
+  BYTE-IDENTICAL -- only the O1.js header comment, the `VERSION` const, and their
+  `VERSION` test assertions changed.
+
+[0.4.0]: https://www.npmjs.com/package/@zakkster/lite-o1/v/0.4.0
+
 ## [0.3.0] - 2026-09-15
 
 The third member of the O(1) family: a disjoint-set forest with near-O(1)

@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-> Zero-GC, O(1) data structures that PROVE their constant. v0.3.0 ships SparseSet (an integer set with O(1) add / has / delete / iterate and an O(1) clear() that zeroes nothing), RingDeque (a fixed-capacity numeric double-ended queue with O(1) push/pop at both ends), and UnionFind (a disjoint-set forest with near-O(1) amortized find / union) -- plus a throughput-invariance witness that shows the flat cost curve while a native Set, Array.prototype.shift, or a naive disjoint-set decays.
+> Zero-GC, O(1) data structures that PROVE their constant. v0.4.0 ships SparseSet (an integer set with O(1) add / has / delete / iterate and an O(1) clear() that zeroes nothing), RingDeque (a fixed-capacity numeric double-ended queue with O(1) push/pop at both ends), UnionFind (a disjoint-set forest with near-O(1) amortized find / union), and MonoDeque (a monotonic deque for O(1)-amortized sliding-window min / max) -- plus a throughput-invariance witness that shows the flat cost curve while a native Set, Array.prototype.shift, a naive disjoint-set, or a full-window rescan decays.
 
 [![npm version](https://img.shields.io/npm/v/@zakkster/lite-o1.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-o1)
 [![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
@@ -17,7 +17,7 @@
 
 Almost no JavaScript data-structure library ships the evidence that its Big-O claim survives contact with a real engine -- megamorphic call sites, GC pauses, cache misses, deopts. `lite-o1` is a curated, tree-shakeable family of the O(1) structures that actually matter, each zero-GC, each written to teach the trick that buys the constant, and each shipped with a harness that DEMONSTRATES the flat cost curve rather than asserting it. The complexity class IS the product.
 
-v0.3.0 ships three members. **SparseSet**, the textbook O(1) integer set (a dense + sparse array pair) whose `clear()` runs in O(1) by resetting a count and zeroing nothing at all. **RingDeque**, a fixed-capacity double-ended queue of numbers over one circular `Float64Array` -- O(1) push/pop at both ends, the zero-GC answer to the `Array.prototype.shift` O(n) trap. And **UnionFind**, a disjoint-set forest over two `Uint32Array` columns -- near-O(1) amortized `find` / `union` via path halving + union by size, the family's amortized-honesty member. They share no mutable module state, so a bundler that imports one drops the others.
+v0.4.0 ships four members. **SparseSet**, the textbook O(1) integer set (a dense + sparse array pair) whose `clear()` runs in O(1) by resetting a count and zeroing nothing at all. **RingDeque**, a fixed-capacity double-ended queue of numbers over one circular `Float64Array` -- O(1) push/pop at both ends, the zero-GC answer to the `Array.prototype.shift` O(n) trap. **UnionFind**, a disjoint-set forest over two `Uint32Array` columns -- near-O(1) amortized `find` / `union` via path halving + union by size, the family's first amortized-honesty member. And **MonoDeque**, a monotonic deque over two parallel `Float64Array` columns -- O(1)-amortized sliding-window min / max, the zero-GC answer to the full-window-rescan O(W) trap. They share no mutable module state, so a bundler that imports one drops the others.
 
 ```bash
 npm install @zakkster/lite-o1
@@ -65,6 +65,9 @@ Every op above is O(1) worst-case and allocates zero bytes after construction. T
 - [UnionFind](#unionfind)
   - [How UnionFind works](#how-unionfind-works)
   - [UnionFind API reference](#unionfind-api-reference)
+- [MonoDeque](#monodeque)
+  - [How MonoDeque works](#how-monodeque-works)
+  - [MonoDeque API reference](#monodeque-api-reference)
 - [Composability with the ecosystem](#composability-with-the-ecosystem)
 - [Zero-GC design notes](#zero-gc-design-notes)
 - [Design decisions worth knowing](#design-decisions-worth-knowing)
@@ -110,8 +113,15 @@ Existing options: a native `Set` (arbitrary keys, but a hash table that decays a
   - **`count` / `capacity`** -- getters (`count` is the live component count, maintained in O(1); `capacity` is the fixed `n`).
   - **`reset()`** -- re-singleton every element. O(n) (the honest exception; allocates nothing, but is a bulk op, not a per-op hot path).
   - **`forEachRoots(fn)` / `roots()`** -- visit the current roots; `forEachRoots` is an O(n) alloc-free scan, `roots()` is an allocating generator.
+- **`MonoDeque(capacity, kind)`** -- a zero-GC O(1)-amortized monotonic deque for sliding-window min / max over two parallel `Float64Array` columns (value + monotonic seq). `kind` (`'min'` | `'max'`) is frozen at construction; capacity rounds up to the next power of two. The hot surface is four ops plus three getters:
+  - **`push(v)`** -- assign the next monotonic seq, pop dominated back entries, append. O(1)-amortized. Returns the assigned seq. Throws a `[lite-o1]` error when full (a byte-identical no-op), on a non-clean value, or past seq 2^53.
+  - **`evictOlderThan(seq)`** -- drop front entries the caller has slid past (stored seq `<=` the given seq). O(1)-amortized. Throws on a non-number / NaN seq.
+  - **`value()` / `frontSeq()`** -- the current window extreme (front value) and its seq. O(1). `undefined` on empty -- never a throw.
+  - **`kind` / `size` / `capacity`** -- getters (`kind` is the frozen `'min'`/`'max'`; `capacity` reports the rounded power of two).
+  - **`clear()`** -- empty in O(1): resets head + count + the seq counter, zeroes no store.
+  - **`forEach(fn)` / `[Symbol.iterator]`** -- iterate live entries front -> back (O(k)); `forEach` is alloc-free, `[Symbol.iterator]` allocates a `[value, seq]` tuple per step by protocol.
 - **`VERSION`** -- the package version string.
-- **The O(1) Witness** (`npm run witness`) -- an offline harness that times a fixed batch of each member's hot op across an n-sweep, reports ops/ms + a flatness ratio (SparseSet vs a native `Set`, RingDeque vs `Array.prototype.shift`, UnionFind vs a naive disjoint-set), and fails if the constant regressed.
+- **The O(1) Witness** (`npm run witness`) -- an offline harness that times a fixed batch of each member's hot op across an n-sweep, reports ops/ms + a flatness ratio (SparseSet vs a native `Set`, RingDeque vs `Array.prototype.shift`, UnionFind vs a naive disjoint-set, MonoDeque vs a full-window rescan), and fails if the constant regressed.
 
 Full types ship in [`O1.d.ts`](./O1.d.ts). Tree-shakeable named exports (`sideEffects: false`) -- import only what you use.
 
@@ -178,7 +188,7 @@ get capacity: number        // max live members as constructed
 
 | Constant   | Value     | Meaning                                            |
 | ---------- | --------- | -------------------------------------------------- |
-| `VERSION`  | `'0.3.0'` | Package version string.                            |
+| `VERSION`  | `'0.4.0'` | Package version string.                            |
 
 Contract bounds (validated, not exported):
 
@@ -191,6 +201,10 @@ Contract bounds (validated, not exported):
 | RingDeque value     | `typeof 'number'` and not `NaN` (`+/-Infinity` OK) |
 | UnionFind `n`       | integer in `[1, 2^32-1]`                          |
 | UnionFind element   | integer in `[0, n)`                               |
+| MonoDeque `capacity`| integer in `[1, 2^31]`, rounded up to a power of two |
+| MonoDeque `kind`    | `'min'` or `'max'` (frozen at construction)      |
+| MonoDeque value     | `typeof 'number'` and not `NaN` (`+/-Infinity` OK) |
+| MonoDeque seq ceiling | `MAX_SEQ = 2^53` (push past it throws)         |
 
 ---
 
@@ -394,6 +408,111 @@ get capacity: number                 // the fixed element universe n
 
 ---
 
+## MonoDeque
+
+The fourth member: a **monotonic deque for sliding-window minimum / maximum** over two parallel `Float64Array` columns (value + monotonic seq). `push` / `evictOlderThan` are O(1) **amortized** and allocate zero bytes -- the family's second amortized-honesty member, and the zero-GC answer to the naive rolling-extreme that rescans the whole window each step (O(W) per element).
+
+```js
+import { MonoDeque } from '@zakkster/lite-o1';
+
+// A sliding-window MINIMUM over a numeric stream; window width W = 3.
+const lo = new MonoDeque(8, 'min');   // kind frozen; capacity rounds up (8 stays 8)
+const W = 3;
+
+const stream = [5, 3, 8, 1, 9, 2];
+for (const x of stream) {
+  const seq = lo.push(x);        // returns this element's monotonic seq
+  lo.evictOlderThan(seq - W);    // slide: drop everything older than the last W
+  console.log('min of last', W, '=', lo.value());
+}
+// -> 5, 3, 3, 1, 1, 1
+
+lo.kind;                 // -> 'min'  (frozen at construction)
+lo.value();              // -> 1      (current window minimum, O(1))
+lo.frontSeq();           // -> the seq of that minimum
+
+// lo.push(NaN);         // throws [lite-o1]: NaN is rejected (+/-Infinity accepted)
+// lo.push(Symbol());    // throws [lite-o1]: fail-closed, never a raw TypeError
+
+lo.clear();              // O(1): resets head + count + the seq counter (seq restarts at 0)
+lo.value();              // -> undefined  (empty never throws)
+```
+
+Every `push` / `evictOlderThan` is O(1)-amortized and zero-allocation after construction; `value()` / `frontSeq()` are O(1) front reads that return `undefined` on empty (never throw). A push on a full ring throws a `[lite-o1]` error as a byte-identical no-op -- fail closed, no silent drop. For BOTH the min and the max of the same stream, run two MonoDeques (`kind` is frozen per instance). The `witness` harness proves MonoDeque's amortized push holds its ops/ms while a full-window rescan collapses as the window grows:
+
+```
+  W         MonoDeque ops/ms   naive ops/ms   ratio
+  --------  ----------------   ------------   -----
+  1e3             ~53420.94       ~3378.68   ~15.81x
+  1e4             ~48449.81        ~254.91  ~190.06x
+  1e5             ~51320.65         ~30.12 ~1703.67x
+
+  MonoDeque flatness (last/first): ~0.96   (gate >= 0.70)
+  naive foil flatness (last/first): ~0.01   (gate <= 0.55)
+  min MonoDeque/naive ratio:        ~15.81x  (gate >= 1.50x)
+  MAX single push (O(W) pop-storm, W=1e5): ~0.043 ms   vs typical O(1) push: ~0.0002 ms   (amortized, not worst-case)
+```
+
+MonoDeque's amortized push streams flat across the window sweep while the naive rescan collapses ~100x per order of magnitude (its ratio blows from ~16x to ~1700x). The MAX-single-op line is the amortized-honesty bar: a deliberate O(W) pop-storm is a tall ~0.043 ms spike beside the ~0.0002 ms typical push -- a single push is worst-case O(k), amortized O(1), and the witness shows both. (Absolute ops/ms is machine-specific; reproduce on your own hardware.)
+
+### How MonoDeque works
+
+<details>
+<summary>The monotone invariant, the caller-driven window, and why push is amortized -- not worst-case -- O(1).</summary>
+
+A MonoDeque holds two parallel `Float64Array`s in a head + count power-of-two ring (the same substrate as RingDeque): a **value** column and a **seq** column, where `seq` is a monotonically increasing insertion number.
+
+The monotone invariant is the whole trick. For a `'min'` deque, `push(v)` first pops every back entry whose value is `>= v`:
+
+```
+while (count > 0 && backValue >= v) count--;   // drop dominated entries
+```
+
+Any entry `>= v` can never again be the window minimum while `v` is in the window (v is smaller and stays at least as long), so it is redundant -- dropped. What remains is STRICTLY INCREASING front -> back, so the **front is always the window minimum** and `value()` is a single O(1) read. (`'max'` is the mirror: pop while `<= v`, strictly decreasing, front is the maximum.) The seqs stay strictly increasing front -> back because insertion order is FIFO.
+
+- **`push(v)`** assigns `seq = nextSeq++`, pops the dominated back run, appends `(v, seq)`, and returns `seq`.
+- **`evictOlderThan(seq)`** drops front entries whose stored seq `<=` the given seq -- the caller's window slide.
+- **`value()` / `frontSeq()`** read the front `(value, seq)`; `undefined` on empty.
+- **`clear()`** is `head = 0; count = 0; nextSeq = 0`. The store is left byte-identical (numbers retain no references, so there is nothing to zero) and the seq counter restarts.
+
+**The window is caller-driven -- a primitive, not a policy.** The deque owns the monotone invariant; the caller owns which seqs are still in the window. `evictOlderThan(seq - W)` gives a count window; evicting by a stored timestamp seq gives a time window; one MonoDeque serves any rule without baking in a policy it cannot know.
+
+**Amortized, not worst-case.** A single `push` can pop a whole dominated run -- O(k) in the worst case. But every element is pushed once and popped at most once, so the pops charged across a run of pushes total at most that run's length: amortized O(1). The [witness](#the-o1-witness) proves it against a naive O(W)-window-rescan foil AND prints the MAX single-op time (a deliberate O(W) pop-storm) beside a typical O(1) push, so a hidden worst-case spike shows as a tall bar even though the amortized line stays flat.
+
+The cost of the constant is the value domain (numbers only, like RingDeque) and a seq ceiling: seqs live in a `Float64Array` slot, so a push whose seq would pass `MAX_SEQ = 2^53` throws rather than lose integer precision -- `clear()` (which resets the counter) is the way to reuse a very long-lived instance.
+
+</details>
+
+### MonoDeque API reference
+
+```ts
+new MonoDeque(capacity: number, kind: 'min' | 'max')   // capacity rounds up to a power of two
+```
+
+- **`capacity`** -- the maximum number of simultaneously-live entries; an integer in `[1, 2^31]`. Rounded UP to the next power of two; the `capacity` getter reports the rounded value. The constructor throws a `[lite-o1]`-tagged `RangeError` on a non-integer / out-of-range / non-number argument (typeof-guarded before any coercion).
+- **`kind`** -- `'min'` or `'max'`, FROZEN at construction (one monotone invariant per instance). Anything else throws `[lite-o1]`.
+
+```ts
+push(v: number): number              // append (assign seq); amortized O(1); throws when full / bad value / seq > 2^53
+evictOlderThan(seq: number): void    // drop front entries with stored seq <= seq; amortized O(1)
+value(): number | undefined          // current window extreme (front value); undefined on empty
+frontSeq(): number | undefined       // seq of the current extreme; undefined on empty
+clear(): void                        // O(1) empty; resets head + count + the seq counter; zeroes no store
+forEach(fn: (value: number, seq: number, deque: MonoDeque) => void): void  // front -> back, alloc-free
+[Symbol.iterator](): IterableIterator<[number, number]>                    // front -> back [value, seq] tuples
+get kind: 'min' | 'max'              // the frozen monotone invariant
+get size: number                     // live entry count
+get capacity: number                 // max simultaneously-live entries (power-of-two, rounded up)
+```
+
+- **`push(v)`** throws `[lite-o1] MonoDeque full ...` when the ring is at capacity (a byte-identical no-op -- both stores + head + count + the seq counter unchanged), `[lite-o1] MonoDeque value must be a number ...` on a value that is not a clean number (`typeof v === 'number'` AND not `NaN`; `+/-Infinity` accepted; the `typeof` guard runs first so a Symbol / BigInt never reaches arithmetic), and `[lite-o1] MonoDeque seq ceiling 2^53 reached ...` past `MAX_SEQ`. It returns the seq it assigned.
+- **`evictOlderThan(seq)`** throws `[lite-o1]` on a non-number / NaN seq (typeof-guarded). A threshold below the oldest live seq (or negative) is a no-op.
+- **`value()` / `frontSeq()`** never throw: an empty deque returns `undefined`. Because every stored value is a real number, `undefined` unambiguously means "empty".
+
+**Reach for MonoDeque when** you need the MIN or MAX of a sliding window over a numeric stream at O(1) amortized with zero per-op allocation (rolling extrema, envelope / peak detection, stock-span, bounded-window statistics) and you were about to rescan the window each step. **Avoid it when** you need BOTH extremes of one window (run two instances -- `kind` is frozen), arbitrary order statistics or a window SUM (a monotonic deque only answers the extreme), or you are on a strict per-op WORST-CASE budget (a single `push` is O(k), amortized O(1)). See [`GUIDE.md`](./GUIDE.md) for the full reach-for / avoid / measure-it.
+
+---
+
 ## Composability with the ecosystem
 
 SparseSet is the dense-integer membership primitive under an ECS-style loop. A common pattern: a `SparseSet` per component tracks which entity ids currently have that component; a `@zakkster/lite-arena` `Arena` owns the component payloads by generational handle. Membership and iteration are O(1) and alloc-free; the per-frame `clear()` of a scratch set (visited masks, this-frame-touched ids) is free.
@@ -479,6 +598,20 @@ The value guard is a two-test branchless check on the hot body -- `typeof v !== 
 
 `find` is path-halving and ITERATIVE -- no recursion and no stack array -- so the flattening that buys the amortized constant costs zero allocation. The element guard is the same branchless typeof-first check as the other members (`typeof x !== 'number' || (x >>> 0) !== x || x >= n`), with the `_oob` throw builder (using `String(x)`) on the cold path. The torture gate proves UnionFind at **0 B/op** across `find` / `union` / `connected` / `componentSize` churn (with real merges and O(n) `reset` / `forEachRoots` cycles exercised), 0 major GCs, a 0-delta on the two-column backing, and the leak tracker back at `size() = 0`. `reset()` and `forEachRoots()` are O(n) bulk primitives (still alloc-free) and are excluded from the zero-alloc-**per-op** claim; `roots()` is the one op that allocates, by generator protocol.
 
+**MonoDeque** allocates its two `Float64Array` columns (value + seq) once, at construction:
+
+| Operation                        | Steady-state allocations |
+| -------------------------------- | ------------------------ |
+| `push(v)`                        | **0** (amortized; pops touch no store) |
+| `evictOlderThan(seq)`            | **0**                    |
+| `value()` / `frontSeq()`         | **0**                    |
+| `clear()`                        | **0** (head + count + seq = 0) |
+| `forEach(fn)`                    | **0** (O(k) scan)        |
+| `[Symbol.iterator]()`            | a `[value,seq]` tuple + `{value,done}` per step (protocol) |
+| `new MonoDeque(...)`             | once, at construction (both typed arrays) |
+
+The value guard is the same branchless typeof-first check as RingDeque (`typeof v !== 'number' || v !== v`), with the `_bad` / `_full` / `_seqOverflow` / `_badSeq` throw builders (all using `String(v)`) on the cold path. The dominated-pop loop only decrements `count` -- it touches no store -- which is also why a full-ring push is a byte-identical no-op (a full ring is full of non-dominated entries, so the loop provably ran zero iterations). The torture and perf gates prove MonoDeque at **0 B/op** across push-churn / bulk-evict / value-read scenarios, with a 0-delta on BOTH `Float64Array` columns (fixed capacity -- no resize) and the leak tracker back at `size() = 0`. `forEach` is the alloc-free O(k) scan; `[Symbol.iterator]` is the one op that allocates, by generator protocol.
+
 </details>
 
 ---
@@ -492,15 +625,16 @@ The value guard is a two-test branchless check on the hot body -- `typeof v !== 
 - **The witness is a first-class deliverable, with a gated floor.** SparseSet flatness `>= 0.70`, the `Set` foil `<= 0.55`, ratio `>= 1.5x` -- a regression in the constant fails the build. See [`decisions/0004`](./decisions/0004-witness-flatness-gate.md).
 - **RingDeque is fixed-capacity (power-of-two), fail closed on full, and stores numbers only.** A power-of-two capacity buys the single-`& MASK` wrap; head + count makes full / empty single tests; a full push throws (no silent drop / overwrite); the numeric substrate keeps it zero-GC and makes `undefined`-on-empty unambiguous. See [`decisions/0005`](./decisions/0005-ring-capacity-fail-closed.md) and [`decisions/0006`](./decisions/0006-numeric-ring-substrate.md).
 - **UnionFind is amortized, not worst-case, and honest about it.** Path halving (iterative, no stack -- so zero-alloc) plus union by size bound any single op at O(alpha(n)) amortized; a single `find` is O(depth) worst-case, and the witness proves the amortized line against a naive-disjoint-set foil. `reset()` and `forEachRoots()` are the O(n) exceptions (named `reset()`, not `clear()`, to flag the cost); `roots()` is the one allocating op. See [`decisions/0007`](./decisions/0007-unionfind-path-halving-union-by-size.md).
+- **MonoDeque is a caller-driven windowing primitive, amortized and honest about it.** The monotone invariant lives in the deque (`push` pops dominated back entries -- amortized O(1), a single push is O(k) worst-case); the window rule lives in the caller (`push` returns a seq, `evictOlderThan(seq)` slides). `kind` is frozen per instance (one invariant, no per-op mode branch). Two numeric `Float64Array` columns keep it zero-GC and `undefined`-on-empty unambiguous; the seq ceiling is `MAX_SEQ = 2^53` (fail closed past it). The witness prints the MAX single-op time beside the flat amortized curve. See [`decisions/0008`](./decisions/0008-monodeque-monotonic-amortized.md).
 
 ---
 
 ## Testing
 
-**83 deterministic `node:test` cases**, plus a torture gate, a hard perf gate, and the O(1) witness gate.
+**119 deterministic `node:test` cases**, plus a torture gate, a hard perf gate, and the O(1) witness gate.
 
 ```bash
-npm test           # 83 node:test cases (contract + boundary + differential fuzz)
+npm test           # 119 node:test cases (contract + boundary + differential fuzz)
 npm run test:types # tsc --noEmit against O1.d.ts
 npm run torture    # @zakkster/lite-leak + lite-gc-profiler: 0 B/op + leak-free
 npm run witness    # the O(1) throughput-invariance harness + foils + flatness gate
@@ -508,7 +642,7 @@ npm run test:perf  # @zakkster/lite-perf-gate: hard zero-alloc scavenge-scaling 
 npm run verify     # all five, the publish gate
 ```
 
-For SparseSet the suite covers: constructor validation (every bad `universe` / `capacity`), the add/has/delete/clear/iterate surface, the delete-swap back-pointer, idempotent add, insertion-order iteration, the full fail-closed key surface (`add` throws `/^\[lite-o1\]/`, `has` never throws), `null is not zero`, a **byte-identical** proof that `clear()` leaves the dense + sparse `ArrayBuffer`s untouched, and a **1,000,000-op differential fuzz** of mixed add/delete/has against a native `Set` oracle. For RingDeque: power-of-two capacity rounding, push/pop/peek at both ends, wrap-around across the `& MASK` seam, the fail-closed surface (full push throws as a byte-identical no-op; a non-number or NaN throws; a Symbol / BigInt fails closed, not raw; `+/-Infinity` accepted; empty pop/peek returns `undefined`), a byte-identical `clear()` proof, and a **1,000,000-op both-ends differential fuzz** against a plain-`Array` reference deque (0 divergences, with the full-throw and empty-undefined edges both exercised). For UnionFind: constructor validation (every bad `n`), the find/union/connected/componentSize/count/reset/forEachRoots/roots surface, `count` decrementing exactly once per true merge, a **path-halving depth-shrink proof** (a test-only peek at `_parent`), the full fail-closed element surface (a bad element -- including a Symbol / BigInt -- throws `/^\[lite-o1\]/`, never raw; `null is not zero`), and a **>= 100,000-op mixed union/find/connected differential fuzz** against a trivial no-compression / no-union-by-size oracle (0 divergences on connectivity, component size, and live count). No gate output is a FAIL.
+For SparseSet the suite covers: constructor validation (every bad `universe` / `capacity`), the add/has/delete/clear/iterate surface, the delete-swap back-pointer, idempotent add, insertion-order iteration, the full fail-closed key surface (`add` throws `/^\[lite-o1\]/`, `has` never throws), `null is not zero`, a **byte-identical** proof that `clear()` leaves the dense + sparse `ArrayBuffer`s untouched, and a **1,000,000-op differential fuzz** of mixed add/delete/has against a native `Set` oracle. For RingDeque: power-of-two capacity rounding, push/pop/peek at both ends, wrap-around across the `& MASK` seam, the fail-closed surface (full push throws as a byte-identical no-op; a non-number or NaN throws; a Symbol / BigInt fails closed, not raw; `+/-Infinity` accepted; empty pop/peek returns `undefined`), a byte-identical `clear()` proof, and a **1,000,000-op both-ends differential fuzz** against a plain-`Array` reference deque (0 divergences, with the full-throw and empty-undefined edges both exercised). For UnionFind: constructor validation (every bad `n`), the find/union/connected/componentSize/count/reset/forEachRoots/roots surface, `count` decrementing exactly once per true merge, a **path-halving depth-shrink proof** (a test-only peek at `_parent`), the full fail-closed element surface (a bad element -- including a Symbol / BigInt -- throws `/^\[lite-o1\]/`, never raw; `null is not zero`), and a **>= 100,000-op mixed union/find/connected differential fuzz** against a trivial no-compression / no-union-by-size oracle (0 divergences on connectivity, component size, and live count). For MonoDeque: power-of-two capacity rounding, seq assignment + dominated-pop for both `'min'` and `'max'`, `evictOlderThan` window slides, the fail-closed surface (ctor rejects a bad capacity + a bad kind; push throws on a non-number / NaN / Symbol / BigInt / object-with-valueOf, `+/-Infinity` accepted; a full push throws as a byte-identical no-op; `value` / `frontSeq` on empty return `undefined`), a byte-identical `clear()` proof, and a **>= 1,000,000-op push/evictOlderThan/value differential fuzz (both kinds)** against a brute-force sliding-window-extreme oracle (0 divergences), which also proves the monotone invariant and the amortized bound (total pops `<=` total pushes). No gate output is a FAIL.
 
 ---
 
@@ -517,9 +651,10 @@ For SparseSet the suite covers: constructor validation (every bad `universe` / `
 - **Not a general-purpose set.** SparseSet keys are integers in a known, bounded `[0, universe)`. For arbitrary keys (strings, objects, huge sparse integer domains), use a native `Set` / `Map` -- SparseSet trades universe-sized memory for the flat constant and the O(1) clear.
 - **Not a general-purpose queue.** RingDeque stores numbers only. To queue objects / strings, queue their integer handles and keep the payloads in a parallel column or `@zakkster/lite-arena`.
 - **Not a splittable disjoint-set.** UnionFind is merge-only: there is no per-element un-merge / undo. `reset()` re-singletons the whole forest in O(n); rollback means keeping your own edge log and rebuilding. It also eagerly allocates two `n`-sized `Uint32Array` columns at construction, so it is not for a huge / unbounded or non-integer element domain -- and a single `find` is amortized alpha(n), not worst-case O(1).
-- **Not a growable collection.** All three members are fixed-capacity: a SparseSet key past capacity, or a RingDeque push on a full ring, throws; UnionFind's element universe `n` is fixed at construction. This is deliberate (worst-case / amortized bounds, fail closed -- no hidden resize), not a missing feature. An overwrite-oldest RingDeque preset (RingLog) is a deferred future variant, not the current default.
-- **Not a payload store.** SparseSet holds membership, RingDeque holds numbers, UnionFind holds connectivity -- none holds object payloads. Store component data in a parallel SoA column or `@zakkster/lite-arena` keyed by the same ids / handles.
-- **Not the full family yet.** v0.3.0 is SparseSet + RingDeque + UnionFind. SlotPool, MonoDeque, and the eight-dimension benchmark suite are on the roadmap, not in this release.
+- **Not a general-purpose window aggregator.** MonoDeque answers only the window MIN or MAX (one, frozen at construction -- run two instances for both), not the median, k-th, or SUM of the window. It stores numbers only, is caller-driven (it does not evict on its own -- you call `evictOlderThan`), and a single `push` is amortized O(1) (O(k) worst-case).
+- **Not a growable collection.** All four members are fixed-capacity: a SparseSet key past capacity, or a RingDeque / MonoDeque push on a full ring, throws; UnionFind's element universe `n` is fixed at construction. This is deliberate (worst-case / amortized bounds, fail closed -- no hidden resize), not a missing feature. An overwrite-oldest RingDeque preset (RingLog) is a deferred future variant, not the current default.
+- **Not a payload store.** SparseSet holds membership, RingDeque holds numbers, UnionFind holds connectivity, MonoDeque holds numeric window extremes -- none holds object payloads. Store component data in a parallel SoA column or `@zakkster/lite-arena` keyed by the same ids / handles.
+- **Not the full family yet.** v0.4.0 is SparseSet + RingDeque + UnionFind + MonoDeque. SlotPool and the eight-dimension benchmark suite are on the roadmap, not in this release.
 - **Not a benchmark suite.** The witness proves throughput invariance (one axis); the full latency/memory/cache/GC benchmark suite is a separate, planned deliverable.
 
 ---
