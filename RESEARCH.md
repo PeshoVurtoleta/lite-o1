@@ -53,7 +53,7 @@ lite-lru's killer feature is "% of Belady optimal" -- an absolute reference that
 an actionable number. lite-filter's is "measured vs theoretical FPR" -- the paper's formula checked
 against your keys.
 
-> **The anchor's lineage.** The name honors László Bélády, the
+> **The anchor's lineage.** The name honors Laszlo Belady, the
 > Hungarian-American computer scientist (1928-2021) who at IBM in 1966 formulated the optimal, clairvoyant
 > page-replacement algorithm ("Belady's OPT/MIN", the unbeatable ceiling lite-lru measures every policy
 > against) and is also the namesake of Belady's anomaly. lite-o1 inherits the discipline his idea started:

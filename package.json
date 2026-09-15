@@ -1,0 +1,60 @@
+{
+  "name": "@zakkster/lite-o1",
+  "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
+  "version": "0.1.0",
+  "description": "Zero-dependency, zero-GC family of O(1) data structures that proves its constant: SparseSet (O(1) add/has/delete/clear/iterate) with a throughput-invariance witness harness. Tree-shakeable named exports.",
+  "type": "module",
+  "main": "./O1.js",
+  "module": "./O1.js",
+  "types": "./O1.d.ts",
+  "exports": {
+    ".": {
+      "types": "./O1.d.ts",
+      "node": "./O1.js",
+      "import": "./O1.js",
+      "default": "./O1.js"
+    }
+  },
+  "files": [
+    "O1.js",
+    "O1.d.ts",
+    "llms.txt",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "test:types": "tsc -p test/types/tsconfig.json",
+    "torture": "node --expose-gc test/torture.mjs",
+    "witness": "node test/witness.mjs",
+    "verify": "npm test && npm run test:types && npm run torture && npm run witness"
+  },
+  "keywords": [
+    "o1",
+    "big-o",
+    "sparse-set",
+    "data-structures",
+    "zero-gc",
+    "gc",
+    "garbage-collection",
+    "typed-array",
+    "ecs",
+    "performance",
+    "lightweight",
+    "zero-dependency"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "@zakkster/lite-gc-profiler": "^1.16.0",
+    "@zakkster/lite-leak": "^1.10.0",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "sideEffects": false
+}

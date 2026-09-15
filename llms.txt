@@ -1,0 +1,80 @@
+# @zakkster/lite-o1
+
+Version: 0.1.0
+License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
+Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
+Node: >= 18.
+
+## What it is
+
+A tree-shakeable, zero-GC family of O(1) data structures that PROVES its
+constant instead of asserting it. The complexity class is the product: every hot
+op is O(1) worst-case and allocates zero bytes after construction, and a shipped
+witness harness demonstrates the flat throughput curve against a built-in foil.
+
+v0.1.0 ships one member: SparseSet.
+
+## Exports (from the single main file O1.js)
+
+- `SparseSet` -- class. A zero-GC O(1) integer set over [0, universe).
+- `VERSION` -- string, '0.1.0'.
+
+## SparseSet
+
+    new SparseSet(universe, capacity = universe)
+
+- universe: exclusive key ceiling; integer in [1, 2^32]. Sizes the sparse array.
+- capacity: max live members; integer in [1, universe], default universe. Sizes
+  the dense array.
+- Constructor throws a [lite-o1] RangeError on a non-integer / out-of-range arg.
+
+Hot surface (all O(1) worst-case, zero allocation):
+
+- add(k) -> this        Insert; idempotent. Throws [lite-o1] on a bad key
+                        (not an integer in [0, universe): -1, 1.5, NaN, null,
+                        k === universe) or when a NEW key exceeds capacity.
+                        Re-adding a present key when full is a no-op.
+- has(k) -> boolean     Membership. A bad key is ABSENT, never a throw. null is
+                        not zero: has(null) is false even when 0 is a member.
+- delete(k) -> boolean  Remove by swapping the last dense entry into the hole and
+                        fixing its back-pointer. true iff k was present. Never throws.
+- clear() -> void       Empty in O(1): resets the live count, zeroes NO store.
+                        Stale sparse pointers fail the has() cross-check.
+- forEach(fn) -> void   Iterate present keys in insertion order, alloc-free.
+                        fn is (key, set).
+- [Symbol.iterator]()   Iterate present keys in insertion order.
+- size (getter)         Live member count.
+- capacity (getter)     Max live members as constructed.
+
+Membership invariant (the whole trick):
+
+    has(k) == sparse[k] < n && dense[sparse[k]] === k
+
+The cross-check rejects stale sparse pointers, which is why clear() can be O(1)
+and never zero a store.
+
+## Design bounds
+
+- valid key: integer in [0, universe).
+- Fixed capacity: no silent growth; a new key past capacity throws (fail closed).
+- Fail closed on add, absent on query. null is never coerced to key 0.
+
+## Scripts
+
+- npm test           -- 19 node:test cases (contract + boundary + differential fuzz).
+- npm run test:types -- tsc --noEmit against O1.d.ts.
+- npm run torture    -- lite-leak + lite-gc-profiler: 0 B/op, 0 major GC, leak-free.
+- npm run witness    -- O(1) throughput-invariance harness + Set foil + flatness gate.
+- npm run verify     -- all four (publish gate).
+
+## Witness gate (locked)
+
+- n-sweep [1e3, 1e4, 1e5, 1e6, 1e7], batch 1e6, warm-up + median of 5.
+- SparseSet flatness (opsPerMs last/first) >= 0.70.
+- Native Set foil flatness <= 0.55 AND SparseSet/Set ops-per-ms ratio >= 1.5x.
+
+## Not in v0.1.0
+
+RingDeque, SlotPool, UnionFind, MonoDeque, and the eight-dimension benchmark
+suite are on the roadmap, not this release. SparseSet holds membership, not
+payloads (store values in a parallel SoA column or @zakkster/lite-arena).
