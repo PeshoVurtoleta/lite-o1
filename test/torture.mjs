@@ -39,7 +39,7 @@ async function main() {
     const { GcProfiler, checkNoGc, measureAllocs } =
         await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog } = await import('../O1.js');
+    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap } = await import('../O1.js');
 
     const U = 1 << 16;      // universe 65536
     const CAP = 1 << 14;    // capacity 16384
@@ -184,6 +184,18 @@ async function main() {
             rl.newest();
             rl.get(0);
             tracker.track(rl, noop, 'ringlog', { audit: true });
+            // CuckooMap owns only its Uint8Array occupancy + two Float64Array columns;
+            // nothing external to release. Its columns hold numbers, so a reclaimed
+            // instance is the desired outcome, proven by size()->0. Exercise the
+            // set/get/has/delete surface (integer keys incl. 0 + negatives) before tracking.
+            const cm = new CuckooMap(256);
+            cm.set(i & 255, i);
+            cm.set(-(i & 127) - 1, i + 1);
+            cm.set(0, i);            // 0 is a legal key
+            cm.get(i & 255);
+            cm.has(0);
+            cm.delete(i & 255);
+            tracker.track(cm, noop, 'cuckoomap', { audit: true });
         }
         return tracker.size();
     }
@@ -434,6 +446,31 @@ async function main() {
     const ringLogAllocBytes = Math.max(0, Math.round(ringLogBpc));
     const ringLogAllocOk = ringLogAllocBytes === 0;
 
+    // CuckooMap hot path: a bounded resident map at a MODERATE steady load (~0.5, well under
+    // the 0.90 ceiling and far from any re-seed), churned in place. Each step deletes a
+    // walking key then re-inserts it (an empty-slot / short-eviction insert), then reads it
+    // back with get + has -- so size returns to CUCK_W every step and no op touches the
+    // ceiling or the re-seed path. Every op is worst-case-O(1) lookup / amortized-O(1)
+    // insert, zero-alloc (the occupancy byte + the two Float64 columns are typed slots). Keys
+    // are SMI ints (masked) so no coercion, no heap double. The get return folds into a sink.
+    const CUCK_CAP = 1 << 14;            // usable capacity >= 16384
+    const CUCK_W = 1 << 13;              // 8192 resident keys -> ~0.5 load, never near the ceiling
+    const cuck = new CuckooMap(CUCK_CAP);
+    for (let k = 0; k < CUCK_W; k++) cuck.set(k, k);
+    let cuk = 0;
+    let cuSink = 0;
+    const cuckStep = () => {
+        cuk = (cuk + 1) & (CUCK_W - 1);
+        cuck.delete(cuk);                // remove the walking key (size CUCK_W-1)
+        cuck.set(cuk, cuk * 3);          // re-insert it (size CUCK_W)
+        cuSink = (cuSink + (cuck.get(cuk) | 0)) | 0;
+        cuSink = (cuSink + (cuck.has(cuk ^ 1) ? 1 : 0)) | 0;
+    };
+    const cuckAllocRes = measureAllocs(cuckStep, { iterations: 100000, batches: 8 });
+    const cuckBpc = cuckAllocRes.bytesPerCall === null ? 0 : cuckAllocRes.bytesPerCall;
+    const cuckAllocBytes = Math.max(0, Math.round(cuckBpc));
+    const cuckAllocOk = cuckAllocBytes === 0;
+
     // "0 B/op" resolved at the sampling floor: heapUsed deltas are quantized and
     // noisy, so a truly non-allocating op reads a sub-byte figure (a lone blip
     // in one batch / iterations). Round to the nearest byte -- any per-op
@@ -458,6 +495,7 @@ async function main() {
         twStep();
         htwStep();
         ringLogStep();
+        cuckStep();
         if ((i & 8191) === 0) {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
         }
@@ -560,6 +598,16 @@ async function main() {
         ringLog.forEach(cb);
         ringLog.clear();
     }
+    // CuckooMap fill (distinct integer keys -> real eviction churn) + forEach scan + O(cap)
+    // clear cycles -- exercises the set insert/eviction hot body, the alloc-free dense-slot
+    // scan, and clear. The 512-key fill stays well under the ceiling so no re-seed fires;
+    // clear() zeroes the occupancy signal each cycle.
+    const cuckCb = (k, v) => { SINK += (k + v) | 0; };
+    for (let f = 0; f < 1024; f++) {
+        for (let k = 0; k < 512; k++) cuck.set(k + (f << 9), k);
+        cuck.forEach(cuckCb);
+        cuck.clear();
+    }
     await new Promise((r) => setTimeout(r, 50));
     const s2 = gc.summary();
     const report = checkNoGc(s2, { maxMajor: 0, maxPauseMs: 2 });
@@ -604,6 +652,8 @@ async function main() {
         htw.clear();
         for (let k = 0; k < CAP; k++) ringLog.push(k); // fill to capacity (overwrites once full)
         ringLog.clear();                               // O(1): the reused buffer grows no store
+        for (let k = 0; k < CUCK_W; k++) cuck.set(k, k); // fill under the ceiling (no re-seed)
+        cuck.clear();                                    // O(cap): the reused columns grow no store
     }
     globalThis.gc();
     const abAfter = process.memoryUsage().arrayBuffers;
@@ -614,7 +664,7 @@ async function main() {
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
         findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && monoAllocOk &&
         minAllocOk && randAllocOk && freqAllocOk && buckAllocOk && twAllocOk && htwAllocOk &&
-        ringLogAllocOk && abOk;
+        ringLogAllocOk && cuckAllocOk && abOk;
 
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
@@ -627,9 +677,10 @@ async function main() {
         freqAllocBytes + ' B/op (FreqO1) ' + buckAllocBytes + ' B/op (BucketQueue) ' +
         twAllocBytes + ' B/op (TimerWheel) ' +
         htwAllocBytes + ' B/op (HierarchicalTimerWheel) ' +
-        ringLogAllocBytes + ' B/op (RingLog)' +
+        ringLogAllocBytes + ' B/op (RingLog) ' +
+        cuckAllocBytes + ' B/op (CuckooMap)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
-        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' abGrowth=' + abDelta + ')');
+        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' abGrowth=' + abDelta + ')');
 
     if (!ok) {
         if (!trackedOk) console.error('  vacuous: tracker held ' + trackedMid + ' instances (expected > 0)');
@@ -649,6 +700,7 @@ async function main() {
         if (!twAllocOk) console.error('  alloc ' + twAllocBytes + ' B/op TimerWheel (raw bytesPerCall ' + twBpc + ')');
         if (!htwAllocOk) console.error('  alloc ' + htwAllocBytes + ' B/op HierarchicalTimerWheel (raw bytesPerCall ' + htwBpc + ')');
         if (!ringLogAllocOk) console.error('  alloc ' + ringLogAllocBytes + ' B/op RingLog (raw bytesPerCall ' + ringLogBpc + ')');
+        if (!cuckAllocOk) console.error('  alloc ' + cuckAllocBytes + ' B/op CuckooMap (raw bytesPerCall ' + cuckBpc + ')');
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;
     }

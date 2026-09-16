@@ -48,7 +48,7 @@
  * metric are unchanged; only the measurement is made steadier.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap } from '../O1.js';
 
 const SIZES = [1e3, 1e4, 1e5, 1e6, 1e7];
 const BATCH = 1e6;
@@ -1351,5 +1351,170 @@ if (!rlAllOk) {
     if (!rlOk) console.error('  violation RingLog flatness ' + fmt(rl.flatness) + ' < 0.70');
     if (!arrLogOk) console.error('  violation Array foil flatness ' + fmt(arrLog.flatness) + ' > 0.55');
     if (!rlRatioOk) console.error('  violation min RingLog ratio ' + fmt(rlRatio) + 'x < 1.50x');
+    process.exitCode = 1;
+}
+
+// ===========================================================================
+// CuckooMap witness -- bounded-probe WORST-CASE-O(1) lookup vs a naive O(n) linear-scan
+// map, PLUS the max-single-op re-seed spike (the amortized-honesty headline).
+// ===========================================================================
+// n is the number of live keys. The op is a steady lookup (get) over a mix of hits and
+// misses -- AT MOST 8 slot reads + 2 hashes, O(1) INDEPENDENT of n. The foil is an
+// ALLOC-FREE naive map: parallel Float64Array key/value columns searched by a LINEAR SCAN
+// (the obvious no-hashing way to map integer keys to numbers) -- O(n) per lookup, the exact
+// trap CuckooMap's bounded probe kills. This is a TRUE O(n) foil (a full factor of n lost
+// per decade), so it collapses to the <= 0.55 bar (like the RingLog / TimerWheel foils).
+// ops/ms is a RATE, so the map (batch 5e5) and the foil (batch 2e2) use DIFFERENT batches
+// yet flatness + ratio compare directly. The gate window is DRAM-resident [1e5, 1e6]: below
+// it (n=1e4) the ~450 KB structure fits L2 and the CPU turbo-boosts, so ops/ms turbo-spikes
+// as the flatness DENOMINATOR (the ADR-0004 effect) -- n=1e4 is DISPLAYED, tagged, not gated.
+const CU_SIZES = [1e4, 1e5, 1e6];
+const CU_BATCH = 5e5;        // large: stable timing for the O(1) lookup
+const CU_FOIL_BATCH = 2e2;   // small: an O(n) linear scan at n=1e6 must stay tractable
+const CU_GATE_MIN = 1e5;     // gate over the DRAM-resident steady window [1e5, 1e6]
+
+// CuckooMap: fill n keys (0..n-1), then each op looks up a walking key over [0, 2n) so
+// ~half hit and ~half miss -- every lookup is the worst-case <= 8-slot probe.
+function buildCuckooMap(n) {
+    const m = new CuckooMap(n);
+    for (let k = 0; k < n; k++) m.set(k, k);
+    let key = 0;
+    const lim = 2 * n;
+    const op = () => {
+        key++;
+        if (key >= lim) key = 0;
+        const v = m.get(key);
+        if (v !== undefined) SINK += v;
+    };
+    return { op };
+}
+
+// Foil: a naive map over two parallel Float64Array columns, looked up by a LINEAR SCAN. The
+// query STRIDES across [0, 2n) by ~n/2 each call so successive lookups land at varied depths
+// (hits) and full scans (misses) even under a small batch -- the honest O(n) average the
+// bounded probe replaces. ALLOC-FREE (the columns + a running key index are all typed / int).
+function buildNaiveScanFoil(n) {
+    const ks = new Float64Array(n), vs = new Float64Array(n);
+    for (let k = 0; k < n; k++) { ks[k] = k; vs[k] = k; }
+    let key = 0;
+    const lim = 2 * n;
+    const step = (n >> 1) + 1;
+    const op = () => {
+        key += step;
+        if (key >= lim) key -= lim;
+        for (let i = 0; i < n; i++) { if (ks[i] === key) { SINK += vs[i]; break; } }
+    };
+    return { op };
+}
+
+// ---- CuckooMap max-single-op: the in-place re-seed spike --------------------
+// A local hash replica (MUST mirror O1.js CuckooMap) so we can FORCE the re-seed
+// deterministically: 9 keys sharing ONE (h1,h2) pair fill the 8 slots of that bucket
+// pair, and the 9th trips MaxLoop -> an O(capacity) in-place re-seed. We time that single
+// set against the batch-mean of a typical (update-in-place, no growth) set.
+function cuFmix32(h) {
+    h = h ^ (h >>> 16);
+    h = Math.imul(h, 0x85ebca6b);
+    h = h ^ (h >>> 13);
+    h = Math.imul(h, 0xc2b2ae35);
+    h = h ^ (h >>> 16);
+    return h | 0;
+}
+function cuHash(key, seed) {
+    let neg = 0, a = key;
+    if (a < 0) { a = -a; neg = 1; }
+    const lo = a >>> 0;
+    const hi = (a - lo) / 4294967296;
+    let h = cuFmix32((seed ^ lo) | 0);
+    h = (h ^ Math.imul(hi | 0, 0x9e3779b1)) ^ neg;
+    return cuFmix32(h | 0);
+}
+function cuckooMaxSingleOpMs() {
+    const m = new CuckooMap(900, 1234567);          // seeded for reproducible collisions
+    const seed = m.seed, seed2 = cuFmix32((seed ^ 0x85ebca6b) | 0), B = m._B, mask = B - 1;
+    // Find 9 keys sharing ONE (h1,h2) pair (bounded scan over a small bin space).
+    const bins = new Map();
+    let colliders = null;
+    for (let k = 0; k < 4000000 && !colliders; k++) {
+        const key = (cuHash(k, seed) & mask) * B + (cuHash(k, seed2) & mask);
+        let arr = bins.get(key); if (!arr) { arr = []; bins.set(key, arr); }
+        arr.push(k);
+        if (arr.length >= 9) colliders = arr.slice(0, 9);
+    }
+    // Fill a real population (~0.55 load) of non-colliders so the re-seed rehashes many keys.
+    const fillN = Math.floor(m.capacity * 0.55);
+    let added = 0;
+    for (let k = 10000000; added < fillN; k++) { m.set(k, k); added++; }
+    for (let i = 0; i < 8; i++) m.set(colliders[i], colliders[i]); // fill the colliding pair's 8 slots
+    // Worst single op: the 9th collider trips MaxLoop -> the O(capacity) in-place re-seed.
+    const t0 = performance.now();
+    m.set(colliders[8], colliders[8]);
+    const worst = performance.now() - t0;
+    // Typical: batch-mean of an update-in-place set (present key, no growth, no eviction).
+    const m2 = new CuckooMap(900);
+    for (let k = 0; k < 400; k++) m2.set(k, k);
+    const BATCH = 500000;
+    for (let r = 0; r < BATCH; r++) m2.set(r % 400, r);   // warm to steady state
+    const t1 = performance.now();
+    for (let r = 0; r < BATCH; r++) m2.set(r % 400, r);
+    const typical = (performance.now() - t1) / BATCH;
+    const ratio = typical > 0 ? worst / typical : Infinity;
+    return { worst, typical, ratio, rehashed: fillN + 9 };
+}
+
+const cu = witness(buildCuckooMap, CU_SIZES, CU_BATCH, REPS, CU_GATE_MIN);
+const naiveMap = witness(buildNaiveScanFoil, CU_SIZES, CU_FOIL_BATCH, REPS, CU_GATE_MIN);
+
+console.log('');
+console.log('O(1) Witness -- CuckooMap bounded-probe lookup vs a naive O(n) linear-scan map (rate ops/ms, median of ' +
+    REPS + ', gate size >= ' + nStr(CU_GATE_MIN) + ')');
+console.log('');
+console.log('  size      CuckooMap ops/ms   naive ops/ms   ratio');
+console.log('  --------  ----------------   ------------   -----');
+let cuRatio = Infinity;
+for (let i = 0; i < CU_SIZES.length; i++) {
+    const a = cu.rows[i].opsPerMs;
+    const b = naiveMap.rows[i].opsPerMs;
+    const ratio = b > 0 ? a / b : Infinity;
+    const gated = CU_SIZES[i] >= CU_GATE_MIN;
+    if (gated && ratio < cuRatio) cuRatio = ratio;
+    const tag = CU_SIZES[i] < CU_GATE_MIN ? '   <- L2 turbo micro-case (shown, not gated)' : '';
+    console.log('  ' + nStr(CU_SIZES[i]).padEnd(8) + '  ' +
+        fmt(a).padStart(16) + '   ' + fmt(b).padStart(12) + '   ' + fmt(ratio).padStart(5) + 'x' + tag);
+}
+
+const cuSpike = cuckooMaxSingleOpMs();
+
+console.log('');
+console.log('  CuckooMap flatness (size >= ' + nStr(CU_GATE_MIN) + '): ' + fmt(cu.flatness) + '   (gate >= 0.70)');
+console.log('  naive foil flatness (last/first): ' + fmt(naiveMap.flatness) + '   (gate <= 0.55 -- true O(n) collapse)');
+console.log('  min CuckooMap/naive ratio:        ' + fmt(cuRatio) + 'x  (gate >= 1.50x)');
+console.log('  MAX single set (O(capacity) in-place re-seed, rehashed ' + cuSpike.rehashed +
+    '): ' + cuSpike.worst.toFixed(4) + ' ms   vs typical O(1) set: ' +
+    cuSpike.typical.toFixed(6) + ' ms   spike ' + fmt(cuSpike.ratio) + 'x   (gate >= 2x -- the amortized-honesty line)');
+
+// Gate: CuckooMap is genuinely bounded-probe O(1) (flatness >= 0.70 over the DRAM-resident
+// window), it beats the naive O(n) linear scan by a sustained constant factor (ratio >= 1.5x),
+// the TRUE O(n) foil collapses (flatness <= 0.55 -- a full factor of n lost per decade), and
+// the in-place re-seed WEARS a visible max-single-op spike (>= 2x the typical set) -- the
+// amortized-honesty line, the thematic sibling of HierarchicalTimerWheel's cascade.
+const cuOk = cu.flatness >= 0.70;
+const cuNaiveOk = naiveMap.flatness <= 0.55;
+const cuRatioOk = cuRatio >= 1.5;
+const cuSpikeOk = cuSpike.ratio >= 2;
+const cuAllOk = cuOk && cuNaiveOk && cuRatioOk && cuSpikeOk;
+
+console.log('');
+console.log('WITNESS CuckooMap ' + (cuAllOk ? 'ok' : 'FAIL') +
+    ' cu.flatness=' + fmt(cu.flatness) +
+    ' naive.flatness=' + fmt(naiveMap.flatness) +
+    ' minRatio=' + fmt(cuRatio) + 'x' +
+    ' spike=' + fmt(cuSpike.ratio) + 'x');
+
+if (!cuAllOk) {
+    if (!cuOk) console.error('  violation CuckooMap flatness ' + fmt(cu.flatness) + ' < 0.70');
+    if (!cuNaiveOk) console.error('  violation naive foil flatness ' + fmt(naiveMap.flatness) + ' > 0.55');
+    if (!cuRatioOk) console.error('  violation min CuckooMap ratio ' + fmt(cuRatio) + 'x < 1.50x');
+    if (!cuSpikeOk) console.error('  violation re-seed spike ' + fmt(cuSpike.ratio) + 'x < 2x (must wear the max-single-op line)');
     process.exitCode = 1;
 }

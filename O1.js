@@ -3,10 +3,11 @@
  * that doubles as a teachable textbook: each member solves a real problem AND
  * proves its constant is real (the O(1) Witness -- see test/witness.mjs).
  *
- * v1.1.0 ships eleven members -- SparseSet, RingDeque, UnionFind, MonoDeque,
- * MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, and
- * RingLog -- plus its `VERSION` const. The eleven are independent (no shared mutable
- * module state), so a bundler that imports one drops the others (`sideEffects: false`).
+ * v1.2.0 ships twelve members -- SparseSet, RingDeque, UnionFind, MonoDeque,
+ * MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel,
+ * RingLog, and CuckooMap -- plus its `VERSION` const. The twelve are independent (no
+ * shared mutable module state), so a bundler that imports one drops the others
+ * (`sideEffects: false`).
  *
  * The complexity class IS the product: every hot op below is O(1) worst-case and
  * allocates ZERO bytes after construction. The witness harness (never imported
@@ -17,7 +18,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.1.0';
+export const VERSION = '1.2.0';
 
 /** Largest universe the Uint32 substrate + the (k >>> 0) key check can honor. */
 const MAX_UNIVERSE = 0x100000000; // 2^32
@@ -3042,5 +3043,435 @@ export class RingLog {
         // BigInt, which would turn a fail-closed reject into a different crash.
         throw new TypeError(
             '[lite-o1] RingLog value must be a number and not NaN, got ' + String(v));
+    }
+}
+
+// ---- CuckooMap internals (module-level, cold-shared, no mutable module state) ----
+
+/** Largest requested CuckooMap capacity: keeps total slots (8*B) under 2^31. */
+const CUCKOO_MAX_CAP = 0x40000000; // 2^30
+/** 53-bit safe-integer key ceiling: |k| <= 2^53 (Number.isSafeInteger range). */
+const CUCKOO_KEY_MAX = 9007199254740991; // 2^53 - 1
+/** Max fresh seeds a single set() will try before it fails closed. */
+const CUCKOO_RESEED_TRIES = 32;
+
+/**
+ * MurmurHash3 32-bit finalizer (fmix32). Pure, branch-free, zero-alloc. Every internal
+ * step stays in int32 (Math.imul + XOR + the unsigned shift), and the RESULT is returned
+ * as a SIGNED int32 (`| 0`) so it is always a tagged SMI -- never a boxed HeapNumber at
+ * the call boundary (a uint32 >= 2^31 would box, and that box scales with n on the hot
+ * path). The low bits are bit-identical to `>>> 0`, and every consumer masks / XORs, so
+ * signedness is irrelevant to the bucket. Cold constants are plain hex (ASCII-safe).
+ * @param {number} h  an int32
+ * @returns {number}  a well-mixed SIGNED int32 (SMI)
+ */
+function _cuFmix32(h) {
+    h = h ^ (h >>> 16);
+    h = Math.imul(h, 0x85ebca6b);
+    h = h ^ (h >>> 13);
+    h = Math.imul(h, 0xc2b2ae35);
+    h = h ^ (h >>> 16);
+    return h | 0;
+}
+
+/**
+ * Hash a 53-bit signed integer key with an int32 seed to a SIGNED int32 (SMI) bucket hash.
+ * The key is split into its low 32 bits (ToUint32 = a mod 2^32) and its high bits (0..2^21),
+ * folded with the sign, and finalized -- all in int32 math, so a hot lookup allocates
+ * nothing and produces no heap double. Every value crossing a call boundary is forced to an
+ * SMI (`| 0`). Two decorrelated sub-hashes come from the two per-instance seeds (proven
+ * non-colliding-in-practice by the differential fuzz).
+ * @param {number} key   a safe integer, |key| <= 2^53
+ * @param {number} seed  an int32 seed
+ * @returns {number}     a SIGNED int32 (SMI); mask with (B-1) for the bucket index
+ */
+function _cuHash(key, seed) {
+    let neg = 0;
+    let a = key;
+    if (a < 0) { a = -a; neg = 1; }
+    const lo = a >>> 0;                 // low 32 bits (ToUint32 -> a mod 2^32)
+    const hi = (a - lo) / 4294967296;   // high 21 bits, exact (a - lo divisible by 2^32)
+    let h = _cuFmix32((seed ^ lo) | 0);                       // SMI arg + SMI return
+    h = (h ^ Math.imul(hi | 0, 0x9e3779b1)) ^ neg;            // int32 (fold high word + sign)
+    return _cuFmix32(h | 0);                                  // SMI arg + SMI return
+}
+
+/**
+ * CuckooMap -- a zero-GC, bounded-probe exact map from GENERAL INTEGER keys to numbers.
+ *
+ * The suite's first GENERAL-KEY exact dictionary: keys are ANY safe integer (|k| <= 2^53,
+ * Number.isSafeInteger range), NOT a dense [0, universe) like SparseSet -- that is the
+ * whole point. It buys O(capacity) space over a sparse / large integer key domain, versus
+ * SparseSet's O(universe) space over a dense one. Values are any finite number plus
+ * +/-Infinity (typeof 'number', not NaN), stored in a Float64 column. Keys and values are
+ * numbers ONLY -- the zero-GC law forbids storing object / string references.
+ *
+ * Algorithm: BUCKETIZED cuckoo hashing, 2 tables x 4 slots. A lookup probes AT MOST 8
+ * slots ALWAYS (2 candidate buckets x 4 slots) -> HARD bounded-probe WORST-CASE O(1) for
+ * get / has / delete. Insert is AMORTIZED O(1): a set that fills a home bucket kicks a
+ * resident to its alternate bucket (the eviction chain, bounded by MaxLoop), and on a
+ * MaxLoop dead end performs ONE in-place RE-SEED OPERATION (up to CUCKOO_RESEED_TRIES = 32
+ * candidate seed tries, each a fresh per-instance seed + re-insert of every live entry into
+ * the SAME-SIZE tables) -- an O(capacity) rehash. That re-seed is the member's MAX-SINGLE-OP
+ * line, the thematic sibling of HierarchicalTimerWheel's cascade spike: it WEARS its worst
+ * single op rather than hiding it behind the flat average.
+ *
+ * Capacity: FIXED, fail closed. The constructor rounds the bucket count up (power of two)
+ * so the requested capacity fits UNDER a 0.90 load ceiling; the `capacity` getter reports
+ * the usable capacity. A set() that would exceed the ceiling, or whose eviction chain
+ * cannot place the key even after the re-seed, THROWS [lite-o1] -- fail closed. The
+ * load-ceiling reject is a BYTE-IDENTICAL no-op (the check precedes every write).
+ *
+ * Sentinel discipline: 0 is a LEGAL key and any finite number a legal value. Emptiness is
+ * signalled ONLY by the occupancy byte array (`_occ`), NEVER by a key / value being 0
+ * ("null is not zero"). Every slot read checks _occ first. Deletion clears the occupancy
+ * byte -- cuckoo needs no tombstones (a lookup only ever visits the two home buckets).
+ *
+ * Fail closed on every unverified state: set() typeof-guards BOTH the key and the value
+ * FIRST (a Symbol / BigInt / object never reaches arithmetic or coercion), and a rejected
+ * mutation is a byte-identical no-op. get / has / delete NEVER throw (a bad / absent key
+ * reads as undefined / false).
+ *
+ * The only allocators are the constructor, the per-protocol [Symbol.iterator], and the
+ * rare O(capacity) re-seed (its snapshot arrays) -- set / get / has / delete allocate
+ * ZERO bytes on their hot bodies.
+ */
+export class CuckooMap {
+    /**
+     * @param {number} capacity   requested max live entries; an integer in [1, 2^30]. The
+     *                            usable `capacity` getter reports the value after rounding
+     *                            the table up to fit under the 0.90 load ceiling.
+     * @param {number} [seed]     OPTIONAL uint32 seed (for reproducible placement / tests);
+     *                            defaults to a deterministic function of the table size.
+     */
+    constructor(capacity, seed) {
+        // typeof guard BEFORE any coercion: Number.isInteger never coerces (false on a
+        // Symbol / BigInt), and String(x) in the cold message is Symbol / BigInt-safe.
+        if (typeof capacity !== 'number' || !Number.isInteger(capacity) ||
+            capacity < 1 || capacity > CUCKOO_MAX_CAP) {
+            throw new RangeError(
+                '[lite-o1] CuckooMap capacity must be an integer in [1, 2^30], got ' + String(capacity));
+        }
+        // Smallest power-of-two bucket count B so floor(8*B * 0.9) >= capacity.
+        const minB = Math.ceil((capacity * 10) / 72); // capacity / 7.2, exact-enough integer
+        let B = 1;
+        while (B < minB) B *= 2;
+        const total = B * 8;                       // 2 tables x B buckets x 4 slots
+        this._B = B;                               // buckets per table (power of two)
+        this._mask = B - 1;                        // bucket index mask (B is a power of two)
+        this._fourB = B * 4;                       // slot base of table 1 (table 0 is [0, 4B))
+        this._cap = Math.floor((total * 9) / 10);  // usable capacity = floor(0.9 * total)
+        this._occ = new Uint8Array(total);         // occupancy: 1 iff the slot holds a live entry
+        this._keys = new Float64Array(total);      // key column (safe integers, exact in f64)
+        this._vals = new Float64Array(total);      // value column (any clean number)
+        // MaxLoop ~ 8 * log2(cap): the eviction-chain bound before an in-place re-seed.
+        this._maxLoop = 8 * Math.max(1, Math.ceil(Math.log2(this._cap + 1)));
+        this._size = 0;
+        // Per-instance seeds, kept as SIGNED int32 (SMI) fields so a hot _h1 / _h2 reads a
+        // tagged SMI, never a boxed HeapNumber. Default is deterministic (reproducible);
+        // an optional uint32 override is accepted (coerced to its int32 bit pattern).
+        let s;
+        if (seed === undefined) {
+            s = _cuFmix32(total | 0);
+        } else {
+            if (typeof seed !== 'number' || !Number.isInteger(seed) || seed < 0 || seed > 0xffffffff) {
+                throw new RangeError(
+                    '[lite-o1] CuckooMap seed must be a uint32 integer in [0, 2^32-1], got ' + String(seed));
+            }
+            s = seed | 0; // same 32 bits, signed
+        }
+        this._seed = s | 0;
+        this._seed2 = _cuFmix32((s ^ 0x85ebca6b) | 0);
+        // Scratch for the floating entry of a stalled eviction chain (see _evict / _reseed).
+        this._pk = 0;
+        this._pv = 0;
+    }
+
+    /** Number of live entries. O(1). */
+    get size() { return this._size; }
+
+    /** Usable capacity (max live entries under the 0.90 load ceiling). O(1). */
+    get capacity() { return this._cap; }
+
+    /** Current per-instance hash seed as a uint32 (changes on an in-place re-seed). O(1). */
+    get seed() { return this._seed >>> 0; }
+
+    /** Current load factor: size / capacity, in [0, 1]. O(1). */
+    get load() { return this._size / this._cap; }
+
+    /** @private table-0 bucket index for key k. */
+    _h1(k) { return _cuHash(k, this._seed) & this._mask; }
+
+    /** @private table-1 bucket index for key k. */
+    _h2(k) { return _cuHash(k, this._seed2) & this._mask; }
+
+    /**
+     * Insert / update k -> v. AMORTIZED O(1), zero-alloc on the common path. Returns this.
+     * Guards typeof of BOTH k and v FIRST (a Symbol / BigInt / object never coerces); a bad
+     * key or value throws [lite-o1] a byte-identical no-op. An UPDATE of a present key
+     * overwrites the value (no eviction, size unchanged). A NEW key past the 0.90 load
+     * ceiling throws [lite-o1] as a byte-identical no-op (the check precedes every write). A
+     * full home-bucket pair triggers the bounded eviction chain, then -- if it stalls -- one
+     * in-place re-seed (the O(capacity) max-single-op spike); if even that cannot place the
+     * key, set throws [lite-o1] fail-closed.
+     * @param {number} k  a safe integer, |k| <= 2^53
+     * @param {number} v  a clean number (not NaN; +/-Infinity accepted)
+     * @returns {this}
+     */
+    set(k, v) {
+        if (typeof k !== 'number' || !Number.isSafeInteger(k)) return this._badKey(k);
+        if (typeof v !== 'number' || v !== v) return this._badVal(v); // v !== v -> NaN
+        const occ = this._occ, keys = this._keys, vals = this._vals, fourB = this._fourB;
+        const b1 = this._h1(k), b2 = this._h2(k);
+        let empty = -1;
+        // Scan table 0 bucket b1 (4 slots): update-in-place on a match, note first empty.
+        let base = b1 * 4;
+        for (let s = 0; s < 4; s++) {
+            const idx = base + s;
+            if (occ[idx]) { if (keys[idx] === k) { vals[idx] = v; return this; } }
+            else if (empty < 0) empty = idx;
+        }
+        // Scan table 1 bucket b2 (4 slots): same.
+        base = fourB + b2 * 4;
+        for (let s = 0; s < 4; s++) {
+            const idx = base + s;
+            if (occ[idx]) { if (keys[idx] === k) { vals[idx] = v; return this; } }
+            else if (empty < 0) empty = idx;
+        }
+        // Not present: this is a NEW key. Fail closed at the load ceiling (byte-identical).
+        if (this._size >= this._cap) return this._full(k);
+        if (empty >= 0) { occ[empty] = 1; keys[empty] = k; vals[empty] = v; this._size++; return this; }
+        // Both home buckets full: kick a resident down its alternate bucket chain.
+        if (this._evict(k, v, b1, b2)) return this;
+        // Chain stalled at MaxLoop: one in-place re-seed of the floating entry + rebuild.
+        return this._reseed(k, this._pk, this._pv);
+    }
+
+    /**
+     * The value bound to k, or `undefined` if k is absent / not a safe integer. WORST-CASE
+     * O(1): at most 8 slot reads (2 home buckets x 4). NEVER throws; typeof-guarded FIRST so
+     * a Symbol / BigInt never reaches arithmetic.
+     * @param {number} k
+     * @returns {number|undefined}
+     */
+    get(k) {
+        if (typeof k !== 'number' || !Number.isSafeInteger(k)) return undefined;
+        const occ = this._occ, keys = this._keys, vals = this._vals, fourB = this._fourB;
+        let base = this._h1(k) * 4;
+        if (occ[base] && keys[base] === k) return vals[base];
+        if (occ[base + 1] && keys[base + 1] === k) return vals[base + 1];
+        if (occ[base + 2] && keys[base + 2] === k) return vals[base + 2];
+        if (occ[base + 3] && keys[base + 3] === k) return vals[base + 3];
+        base = fourB + this._h2(k) * 4;
+        if (occ[base] && keys[base] === k) return vals[base];
+        if (occ[base + 1] && keys[base + 1] === k) return vals[base + 1];
+        if (occ[base + 2] && keys[base + 2] === k) return vals[base + 2];
+        if (occ[base + 3] && keys[base + 3] === k) return vals[base + 3];
+        return undefined;
+    }
+
+    /**
+     * True iff k is present. WORST-CASE O(1), at most 8 slot reads. NEVER throws; a bad key
+     * is absent. typeof-guarded FIRST.
+     * @param {number} k
+     * @returns {boolean}
+     */
+    has(k) {
+        if (typeof k !== 'number' || !Number.isSafeInteger(k)) return false;
+        const occ = this._occ, keys = this._keys, fourB = this._fourB;
+        let base = this._h1(k) * 4;
+        if (occ[base] && keys[base] === k) return true;
+        if (occ[base + 1] && keys[base + 1] === k) return true;
+        if (occ[base + 2] && keys[base + 2] === k) return true;
+        if (occ[base + 3] && keys[base + 3] === k) return true;
+        base = fourB + this._h2(k) * 4;
+        if (occ[base] && keys[base] === k) return true;
+        if (occ[base + 1] && keys[base + 1] === k) return true;
+        if (occ[base + 2] && keys[base + 2] === k) return true;
+        if (occ[base + 3] && keys[base + 3] === k) return true;
+        return false;
+    }
+
+    /**
+     * Remove k. WORST-CASE O(1): clears the occupancy byte in one of the 8 home slots and
+     * decrements size. Returns true iff k was present. NEVER throws; a bad / absent key
+     * returns false. No tombstone is needed (a lookup only ever visits the two home buckets).
+     * @param {number} k
+     * @returns {boolean}
+     */
+    delete(k) {
+        if (typeof k !== 'number' || !Number.isSafeInteger(k)) return false;
+        const occ = this._occ, keys = this._keys, fourB = this._fourB;
+        let base = this._h1(k) * 4;
+        for (let s = 0; s < 4; s++) {
+            const idx = base + s;
+            if (occ[idx] && keys[idx] === k) { occ[idx] = 0; this._size--; return true; }
+        }
+        base = fourB + this._h2(k) * 4;
+        for (let s = 0; s < 4; s++) {
+            const idx = base + s;
+            if (occ[idx] && keys[idx] === k) { occ[idx] = 0; this._size--; return true; }
+        }
+        return false;
+    }
+
+    /**
+     * Empty the map. O(capacity): zeroes the occupancy signal (a single Uint8Array.fill(0))
+     * and resets size. The key / value columns are left untouched -- stale numbers are
+     * unreachable (every read checks _occ first) and retain no references. Honest cost:
+     * unlike RingLog / RingDeque (whose O(1) clear rides a bounded read window), a hashed
+     * map's live slots are scattered, so emptiness must be signalled per slot -> O(capacity).
+     */
+    clear() { this._occ.fill(0); this._size = 0; }
+
+    /**
+     * Iterate live entries in DENSE SLOT order, alloc-free. O(capacity). A HOISTED callback
+     * makes this a zero-allocation scan.
+     * @param {(key:number, value:number, map:CuckooMap)=>void} fn
+     */
+    forEach(fn) {
+        const occ = this._occ, keys = this._keys, vals = this._vals, total = occ.length;
+        for (let i = 0; i < total; i++) if (occ[i]) fn(keys[i], vals[i], this);
+    }
+
+    /** Iterate [key, value] tuples in dense slot order. O(capacity). Allocates per protocol. */
+    *[Symbol.iterator]() {
+        const occ = this._occ, keys = this._keys, vals = this._vals, total = occ.length;
+        for (let i = 0; i < total; i++) if (occ[i]) yield [keys[i], vals[i]];
+    }
+
+    // ---- private insert machinery -----------------------------------------
+
+    /**
+     * @private
+     * The cuckoo eviction chain. Places (k, v) starting from table-0 bucket b1: at each step
+     * it scans the current bucket for an empty slot (place + size++ + true), else kicks a
+     * resident (rotating which slot, for spread), carries the displaced entry to ITS
+     * alternate table / bucket, and repeats up to MaxLoop. On MaxLoop it stores the still-
+     * homeless entry in _pk/_pv (a REAL pre-existing entry, distinct from the new key) and
+     * returns false so the caller can re-seed. Zero-alloc: all state is number locals.
+     * @returns {boolean} true iff placed within MaxLoop
+     */
+    _evict(k, v, b1, b2) {
+        const occ = this._occ, keys = this._keys, vals = this._vals, fourB = this._fourB, maxLoop = this._maxLoop;
+        // Caller guarantees BOTH home buckets (table-0 b1, table-1 b2) are full, so begin the
+        // chain by kicking from table-0 b1; each displaced resident is carried to ITS OWN
+        // alternate table / bucket. `b2` is unused here (documented in the signature for the
+        // caller's intent) because the new key's table-1 bucket was already probed full.
+        let ck = k, cv = v, ti = 0, bb = b1;
+        for (let n = 0; n < maxLoop; n++) {
+            const base = ti === 0 ? bb * 4 : fourB + bb * 4;
+            for (let s = 0; s < 4; s++) {
+                const idx = base + s;
+                if (!occ[idx]) { occ[idx] = 1; keys[idx] = ck; vals[idx] = cv; this._size++; return true; }
+            }
+            // No empty slot: kick a resident (rotate slot by n) and carry it onward.
+            const vidx = base + (n & 3);
+            const tk = keys[vidx], tv = vals[vidx];
+            keys[vidx] = ck; vals[vidx] = cv; // occ[vidx] stays 1
+            ck = tk; cv = tv;
+            ti ^= 1; // hop to the carried entry's alternate table
+            bb = ti === 0 ? this._h1(ck) : this._h2(ck);
+        }
+        this._pk = ck; this._pv = cv; // still homeless: hand to the re-seed
+        return false;
+    }
+
+    /**
+     * @private
+     * Full insert used ONLY by the re-seed rebuild: place (k, v) via empty-slot-then-evict.
+     * Returns false (leaving a floating entry in _pk/_pv) if the chain stalls at MaxLoop, so
+     * the re-seed can abandon this seed and try another. Never recurses into _reseed.
+     * @returns {boolean}
+     */
+    _place(k, v) {
+        const occ = this._occ, keys = this._keys, vals = this._vals, fourB = this._fourB;
+        const b1 = this._h1(k), b2 = this._h2(k);
+        let base = b1 * 4;
+        for (let s = 0; s < 4; s++) {
+            const idx = base + s;
+            if (!occ[idx]) { occ[idx] = 1; keys[idx] = k; vals[idx] = v; this._size++; return true; }
+        }
+        base = fourB + b2 * 4;
+        for (let s = 0; s < 4; s++) {
+            const idx = base + s;
+            if (!occ[idx]) { occ[idx] = 1; keys[idx] = k; vals[idx] = v; this._size++; return true; }
+        }
+        return this._evict(k, v, b1, b2);
+    }
+
+    /**
+     * @private
+     * The MAX-SINGLE-OP line: an in-place O(capacity) re-seed. The eviction chain for the new
+     * key stalled at MaxLoop, leaving `floatK`/`floatV` homeless (a real pre-existing entry)
+     * while the new key `newK` is stored somewhere in the chain. Gather every live entry plus
+     * the floating one, then try fresh seeds (up to CUCKOO_RESEED_TRIES = 32 seed tries) until
+     * all of them (the originals + the new key) re-place into the same-size tables. On success
+     * size becomes oldSize + 1. If NO seed succeeds within CUCKOO_RESEED_TRIES, restore the
+     * LOGICAL pre-set contents (the originals, excluding newK) under the original seed and throw
+     * [lite-o1] fail-closed -- size intact, every prior key survives (see decisions/0017 for why
+     * this rare path restores logical, not byte, state; the reachable load-ceiling reject IS
+     * byte-identical). If even the RESTORE cannot re-place a live entry (an unverified state that
+     * would silently drop a key + undercount size), it fails CLOSED with a LOUD [lite-o1]
+     * invariant error rather than proceeding.
+     * @returns {this}
+     */
+    _reseed(newK, floatK, floatV) {
+        const occ = this._occ, keys = this._keys, vals = this._vals, total = occ.length;
+        const oldSeed = this._seed, oldSeed2 = this._seed2;
+        const cnt = this._size + 1;                 // live entries + the floating one
+        const sk = new Float64Array(cnt);           // snapshot (sanctioned re-seed allocation)
+        const sv = new Float64Array(cnt);
+        let m = 0;
+        for (let i = 0; i < total; i++) if (occ[i]) { sk[m] = keys[i]; sv[m] = vals[i]; m++; }
+        sk[m] = floatK; sv[m] = floatV; m++;        // m === cnt
+        for (let attempt = 1; attempt <= CUCKOO_RESEED_TRIES; attempt++) {
+            this._seed = _cuFmix32((oldSeed + Math.imul(attempt, 0x9e3779b1)) | 0);
+            this._seed2 = _cuFmix32((this._seed ^ 0x85ebca6b) | 0);
+            occ.fill(0); this._size = 0;
+            let ok = true;
+            for (let j = 0; j < cnt; j++) if (!this._place(sk[j], sv[j])) { ok = false; break; }
+            if (ok) return this;                    // every entry (incl. newK) placed
+        }
+        // Total failure (astronomically rare at the 0.90 ceiling): restore the logical
+        // originals (every prior key, EXCLUDING the rejected newK) under the original seed.
+        this._seed = oldSeed; this._seed2 = oldSeed2;
+        occ.fill(0); this._size = 0;
+        for (let j = 0; j < cnt; j++) {
+            if (sk[j] !== newK && !this._place(sk[j], sv[j])) {
+                // A live entry could not be re-placed during restore -- an unverified state
+                // (silent key drop + size undercount). Fail CLOSED, loudly, rather than
+                // proceed: this invariant cannot hold if the originals fit before.
+                throw new Error(
+                    '[lite-o1] CuckooMap invariant: reseed restore failed to re-place a live entry');
+            }
+        }
+        return this._fail(newK);
+    }
+
+    // ---- cold path only: throw builders (string concat off the hot body) ----
+
+    /** @private */
+    _badKey(k) {
+        throw new TypeError(
+            '[lite-o1] CuckooMap key must be a safe integer in [-(2^53-1), 2^53-1], got ' + String(k));
+    }
+
+    /** @private */
+    _badVal(v) {
+        throw new TypeError(
+            '[lite-o1] CuckooMap value must be a number and not NaN, got ' + String(v));
+    }
+
+    /** @private */
+    _full(k) {
+        throw new RangeError(
+            '[lite-o1] CuckooMap at capacity ' + this._cap + ' (0.90 load ceiling), cannot set key ' + String(k));
+    }
+
+    /** @private */
+    _fail(k) {
+        throw new RangeError(
+            '[lite-o1] CuckooMap could not place key ' + String(k) + ' after an in-place re-seed (load too high)');
     }
 }

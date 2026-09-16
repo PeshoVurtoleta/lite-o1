@@ -22,7 +22,7 @@
  */
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap } from '../../O1.js';
 
 const U = 1 << 16;      // universe 65536
 const CAP = 1 << 14;    // capacity 16384
@@ -1251,6 +1251,129 @@ const ringLogForEachDrain = {
     statsOf(s) { return { grows: ringLogGrows(s) }; },
 };
 
+// ===========================================================================
+// CuckooMap scenarios -- one Uint8Array occupancy signal + two Float64Array columns
+// (key + value), 2 tables x 4 slots. get / has / delete are WORST-CASE O(1) (<= 8 slot
+// reads); set is AMORTIZED O(1). The bucket probes + eviction chain are pure typed-slot
+// arithmetic over integer hashes -- no coercion, no heap double. All scenarios stay at a
+// MODERATE load (~0.5), far from the 0.90 ceiling and the O(capacity) re-seed (the sole,
+// rare allocator), so every measured op is strict zero-alloc.
+// ===========================================================================
+
+const CUCK_CAP = 1 << 14; // requested capacity (usable rounds up >= this)
+const CUCK_W = 1 << 13;   // 8192 resident keys -> ~0.5 load, never near the ceiling
+const CUCK_MASK = CUCK_W - 1; // power-of-2 mask: key & MASK is always in [0, CUCK_W)
+
+/**
+ * The zero-alloc counter for CuckooMap scenarios: the byte lengths of the occupancy signal
+ * + BOTH Float64Array columns. Capacity is fixed at construction (no re-seed at this load),
+ * so this NEVER grows -- the delta across the window must be 0 (the `cuckGrows` 0-delta
+ * canary; mirrors grows / ringGrows / ... / ringLogGrows).
+ */
+function cuckGrows(s) {
+    const m = s.cuck;
+    return m._occ.buffer.byteLength + m._keys.buffer.byteLength + m._vals.buffer.byteLength;
+}
+
+/** A CuckooMap primed with a bounded resident window (~0.5 load, steady-state churn). */
+function cuckFill() {
+    const cuck = new CuckooMap(CUCK_CAP);
+    for (let k = 0; k < CUCK_W; k++) cuck.set(k, k);
+    return cuck;
+}
+
+/**
+ * get-hit: a prefilled map; every op a resident lookup (the <= 8-slot bounded probe),
+ * int32-wrapped acc so the read is never dead-code-eliminated / promoted to a heap double.
+ */
+const cuckGetHit = {
+    name: 'CuckooMap get-hit',
+    setup() { return { cuck: cuckFill(), acc: 0 }; },
+    hot(s, n) {
+        const cuck = s.cuck;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) acc = (acc + (cuck.get(i & CUCK_MASK) | 0)) | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: cuckGrows(s) }; },
+};
+
+/** has-hit: a prefilled map; every op a resident membership probe, int32-wrapped acc. */
+const cuckHasHit = {
+    name: 'CuckooMap has-hit',
+    setup() { return { cuck: cuckFill(), acc: 0 }; },
+    hot(s, n) {
+        const cuck = s.cuck;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) acc = (acc + (cuck.has(i & CUCK_MASK) ? 1 : 0)) | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: cuckGrows(s) }; },
+};
+
+/**
+ * set-churn: a prefilled map; each op deletes a walking key then re-inserts it (an
+ * empty-slot / short-eviction insert). Size oscillates CUCK_W-1 -> CUCK_W (< the ceiling,
+ * no re-seed), every key stays in [0, CUCK_W), and every op is a real delete + set. Keys
+ * are SMI ints (masked) -> no coercion, no heap double. Zero-alloc.
+ */
+const cuckSetChurn = {
+    name: 'CuckooMap set-churn (delete + re-insert)',
+    setup() { return { cuck: cuckFill(), k: 0 }; },
+    hot(s, n) {
+        const cuck = s.cuck;
+        let k = s.k | 0;
+        for (let i = 0; i < n; i++) {
+            cuck.delete(k);      // remove the walking key
+            cuck.set(k, k * 3);  // re-insert it (empty-slot / short-eviction path)
+            k = (k + 1) & CUCK_MASK;
+        }
+        s.k = k | 0;
+    },
+    statsOf(s) { return { grows: cuckGrows(s) }; },
+};
+
+/**
+ * update-churn: a prefilled map; each op OVERWRITES a present key's value (no eviction, no
+ * growth) -- the update-in-place hot body. int32 value so no heap double.
+ */
+const cuckUpdateChurn = {
+    name: 'CuckooMap update-in-place-churn',
+    setup() { return { cuck: cuckFill(), k: 0 }; },
+    hot(s, n) {
+        const cuck = s.cuck;
+        let k = s.k | 0;
+        for (let i = 0; i < n; i++) {
+            cuck.set(k, i | 0); // present key -> value overwrite, size unchanged
+            k = (k + 1) & CUCK_MASK;
+        }
+        s.k = k | 0;
+    },
+    statsOf(s) { return { grows: cuckGrows(s) }; },
+};
+
+/**
+ * CuckooMap forEach-drain: a primed map scanned each op through a HOISTED module-scope
+ * callback (never re-created per op). Proves forEach itself (the alloc-free dense-slot
+ * scan; the ONE per-protocol allocator is [Symbol.iterator], gated separately by
+ * cuckMustFailAlloc) allocates nothing over its own dedicated window.
+ */
+let cuckDrainAcc = 0;
+function cuckForEachInto(k, v) { cuckDrainAcc = (cuckDrainAcc + k + v) | 0; }
+const cuckForEachDrain = {
+    name: 'CuckooMap forEach-drain',
+    setup() {
+        const cuck = new CuckooMap(CUCK_CAP);
+        for (let i = 0; i < 256; i++) cuck.set(i, i); // bounded resident set to scan
+        return { cuck };
+    },
+    hot(s, n) {
+        const cuck = s.cuck;
+        for (let i = 0; i < n; i++) cuck.forEach(cuckForEachInto);
+    },
+    statsOf(s) { return { grows: cuckGrows(s) }; },
+};
+
 const scenarios = [
     addChurn, hasHit, deleteChurn, clearRefill, forEachDrain,
     ringFifo, ringLifo, ringInterleave,
@@ -1263,6 +1386,7 @@ const scenarios = [
     twScheduleChurn, twDrainDrain, twCancelChurn, twAdvanceTick, twForEachDrain,
     htwScheduleChurn, htwDrainCascade, htwCancelChurn, htwAdvanceTick, htwForEachDrain,
     ringLogFillChurn, ringLogOverwriteChurn, ringLogGetScan, ringLogForEachDrain,
+    cuckGetHit, cuckHasHit, cuckSetChurn, cuckUpdateChurn, cuckForEachDrain,
 ];
 
 /**
@@ -1529,6 +1653,33 @@ const ringLogMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/**
+ * The CuckooMap teeth: a per-op `[Symbol.iterator]` spread into a FRESH [] each op -- the
+ * generator + its per-step `[key, value]` tuple objects + the {value, done} wrappers + the
+ * array MUST trip the gate (scavenges scale with n), proving the instrument has teeth on the
+ * CuckooMap surface too (its iterator is the ONE documented per-protocol allocator; forEach
+ * is the alloc-free scan). statsOf returns a constant so the failure is the allocation lanes,
+ * not a missing-counter artifact.
+ */
+const cuckMustFailAlloc = {
+    name: 'CuckooMap [Symbol.iterator] spread into fresh array (MUST allocate)',
+    setup() {
+        const cuck = new CuckooMap(256);
+        for (let i = 0; i < 64; i++) cuck.set(i, i);
+        return { cuck };
+    },
+    hot(s, n) {
+        const cuck = s.cuck;
+        let sink = 0;
+        for (let i = 0; i < n; i++) {
+            const arr = [...cuck]; // fresh generator + tuples + array per op -> heap churn
+            sink += arr.length;
+        }
+        s.sink = sink;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -1538,5 +1689,5 @@ zgcSuite({
     counters: { grows: 0 },
     maxRetainedKB: 64,
     scenarios,
-    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc, twMustFailAlloc, htwMustFailAlloc, ringLogMustFailAlloc],
+    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc, twMustFailAlloc, htwMustFailAlloc, ringLogMustFailAlloc, cuckMustFailAlloc],
 });

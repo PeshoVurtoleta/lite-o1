@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-Version: 1.1.0
+Version: 1.2.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -13,10 +13,11 @@ op is O(1) worst-case (or O(1)-amortized where stated) and allocates zero bytes
 after construction, and a shipped witness harness demonstrates the flat
 throughput curve against a built-in foil.
 
-v1.1.0 ships eleven members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
-RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, and RingLog. They
-share no mutable module state, so a bundler that imports one drops the others
-(tree-shakeable). 1.1.0 is additive + backward-compatible: it only adds RingLog.
+v1.2.0 ships twelve members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
+RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, and CuckooMap.
+They share no mutable module state, so a bundler that imports one drops the others
+(tree-shakeable). 1.2.0 is additive + backward-compatible: it only adds CuckooMap (1.1.0
+added RingLog).
 
 ## Exports (from the single main file O1.js)
 
@@ -47,7 +48,13 @@ share no mutable module state, so a bundler that imports one drops the others
   throws on full -- it OVERWRITES the oldest entry and RETURNS it (undefined until
   full). Read-only snapshot surface get() / oldest() / newest() / forEach() / iterate;
   NO drain (inverts RingDeque's fail-closed policy).
-- `VERSION` -- string, '1.1.0'.
+- `CuckooMap` -- class. A zero-GC bounded-probe exact map from GENERAL INTEGER keys
+  (|k| <= 2^53) to numbers, via bucketized cuckoo hashing (2 tables x 4 slots). get() /
+  has() / delete() are WORST-CASE O(1) (<= 8 slot reads); set() is AMORTIZED O(1) (an
+  eviction chain + a rare in-place O(capacity) re-seed -- the max-single-op line). Fixed
+  capacity, fail closed under a 0.90 load ceiling. 0 is a legal key (occupancy byte is the
+  only emptiness signal). O(capacity) space over a sparse / large integer key domain.
+- `VERSION` -- string, '1.2.0'.
 
 ## SparseSet
 
@@ -678,6 +685,69 @@ surface), NOT a queue you CONSUME -- there is deliberately NO popOldest / drain.
 for RingDeque when you need to drain entries or fail closed at capacity; reach for RingLog
 when you want to keep only the last N and never block.
 
+## CuckooMap
+
+    new CuckooMap(capacity, seed?)
+
+- A bounded-probe EXACT map from GENERAL INTEGER keys to numbers -- the suite's first
+  general-key dictionary. Keys are ANY safe integer (|k| <= 2^53, Number.isSafeInteger
+  range), NOT a dense [0, universe) like SparseSet: CuckooMap costs O(capacity) space over a
+  SPARSE / large integer key domain, versus SparseSet's O(universe) over a dense one. Values
+  are any finite number plus +/-Infinity (typeof 'number', not NaN), in a Float64 column.
+  Keys and values are numbers ONLY -- the zero-GC law forbids object / string references
+  (map them to integer handles).
+- Algorithm: BUCKETIZED cuckoo hashing, 2 tables x 4 slots. A lookup probes AT MOST 8 slots
+  ALWAYS -> HARD bounded-probe WORST-CASE O(1) for get / has / delete. set is AMORTIZED O(1):
+  a full home-bucket pair kicks a resident to its alternate bucket (an eviction chain bounded
+  by MaxLoop = 8*log2(cap)), and on a MaxLoop dead end ONE in-place O(capacity) RE-SEED (a
+  fresh per-instance seed + re-insert of every live entry) -- the member's MAX-SINGLE-OP line,
+  the thematic sibling of HierarchicalTimerWheel's cascade spike.
+- capacity: requested max live entries; integer in [1, 2^30]. The constructor rounds the
+  bucket count up (power of two) so the request fits UNDER a 0.90 load ceiling; the capacity
+  getter reports the usable capacity. seed: OPTIONAL uint32 for reproducible placement,
+  defaults deterministically.
+- Fixed capacity, fail closed: a set of a NEW key past the 0.90 ceiling, or one the eviction
+  chain + re-seed cannot place, throws [lite-o1] (the load-ceiling reject is a byte-identical
+  no-op). No silent growth.
+- Sentinel discipline: 0 is a LEGAL key and any finite number a legal value. Emptiness is
+  signalled ONLY by a Uint8Array occupancy column, NEVER by a 0 key / value ("null is not
+  zero"). Deletion clears the occupancy byte -- cuckoo needs no tombstones.
+- Hash: an inline murmur-style int32 finalizer over the 53-bit key (low 32 bits + high 21
+  bits + sign) with two decorrelated per-instance seeds, all int32 math (no coercion, no heap
+  double).
+
+Hot surface:
+
+- set(k, v) -> this        Insert / update. AMORTIZED O(1), zero-alloc on the common path.
+                        Guards typeof of BOTH k and v FIRST (a Symbol / BigInt / object never
+                        coerces); a bad key / value throws [lite-o1] a byte-identical no-op. An
+                        UPDATE of a present key overwrites the value (no eviction, size
+                        unchanged). A NEW key past the ceiling / an unplaceable key throws
+                        [lite-o1] fail closed. The in-place re-seed is the max-single-op spike.
+- get(k) -> number|undefined  WORST-CASE O(1), <= 8 slot reads. A bad / absent key -> undefined,
+                        NEVER throws (typeof-first).
+- has(k) -> boolean     WORST-CASE O(1). A bad / absent key -> false, never throws.
+- delete(k) -> boolean  WORST-CASE O(1): clears the occupancy byte, decrements size. true iff
+                        present; never throws.
+- clear() -> void       O(capacity): zeroes the occupancy signal (a Uint8Array fill), resets
+                        size. The key / value columns are left as stale, unreachable numbers.
+- size / capacity (usable) / seed (uint32) / load (size/capacity) -- getters.
+- forEach(fn) -> void   O(capacity) alloc-free scan in DENSE SLOT order; fn is (key, value, map).
+- [Symbol.iterator]()   O(capacity) scan yielding [key, value] tuples; the ONE per-protocol
+                        ALLOCATOR -- use forEach for the alloc-free scan.
+
+Key / value contract (LOCKED): a key must be typeof 'number' AND Number.isSafeInteger
+(|k| <= 2^53); a value must be typeof 'number' AND not NaN (+/-Infinity accepted). Rejected on
+set (throws [lite-o1], a byte-identical no-op): null, undefined, string, Symbol, BigInt, object
+(incl. one with a numeric valueOf), NaN, a non-safe-integer key. The typeof guard runs FIRST so
+a Symbol / BigInt never reaches arithmetic. -0 aliases key 0.
+
+SparseSet vs CuckooMap (the space contrast): SparseSet is an O(universe)-space DENSE integer
+SET (membership only) over a bounded [0, universe); CuckooMap is an O(capacity)-space exact MAP
+(key -> number) over SPARSE / large integer keys. Pick SparseSet when keys are dense + bounded
+and you need only membership; pick CuckooMap when keys are sparse / large and you need values.
+(For APPROXIMATE membership with false positives, reach for @zakkster/lite-filter instead.)
+
 ## Design bounds
 
 - SparseSet valid key: integer in [0, universe).
@@ -756,10 +826,22 @@ when you want to keep only the last N and never block.
   push / get / oldest / newest are WORST-CASE O(1); get out-of-range / non-int returns
   undefined, oldest / newest undefined on empty (never throw). forEach / [Symbol.iterator]
   scan oldest -> newest (iterator allocates).
+- CuckooMap valid key: any safe integer, |k| <= 2^53 (Number.isSafeInteger); valid value:
+  typeof 'number' and not NaN (+/-Infinity accepted). Fixed capacity (rounded up under a 0.90
+  load ceiling), no growth. BUCKETIZED cuckoo (2 tables x 4 slots): get / has / delete are
+  WORST-CASE O(1) (<= 8 slot reads); set is AMORTIZED O(1) (eviction chain bounded by
+  MaxLoop = 8*log2(cap), then one in-place O(capacity) re-seed -- the max-single-op line).
+  Fail closed on set (a NEW key past the ceiling / an unplaceable key throws [lite-o1], a
+  byte-identical no-op on the load-ceiling reject; a bad key / value throws typeof-first),
+  absent / false on the queries get / has / delete (never throw). 0 is a LEGAL key + any finite
+  number a legal value -- emptiness is a Uint8Array occupancy byte, never a 0 sentinel; no
+  tombstones (a lookup visits only the two home buckets). Space O(capacity) over a sparse /
+  large integer key domain (vs SparseSet's O(universe) over a dense one). clear() is O(capacity)
+  (a Uint8Array fill). forEach / [Symbol.iterator] scan in dense slot order (iterator allocates).
 
 ## Scripts
 
-- npm test           -- 503 node:test cases (contract + boundary + differential fuzz).
+- npm test           -- 525 node:test cases (contract + boundary + differential fuzz).
 - npm run test:types -- tsc --noEmit against O1.d.ts.
 - npm run torture    -- lite-leak + lite-gc-profiler: 0 B/op, 0 major GC, leak-free.
 - npm run witness    -- O(1) throughput-invariance harness + foils + flatness gate.
@@ -846,14 +928,24 @@ when you want to keep only the last N and never block.
   UNLIKE TimerWheel, it WEARS a MAX-single-op line: the witness gates a visible cascade
   SPIKE (a level-0 wrap re-filing a heavily-loaded level-1 bucket down) at >= 8x the
   typical tick -- the amortized-honesty bar for the cascade, the member's headline.
+- CuckooMap: size-sweep [1e4, 1e5, 1e6], bounded-probe WORST-CASE-O(1) lookup (get over a
+  mix of hits + misses, <= 8 slot reads) vs a naive O(n) LINEAR-SCAN map (parallel
+  Float64Array key/value columns searched by a linear scan, the obvious no-hashing way).
+  ops/ms is a rate (map batch 5e5, naive batch 2e2). Gated over the DRAM-resident steady
+  window size >= 1e5 (the 1e4 point is an L2 turbo micro-case shown but not gated). CuckooMap
+  flatness >= 0.70; naive foil flatness <= 0.55 (a TRUE O(n) foil, so it collapses);
+  CuckooMap/naive ratio >= 1.5x. LIKE HierarchicalTimerWheel it WEARS a MAX-single-op line:
+  the witness prints the in-place O(capacity) RE-SEED spike (9 fully-colliding keys trip
+  MaxLoop) beside a typical O(1) set, gated as a visible >= 2x spike -- the amortized-honesty
+  bar for set.
 
 ## Not yet shipped
 
-The public API is STABLE; 1.1.0 adds RingLog (additive, backward-compatible -- the prior
-ten members are unchanged). Not in this release, planned for later: SlotPool (a free-list
-slot allocator with generational ABA-safe handles), CuckooMap / Hopscotch (a general-key
-worst-case-O(1) map), and SparseTable / StaticRMQ (an O(1)-query static range-minimum
-table). SparseSet holds membership, not payloads (store values in a parallel SoA
+The public API is STABLE; 1.2.0 adds CuckooMap (additive, backward-compatible -- the prior
+eleven are unchanged; 1.1.0 added RingLog). Not in this release, planned for later:
+SlotPool (a free-list slot allocator with generational ABA-safe handles) and SparseTable /
+StaticRMQ (an O(1)-query static range-minimum table, the remaining post-1.0 member -> 1.3.0).
+SparseSet holds membership, not payloads (store values in a parallel SoA
 column or @zakkster/lite-arena); RingDeque holds numbers only; UnionFind holds
 disjoint-set connectivity over [0, n), not payloads; MonoDeque holds numeric
 window extremes only, MinStack holds numeric stack values + their running
@@ -868,4 +960,7 @@ IDS over [0, universe) filed against a delay in [0, 2^26) -- a BOUNDED CASCADING
 wheel, not an UNbounded one (a fully unbounded / hashed wheel remains a deferred future
 member; both wheels schedule integer handles for object payloads, not payloads directly);
 and RingLog holds numbers only, a LOSSY rolling window you READ (keep the last N,
-overwrite-oldest) -- NOT a consumable queue (reach for RingDeque to drain / fail closed).
+overwrite-oldest) -- NOT a consumable queue (reach for RingDeque to drain / fail closed) --
+and CuckooMap holds an exact integer-key -> number MAP over sparse / large safe-integer keys
+(|k| <= 2^53), O(capacity) space (NOT SparseSet's O(universe) dense set, NOT lite-filter's
+approximate membership; map object payloads to integer handles).

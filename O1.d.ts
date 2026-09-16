@@ -615,3 +615,66 @@ export class RingLog {
     /** Iterate live entries oldest -> newest. Allocates per protocol. */
     [Symbol.iterator](): IterableIterator<number>;
 }
+
+/**
+ * CuckooMap -- a zero-GC, bounded-probe exact map from GENERAL INTEGER keys to numbers.
+ * The suite's first general-key dictionary: keys are ANY safe integer (|k| <= 2^53), NOT a
+ * dense [0, universe) like SparseSet -- so it costs O(capacity) space over a sparse / large
+ * integer key domain rather than SparseSet's O(universe). Values are any finite number plus
+ * +/-Infinity (typeof 'number', not NaN), stored in a Float64 column; keys and values are
+ * numbers ONLY. Algorithm: bucketized cuckoo hashing (2 tables x 4 slots) -> get / has /
+ * delete are WORST-CASE O(1) (at most 8 slot reads); set is AMORTIZED O(1) (an eviction
+ * chain bounded by MaxLoop, then ONE in-place O(capacity) re-seed -- the max-single-op line).
+ * Fixed capacity, fail closed: the constructor rounds the table up so the requested capacity
+ * fits under a 0.90 load ceiling (the `capacity` getter reports the usable capacity); a set
+ * past the ceiling, or one the re-seed cannot place, throws [lite-o1] (the load-ceiling reject
+ * is a byte-identical no-op). 0 is a legal key and any finite number a legal value -- emptiness
+ * is an occupancy byte, never a 0 sentinel. set typeof-guards BOTH the key and value FIRST;
+ * get / has / delete never throw.
+ */
+export class CuckooMap {
+    /**
+     * @param capacity  requested max live entries; an integer in [1, 2^30]. The `capacity`
+     *                  getter reports the usable value after rounding under the 0.90 ceiling.
+     * @param seed      OPTIONAL uint32 seed for reproducible placement; defaults deterministically.
+     */
+    constructor(capacity: number, seed?: number);
+
+    /** Number of live entries. */
+    readonly size: number;
+
+    /** Usable capacity (max live entries under the 0.90 load ceiling). */
+    readonly capacity: number;
+
+    /** Current per-instance hash seed as a uint32 (changes on an in-place re-seed). */
+    readonly seed: number;
+
+    /** Current load factor: size / capacity, in [0, 1]. */
+    readonly load: number;
+
+    /**
+     * Insert / update k -> v. Amortized O(1). Returns this. An update of a present key
+     * overwrites the value (no eviction). Throws [lite-o1] (a byte-identical no-op) on a bad
+     * key (not a safe integer) or value (not a number / NaN), and fail-closed at the 0.90
+     * load ceiling or when an eviction chain + re-seed cannot place a new key.
+     */
+    set(k: number, v: number): this;
+
+    /** The value bound to k, or `undefined` if absent / not a safe integer. Worst-case O(1) (<= 8 reads). Never throws. */
+    get(k: number): number | undefined;
+
+    /** True iff k is present. Worst-case O(1). A bad key is absent. Never throws. */
+    has(k: number): boolean;
+
+    /** Remove k. Worst-case O(1). Returns true iff k was present. A bad / absent key returns false. Never throws. */
+    delete(k: number): boolean;
+
+    /** Empty the map. O(capacity): zeroes the occupancy signal; the columns are left as stale, unreachable numbers. */
+    clear(): void;
+
+    /** Iterate live entries in dense slot order, alloc-free. fn is (key, value, map). */
+    forEach(fn: (key: number, value: number, map: CuckooMap) => void): void;
+
+    /** Iterate [key, value] tuples in dense slot order. Allocates per protocol. */
+    [Symbol.iterator](): IterableIterator<[number, number]>;
+}

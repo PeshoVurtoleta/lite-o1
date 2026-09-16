@@ -8,6 +8,77 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.2.0] - 2026-09-16
+
+### Added
+
+- **`CuckooMap` -- the twelfth member: a zero-GC, bounded-probe exact map from GENERAL
+  INTEGER keys to numbers.** The suite's first general-key dictionary -- keys are ANY safe
+  integer (`|k| <= 2^53`, `Number.isSafeInteger` range), NOT a dense `[0, universe)` like
+  SparseSet, so it costs O(capacity) space over a sparse / large integer key domain rather
+  than SparseSet's O(universe). Values are any finite number plus `+/-Infinity` (a Float64
+  column); keys and values are numbers ONLY (the zero-GC law forbids reference storage).
+  Algorithm: BUCKETIZED cuckoo hashing, 2 tables x 4 slots -- `get` / `has` / `delete` probe
+  AT MOST 8 slots, HARD bounded-probe WORST-CASE O(1); `set` is AMORTIZED O(1) (an eviction
+  chain bounded by `MaxLoop = 8*log2(cap)`, then ONE in-place O(capacity) RE-SEED that
+  WEARS the max-single-op line -- the thematic sibling of HierarchicalTimerWheel's cascade
+  spike). Fixed capacity, fail closed: the constructor rounds the bucket count up (power of
+  two) so the requested capacity fits under a 0.90 load ceiling (the `capacity` getter
+  reports the usable capacity); a `set` past the ceiling, or one the eviction chain + re-seed
+  cannot place, throws `[lite-o1]` (the load-ceiling reject is a byte-identical no-op). Hash
+  is an inline murmur-style integer finalizer over the 53-bit key with two per-instance
+  seeds, all int32 math (no coercion, no heap double, ASCII hex constants). `0` is a LEGAL
+  key and any finite number a legal value -- emptiness is signalled ONLY by a `Uint8Array`
+  occupancy column, never by a 0 key / value ("null is not zero"). `set` typeof-guards BOTH
+  the key and value FIRST; `get` / `has` / `delete` never throw. The only allocators are the
+  constructor, the per-protocol `[Symbol.iterator]`, and the rare O(capacity) re-seed.
+  Surface: `set(k,v) -> this`, `get(k) -> number|undefined`, `has(k) -> boolean`,
+  `delete(k) -> boolean`, `clear()`, `forEach(fn)` (alloc-free), `[Symbol.iterator]`, and
+  getters `size` / `capacity` / `seed` / `load`. See the settled calls in
+  [`decisions/0017`](./decisions/0017-cuckoomap.md).
+- **`test/CuckooMap.test.js`** -- full behavioral suite: constructor rounding + RangeError
+  cases (bad capacity / bad optional seed, typeof-first), 0-is-a-legal-key round-trip (`0`
+  and `-0` alias; a `0` value is a real value), general negative + 2^53 key ranges,
+  update-in-place (overwrite, size unchanged, no spurious eviction), the typeof-guard
+  adversarial for BOTH key and value (`null` / `undefined` / string / Symbol / BigInt /
+  object-with-`valueOf` / NaN / non-safe-integer throw a byte-identical no-op and never
+  coerce; `get` / `has` / `delete` return `undefined` / `false` / `false`), `+/-Infinity`
+  accepted, the load-ceiling fail-closed throw proven byte-identical (occ + both columns
+  unchanged), an eviction-chain white-box + an in-place re-seed white-box (force `MaxLoop`
+  via 9 fully-colliding keys, assert every key survives + size intact + the seed rotated), a
+  bounded-probe assertion (a replicated `<= 8`-slot model cross-checked against `get` over
+  `>= 1e6` lookups), forEach + iterator order, clear-then-reuse, and a **>= 1e5-op
+  differential fuzz** vs a native `Map` oracle (mixed set / get / delete / has over random
+  integer keys incl. `0` + negatives, 0 divergences, non-vacuous).
+- CuckooMap wired into the gates: a `cuck` lane in `test/torture.mjs` (a moderate-load
+  delete + re-insert hot loop at 0 B/op + a fill/clear retention cycle), five scenarios +
+  a `cuckGrows` 0-delta canary + a `[Symbol.iterator]` must-fail in
+  `test/perf/PerfGate.test.mjs`, and a `buildCuckooMap` witness vs a naive O(n) linear-scan
+  map foil (collapses) with the in-place re-seed max-single-op spike in `test/witness.mjs`.
+
+### Changed
+
+- Version bumped **1.1.0 -> 1.2.0** (additive, backward-compatible -- the prior eleven
+  members are byte-identical; the sole `O1.js` edits are the header member-count, the
+  `VERSION` string, and the appended `CuckooMap` class). `VERSION` const / `package.json` /
+  `llms.txt` in lockstep, enforced by the version-trinity test. New keywords (cuckoo,
+  cuckoo-hashing, hash-map, hashmap, dictionary, exact-map, open-addressing, bounded-probe,
+  integer-map).
+
+### Docs
+
+- `GUIDE.md` gains a CuckooMap flowchart leaf, a picker-table row, a `### CuckooMap (v1.2.0)`
+  per-member section, and a SparseSet-vs-CuckooMap contrast (O(universe) dense integer set
+  vs O(capacity) exact map over sparse / large integer keys) plus an approximate lite-filter
+  contrast; intro count/version -> twelve / v1.2.0.
+- `README.md` integrates CuckooMap across the spine (positioning + what-you-get, a Zero-GC
+  design allocation table, API reference + a constants note, GOOD-FOR / NOT-FOR bullets incl.
+  the SparseSet-vs-CuckooMap contrast, testing count); the repo-only benchmark matrix + its
+  80-cell numbers are unchanged (CuckooMap stays out of the bench, like RingLog).
+- `llms.txt` -> Version 1.2.0, twelve members, `VERSION -- '1.2.0'`, a `## CuckooMap` surface
+  section + a design-bounds entry, the witness-gate note, and a roadmap that lists only
+  SparseTable / StaticRMQ (1.3.0) as remaining post-1.0 work.
+
 ## [1.1.0] - 2026-09-16
 
 ### Added

@@ -1,7 +1,7 @@
 # lite-o1 -- which structure to pick (GUIDE)
 
 A repo-only decision guide for the O(1) family: which member, reach-for / avoid,
-and how to measure the constant yourself. At v1.1.0 the family is STABLE at eleven
+and how to measure the constant yourself. At v1.2.0 the family is STABLE at twelve
 members and this guide is complete for them -- still open (a new section lands with
 each future member), but no longer a skeleton. It is NOT an API encyclopedia (that
 is the README + `O1.d.ts`); it answers "which member, and is my constant real?"
@@ -23,7 +23,7 @@ flatness floor for YOUR workload -- run `npm run witness` and read the shape.
 
 ## Which member? (decision flowchart)
 
-ASCII, routes on the discriminating questions. Every leaf is one of the eleven
+ASCII, routes on the discriminating questions. Every leaf is one of the twelve
 members; `(wc)` = worst-case O(1), `(am)` = amortized O(1).
 
 ```
@@ -34,6 +34,9 @@ START -- what is the SHAPE of your workload?
 |     +-- also need a UNIFORM-RANDOM live member (sample / removeRandom)? -> RandomSet (wc)
 |     +-- also need the LEAST-FREQUENTLY-USED key (access counts, LFU victim)? -> FreqO1 (wc)
 |     +-- just add / has / delete / O(1) clear / dense iterate? -> SparseSet (wc)
+|
++-- An exact key -> NUMBER map over SPARSE / large INTEGER keys (|k| <= 2^53),
+|   not a dense [0, universe)? -> CuckooMap (am set / wc lookup)
 |
 +-- A LINEAR sequence of NUMBERS you push/pop (stack or queue)?
 |     |
@@ -59,10 +62,12 @@ START -- what is the SHAPE of your workload?
 ```
 
 Budget rule of thumb: if you cannot tolerate ANY per-op spike (hard-real-time on
-the WORST single op), stay on the seven `(wc)` members. The four `(am)` members
-(UnionFind, MonoDeque, BucketQueue, HierarchicalTimerWheel) buy their constant with
-an amortized average and wear an honest worst-single-op tail -- read the MAX-single-op
-line the witness prints, and the per-member "avoid it when" notes below.
+the WORST single op), stay on the seven `(wc)` members. The five `(am)` members
+(UnionFind, MonoDeque, BucketQueue, HierarchicalTimerWheel, CuckooMap) buy their constant
+with an amortized average and wear an honest worst-single-op tail -- read the MAX-single-op
+line the witness prints, and the per-member "avoid it when" notes below. (CuckooMap's
+lookup -- get / has / delete -- is worst-case O(1), a hard <= 8-slot probe; only its `set`
+is amortized, wearing the in-place re-seed spike.)
 
 ## Which member? (picker table)
 
@@ -81,6 +86,7 @@ One row per member; pick by the left column, confirm with the discriminator.
 | timers over a delay horizon that fits ONE rotation           | TimerWheel             | worst-case  | simple Varghese-Lauck wheel; drain-before-advance, no spike  |
 | timers over a WIDE but bounded delay horizon (< 2^26)        | HierarchicalTimerWheel | amortized   | cascading tvec wheel; O(1) amortized, periodic cascade spike |
 | "keep the last N" numbers, never block, overwrite the oldest  | RingLog                | worst-case  | lossy overwrite-oldest ring; push returns the evicted; read-only, no drain |
+| an exact key -> number MAP over sparse / large INTEGER keys   | CuckooMap              | amortized*  | bucketized cuckoo, <= 8-slot probe; *lookup wc, set amortized (re-seed spike) |
 
 ---
 
@@ -538,18 +544,71 @@ there is no amortized spike to expose -- the flat line IS the worst-case claim.
 
 ---
 
+### CuckooMap (v1.2.0)
+
+An exact key -> number MAP over GENERAL INTEGER keys (`|k| <= 2^53`,
+`Number.isSafeInteger`), via bucketized cuckoo hashing (2 tables x 4 slots). `get` / `has`
+/ `delete` probe AT MOST 8 slots -> a HARD bounded-probe WORST-CASE O(1) lookup; `set` is
+AMORTIZED O(1) (an eviction chain bounded by `MaxLoop = 8*log2(cap)`, then ONE in-place
+O(capacity) re-seed on a dead end -- the max-single-op spike). Fixed capacity, fail closed
+under a 0.90 load ceiling. Values are numbers (any finite number + `+/-Infinity`); `0` is a
+legal key (an occupancy byte is the only emptiness signal). Space is O(capacity) over a
+sparse / large integer key domain.
+
+**Reach for it when:**
+
+- You need an EXACT key -> value map (not membership, not approximate) and the keys are
+  integers that are SPARSE or over a LARGE domain -- entity / handle ids, hashes truncated
+  to 53 bits, sparse node ids -- so a dense SparseSet-style `[0, universe)` array would waste
+  O(universe) memory.
+- You need a HARD per-LOOKUP budget: `get` / `has` / `delete` are worst-case O(1) (at most
+  8 slot reads), never an amortized probe chain -- the guarantee a general hash map's average
+  case cannot make.
+- You want zero per-op allocation and zero GC on the lookup path (the values live in a
+  `Float64` column; no boxed keys, no per-op objects).
+- The values are numbers (or integer handles into a parallel payload store).
+
+**Avoid it when:**
+
+- Keys are DENSE and bounded `[0, universe)` -- reach for **SparseSet** (an O(universe) dense
+  integer SET with an O(1) clear) or **RandomSet** / **FreqO1** for the same domain with
+  sampling / LFU. CuckooMap trades that O(universe) dense array for O(capacity) over a sparse
+  domain; do not pay the cuckoo hashing for keys a dense array already serves for free.
+- Keys are STRINGS or OBJECTS -- CuckooMap is integer-keyed (the zero-GC law forbids
+  reference storage). Map them to integer handles first, or use a native `Map`.
+- You can tolerate FALSE POSITIVES for a big memory win (approximate membership, not exact
+  lookup) -- reach for `@zakkster/lite-filter` (Bloom / cuckoo / binary-fuse filters).
+- You cannot bound capacity up front, or you cannot tolerate the occasional re-seed spike on
+  `set` in a hard-real-time WRITE path (the lookup path has no spike; only `set` does).
+
+**SparseSet vs CuckooMap** (the space contrast): both key on integers, but SparseSet is an
+O(universe)-space DENSE integer SET (membership only, `[0, universe)`), while CuckooMap is an
+O(capacity)-space exact MAP (key -> number) over SPARSE / large integer keys (`|k| <= 2^53`).
+Pick SparseSet when the key range is dense + bounded and you need only membership + an O(1)
+clear; pick CuckooMap when the keys are sparse / large and you need to store a value per key.
+For APPROXIMATE membership (false positives OK, no values), neither fits -- reach for
+`@zakkster/lite-filter`.
+
+**Measure it:** `npm run witness` -- CuckooMap lookup flatness `>= 0.70` across the
+DRAM-resident sweep `[1e5..1e6]` (the 1e4 point is an L2 turbo micro-case, shown but not
+gated) while a naive O(n) linear-scan map foil collapses (`<= 0.55`), ratio `>= 1.5x`. It
+WEARS a MAX-single-op line: the witness prints the in-place O(capacity) re-seed spike (9
+fully-colliding keys trip `MaxLoop`) beside a typical O(1) `set`, gated `>= 2x` -- the
+amortized-honesty bar for `set`, the thematic sibling of HierarchicalTimerWheel's cascade.
+
+---
+
 ## Roadmap members (not yet shipped, planned)
 
-The public API is stable at v1.1.0's eleven members; these are planned, not shipped.
+The public API is stable at v1.2.0's twelve members; these are planned, not shipped.
 Placeholders so the decision axes are visible early; each fills in on release.
 
 - **SlotPool** -- free-list slot allocator with generational (ABA-safe) handles.
   Reach for it as the SoA substrate; reconcile against `@zakkster/lite-arena`
   before picking one.
-- **CuckooMap / Hopscotch** -- a general-key (not integer-bounded) worst-case-O(1)
-  map, for when the key space is not a small bounded integer range.
 - **SparseTable / StaticRMQ** -- an O(1)-query static range-minimum table (build
   once, query O(1)); carries the "admit static, build-once members?" boundary call.
+  The remaining post-1.0 member -> 1.3.0.
 
 ---
 
