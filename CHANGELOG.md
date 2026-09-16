@@ -10,9 +10,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **8-dimension benchmark suite (`benchmark/`, repo-only -- NOT part of the
   published surface, NO version bump).** The ecosystem MVP of RESEARCH.md section 3:
-  it profiles six of the nine shipped members (SparseSet, RingDeque, UnionFind,
-  MonoDeque, MinStack, RandomSet; FreqO1, BucketQueue, and TimerWheel are not yet
-  in the matrix)
+  it profiles all nine shipped members (SparseSet, RingDeque, UnionFind, MonoDeque,
+  MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel)
   against the JS built-ins across eight axes -- D1 latency distribution
   (p50/p90/p99/p99.9/max, with + without forced GC), D2 amortized drift over long
   mixed traces, D3 memory footprint + stability, D4 cache behaviour (a labelled
@@ -33,6 +32,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   impossible 0 fails) + FIXED-SEED DETERMINISM (two runs at seed `0x9e3779b1`
   produce byte-identical workload trace hashes, using the repo's own Numerical
   Recipes LCG -- no new PRNG introduced).
+- **Benchmark accuracy additions (repo-only, no version bump).** The suite now
+  profiles all NINE shipped members (FreqO1 / BucketQueue / TimerWheel added to the
+  matrix, mirroring their `test/witness.mjs` foils: a naive LFU min-scan, an
+  alloc-free binary min-heap, and a naive O(n)-scan scheduler). D1 gains a true
+  per-op tail (`p99` / `max` via `process.hrtime.bigint()`, calibrated empty-call
+  overhead subtracted and clamped >= 0) for the AMORTIZED members (MonoDeque,
+  UnionFind, BucketQueue) -- `n/a` (never 0) for the worst-case-O(1) members. New
+  `Harness.stats()` (median / mean / cv / stable, fail-closed on empty / zero-mean)
+  and a post-run drift sentinel (re-times SparseSet/D1 and DISCLOSES thermal / turbo
+  drift > 10% -- a warning, not a hard failure). CPU model + count recorded in the
+  report meta. Every dispatch site is now an explicit per-member branch ending in a
+  loud `throw` (an unknown member fails closed, never silently defaults to RandomSet).
 
 ## [0.9.0] - 2026-09-16
 

@@ -407,7 +407,7 @@ amortized drift, memory, cache proxy, bundle size, GC pressure, key-type / load-
 scaling, and workload micro-benches:
 
 ```bash
-npm run bench          # all 48 (member x dimension) cells, one child process each
+npm run bench          # all 72 (member x dimension) cells, one child process each
 npm run bench:report   # renders a zero-dep HTML report -> benchmark/report.html
 ```
 
@@ -415,10 +415,10 @@ Decision-relevant highlights (full charts + tables in `benchmark/report.html`):
 
 | axis | what to read | what the members show |
 |------|--------------|-----------------------|
-| D5 bundle | single-member gzip vs all-member (~2.1 KB) | each lone import drops the other five; every member < 40% of all, MonoDeque closest at ~0.39 (it is the heaviest member) |
-| D6 GC | zero-alloc + max major GC over n=1e3..1e6 | 0 B/op, 0 major GC, sub-ms pause for all six -- the 0 B/op gate as a curve |
-| D3 memory | bytes/live vs theoretical min | SparseSet + RandomSet 2.0x (sparse index), RingDeque + UnionFind 1.0x, MinStack 2.0x (running-extreme column); all fixed-capacity (clear() keeps the buffer) |
-| D1 latency | p99 / max ns/op (with + without GC) | flat tails; amortized members (UnionFind, MonoDeque) show their worst single op vs the typical one, while MinStack is worst-case O(1) |
+| D5 bundle | single-member gzip vs all-member (~4.3 KB) | each lone import drops the other eight; every member < 40% of all, TimerWheel closest at ~0.32 (the newer members carry the heaviest machinery) |
+| D6 GC | zero-alloc + max major GC over n=1e3..1e6 | 0 B/op, 0 major GC, sub-ms pause for all nine -- the 0 B/op gate as a curve |
+| D3 memory | bytes/live vs theoretical min | SparseSet + RandomSet 2.0x (sparse index), RingDeque + UnionFind 1.0x, MinStack 2.0x (running-extreme column); FreqO1's bytes/live is load-dependent (bucket free-list + O(distinct-freq) pool); all fixed-capacity (clear() keeps the buffer) |
+| D1 latency | p99 / max ns/op (with + without GC) | flat tails; amortized members (UnionFind, MonoDeque, BucketQueue) show a true per-op tail (p99/max via hrtime) for their worst single op vs the typical one, while the worst-case-O(1) members read n/a there |
 
 D4 is a labelled PORTABLE PROXY (dense-iteration vs random-lookup + a working-set
 stride sweep) -- no native perf counters. The applicability matrix prints `n/a`

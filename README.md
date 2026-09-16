@@ -1273,7 +1273,7 @@ For SparseSet the suite covers: constructor validation (every bad `universe` / `
 
 The **eight-dimension benchmark suite** -- the ecosystem MVP of the research notes --
 lives in `benchmark/` as repo-only dev infra (it is NOT in the published tarball and
-NOT a data-structure member). It profiles all six members against the JS built-in
+NOT a data-structure member). It profiles all nine members against the JS built-in
 each one replaces, across eight axes that a single ops/ms number hides: D1 latency
 distribution (p50..max, with + without forced GC), D2 amortized drift, D3 memory,
 D4 cache behaviour (a labelled PORTABLE PROXY -- no native perf counters), D5 bundle
@@ -1281,7 +1281,7 @@ size + tree-shaking, D6 GC pressure + allocation curve, D7 key-type + load-facto
 scaling, and D8 workload micro-benches.
 
 ```bash
-npm run bench          # run all 48 (member x dimension) cells, one child process each
+npm run bench          # run all 72 (member x dimension) cells, one child process each
 npm run bench:report   # the above, then render a zero-dep HTML report (hand-rolled SVG)
                        #   -> benchmark/report.html (open it for the full charts + tables)
 ```
@@ -1290,33 +1290,40 @@ Key deterministic results (machine-independent; latency / throughput numbers var
 host and live in the report):
 
 **D5 -- bundle size + tree-shaking** (esbuild minify + gzip). A single-member import
-drops the other five; the all-member import is ~2.1 KB gzipped:
+drops the other eight; the all-member import is ~4.3 KB gzipped:
 
 | import        | gzip (single) | gzip (all) | single / all |
 |---------------|---------------|------------|--------------|
-| SparseSet     | ~577 B        | ~2081 B    | ~0.28        |
-| RingDeque     | ~646 B        | ~2081 B    | ~0.31        |
-| UnionFind     | ~594 B        | ~2081 B    | ~0.29        |
-| MonoDeque     | ~817 B        | ~2081 B    | ~0.39        |
-| MinStack      | ~604 B        | ~2081 B    | ~0.29        |
-| RandomSet     | ~716 B        | ~2081 B    | ~0.34        |
+| SparseSet     | ~579 B        | ~4352 B    | ~0.13        |
+| RingDeque     | ~649 B        | ~4352 B    | ~0.15        |
+| UnionFind     | ~602 B        | ~4352 B    | ~0.14        |
+| MonoDeque     | ~823 B        | ~4352 B    | ~0.19        |
+| MinStack      | ~609 B        | ~4352 B    | ~0.14        |
+| RandomSet     | ~722 B        | ~4352 B    | ~0.17        |
+| FreqO1        | ~1356 B       | ~4352 B    | ~0.31        |
+| BucketQueue   | ~1174 B       | ~4352 B    | ~0.27        |
+| TimerWheel    | ~1403 B       | ~4352 B    | ~0.32        |
 
 Tree-shaking works for every member (each lone import is smaller than the whole).
-The "< 40% of all" claim holds for every member; MonoDeque is the closest to the
-line (~0.39) because it is the single heaviest member -- nearly half the library's
-code -- so its lone import is inherently the largest fraction of the bundle.
-(The single/all fractions shift with the sixth member; reproduce with `npm run bench`.)
+The "< 40% of all" claim holds for every member; with nine members the all-member
+bundle grew, so each lone import is now a smaller fraction and the newer, heavier
+members (TimerWheel ~0.32 / FreqO1 ~0.31 / BucketQueue ~0.27) are the closest to the
+line. The six-member era's MonoDeque exception (~0.48) no longer applies (it is now
+~0.19). (Numbers shift as members are added; reproduce with `npm run bench`.)
 
 **D6 -- GC pressure curve** (n = 1e3 .. 1e6, the 0 B/op gate as a measured line):
 
 | member    | zero-alloc | max major GC | max pause (ms / 1e6 ops) |
 |-----------|------------|--------------|--------------------------|
-| SparseSet | yes        | 0            | <= 1                     |
-| RingDeque | yes        | 0            | <= 1                     |
-| UnionFind | yes        | 0            | <= 1                     |
-| MonoDeque | yes        | 0            | <= 1                     |
-| MinStack  | yes        | 0            | <= 1                     |
-| RandomSet | yes        | 0            | <= 1                     |
+| SparseSet   | yes        | 0            | <= 1                     |
+| RingDeque   | yes        | 0            | <= 1                     |
+| UnionFind   | yes        | 0            | <= 1                     |
+| MonoDeque   | yes        | 0            | <= 1                     |
+| MinStack    | yes        | 0            | <= 1                     |
+| RandomSet   | yes        | 0            | <= 1                     |
+| FreqO1      | yes        | 0            | <= 1                     |
+| BucketQueue | yes        | 0            | <= 1                     |
+| TimerWheel  | yes        | 0            | <= 1                     |
 
 **D3 -- memory footprint** (bytes per live element vs the theoretical minimum):
 
@@ -1328,8 +1335,11 @@ code -- so its lone import is inherently the largest fraction of the bundle.
 | MonoDeque | sized for worst case | 16 (value+seq) | fixed-capacity: sized for a fully-monotone window, so few survivors after dominated pops |
 | MinStack  | 16           | 16 (value+ext)  | 1.0x per live element; the running-extreme column doubles a plain numeric stack |
 | RandomSet | 8            | 4 (dense slot)  | 2.0x (the sparse index doubles it, same as SparseSet) |
+| FreqO1    | LOAD-DEPENDENT (~48 at full load) | 20 (dense+freq+bkt+nk+pk) | the universe-sized sparse array + bucket free-list + O(distinct-frequencies) bucket pool are NOT per-live; theoMin is the dense floor, not widened to hide this |
+| BucketQueue | O(ceiling)-dominated (~148 at ceiling 2^20, live 65536) | 16 (dense+prio+nk+pk) | the static per-priority bucket array is O(ceiling), NOT per-live -- bytes/live tracks the ceiling:live ratio, an honest space characteristic |
+| TimerWheel | ~28 (slots >= live) | 16 (dense+slotOf+next+prev) | the static per-slot FIFO ring is O(slots); with slots rounded up to a power of two >= live, ~1.75x |
 
-All six are fixed-capacity by design: they reuse one backing store, so `clear()`
+All nine are fixed-capacity by design: they reuse one backing store, so `clear()`
 retains the buffer (stated, not implicit). The suite's applicability matrix emits the
 string `n/a` -- never `0` -- for cells that do not apply (fail closed). D4 is labelled
 a PROXY (dense-iteration vs random-lookup + a working-set stride sweep) because a true

@@ -3,7 +3,7 @@
  *
  * Repo-only dev/measurement infra. NOT part of the published tarball (not in
  * package.json files[]), NOT imported by O1.js, and NOT a data-structure member.
- * It profiles the four shipped members against the JS built-ins across the eight
+ * It profiles the nine shipped members against the JS built-ins across the eight
  * dimensions of RESEARCH.md section 3.
  *
  * The PRNG is the repo's own Numerical Recipes LCG (the one every *.test.js uses):
@@ -142,4 +142,69 @@ export function foldHash(h, x) {
     h = (h ^ (x | 0)) >>> 0;
     h = (Math.imul(h, 16777619)) >>> 0; // FNV-1a prime
     return h >>> 0;
+}
+
+/**
+ * Dispersion of a sample set: median, mean, coefficient of variation, and a
+ * stability verdict. cv = POPULATION stddev / mean (population, not sample: these
+ * are exhaustive measured batches, not an inference from a smaller draw). stable
+ * is cv < 0.05 (a 5% spread is the suite's "steady" bar). FAIL CLOSED: an empty
+ * set or a non-positive mean returns { median:0, mean:0, cv:0, stable:false } --
+ * NEVER NaN / Infinity, and NEVER a spurious `stable:true` on no evidence.
+ * @param {ArrayLike<number>} samples
+ * @returns {{median:number, mean:number, cv:number, stable:boolean}}
+ */
+export function stats(samples) {
+    const n = samples.length;
+    if (n === 0) return { median: 0, mean: 0, cv: 0, stable: false };
+    let sum = 0;
+    for (let i = 0; i < n; i++) sum += samples[i];
+    const mean = sum / n;
+    if (!(mean > 0)) return { median: 0, mean: 0, cv: 0, stable: false }; // fail closed: no NaN cv
+    let sq = 0;
+    for (let i = 0; i < n; i++) { const d = samples[i] - mean; sq += d * d; }
+    const std = Math.sqrt(sq / n); // population stddev
+    const cv = std / mean;
+    return { median: median(samples), mean, cv, stable: cv < 0.05 };
+}
+
+/**
+ * True per-op tail latency via process.hrtime.bigint(): time EACH single op call,
+ * subtract the calibrated empty-call overhead (an empty `() => {}` measured through
+ * the identical hrtime path, median of the same iteration count), and CLAMP at 0 so
+ * a reading below the timer's own overhead never reports negative. Returns ns.
+ *
+ * The per-op samples array is pre-sized so the timed inner loop allocates nothing;
+ * hrtime.bigint() itself allocates a BigInt per call, but that is the ONLY portable
+ * per-op nanosecond clock in Node and it is charged to BOTH the op and the empty
+ * baseline, so it cancels in the subtraction.
+ * @param {(i:number) => void} op
+ * @param {number} iters  number of single-op timings to take
+ * @returns {{p99:number, max:number}} nanoseconds, overhead-subtracted, clamped >= 0
+ */
+export function perOpTail(op, iters) {
+    if (iters <= 0) return { p99: 0, max: 0 };
+    // Calibrate the empty-call overhead through the identical hrtime path.
+    const noop = () => {};
+    const cal = new Float64Array(iters);
+    for (let i = 0; i < iters; i++) {
+        const t0 = process.hrtime.bigint();
+        noop(i);
+        const t1 = process.hrtime.bigint();
+        cal[i] = Number(t1 - t0);
+    }
+    cal.sort();
+    const overhead = cal[iters >> 1]; // median empty-call cost (ns)
+
+    const s = new Float64Array(iters);
+    for (let i = 0; i < iters; i++) {
+        const t0 = process.hrtime.bigint();
+        op(i);
+        const t1 = process.hrtime.bigint();
+        let ns = Number(t1 - t0) - overhead;
+        if (ns < 0) ns = 0; // clamp: a reading below timer overhead is not negative time
+        s[i] = ns;
+    }
+    s.sort();
+    return { p99: percentile(s, 99), max: s[iters - 1] };
 }

@@ -14,13 +14,16 @@
  *   - MonoDeque vs a naive O(W) window rescan
  *   - MinStack vs a naive plain-array stack that rescans for the extreme
  *   - RandomSet vs a native Set that iterates to the k-th element to pick uniformly
+ *   - FreqO1 vs a naive frequency table that linearly scans for the LFU key
+ *   - BucketQueue vs an alloc-free binary min-heap on the same monotone trace
+ *   - TimerWheel vs a naive O(n)-scan scheduler that rescans all pending deadlines
  */
 
 /** Sentinel for a cell that does not apply. NEVER 0. */
 export const NA = 'n/a';
 
-/** The six shipped members, in build order. */
-export const SUBJECTS = ['SparseSet', 'RingDeque', 'UnionFind', 'MonoDeque', 'MinStack', 'RandomSet'];
+/** The nine shipped members, in build order. */
+export const SUBJECTS = ['SparseSet', 'RingDeque', 'UnionFind', 'MonoDeque', 'MinStack', 'RandomSet', 'FreqO1', 'BucketQueue', 'TimerWheel'];
 
 /** The eight measurement dimensions (RESEARCH.md section 3). */
 export const DIMENSIONS = ['D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7', 'D8'];
@@ -45,6 +48,9 @@ export const BASELINE = {
     MonoDeque: 'naive-window',
     MinStack: 'naive-stack',
     RandomSet: 'naive-Set-pick',
+    FreqO1: 'naive-freq',
+    BucketQueue: 'binary-heap',
+    TimerWheel: 'naive-scan',
 };
 
 /**
@@ -74,7 +80,7 @@ export function baselineFor(member, dim) {
  */
 export function supportsKeyType(member, keyType) {
     if (!SUBJECTS.includes(member)) return false;
-    return keyType === 'int'; // all six members are integer/numeric substrates
+    return keyType === 'int'; // all nine members are integer/numeric substrates
 }
 
 /**

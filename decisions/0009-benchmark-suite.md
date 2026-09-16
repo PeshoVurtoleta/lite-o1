@@ -92,3 +92,39 @@ is deliberately NO xorshift in this package, so the LCG is reused, not reinvente
 - The measurement is honest by construction: the applicability matrix forbids a
   fabricated 0, the cache dimension is labelled a proxy, and the fixed-seed trace
   hash makes the workload reproducible across machines.
+
+## Amendment (2026-09-16) -- 6 -> 9 members + Tier-1 accuracy additions
+
+This ADR was written when the library shipped four members and later ran the suite
+over six (MinStack + RandomSet joined). As of 2026-09-16 the suite profiles all NINE
+shipped members: FreqO1, BucketQueue, and TimerWheel are now in the matrix, each
+measured against the exact foil its `test/witness.mjs` sweep uses -- a naive LFU
+min-scan (`naive-freq`), an alloc-free binary min-heap (`binary-heap`, an O(log n)
+foil timed gently), and a naive O(n)-scan scheduler (`naive-scan`). The orchestrator
+now runs 72 cells (9 members x 8 dimensions), not 32.
+
+- **No fall-through defaults.** Every per-member dispatch site (`makeSubject`,
+  `makeBaseline`, `makeMixed`, `fillMember`, `memberBytes`, `theoreticalMinPerLive`,
+  `churnNs`, the D3 constructor, `traceHash`) is now an explicit branch per member
+  ending in a loud `throw`; an unknown member fails closed instead of silently being
+  treated as RandomSet / MonoDeque. `test/Bench.test.mjs` asserts the throw.
+- **D5 tree-shaking, restated for nine.** Growing the library to nine members
+  enlarged the all-member bundle (~4.3 KB gzip), so EVERY member's lone import is now
+  a smaller share of the whole: all nine ratios sit under 0.40 (SparseSet ~0.13;
+  heaviest lone imports TimerWheel ~0.32 / FreqO1 ~0.31 / BucketQueue ~0.27). The
+  MonoDeque ~0.48 exception recorded above no longer applies (it is now ~0.19); there
+  is currently NO tree-shaking exception. The 0.40 budget is unchanged, never widened.
+- **Tier-1 accuracy.** D1 adds a true per-op tail (`p99` / `max` via
+  `process.hrtime.bigint()`, empty-call overhead calibrated + subtracted + clamped
+  >= 0) ONLY for the amortized members (MonoDeque, UnionFind, BucketQueue) that wear
+  the witness MAX-single-op line -- `n/a` (never 0) for the worst-case-O(1) members.
+  New `Harness.stats()` (median / mean / cv / stable, fail-closed on empty / zero
+  mean) and a post-run drift sentinel (re-times SparseSet/D1 and DISCLOSES thermal /
+  turbo drift > 10% as a warning, exit stays 0 for drift alone) were added; CPU model
+  + count are recorded in the report meta. Still repo-only, still NO version bump,
+  `O1.js` / `O1.d.ts` / `package.json` / `llms.txt` untouched.
+- **FreqO1 memory honesty.** Its measured bytes-per-live is LOAD-DEPENDENT (the
+  universe-sized sparse array + the bucket free-list + the O(distinct-frequencies)
+  bucket pool are not per-live), so `theoreticalMinPerLive` states only the dense
+  floor (20 B = dense + freq + bkt + nk + pk) and is NOT widened to absorb that fixed
+  overhead -- the D3 overhead ratio shows the real cost rather than hiding it.

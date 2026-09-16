@@ -18,6 +18,7 @@
 import { spawnSync } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import os from 'node:os';
 import { runDimension, vacuityCheck } from './Dimensions.mjs';
 import {
     SUBJECTS, DIMENSIONS, DIMENSION_TITLES, baselineFor, cells,
@@ -30,6 +31,27 @@ const RESULTS_PATH = fileURLToPath(new URL('./results.json', import.meta.url));
 function parseArg(name, fallback) {
     const i = process.argv.indexOf(name);
     return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : fallback;
+}
+
+/** Threshold above which the drift sentinel discloses thermal / turbo noise. */
+export const DRIFT_LIMIT = 0.10;
+
+/**
+ * Fractional drift between two readings of the same cheap cell: |second-first|/first.
+ * Pure + exported so the sentinel logic is unit-testable without spawning children.
+ * FAIL CLOSED: a non-positive first reading returns 0 (no basis to claim drift).
+ * @param {number} first
+ * @param {number} second
+ * @returns {number}
+ */
+export function driftFraction(first, second) {
+    if (!(first > 0) || !isFinite(second)) return 0;
+    return Math.abs(second - first) / first;
+}
+
+/** True iff the drift fraction exceeds the disclosure threshold. Pure + exported. */
+export function driftExceeds(first, second, limit = DRIFT_LIMIT) {
+    return driftFraction(first, second) > limit;
 }
 
 // ---------------------------------------------------------------------------
@@ -93,11 +115,15 @@ function fmt(x) {
 
 function printHeader(seed) {
     const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+    const cpus = os.cpus();
+    const cpuModel = (cpus && cpus.length ? cpus[0].model : 'unknown');
+    const cpuCount = (cpus ? cpus.length : 0);
     console.log('===========================================================================');
-    console.log('@zakkster/lite-o1 -- benchmark suite (8 dimensions, 4 members vs built-ins)');
+    console.log('@zakkster/lite-o1 -- benchmark suite (8 dimensions, 9 members vs built-ins)');
     console.log('===========================================================================');
     console.log('  seed:    0x' + (seed >>> 0).toString(16) + ' (' + (seed >>> 0) + ')');
     console.log('  node:    ' + process.version);
+    console.log('  cpu:     ' + cpuModel + ' x' + cpuCount);
     console.log('  arch:    ' + process.arch + ' / ' + process.platform);
     console.log('  date:    ' + now + ' UTC');
     console.log('  gc:      child processes spawned with --expose-gc');
@@ -185,10 +211,37 @@ async function orchestrate() {
 
     summarize(results);
 
+    // Drift sentinel: re-run ONE canonical cheap cell (SparseSet/D1) after the whole
+    // matrix and compare its subject.p50 to the first run's. A large gap means the box
+    // heated up (thermal throttle / turbo down-clock) DURING the run, so the earlier
+    // cells were measured on a faster machine than the later ones. This is DISCLOSURE,
+    // not a hard failure: a noisy run is still a run, so exit stays 0 for drift alone.
+    // Pick a PRESENT cheap cell as the sentinel; skip disclosure (no crash) if a
+    // filtered run excluded it. Prefer SparseSet/D1, else the first available D1 cell.
+    let sentinelKey = results['SparseSet/D1'] ? 'SparseSet/D1' : null;
+    if (!sentinelKey) for (const m of SUBJECTS) if (results[m + '/D1']) { sentinelKey = m + '/D1'; break; }
+    let sentinel = null;
+    if (sentinelKey) {
+        const firstP50 = results[sentinelKey].subject.p50;
+        const [sMember, sDim] = sentinelKey.split('/');
+        const secondP50 = spawnCell(sMember, sDim, seed).subject.p50;
+        const drift = driftFraction(firstP50, secondP50);
+        sentinel = { cell: sentinelKey, firstP50, secondP50, drift, limit: DRIFT_LIMIT };
+        if (driftExceeds(firstP50, secondP50)) {
+            console.log('[bench] WARNING: thermal/turbo drift ' + (drift * 100).toFixed(0) +
+                '% on the sentinel cell (' + sentinelKey + ' p50 ' + fmt(firstP50) + ' -> ' +
+                fmt(secondP50) + ' ns/op) -- results may be noisy');
+        }
+    }
+
+    const cpus = os.cpus();
     const payload = {
         meta: {
             seed, node: process.version, arch: process.arch, platform: process.platform,
+            cpuModel: (cpus && cpus.length ? cpus[0].model : 'unknown'),
+            cpuCount: (cpus ? cpus.length : 0),
             date: new Date().toISOString(),
+            sentinel, // { cell, firstP50, secondP50, drift, limit } or null if no cell present
         },
         subjects: SUBJECTS, dimensions: DIMENSIONS, titles: DIMENSION_TITLES,
         results,

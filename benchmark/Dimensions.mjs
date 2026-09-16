@@ -14,10 +14,13 @@
  * This file is NEVER imported by O1.js; it imports O1.js the way a consumer does.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet } from '../O1.js';
+import {
+    SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet,
+    FreqO1, BucketQueue, TimerWheel,
+} from '../O1.js';
 import {
     prng, median, warm, gcNow, hasGc, percentile, collect, timeNsPerOp, foldHash,
-    DEFAULT_SEED,
+    perOpTail, DEFAULT_SEED,
 } from './Harness.mjs';
 import { NA, baselineFor, supportsKeyType, supportsWorkload } from './Matrix.mjs';
 
@@ -28,13 +31,19 @@ export function sink() { return SINK; }
 /** The package root, for the D5 esbuild bundle (resolves ./O1.js like a consumer). */
 export const PKG_DIR = new URL('..', import.meta.url).pathname;
 
+// BucketQueue / TimerWheel sizing constants -- mirror test/witness.mjs exactly.
+const BQ_WINDOW = 64;        // bounded active-bucket span (keeps the monotone cursor churn O(1))
+const BQ_CEIL = 1 << 20;     // fixed priority-ceiling headroom the climbing cursor never exhausts
+/** Next power of two >= n (TimerWheel slots; one timer per slot -> ~1 due per tick). */
+function twSlots(n) { let s = 1; while (s < n) s *= 2; return s; }
+
 // ===========================================================================
 // Steady-state hot-op builders -- mirror test/witness.mjs exactly.
 // Each returns { obj, op }: `obj` is filled to a bounded steady state, `op` is a
 // single O(1) (or amortized-O(1)) hot op that keeps the structure bounded.
 // ===========================================================================
 
-function makeSubject(member, n, rng) {
+export function makeSubject(member, n, rng) {
     if (member === 'SparseSet') {
         const s = new SparseSet(n, n);
         for (let k = 0; k < n; k++) s.add(k);
@@ -72,19 +81,54 @@ function makeSubject(member, n, rng) {
         for (let k = 0; k < n; k++) s.add(k);
         return { obj: s, op: () => { if (s.sample() >= 0) SINK++; } };
     }
-    // MonoDeque: a sliding window of width W = n.
-    const W = n;
-    const d = new MonoDeque(W + 1, 'min');
-    let v = 0;
-    const nextVal = () => { v = (v * 1103515245 + 12345) & 0x7fffffff; return v % 1000000; };
-    for (let k = 0; k < W; k++) { const seq = d.push(nextVal()); d.evictOlderThan(seq - W); }
-    return {
-        obj: d,
-        op: () => { const seq = d.push(nextVal()); d.evictOlderThan(seq - W); if (d.value() !== undefined) SINK++; },
-    };
+    if (member === 'FreqO1') {
+        // A frequency structure of size n; each op records one access to a walking key
+        // (increment) and reads the LFU key (peekMin) -- both worst-case O(1).
+        const f = new FreqO1(n, n);
+        for (let k = 0; k < n; k++) f.add(k); // all at frequency 1
+        let key = 0;
+        return {
+            obj: f,
+            op: () => { f.increment(key); if (f.peekMin() >= 0) SINK++; key++; if (key >= n) key = 0; },
+        };
+    }
+    if (member === 'BucketQueue') {
+        // A monotone priority queue of n live keys spread across a bounded window; each
+        // op extractMin-removes the min key and re-inserts it one window ahead of the
+        // cursor (always >= cursor -> the monotone contract holds) -- amortized O(1).
+        const q = new BucketQueue(n, BQ_CEIL, n);
+        for (let k = 0; k < n; k++) q.insert(k, k % BQ_WINDOW);
+        return {
+            obj: q,
+            op: () => { const k = q.extractMin(); q.insert(k, q.cursor + (BQ_WINDOW - 1)); SINK += k; },
+        };
+    }
+    if (member === 'TimerWheel') {
+        // A bounded wheel of n live timers, SLOTS >= n (one timer per slot) so ~1 timer
+        // is due per tick; each op drains the due slot (re-arming every fired timer at
+        // the max delay so the resident set stays n) and advances one tick -- O(1).
+        const S = twSlots(n);
+        const w = new TimerWheel(n, S, n);
+        for (let k = 0; k < n; k++) w.schedule(k, k % S);
+        const rearm = (id, wheel) => { wheel.schedule(id, S - 1); SINK += id; };
+        return { obj: w, op: () => { w.drainDue(rearm); w.advance(1); } };
+    }
+    if (member === 'MonoDeque') {
+        // A sliding window of width W = n.
+        const W = n;
+        const d = new MonoDeque(W + 1, 'min');
+        let v = 0;
+        const nextVal = () => { v = (v * 1103515245 + 12345) & 0x7fffffff; return v % 1000000; };
+        for (let k = 0; k < W; k++) { const seq = d.push(nextVal()); d.evictOlderThan(seq - W); }
+        return {
+            obj: d,
+            op: () => { const seq = d.push(nextVal()); d.evictOlderThan(seq - W); if (d.value() !== undefined) SINK++; },
+        };
+    }
+    throw new Error('[bench] unhandled member: ' + member);
 }
 
-function makeBaseline(member, n) {
+export function makeBaseline(member, n) {
     if (member === 'SparseSet') {
         const set = new Set();
         for (let k = 0; k < n; k++) set.add(k);
@@ -143,45 +187,162 @@ function makeBaseline(member, n) {
             },
         };
     }
-    // naive window rescan (O(W) per element).
-    const W = n;
-    const win = new Float64Array(W);
-    let v = 0;
-    const nextVal = () => { v = (v * 1103515245 + 12345) & 0x7fffffff; return v % 1000000; };
-    for (let k = 0; k < W; k++) win[k] = nextVal();
-    let head = 0;
-    return {
-        op: () => {
-            win[head] = nextVal();
-            head = head + 1; if (head === W) head = 0;
-            let best = win[0];
-            for (let j = 1; j < W; j++) if (win[j] < best) best = win[j]; // O(W) rescan
-            SINK += best;
-        },
-    };
+    if (member === 'FreqO1') {
+        // naive frequency table: a plain Uint32Array of per-key counts with NO bucket
+        // forest. Each op bumps one count and LINEARLY SCANS all n counts for the LFU
+        // key -- O(n) per query, so ops/ms collapses as n grows.
+        const freq = new Uint32Array(n).fill(1);
+        let key = 0;
+        return {
+            op: () => {
+                freq[key]++;
+                let best = 0, bestF = freq[0];
+                for (let j = 1; j < n; j++) if (freq[j] < bestF) { bestF = freq[j]; best = j; } // O(n) scan
+                SINK += best;
+                key++; if (key >= n) key = 0;
+            },
+        };
+    }
+    if (member === 'BucketQueue') {
+        // ALLOC-FREE binary MIN-HEAP (parallel priority + key columns) driven by the SAME
+        // monotone trace: extractMin sifts DOWN O(log n), the drained key re-inserts one
+        // window ahead and sifts UP O(log n) -- O(log n) per op, timed gently.
+        const hp = new Float64Array(n + 1); // 1-based binary min-heap: priorities
+        const hk = new Uint32Array(n + 1);  // parallel keys
+        let size = 0;
+        const up = (i) => {
+            while (i > 1) {
+                const p = i >> 1;
+                if (hp[p] <= hp[i]) break;
+                const tp = hp[p]; hp[p] = hp[i]; hp[i] = tp;
+                const tk = hk[p]; hk[p] = hk[i]; hk[i] = tk;
+                i = p;
+            }
+        };
+        for (let k = 0; k < n; k++) { const i = ++size; hp[i] = k % BQ_WINDOW; hk[i] = k; up(i); }
+        return {
+            op: () => {
+                const mp = hp[1];
+                const mk = hk[1];
+                hp[1] = hp[size]; hk[1] = hk[size]; size--;
+                let i = 1;
+                for (;;) {                                // sift down
+                    const l = i << 1;
+                    const r = l | 1;
+                    let s = i;
+                    if (l <= size && hp[l] < hp[s]) s = l;
+                    if (r <= size && hp[r] < hp[s]) s = r;
+                    if (s === i) break;
+                    const tp = hp[s]; hp[s] = hp[i]; hp[i] = tp;
+                    const tk = hk[s]; hk[s] = hk[i]; hk[i] = tk;
+                    i = s;
+                }
+                const j = ++size;                         // re-insert one window ahead
+                hp[j] = mp + (BQ_WINDOW - 1);
+                hk[j] = mk;
+                up(j);
+                SINK += mk;
+            },
+        };
+    }
+    if (member === 'TimerWheel') {
+        // naive-scan scheduler: n pending absolute deadlines in a flat Float64Array. Each
+        // tick SCANS ALL n entries to find + fire the due ones, re-arming each at the max
+        // horizon -- O(n) per tick, the linear cost a timing wheel exists to remove.
+        const S = twSlots(n);
+        const deadline = new Float64Array(n);
+        for (let k = 0; k < n; k++) deadline[k] = k % S; // same one-per-slot spread as the wheel
+        let now = 0;
+        return {
+            op: () => {
+                for (let k = 0; k < n; k++) {              // O(n): scan ALL pending to find the due ones
+                    if (deadline[k] === now) { deadline[k] = now + (S - 1); SINK += k; }
+                }
+                now++;
+            },
+        };
+    }
+    if (member === 'MonoDeque') {
+        // naive window rescan (O(W) per element).
+        const W = n;
+        const win = new Float64Array(W);
+        let v = 0;
+        const nextVal = () => { v = (v * 1103515245 + 12345) & 0x7fffffff; return v % 1000000; };
+        for (let k = 0; k < W; k++) win[k] = nextVal();
+        let head = 0;
+        return {
+            op: () => {
+                win[head] = nextVal();
+                head = head + 1; if (head === W) head = 0;
+                let best = win[0];
+                for (let j = 1; j < W; j++) if (win[j] < best) best = win[j]; // O(W) rescan
+                SINK += best;
+            },
+        };
+    }
+    throw new Error('[bench] unhandled member: ' + member);
 }
 
-/** True iff a member's baseline op is O(n) per call (so it must be timed gently). */
-const LINEAR_BASELINE = { SparseSet: false, RingDeque: true, UnionFind: true, MonoDeque: true, MinStack: true, RandomSet: true };
+/** True iff a member's baseline op is O(n) (or O(log n)) per call (so it must be timed gently). */
+const LINEAR_BASELINE = {
+    SparseSet: false, RingDeque: true, UnionFind: true, MonoDeque: true, MinStack: true, RandomSet: true,
+    FreqO1: true,        // naive-freq foil is an O(n) LFU scan
+    BucketQueue: true,   // binary-heap foil is O(log n) per op
+    TimerWheel: true,    // naive-scan foil is an O(n) deadline scan
+};
 
 /** Exact backing-store byte footprint of a member instance (typed-array buffers). */
-function memberBytes(member, obj) {
+export function memberBytes(member, obj) {
     if (member === 'SparseSet') return obj._dense.buffer.byteLength + obj._sparse.buffer.byteLength;
     if (member === 'RingDeque') return obj._store.buffer.byteLength;
     if (member === 'UnionFind') return obj._parent.buffer.byteLength + obj._size.buffer.byteLength;
     if (member === 'MonoDeque') return obj._val.buffer.byteLength + obj._seq.buffer.byteLength;
     if (member === 'MinStack') return obj._val.buffer.byteLength + obj._ext.buffer.byteLength;
-    return obj._dense.buffer.byteLength + obj._sparse.buffer.byteLength; // RandomSet (dense + sparse)
+    if (member === 'RandomSet') return obj._dense.buffer.byteLength + obj._sparse.buffer.byteLength;
+    if (member === 'FreqO1') {
+        // key substrate (dense+sparse+freq+bkt+nk+pk) + bucket pool (bFreq+bPrev+bNext+
+        // bHead+bTail+bFree). The bucket pool is O(distinct-frequencies), NOT per-live.
+        return obj._dense.buffer.byteLength + obj._sparse.buffer.byteLength +
+            obj._freq.buffer.byteLength + obj._bkt.buffer.byteLength +
+            obj._nk.buffer.byteLength + obj._pk.buffer.byteLength +
+            obj._bFreq.buffer.byteLength + obj._bPrev.buffer.byteLength +
+            obj._bNext.buffer.byteLength + obj._bHead.buffer.byteLength +
+            obj._bTail.buffer.byteLength + obj._bFree.buffer.byteLength;
+    }
+    if (member === 'BucketQueue') {
+        // key substrate (dense+sparse+prio+nk+pk) + static buckets (bHead+bTail, one per
+        // priority 0..ceiling -> O(ceiling), NOT per-live).
+        return obj._dense.buffer.byteLength + obj._sparse.buffer.byteLength +
+            obj._prio.buffer.byteLength + obj._nk.buffer.byteLength + obj._pk.buffer.byteLength +
+            obj._bHead.buffer.byteLength + obj._bTail.buffer.byteLength;
+    }
+    if (member === 'TimerWheel') {
+        // id substrate (dense+sparse+slotOf+next+prev) + static slots (sHead+sTail, one
+        // per slot -> O(slots), NOT per-live).
+        return obj._dense.buffer.byteLength + obj._sparse.buffer.byteLength +
+            obj._slotOf.buffer.byteLength + obj._next.buffer.byteLength + obj._prev.buffer.byteLength +
+            obj._sHead.buffer.byteLength + obj._sTail.buffer.byteLength;
+    }
+    throw new Error('[bench] unhandled member: ' + member);
 }
 
 /** Theoretical minimum bytes per LIVE element for a member (the dense payload). */
-function theoreticalMinPerLive(member) {
+export function theoreticalMinPerLive(member) {
     if (member === 'SparseSet') return 4;  // one Uint32 dense slot per live key
     if (member === 'RingDeque') return 8;  // one Float64 slot per live value
     if (member === 'UnionFind') return 8;  // parent + size Uint32 per element
     if (member === 'MonoDeque') return 16; // value + seq Float64 per entry
     if (member === 'MinStack') return 16;  // value + ext Float64 per element
-    return 4;                              // RandomSet: one Uint32 dense slot per live key
+    if (member === 'RandomSet') return 4;  // one Uint32 dense slot per live key
+    // FreqO1: dense + freq + bkt + nk + pk = 5 Uint32 per live key (the intrusive bucket
+    // FIFO payload). HONESTY: measured bytesPerLive is LOAD-DEPENDENT here -- the bucket
+    // free-list + universe-sized sparse array + the O(distinct-frequencies) bucket pool
+    // are NOT per-live, so at partial load the measured B/live sits well above this dense
+    // floor. The theoMin is the dense minimum, NOT widened to absorb that fixed overhead.
+    if (member === 'FreqO1') return 20;
+    if (member === 'BucketQueue') return 16; // dense + prio + nk + pk = 4 Uint32 per live key
+    if (member === 'TimerWheel') return 16;  // dense + slotOf + next + prev = 4 Uint32 per live timer
+    throw new Error('[bench] unhandled member: ' + member);
 }
 
 /** The member's live-element count (its `size`/`count`/`capacity` semantics). */
@@ -193,6 +354,16 @@ function liveCount(member, obj) {
 // ===========================================================================
 // D1 -- Latency distribution: p50/p90/p99/p99.9/max, WITH and WITHOUT forced GC.
 // ===========================================================================
+
+/**
+ * The AMORTIZED members: their headline is a per-op cost that is O(1) on average
+ * but hides a rarer worst single op (MonoDeque's pop-storm, UnionFind's pre-flatten
+ * find, BucketQueue's cursor jump). These are the members that wear the witness'
+ * MAX-single-op line, so D1 measures a true per-op tail for them; every other
+ * member is worst-case O(1) (no hidden spike), so its perOpTail reads NA -- the
+ * batch-mean distribution already tells the whole story.
+ */
+const AMORTIZED = { MonoDeque: true, UnionFind: true, BucketQueue: true };
 
 function distOf(op, batch, samples, forceGc) {
     warm(op, batch, 2);
@@ -231,14 +402,33 @@ export function D1(member, opts = {}) {
     const base = makeBaseline(member, n);
     const baseNoGc = distOf(base.op, baseBatch, baseSamples, false);
 
+    // True per-op tail (hrtime.bigint per single op, overhead-subtracted) ONLY for the
+    // amortized members that wear the witness MAX-single-op line. NA (never 0) for the
+    // worst-case-O(1) members, whose batch-mean distribution above is the full story.
+    let perOp = NA;
+    const check = [
+        subjNoGc.p50, subjNoGc.p90, subjNoGc.p99, subjNoGc.p999, subjNoGc.max,
+        subjGc.p50, subjGc.max, baseNoGc.p50, baseNoGc.p99, baseNoGc.max,
+    ];
+    if (AMORTIZED[member]) {
+        const tailSubj = makeSubject(member, n, prng(seed));
+        warm(tailSubj.op, Math.min(2000, subjBatch), 2);
+        const tailIters = opts.tailIters ?? 20000;
+        perOp = perOpTail(tailSubj.op, tailIters); // { p99, max } ns, clamped >= 0
+        // Feed the tail into _check for these 3 members only. perOpTail CLAMPS at 0 (a
+        // single op below the timer's own overhead is legitimately 0 ns), and the vacuity
+        // gate rejects a 0 -- so a genuine sub-overhead reading falls back to the (always
+        // positive) batch-mean p99/max rather than tripping a false vacuity. NA never
+        // reaches the gate: the whole block is skipped for non-amortized members.
+        check.push(perOp.p99 > 0 ? perOp.p99 : subjNoGc.p99, perOp.max > 0 ? perOp.max : subjNoGc.max);
+    }
+
     return {
         dim: 'D1', member, baseline: baselineFor(member, 'D1'), n,
         unit: 'ns/op',
         subject: subjNoGc, subjectGc: subjGc, baselineDist: baseNoGc,
-        _check: [
-            subjNoGc.p50, subjNoGc.p90, subjNoGc.p99, subjNoGc.p999, subjNoGc.max,
-            subjGc.p50, subjGc.max, baseNoGc.p50, baseNoGc.p99, baseNoGc.max,
-        ],
+        perOpTail: perOp, // { p99, max } ns for amortized members; NA otherwise
+        _check: check,
     };
 }
 
@@ -305,6 +495,43 @@ function makeMixed(member, cap, rng) {
             s.add(v);
         };
     }
+    if (member === 'FreqO1') {
+        // A bounded resident set of cap>>1 keys: increment a walking key (peekMin reads
+        // the LFU), then popMin + re-add keeps the resident set steady at cap>>1.
+        const live = cap >> 1;
+        const f = new FreqO1(cap, cap);
+        for (let k = 0; k < live; k++) f.add(k);
+        let key = 0;
+        return () => {
+            f.increment(key);
+            if (f.peekMin() >= 0) SINK++;
+            key = key + 1; if (key >= live) key = 0;
+            const popped = f.popMin();
+            if (popped !== undefined) f.add(popped);
+        };
+    }
+    if (member === 'BucketQueue') {
+        // A bounded monotone churn: extractMin the min key, re-insert it one window ahead
+        // of the cursor. The live-key set stays cap>>1; the cursor climbs slowly within
+        // the fixed BQ_CEIL headroom (never exhausted over the mixed trace).
+        const q = new BucketQueue(cap, BQ_CEIL, cap);
+        for (let k = 0; k < (cap >> 1); k++) q.insert(k, k % BQ_WINDOW);
+        return () => {
+            const k = q.extractMin();
+            q.insert(k, q.cursor + (BQ_WINDOW - 1));
+            SINK += k;
+        };
+    }
+    if (member === 'TimerWheel') {
+        // A bounded wheel of cap>>1 timers, SLOTS >= cap: each op drains the due slot
+        // (re-arming fired timers at the max delay so the resident set stays steady) and
+        // advances one tick.
+        const S = twSlots(cap);
+        const w = new TimerWheel(cap, S, cap);
+        for (let k = 0; k < (cap >> 1); k++) w.schedule(k, k % S);
+        const rearm = (id, wheel) => { wheel.schedule(id, S - 1); SINK += id; };
+        return () => { w.drainDue(rearm); w.advance(1); };
+    }
     // MonoDeque
     const W = cap >> 1;
     const d = new MonoDeque(cap, 'min');
@@ -356,9 +583,22 @@ function fillMember(member, obj, count) {
     if (member === 'RandomSet') { obj.clear(); for (let k = 0; k < count; k++) obj.add(k); return; }
     if (member === 'RingDeque') { obj.clear(); for (let k = 0; k < count; k++) obj.pushBack(k); return; }
     if (member === 'UnionFind') { obj.reset(); for (let k = 1; k < count; k++) obj.union(0, k); return; }
-    obj.clear();
-    let v = 0;
-    for (let k = 0; k < count; k++) { v = (v * 1103515245 + 12345) & 0x7fffffff; obj.push(v % 1000000); }
+    if (member === 'FreqO1') { obj.clear(); for (let k = 0; k < count; k++) obj.add(k); return; }
+    if (member === 'BucketQueue') { obj.clear(); for (let k = 0; k < count; k++) obj.insert(k, k % BQ_WINDOW); return; }
+    if (member === 'TimerWheel') { obj.clear(); for (let k = 0; k < count; k++) obj.schedule(k, k % obj.slots); return; }
+    if (member === 'MonoDeque') {
+        obj.clear();
+        let v = 0;
+        for (let k = 0; k < count; k++) { v = (v * 1103515245 + 12345) & 0x7fffffff; obj.push(v % 1000000); }
+        return;
+    }
+    if (member === 'MinStack') {
+        obj.clear();
+        let v = 0;
+        for (let k = 0; k < count; k++) { v = (v * 1103515245 + 12345) & 0x7fffffff; obj.push(v % 1000000); }
+        return;
+    }
+    throw new Error('[bench] unhandled member: ' + member);
 }
 
 function clearMember(member, obj) {
@@ -368,14 +608,17 @@ function clearMember(member, obj) {
 
 export function D3(member, opts = {}) {
     const n = opts.n ?? 65536;
-    const cap = member === 'MonoDeque' || member === 'RingDeque' ? n : n;
     let obj;
     if (member === 'SparseSet') obj = new SparseSet(n, n);
     else if (member === 'RingDeque') obj = new RingDeque(n);
     else if (member === 'UnionFind') obj = new UnionFind(n);
     else if (member === 'MonoDeque') obj = new MonoDeque(n, 'min');
     else if (member === 'MinStack') obj = new MinStack(n, 'min');
-    else obj = new RandomSet(n, n, 0x9e3779b1);
+    else if (member === 'RandomSet') obj = new RandomSet(n, n, 0x9e3779b1);
+    else if (member === 'FreqO1') obj = new FreqO1(n, n);
+    else if (member === 'BucketQueue') obj = new BucketQueue(n, BQ_CEIL, n); // bounded priority ceiling
+    else if (member === 'TimerWheel') obj = new TimerWheel(n, twSlots(n), n); // slots >= n (one per slot)
+    else throw new Error('[bench] unhandled member: ' + member);
 
     gcNow();
     const heapBase = process.memoryUsage().heapUsed;
@@ -598,8 +841,9 @@ function loadOpNs(member, n, fillFrac, seed) {
     // makeSubject already fills to full; re-fill to the requested fraction.
     const target = Math.max(1, Math.round(n * fillFrac));
     if (member === 'SparseSet') { built.obj.clear(); for (let k = 0; k < target; k++) built.obj.add(k); }
-    // RingDeque/UnionFind/MonoDeque steady ops keep bounded regardless; the op is
-    // representative at the current fill. Re-time the steady op.
+    // RingDeque/UnionFind/MonoDeque/MinStack/RandomSet/FreqO1/BucketQueue/TimerWheel
+    // steady ops keep the structure bounded regardless of the requested fraction (their
+    // op is representative at the current fill). Re-time the steady op.
     return median(collect(built.op, 4000, 60));
 }
 
@@ -646,7 +890,7 @@ export function D7(member, opts = {}) {
 // Inapplicable workloads read NA (never 0).
 // ===========================================================================
 
-function churnNs(member, n, seed) {
+export function churnNs(member, n, seed) {
     if (member === 'SparseSet') {
         const s = new SparseSet(n, n);
         for (let k = 0; k < n; k++) s.add(k);
@@ -680,12 +924,36 @@ function churnNs(member, n, seed) {
         const op = () => { s.sample(); const v = s.removeRandom(); s.add(v); };
         return median(collect(op, 4000, 60));
     }
-    const d = new MonoDeque(n, 'min');
-    const W = n >> 1;
-    let v = 0;
-    const nextVal = () => { v = (v * 1103515245 + 12345) & 0x7fffffff; return v % 1000000; };
-    const op = () => { const seq = d.push(nextVal()); d.evictOlderThan(seq - W); };
-    return median(collect(op, 4000, 60));
+    if (member === 'FreqO1') {
+        const f = new FreqO1(n, n);
+        for (let k = 0; k < n; k++) f.add(k);
+        let k = 0;
+        const op = () => { f.increment(k); const p = f.popMin(); if (p !== undefined) f.add(p); k = (k + 1) % n; };
+        return median(collect(op, 4000, 60));
+    }
+    if (member === 'BucketQueue') {
+        const q = new BucketQueue(n, BQ_CEIL, n);
+        for (let k = 0; k < n; k++) q.insert(k, k % BQ_WINDOW);
+        const op = () => { const k = q.extractMin(); q.insert(k, q.cursor + (BQ_WINDOW - 1)); SINK += k; };
+        return median(collect(op, 4000, 60));
+    }
+    if (member === 'TimerWheel') {
+        const S = twSlots(n);
+        const w = new TimerWheel(n, S, n);
+        for (let k = 0; k < n; k++) w.schedule(k, k % S);
+        const rearm = (id, wheel) => { wheel.schedule(id, S - 1); SINK += id; };
+        const op = () => { w.drainDue(rearm); w.advance(1); };
+        return median(collect(op, 4000, 60));
+    }
+    if (member === 'MonoDeque') {
+        const d = new MonoDeque(n, 'min');
+        const W = n >> 1;
+        let v = 0;
+        const nextVal = () => { v = (v * 1103515245 + 12345) & 0x7fffffff; return v % 1000000; };
+        const op = () => { const seq = d.push(nextVal()); d.evictOlderThan(seq - W); };
+        return median(collect(op, 4000, 60));
+    }
+    throw new Error('[bench] unhandled member: ' + member);
 }
 
 export function D8(member, opts = {}) {
@@ -745,14 +1013,22 @@ export function D8(member, opts = {}) {
 const TRACE_UNIVERSE = 65536;
 
 export function traceHash(member, seed = DEFAULT_SEED, length = 100000) {
+    // Classify the member's trace universe ONCE (cold), fail-closed on an unknown
+    // member, so an unhandled member 10 can never silently inherit MonoDeque's trace
+    // -- and the per-iteration hot loop carries no dispatch branch. Mode 0 = uint32
+    // keys over TRACE_UNIVERSE; 1 = signed +/- 1000 values; 2 = MonoDeque's 0..1e6.
+    let mode;
+    if (member === 'SparseSet' || member === 'UnionFind' || member === 'RandomSet' ||
+        member === 'FreqO1' || member === 'BucketQueue' || member === 'TimerWheel') mode = 0;
+    else if (member === 'RingDeque' || member === 'MinStack') mode = 1;
+    else if (member === 'MonoDeque') mode = 2;
+    else throw new Error('[bench] unhandled member: ' + member);
+
     const rng = prng(seed);
     let h = 0x811c9dc5 >>> 0;
     for (let i = 0; i < length; i++) {
         const r = rng();
-        let x;
-        if (member === 'SparseSet' || member === 'UnionFind' || member === 'RandomSet') x = r % TRACE_UNIVERSE;
-        else if (member === 'RingDeque' || member === 'MinStack') x = (r % 2000) - 1000;
-        else x = r % 1000000; // MonoDeque
+        const x = mode === 0 ? r % TRACE_UNIVERSE : mode === 1 ? (r % 2000) - 1000 : r % 1000000;
         h = foldHash(h, x);
         h = foldHash(h, (r >>> 28)); // fold the op-selector too (trace SHAPE, not just values)
     }
