@@ -22,7 +22,7 @@
  */
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel } from '../../O1.js';
 
 const U = 1 << 16;      // universe 65536
 const CAP = 1 << 14;    // capacity 16384
@@ -851,6 +851,144 @@ const bqForEachDrain = {
     statsOf(s) { return { grows: bucketGrows(s) }; },
 };
 
+// ===========================================================================
+// TimerWheel scenarios -- private Uint32Array id columns + static per-slot FIFO
+// arrays, all WORST-CASE O(1) zero-alloc (schedule / cancel / advance(1)) plus the
+// O(due) drainDue. The slot-list surgery + the (now + delay) & MASK filing are pure
+// pointer arithmetic over recycled typed slots -- no coercion, no heap double.
+// ===========================================================================
+
+const TW_U = 1 << 16;    // universe 65536
+const TW_SLOTS = 1 << 8; // 256 slots
+const TW_CAP = 1 << 14;  // capacity 16384
+const TW_W = 1 << 12;    // 4096 resident timers -> steady state, never full/empty
+
+/**
+ * The zero-alloc counter for TimerWheel scenarios: the byte lengths of EVERY backing
+ * Uint32Array (the id substrate + node columns + the static slot head/tail arrays).
+ * Capacity + universe + slots are fixed at construction, so this NEVER grows -- the
+ * delta across the window must be 0 (the `twGrows` 0-delta canary; mirrors grows /
+ * ringGrows / ufGrows / monoGrows / minGrows / randGrows / freqGrows / bucketGrows).
+ */
+function twGrows(s) {
+    const w = s.tw;
+    return w._dense.buffer.byteLength + w._sparse.buffer.byteLength +
+        w._slotOf.buffer.byteLength + w._next.buffer.byteLength + w._prev.buffer.byteLength +
+        w._sHead.buffer.byteLength + w._sTail.buffer.byteLength;
+}
+
+function twNoop() {}
+
+/**
+ * schedule-churn: fresh timers at capacity, all at delay 0 (the due slot). schedule is
+ * fail-closed past capacity, so clear() (O(1), zero-alloc, resets now to 0) the instant
+ * the wheel is full and keep refilling -- the wheel never exceeds TW_CAP and every op is
+ * a real schedule (the id substrate write + the slot-FIFO tail append).
+ */
+const twScheduleChurn = {
+    name: 'TimerWheel schedule-churn',
+    setup() { return { tw: new TimerWheel(TW_U, TW_SLOTS, TW_CAP), n: 0 }; },
+    hot(s, n) {
+        const w = s.tw;
+        let live = s.n | 0;
+        for (let i = 0; i < n; i++) {
+            if (live === TW_CAP) { w.clear(); live = 0; }
+            w.schedule(live, 0);
+            live = (live + 1) | 0;
+        }
+        s.n = live | 0;
+    },
+    statsOf(s) { return { grows: twGrows(s) }; },
+};
+
+/**
+ * drainDue-drain: refill a bounded resident window spread across ALL slots the instant
+ * the wheel empties, then drain the current due slot + advance one tick per op -- so the
+ * measured window is dominated by REAL drains (the FIFO head-walk, the per-timer
+ * swap-remove pointer fix-up) plus the O(1) advance. clear() resets now to 0 each cycle,
+ * so the wheel oscillates 0 -> TW_W (< TW_CAP), never full, every op zero-alloc.
+ */
+const twDrainDrain = {
+    name: 'TimerWheel drainDue-drain (spread fill then drain + advance)',
+    setup() { return { tw: new TimerWheel(TW_U, TW_SLOTS, TW_CAP) }; },
+    hot(s, n) {
+        const w = s.tw;
+        for (let i = 0; i < n; i++) {
+            if (w.size === 0) {
+                w.clear();
+                for (let k = 0; k < TW_W; k++) w.schedule(k, k & (TW_SLOTS - 1));
+            }
+            w.drainDue(twNoop); // drain the current due slot (FIFO head-walk + swap-remove)
+            w.advance(1);       // step the clock (the drained slot is empty -> legal O(1))
+        }
+    },
+    statsOf(s) { return { grows: twGrows(s) }; },
+};
+
+/**
+ * cancel-churn: prime TW_W resident timers spread across slots, then each op cancels one
+ * (a real unlink from its slot FIFO + swap-remove) and re-schedules it back into its slot
+ * -- so size returns to TW_W every op and no op touches full/empty. No advance, so now
+ * stays 0 and the tick ceiling is never approached. Every op is zero-alloc.
+ */
+const twCancelChurn = {
+    name: 'TimerWheel cancel-churn',
+    setup() {
+        const tw = new TimerWheel(TW_U, TW_SLOTS, TW_CAP);
+        for (let k = 0; k < TW_W; k++) tw.schedule(k, k & (TW_SLOTS - 1));
+        return { tw, i: 0 };
+    },
+    hot(s, n) {
+        const w = s.tw;
+        let idx = s.i | 0;
+        for (let i = 0; i < n; i++) {
+            const key = idx & (TW_W - 1);
+            w.cancel(key);                          // real unlink + swap-remove
+            w.schedule(key, key & (TW_SLOTS - 1));  // re-add -> size returns to TW_W
+            idx = (idx + 1) | 0;
+        }
+        s.i = idx | 0;
+    },
+    statsOf(s) { return { grows: twGrows(s) }; },
+};
+
+/**
+ * advance-tick: an EMPTY wheel advanced one tick per op -- exercises the advance hot body
+ * in isolation (the single emptiness check + the counter add). All slots read empty, so
+ * every advance is legal and O(1); now climbs but never nears the 2^53 ceiling in a run.
+ */
+const twAdvanceTick = {
+    name: 'TimerWheel advance-tick (empty wheel)',
+    setup() { return { tw: new TimerWheel(TW_U, TW_SLOTS, TW_CAP) }; },
+    hot(s, n) {
+        const w = s.tw;
+        for (let i = 0; i < n; i++) w.advance(1);
+    },
+    statsOf(s) { return { grows: twGrows(s) }; },
+};
+
+/**
+ * TimerWheel forEach-drain: a primed wheel scanned each op through a HOISTED module-scope
+ * callback (never re-created per op). Proves forEach itself (the alloc-free dense-order
+ * scan; the ONE per-protocol allocator is [Symbol.iterator], gated separately by
+ * twMustFailAlloc) allocates nothing over its own dedicated window.
+ */
+let twDrainAcc = 0;
+function twForEachInto(id, slot) { twDrainAcc = (twDrainAcc + id + slot) | 0; }
+const twForEachDrain = {
+    name: 'TimerWheel forEach-drain',
+    setup() {
+        const tw = new TimerWheel(TW_U, TW_SLOTS, TW_CAP);
+        for (let i = 0; i < 256; i++) tw.schedule(i, i & (TW_SLOTS - 1)); // bounded resident set to scan
+        return { tw };
+    },
+    hot(s, n) {
+        const w = s.tw;
+        for (let i = 0; i < n; i++) w.forEach(twForEachInto);
+    },
+    statsOf(s) { return { grows: twGrows(s) }; },
+};
+
 const scenarios = [
     addChurn, hasHit, deleteChurn, clearRefill, forEachDrain,
     ringFifo, ringLifo, ringInterleave,
@@ -860,6 +998,7 @@ const scenarios = [
     randSampleRead, randRemoveDrain, randAddChurn, randForEachScan,
     freqIncrementChurn, freqPopMinDrain, freqForEachDrain,
     bqInsertChurn, bqExtractDrain, bqDecreaseKeyChurn, bqForEachDrain,
+    twScheduleChurn, twDrainDrain, twCancelChurn, twAdvanceTick, twForEachDrain,
 ];
 
 /**
@@ -1045,6 +1184,33 @@ const bqMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/**
+ * The TimerWheel teeth: a per-op `[Symbol.iterator]` spread into a FRESH [] each op --
+ * the generator + its per-step {value, done} wrappers + the array MUST trip the gate
+ * (scavenges scale with n), proving the instrument has teeth on the TimerWheel surface
+ * too (its iterator is the ONE documented per-protocol allocator; forEach is the
+ * alloc-free scan). statsOf returns a constant so the failure is the allocation lanes,
+ * not a missing-counter artifact.
+ */
+const twMustFailAlloc = {
+    name: 'TimerWheel [Symbol.iterator] spread into fresh array (MUST allocate)',
+    setup() {
+        const tw = new TimerWheel(256, 256, 256);
+        for (let i = 0; i < 64; i++) tw.schedule(i, i & 255);
+        return { tw };
+    },
+    hot(s, n) {
+        const tw = s.tw;
+        let sink = 0;
+        for (let i = 0; i < n; i++) {
+            const arr = [...tw]; // fresh generator + array per op -> heap churn
+            sink += arr.length;
+        }
+        s.sink = sink;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -1054,5 +1220,5 @@ zgcSuite({
     counters: { grows: 0 },
     maxRetainedKB: 64,
     scenarios,
-    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc],
+    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc, twMustFailAlloc],
 });

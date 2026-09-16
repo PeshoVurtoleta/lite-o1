@@ -442,3 +442,58 @@ export class BucketQueue {
     /** Iterate live keys in dense storage order. */
     [Symbol.iterator](): IterableIterator<number>;
 }
+
+/**
+ * TimerWheel -- a zero-GC, worst-case-O(1) bounded "simple" timing wheel
+ * (Varghese-Lauck's single-wheel variant): schedule integer timer ids against a
+ * monotone tick clock, drain the due slot, advance the clock. Delay is bounded to
+ * [0, slots-1] (the documented range ceiling); space is O(capacity + slots).
+ */
+export class TimerWheel {
+    /**
+     * @param universe  exclusive id ceiling; an integer in [1, 2^32]. Ids are [0, universe).
+     * @param slots     number of wheel slots; an integer in [1, 2^31], ROUNDED UP to the next
+     *                  power of two. Delay is [0, slots-1] (the rounded value).
+     * @param capacity  max simultaneously-live timers; an integer in [1, universe]. Defaults to universe.
+     */
+    constructor(universe: number, slots: number, capacity?: number);
+
+    /** Number of live timers. */
+    readonly size: number;
+
+    /** Max simultaneously-live timers this wheel was sized for. */
+    readonly capacity: number;
+
+    /** Exclusive id ceiling; ids are [0, universe). */
+    readonly universe: number;
+
+    /** Number of wheel slots (power-of-two, rounded up); delay is [0, slots-1]. */
+    readonly slots: number;
+
+    /** The monotone tick counter. */
+    readonly now: number;
+
+    /** True iff id is scheduled. Never throws; a bad id is absent. */
+    has(id: number): boolean;
+
+    /** Schedule id to fire `delay` ticks from now. Idempotent no-op if present. Throws [lite-o1] on a bad id / bad delay / when full. */
+    schedule(id: number, delay: number): this;
+
+    /** Cancel id. Returns true iff it was scheduled; a bad / absent id returns false. Never throws. */
+    cancel(id: number): boolean;
+
+    /** Fire + remove every timer in the due slot (slot[now & MASK]), calling fn(id, wheel) per timer. */
+    drainDue(fn: (id: number, wheel: TimerWheel) => void): void;
+
+    /** Advance the tick clock by `ticks` (default 1). Throws [lite-o1] if a slot left behind is undrained (drain-before-advance) or the 2^53 tick ceiling is reached. */
+    advance(ticks?: number): this;
+
+    /** Empty the wheel in O(1) (resets the count + tick clock; zeroes no store). */
+    clear(): void;
+
+    /** Iterate live timers in dense storage order, alloc-free. fn is (id, slot, wheel). */
+    forEach(fn: (id: number, slot: number, wheel: TimerWheel) => void): void;
+
+    /** Iterate live timer ids in dense storage order. */
+    [Symbol.iterator](): IterableIterator<number>;
+}

@@ -39,7 +39,7 @@ async function main() {
     const { GcProfiler, checkNoGc, measureAllocs } =
         await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue } = await import('../O1.js');
+    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel } = await import('../O1.js');
 
     const U = 1 << 16;      // universe 65536
     const CAP = 1 << 14;    // capacity 16384
@@ -147,6 +147,18 @@ async function main() {
             bq.peekMin();
             bq.extractMin();
             tracker.track(bq, noop, 'bucketqueue', { audit: true });
+            // TimerWheel owns only its private Uint32Array id columns + static slot
+            // arrays; nothing external to release. Its arrays hold numbers, so a
+            // reclaimed instance is the desired outcome, proven by size()->0. Exercise
+            // schedule/has/cancel/drainDue/advance before tracking.
+            const tw = new TimerWheel(1024, 64, 256);
+            tw.schedule(i & 1023, i & 63);
+            tw.schedule((i + 1) & 1023, 0);
+            tw.has(i & 1023);
+            tw.cancel(i & 1023);
+            tw.drainDue(noop);
+            tw.advance(1);
+            tracker.track(tw, noop, 'timerwheel', { audit: true });
         }
         return tracker.size();
     }
@@ -318,6 +330,31 @@ async function main() {
     const buckBpc = buckAllocRes.bytesPerCall === null ? 0 : buckAllocRes.bytesPerCall;
     const buckAllocBytes = Math.max(0, Math.round(buckBpc));
     const buckAllocOk = buckAllocBytes === 0;
+
+    // TimerWheel hot path: a bounded resident timer wheel churned in a rolling drain.
+    // TW_W timers are primed across TW_SLOTS slots; each step drains the current due
+    // slot (fire + swap-remove per timer) re-arming each drained timer at the max delay
+    // (slots-1, the slot just behind the cursor) through a HOISTED callback, then
+    // advance(1) over the now-drained slot (the drain-before-advance contract holds, so
+    // no throw). Size stays steady at TW_W and `now` climbs, exercising the FIFO
+    // head-walk + swap-remove + re-arm + the O(1) advance with no full/empty edge. Every
+    // op is WORST-CASE O(1), zero-alloc (id columns + static slot arrays recycle typed
+    // slots only). drainDue's fn is user code (the documented exception); the drain loop
+    // itself allocates nothing.
+    const TW_SLOTS = 1 << 8;             // 256 slots
+    const TW_W = 1 << 12;                // 4096 resident timers, < CAP so never full
+    const tw = new TimerWheel(U, TW_SLOTS, CAP);
+    for (let k = 0; k < TW_W; k++) tw.schedule(k, k & (TW_SLOTS - 1)); // spread across slots
+    const twReschedule = (id, wheel) => { wheel.schedule(id, TW_SLOTS - 1); }; // re-arm at max delay
+    const twStep = () => {
+        tw.drainDue(twReschedule); // fire+remove the due slot, re-arm each drained timer
+        tw.advance(1);             // the current slot is drained -> legal O(1) advance
+    };
+    const twAllocRes = measureAllocs(twStep, { iterations: 100000, batches: 8 });
+    const twBpc = twAllocRes.bytesPerCall === null ? 0 : twAllocRes.bytesPerCall;
+    const twAllocBytes = Math.max(0, Math.round(twBpc));
+    const twAllocOk = twAllocBytes === 0;
+    const twNoop = () => {};
     // "0 B/op" resolved at the sampling floor: heapUsed deltas are quantized and
     // noisy, so a truly non-allocating op reads a sub-byte figure (a lone blip
     // in one batch / iterations). Round to the nearest byte -- any per-op
@@ -339,6 +376,7 @@ async function main() {
         randStep();
         freqStep();
         buckStep();
+        twStep();
         if ((i & 8191) === 0) {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
         }
@@ -409,6 +447,16 @@ async function main() {
         while (buck.size > 0) SINK += buck.extractMin() >= 0 ? 1 : 0;
         buck.clear();
     }
+    // TimerWheel fill (all at delay 0 -> the single due slot) + forEach (dense scan) +
+    // drainDue drain + O(1) clear cycles -- exercises schedule, the FIFO head-walk +
+    // swap-remove drain, the alloc-free scan, and clear. clear() first resets `now` (the
+    // hot loop left it high) so each cycle re-enters at tick 0; the drain empties it.
+    for (let f = 0; f < 1024; f++) {
+        tw.clear();
+        for (let k = 0; k < 512; k++) tw.schedule(k, 0); // all due at tick 0 (slot 0)
+        tw.forEach(cb);
+        tw.drainDue(twNoop);                             // drain slot 0 -> size 0
+    }
     await new Promise((r) => setTimeout(r, 50));
     const s2 = gc.summary();
     const report = checkNoGc(s2, { maxMajor: 0, maxPauseMs: 2 });
@@ -443,6 +491,10 @@ async function main() {
         for (let k = 0; k < CAP; k++) buck.insert(k, 0);
         while (buck.size > 0) buck.extractMin();
         buck.clear();
+        tw.clear();
+        for (let k = 0; k < CAP; k++) tw.schedule(k, 0); // all due at tick 0 (slot 0)
+        tw.drainDue(twNoop);                             // drain slot 0 -> size 0
+        tw.clear();
     }
     globalThis.gc();
     const abAfter = process.memoryUsage().arrayBuffers;
@@ -452,7 +504,7 @@ async function main() {
     // ---- verdict + GATE line ----------------------------------------------
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
         findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && monoAllocOk &&
-        minAllocOk && randAllocOk && freqAllocOk && buckAllocOk && abOk;
+        minAllocOk && randAllocOk && freqAllocOk && buckAllocOk && twAllocOk && abOk;
 
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
@@ -462,7 +514,8 @@ async function main() {
         ' | alloc=' + allocBytes + ' B/op (SparseSet) ' + ringAllocBytes + ' B/op (RingDeque) ' +
         ufAllocBytes + ' B/op (UnionFind) ' + monoAllocBytes + ' B/op (MonoDeque) ' +
         minAllocBytes + ' B/op (MinStack) ' + randAllocBytes + ' B/op (RandomSet) ' +
-        freqAllocBytes + ' B/op (FreqO1) ' + buckAllocBytes + ' B/op (BucketQueue)' +
+        freqAllocBytes + ' B/op (FreqO1) ' + buckAllocBytes + ' B/op (BucketQueue) ' +
+        twAllocBytes + ' B/op (TimerWheel)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
         ' (tracked=' + trackedMid + ' sink=' + SINK + ' abGrowth=' + abDelta + ')');
 
@@ -481,6 +534,7 @@ async function main() {
         if (!randAllocOk) console.error('  alloc ' + randAllocBytes + ' B/op RandomSet (raw bytesPerCall ' + randBpc + ')');
         if (!freqAllocOk) console.error('  alloc ' + freqAllocBytes + ' B/op FreqO1 (raw bytesPerCall ' + freqBpc + ')');
         if (!buckAllocOk) console.error('  alloc ' + buckAllocBytes + ' B/op BucketQueue (raw bytesPerCall ' + buckBpc + ')');
+        if (!twAllocOk) console.error('  alloc ' + twAllocBytes + ' B/op TimerWheel (raw bytesPerCall ' + twBpc + ')');
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;
     }

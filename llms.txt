@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-Version: 0.8.0
+Version: 0.9.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -13,9 +13,9 @@ op is O(1) worst-case (or O(1)-amortized where stated) and allocates zero bytes
 after construction, and a shipped witness harness demonstrates the flat
 throughput curve against a built-in foil.
 
-v0.8.0 ships eight members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
-RandomSet, FreqO1, and BucketQueue. They share no mutable module state, so a
-bundler that imports one drops the others (tree-shakeable).
+v0.9.0 ships nine members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
+RandomSet, FreqO1, BucketQueue, and TimerWheel. They share no mutable module state,
+so a bundler that imports one drops the others (tree-shakeable).
 
 ## Exports (from the single main file O1.js)
 
@@ -33,7 +33,10 @@ bundler that imports one drops the others (tree-shakeable).
 - `BucketQueue` -- class. A zero-GC AMORTIZED O(1) monotone integer priority queue
   ("Dial") with insert() / decreaseKey() / extractMin() / peekMin() over private key
   columns + a static per-priority bucket array.
-- `VERSION` -- string, '0.8.0'.
+- `TimerWheel` -- class. A zero-GC WORST-CASE O(1) bounded "simple" timing wheel
+  (Varghese-Lauck) with schedule() / cancel() / drainDue() / advance() over private id
+  columns + a static per-slot FIFO ring.
+- `VERSION` -- string, '0.9.0'.
 
 ## SparseSet
 
@@ -456,6 +459,89 @@ capacity-sized), so the `n === capacity` guard rejects a NEW key past capacity a
 byte-identical no-op and no node slot is ever over-allocated. The buckets are static
 (0..ceiling), so there is no bucket free-list to exhaust.
 
+## TimerWheel
+
+    new TimerWheel(universe, slots, capacity = universe)
+
+- A WORST-CASE O(1) BOUNDED "simple" timing wheel (Varghese-Lauck's single-wheel
+  variant, NOT the hashed / hierarchical one). Integer timer ids [0, universe) are
+  scheduled against a monotone tick clock: scheduling id with delay d files it into
+  slot[(now + d) & MASK] until fired or canceled. Delay is bounded to [0, slots-1] (the
+  documented range ceiling); space is O(capacity + slots).
+- universe: exclusive id ceiling; integer in [1, 2^32]. Ids are integers in [0, universe).
+- slots: number of wheel slots; integer in [1, 2^31], ROUNDED UP to the next power of two
+  (the getter reports the rounded value; MASK = slots-1). Space is O(slots) -- the honest
+  bounded-delay-range co-headline (parallel to BucketQueue's ceiling). The 2^31 bound is a
+  TYPE bound, not a practical size; a simple wheel is FOR a bounded delay horizon.
+- capacity: max simultaneously-live timers; integer in [1, universe], default universe.
+- Constructor throws a [lite-o1] RangeError on a bad universe / slots / capacity
+  (typeof-guarded FIRST so a Symbol / BigInt never reaches coercion; String(x) message).
+- Substrate (all PRIVATE Uint32Array columns; NO public SlotPool -- ADR 0003's deferral
+  stands): IDS ride SparseSet's dense + sparse cross-check (dense index = the stable node
+  id). Per NODE: slotOf (which slot it is in) + next/prev intrusive FIFO list within a
+  slot. Per SLOT (a STATIC array indexed 0..slots-1, NO free-list): FIFO head/tail nodes.
+  clear() is O(1): a stale static slot head is voided by the SAME `i < _size` cross-check
+  that voids stale sparse entries (a slot s is non-empty iff
+  _sHead[s] < _size && _slotOf[_sHead[s]] === s), so no per-slot reset is needed.
+
+Hot surface (schedule / cancel / advance(1) / has WORST-CASE O(1); drainDue O(due); all
+zero allocation):
+
+- schedule(id, delay) -> this  File id into slot[(now + delay) & MASK]. IDEMPOTENT no-op
+                            if id is already present (reschedule = cancel then schedule).
+                            Fail closed: a bad id / a delay >= slots / a NEW id past
+                            capacity throw [lite-o1] as a byte-identical no-op.
+- cancel(id) -> boolean     Unlink id from its slot FIFO + swap-remove. True iff it was
+                            scheduled; a bad / absent id returns false, NEVER throws.
+- drainDue(fn) -> void      Fire + remove EXACTLY the timers present in the due slot
+                            (slot[now & MASK]) at ENTRY, calling fn(id, wheel) in FIFO
+                            order. O(due). SNAPSHOT semantics: a timer (re)scheduled during
+                            fn DEFERS to a later drainDue (a self-reschedule-at-0 fires once
+                            this drain then defers -> always terminates; periodic idiom =
+                            reschedule at delay >= 1); a timer canceled during fn before it
+                            fires does NOT fire. Re-entrant schedule/cancel/clear from
+                            inside fn are supported (the due list is moved into a reserved
+                            DRAINING identity at entry, then head-drained); re-entrant
+                            ADVANCE throws (see advance). fn is user code -- the one
+                            documented alloc exception.
+- advance(ticks = 1) -> this  FAIL-CLOSED drain-before-advance: every slot left behind
+                            must be EMPTY (drained), else it throws [lite-o1] as a
+                            byte-identical no-op. Also throws if called from INSIDE a drainDue
+                            callback (an in-flight drain -- advancing would strand the
+                            un-fired due timers). advance(1) is worst-case O(1) (one
+                            emptiness check + a counter add); advance(k) is O(k) checks.
+                            ticks is [0, 2^32-1]; `now` is capped at 2^53 via a `>=` guard.
+- has(id) -> boolean        True iff id is scheduled. A bad id is ABSENT, never throws.
+- size / capacity / universe / slots / now (getters).
+- clear() -> void           O(1): resets the live count + the tick clock to 0; touches NO
+                            store (stale dense/sparse + static slot heads fail the cross-check).
+- forEach(fn) -> void       O(size) alloc-free scan in DENSE STORAGE order (NOT time
+                            order); fn is (id, slot, wheel). Re-reads size each step, so a
+                            re-entrant cancel self-terminates.
+- [Symbol.iterator]()       O(size) scan, same order; ALLOCATES per protocol -- use
+                            forEach for the alloc-free scan.
+
+DRAIN-BEFORE-ADVANCE contract (LOCKED -- this is what buys the worst-case O(1) with NO
+max-single-op line): slot[now & MASK] IS the due set; advance() refuses to lap the wheel
+over an undrained slot (it throws fail-closed). Because a slot is never advanced past
+while non-empty, a slot always holds exactly one rotation's timers -- so there is NO
+cursor, NO absolute-deadline column, and NO O(gap) worst case (unlike BucketQueue). The
+`now` ceiling guard uses `>=` (now + ticks >= 2^53 throws) -- the MonoDeque
+saturating-counter lesson, primed by a white-box test; a `>` would be off-by-one.
+
+Id / delay / ticks model: ids integer [0, universe); delay integer [0, slots-1]; ticks
+integer [0, 2^32-1]. Every guard is typeof-first (`typeof x !== 'number' ||
+(x >>> 0) !== x || x >= bound`) on BOTH the id and the delay/ticks arg, so a Symbol /
+BigInt never reaches the coercing `>>>`; messages via String(x). null is not zero. Fail
+closed on the MUTATORS (schedule / advance), ABSENT on the QUERIES (has / cancel never
+throw). -0 aliases id 0 AND delay 0 via the uint32 coercion.
+
+Pool sizing (why exhaustion is impossible under contract, yet still fails closed): at most
+capacity ids are live at once, one node slot per id (dense / slotOf / next / prev are all
+capacity-sized), so the `size === capacity` guard rejects a NEW id past capacity as a
+byte-identical no-op and no node slot is ever over-allocated. The slots are static
+(0..slots-1), so there is no slot free-list to exhaust.
+
 ## Design bounds
 
 - SparseSet valid key: integer in [0, universe).
@@ -500,10 +586,22 @@ byte-identical no-op and no node slot is ever over-allocated. The buckets are st
   FIFO tie-break within a priority. Static buckets 0..ceiling, no free-list. forEach /
   [Symbol.iterator] scan in dense storage order (iterator allocates). insert of a present
   key, and decreaseKey of an absent key or a non-strict-decrease, are documented no-ops.
+- TimerWheel valid id: integer in [0, universe); valid delay: integer in [0, slots-1];
+  fixed capacity, no growth. BOUNDED "simple" wheel (Varghese-Lauck): schedule files into
+  slot[(now + delay) & MASK]; DRAIN-BEFORE-ADVANCE -- advance() refuses to lap over an
+  undrained slot (throws fail-closed), so there is no cursor and no O(gap) worst case.
+  Space O(slots). Fail closed on the mutators schedule / advance (throws [lite-o1]; null
+  is never coerced to id 0), absent on the queries has / cancel (never throw; cancel
+  returns false). schedule / cancel / advance(1) / has are WORST-CASE O(1); drainDue is
+  O(due). `now` ceiling 2^53 (a `>=` guard; advance past it throws, no precision loss).
+  FIFO within-slot order; drainDue captures next-before-fn (re-entrancy-safe). Static
+  slots 0..slots-1, no free-list. forEach / [Symbol.iterator] scan in dense storage order
+  (iterator allocates). schedule of a present id is an idempotent no-op (reschedule =
+  cancel then schedule). NO pollDue, NO cursor, NO absolute-deadline column.
 
 ## Scripts
 
-- npm test           -- 339 node:test cases (contract + boundary + differential fuzz).
+- npm test           -- 389 node:test cases (contract + boundary + differential fuzz).
 - npm run test:types -- tsc --noEmit against O1.d.ts.
 - npm run torture    -- lite-leak + lite-gc-profiler: 0 B/op, 0 major GC, leak-free.
 - npm run witness    -- O(1) throughput-invariance harness + foils + flatness gate.
@@ -569,6 +667,15 @@ byte-identical no-op and no node slot is ever over-allocated. The buckets are st
   evidence is the sustained throughput lead, not a foil collapse (see ADR 0013). The
   witness ALSO prints the MAX single-op time (an O(gap) cursor jump across empty buckets)
   beside a typical O(1) extractMin -- the amortized-honesty bar (reported, NOT gated).
+- TimerWheel: size-sweep [1e3, 1e4, 1e5], WORST-CASE-O(1) TICK (a steady-state
+  drainDue + advance, with slots >= n so ~1 timer is due per tick) vs a NAIVE-SCAN
+  scheduler that SCANS ALL n pending deadlines each tick to find + fire the due ones
+  (O(n)/tick). ops/ms is a rate (wheel batch 5e5, naive batch 2e3). Gated over the steady
+  window size >= 1e4 (the 1e3 point is a pure-L1 micro-case shown but not gated).
+  TimerWheel flatness >= 0.70; naive foil flatness <= 0.55 (a TRUE O(n) foil, so it
+  collapses -- unlike BucketQueue's O(log n) heap); TimerWheel/naive ratio >= 1.5x. NO
+  MAX-single-op line: schedule / cancel / advance(1) are worst-case O(1) (drain-before-
+  advance keeps a slot to one rotation's timers), so there is no amortized spike.
 
 ## Not yet shipped
 
@@ -582,4 +689,7 @@ extreme only, RandomSet holds integer membership + uniform sampling over
 [0, universe), FreqO1 holds integer keys + their access FREQUENCY over
 [0, universe) -- an LFU primitive, not a full cache -- and BucketQueue holds integer
 keys + their integer PRIORITY over [0, universe) x [0, ceiling] -- a monotone priority
-queue, not a general heap (queue integer handles for object payloads).
+queue, not a general heap (queue integer handles for object payloads) -- and TimerWheel
+holds integer timer IDS over [0, universe) filed against a delay in [0, slots-1] -- a
+BOUNDED simple wheel, not a hashed / hierarchical one (a hashed wheel for unbounded
+delays is a deferred future member; schedule integer handles for object payloads).

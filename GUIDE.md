@@ -335,6 +335,50 @@ O(1) violation.
 
 ---
 
+### TimerWheel (v0.9.0)
+
+Bounded "simple" timing wheel (Varghese-Lauck's single-wheel variant, NOT the hashed /
+hierarchical one) over private `Uint32Array` id columns + a STATIC per-slot FIFO ring.
+`schedule(id, delay)` files a timer into `slot[(now + delay) & MASK]`, `cancel(id)`
+removes it, `drainDue(fn)` fires the slot due now, `advance(ticks)` steps the monotone
+clock -- schedule / cancel / advance(1) all WORST-CASE O(1), drainDue O(due). The
+standalone primitive behind O(1) timer scheduling; the drain-before-advance contract is
+what removes the amortized asterisk (no cursor, no O(gap) worst case).
+
+**Reach for it when:**
+
+- You schedule many timers against a TICK clock over a BOUNDED delay horizon -- discrete-
+  event simulation, connection-timeout sweeps, rate limiters, retry backoff, game-loop
+  cooldowns. Where a binary-heap timer queue is O(log n) per op and a linear scan is O(n)
+  per tick, a timing wheel is O(1).
+- You need `schedule` AND `cancel` at WORST-CASE O(1) (not amortized) with zero per-op
+  allocation -- a heap's cancel needs a position map and a sift; the wheel unlinks in O(1).
+- You fire timers by advancing a clock tick-by-tick and draining the due slot -- the
+  natural discrete-event loop. The delay range fits `slots` (rounded up to a power of two).
+
+**Avoid it when:**
+
+- Your delays are UNBOUNDED, far in the future, or of unknown horizon -- the ring is
+  `slots` slots (space O(slots)); a delay `>= slots` throws. Reach for a hierarchical /
+  hashed wheel (a deferred future member) or a binary-heap timer queue for a wide horizon.
+- You need SUB-TICK or floating-point deadlines -- a wheel is integer-tick; quantize to a
+  tick, or use a heap keyed by a float deadline.
+- You cannot follow the drain-before-advance discipline (drain the due slot before you
+  advance past it) -- `advance` fails closed (throws) on an undrained slot, by design, to
+  prevent a silent misfire when the clock laps the wheel.
+- Ids are strings, objects, or sparse integers over a huge / unbounded domain -- the
+  `sparse` array is universe-sized; the same SparseSet caveat applies.
+
+**Measure it:** `npm run witness` -- TimerWheel single-tick (`drainDue` + `advance`)
+flatness `>= 0.70` across the size sweep `[1e4..1e5]` (the 1e3 point is a pure-L1
+micro-case, shown but not gated) while a NAIVE-SCAN scheduler that scans all `n` pending
+timers each tick collapses to `<= 0.55` and runs `>= 1.5x` (in practice hundreds of times)
+slower per tick. Unlike BucketQueue's O(log n) heap, this is a TRUE O(n) foil, so it hits
+the standard 0.55 collapse. NO MAX-single-op line: every hot op is worst-case O(1), so the
+flat line is the whole claim.
+
+---
+
 ## Roadmap members (not yet shipped)
 
 Placeholders so the decision axes are visible early; each fills in on release.

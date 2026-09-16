@@ -10,8 +10,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **8-dimension benchmark suite (`benchmark/`, repo-only -- NOT part of the
   published surface, NO version bump).** The ecosystem MVP of RESEARCH.md section 3:
-  it profiles six of the eight shipped members (SparseSet, RingDeque, UnionFind,
-  MonoDeque, MinStack, RandomSet; FreqO1 and BucketQueue are not yet in the matrix)
+  it profiles six of the nine shipped members (SparseSet, RingDeque, UnionFind,
+  MonoDeque, MinStack, RandomSet; FreqO1, BucketQueue, and TimerWheel are not yet
+  in the matrix)
   against the JS built-ins across eight axes -- D1 latency distribution
   (p50/p90/p99/p99.9/max, with + without forced GC), D2 amortized drift over long
   mixed traces, D3 memory footprint + stability, D4 cache behaviour (a labelled
@@ -32,6 +33,125 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   impossible 0 fails) + FIXED-SEED DETERMINISM (two runs at seed `0x9e3779b1`
   produce byte-identical workload trace hashes, using the repo's own Numerical
   Recipes LCG -- no new PRNG introduced).
+
+## [0.9.0] - 2026-09-16
+
+The ninth member of the O(1) family: a WORST-CASE O(1) BOUNDED "simple" timing wheel
+(Varghese-Lauck's single-wheel variant, NOT the hashed / hierarchical one) -- the
+standalone primitive behind O(1) timer scheduling. Tree-shakeable alongside SparseSet,
+RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, and BucketQueue (the nine
+share no mutable module state).
+
+### Added
+
+- **`TimerWheel(universe, slots, capacity = universe)`** -- a zero-GC, WORST-CASE O(1)
+  bounded "simple" timing wheel over PRIVATE `Uint32Array` id columns and a STATIC
+  per-slot FIFO ring (NO public SlotPool; ADR 0003's SlotPool deferral STANDS --
+  TimerWheel owns its own columns and stays self-contained + tree-shakeable):
+  - Layout: IDS ride SparseSet's dense + sparse cross-check (the dense index is the
+    stable node id), so `clear()` is O(1). Per NODE: which slot it is in (`_slotOf`) and
+    an intrusive DOUBLY-linked FIFO list within a slot. Per SLOT (a STATIC array indexed
+    0..slots-1, NO free-list): FIFO head/tail nodes. `slots` ROUNDS UP to the next power
+    of two (MASK = slots-1); the `slots` getter reports the rounded value. A stale static
+    slot head (left by a prior generation after `clear()`) is voided by the SAME
+    `i < _size` cross-check that voids stale sparse entries (a slot s is non-empty iff
+    `_sHead[s] < _size && _slotOf[_sHead[s]] === s`), so `clear()` needs no per-slot reset.
+  - `schedule(id, delay) -> this` -- file id into slot `(now + delay) & MASK`. IDEMPOTENT
+    no-op if id is already present (reschedule = cancel then schedule; the delay arg is
+    still validated fail-closed). delay in [0, slots-1] -- the bounded delay range.
+  - `cancel(id) -> boolean` -- unlink id from its slot FIFO (fixing head/tail via
+    `_slotOf`) + swap-remove. true iff scheduled; a bad / absent id returns false, NEVER
+    throws.
+  - `drainDue(fn) -> void` -- fire + remove EXACTLY the timers present in the due slot
+    (`slot[now & MASK]`) at ENTRY, calling fn(id, wheel) in FIFO order. O(due). SNAPSHOT
+    semantics: a timer (re)scheduled during fn DEFERS to a later drainDue (a
+    self-reschedule-at-0 fires once this drain then defers -> always terminates; periodic
+    idiom = reschedule at delay >= 1), and a timer canceled during fn before it fires does
+    NOT fire. Re-entrant schedule / cancel / clear from inside fn are supported; re-entrant
+    ADVANCE throws (see advance). Mechanism (zero-alloc, O(due)): the due list is moved into
+    a reserved DRAINING identity (`_sHead`/`_sTail` sized slots + 1) at entry so the real
+    slot empties (schedules defer there), then head-drained (each step re-reads the head and
+    breaks on `i >= _size || _slotOf[i] !== draining`, surviving a re-entrant cancel of any
+    not-yet-fired node AND a re-entrant clear()/clear+repopulate). fn is user code (the one
+    alloc exception).
+  - `advance(ticks = 1) -> this` -- FAIL-CLOSED drain-before-advance: every slot left
+    behind must be EMPTY (drained), else it throws `[lite-o1]` as a byte-identical no-op
+    (the scan precedes the `now` mutation). ALSO throws if called from INSIDE a drainDue
+    callback (an in-flight drain -- advancing would strand the un-fired due timers relabeled
+    DRAINING, invisible to the real-slot scan). advance(1) is worst-case O(1) (one check +
+    a counter add); advance(k) is O(k) checks. `ticks` in [0, 2^32-1]; `now` capped at 2^53
+    via a `>=` guard (advance past it throws -- no precision loss).
+  - `has(id) -> boolean` -- membership; a bad id is ABSENT, never throws.
+  - `size` / `capacity` / `universe` / `slots` / `now` getters. `clear()` is O(1): resets
+    the live count + the tick clock to 0, touches NO store.
+  - `forEach(fn)` -- an O(size) alloc-free scan in DENSE STORAGE order (NOT time order;
+    fn is (id, slot, wheel)), re-reading `size` each step so a re-entrant `cancel`
+    self-terminates. `[Symbol.iterator]` -- an O(size) scan in the same order that
+    ALLOCATES per protocol, kept out of the zero-alloc claims.
+  - DRAIN-BEFORE-ADVANCE contract (what buys the worst-case O(1) with NO max-single-op
+    line): `slot[now & MASK]` IS the due set, and `advance` refuses to lap over an
+    undrained slot -- so a slot always holds exactly one rotation's timers, and there is
+    NO cursor, NO absolute-deadline column, and NO O(gap) worst case (unlike BucketQueue).
+    Space is O(capacity + slots) -- the O(slots) delay-range term is the documented
+    co-headline; slots in [1, 2^31] is a TYPE bound. Fail closed: a bad id / delay throws
+    `[lite-o1]` on the MUTATORS schedule / advance (typeof-guarded BEFORE the coercing
+    `>>>` on BOTH the id and the delay/ticks arg, so a Symbol / BigInt never triggers a
+    raw `TypeError`; `null` is not zero), but is ABSENT for the QUERIES has / cancel
+    (never throw). A NEW id past capacity throws a byte-identical no-op. Pool sizing: at
+    most `capacity` ids are live, one capacity-sized node slot per id, so the
+    `size === capacity` guard makes over-allocation impossible; the static slots have no
+    free-list to exhaust.
+- **`TimerWheel` type surface** in `O1.d.ts` (constructor + five getters + the five
+  methods + forEach + iterator), exercised by `test/types/o1.test-d.ts`.
+- **`test/TimerWheel.test.js`** -- contract (every method, return types) + boundary
+  (universe=1, slots=1, capacity=1, empty, full, id at 0 and universe-1, delay 0 and
+  delay slots-1, slots power-of-two rounding) + WHITE-BOX priming of the `<` delay guard
+  (delay===slots-1 ok, delay===slots throws) and the `>=` MAX_TICK ceiling guard (`_now`
+  forced to 2^53-1, advance throws -- proving the guard is not dead code) as byte-identical
+  no-ops + the drain-before-advance FAIL-CLOSED throw (advance over an undrained slot
+  throws byte-identical) + FIFO drain order + clear/reuse (stale static slot heads voided)
+  + re-entrant cancel / schedule from inside drainDue and forEach + a multi-tick wrap
+  proof + a >= 3e5-op interleaved schedule / cancel / advance+drain differential fuzz vs a
+  brute-force per-slot FIFO ORACLE over a wrapping clock, 0 divergences.
+
+### Proof
+
+- **Torture** (`node --expose-gc test/torture.mjs`): TimerWheel added to every phase --
+  0 B/op on the hot path (a rolling drainDue + advance churn re-arming each fired timer),
+  `maxMajor` 0, `maxPauseMs <= 2`, arrayBuffers delta <= 0, `tracker.size()` back to 0
+  after the retention churn. The run proves 0 B/op across ALL NINE members.
+- **Witness** (`node test/witness.mjs`): a TimerWheel single TICK (`drainDue` + `advance`,
+  with slots >= n so ~1 timer is due per tick) stays FLAT from size 1e3 to 1e5 vs a
+  NAIVE-SCAN scheduler that scans all n pending deadlines each tick (O(n)/tick). Measured
+  flatness ~0.85 (steady window size >= 1e4), naive foil ~0.10 (a TRUE O(n) foil, so it
+  hits the standard <= 0.55 collapse -- unlike BucketQueue's O(log n) heap),
+  TimerWheel/naive ratio ~615x (gate >= 1.5x). NO MAX-single-op line: every hot op is
+  worst-case O(1).
+- **Perf gate** (`npm run test:perf`): five new zero-alloc scenarios (schedule-churn,
+  drainDue-drain, cancel-churn, advance-tick, forEach-drain), with a `twGrows` 0-delta
+  canary on ALL backing `Uint32Array` columns (the id substrate + node columns + the
+  static slot head/tail arrays), plus an iterator-into-fresh-array `mustFail` teeth case.
+
+### Changed
+
+- `VERSION` -> `'0.9.0'`; `package.json` version + description + keywords
+  (`timing-wheel`, `timer-wheel`, `timer`, `scheduler`, `event-scheduling`,
+  `delayed-execution`). The three version sites (`package.json` / `VERSION` / `llms.txt`)
+  move together. The prior EIGHT class bodies (SparseSet / RingDeque / UnionFind /
+  MonoDeque / MinStack / RandomSet / FreqO1 / BucketQueue) are BYTE-IDENTICAL -- only the
+  `O1.js` header comment, the `VERSION` const, the appended `TW_NIL` + `class TimerWheel`,
+  and the prior members' `VERSION` test assertions changed.
+
+### ADR
+
+- [`0014`](./decisions/0014-timerwheel.md) -- the bounded-simple-wheel decision (and why
+  a hierarchical / hashed wheel is a deferred future member), the drain-before-advance
+  contract (and why it buys worst-case O(1) / no max-single-op line, vs the amortized
+  cursor alternative), the O(slots) bounded-delay space co-headline, the naming honesty
+  (simple not hashed), the private-columns / static-slots / no-free-list decision (ADR
+  0003's SlotPool deferral stands), the O(1)-clear-over-static-slots cross-check, the FIFO
+  within-slot order + SNAPSHOT drain re-entrancy (move-to-DRAINING + head-drain), the
+  idempotent-schedule / fail-closed decisions, and the O(n) naive-scan witness-foil rationale.
 
 ## [0.8.0] - 2026-09-16
 

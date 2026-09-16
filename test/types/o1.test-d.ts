@@ -5,7 +5,7 @@
  * fails `npm run test:types`. Not executed; only type-checked.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, VERSION } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, VERSION } from '../../O1.js';
 
 // VERSION is a string.
 const v: string = VERSION;
@@ -411,3 +411,66 @@ new BucketQueue('1000', 255);
 new BucketQueue(1000, 'x');
 // @ts-expect-error -- insert takes numbers.
 bq.insert('3', 0);
+
+// --- TimerWheel ------------------------------------------------------------
+
+// Constructor: universe + slots required; capacity optional (all numbers).
+const tw: TimerWheel = new TimerWheel(1000, 64);
+const twCap: TimerWheel = new TimerWheel(1000, 64, 256);
+void twCap;
+
+// Getters: size / capacity / universe / slots / now are readonly numbers.
+const twsize: number = tw.size;
+const twcap: number = tw.capacity;
+const twuniv: number = tw.universe;
+const twslots: number = tw.slots;
+const twnow: number = tw.now;
+void twsize; void twcap; void twuniv; void twslots; void twnow;
+
+// @ts-expect-error -- size is readonly.
+tw.size = 5;
+// @ts-expect-error -- slots is readonly.
+tw.slots = 5;
+// @ts-expect-error -- now is readonly.
+tw.now = 5;
+
+// schedule / advance -> this (chainable); has / cancel -> boolean.
+const chainedTw: TimerWheel = tw.schedule(1, 3).advance(1);
+const twhas: boolean = tw.has(1);
+const twcancel: boolean = tw.cancel(1);
+const twcleared: void = tw.clear();
+void chainedTw; void twhas; void twcancel; void twcleared;
+
+// advance defaults ticks to 1.
+const twadv: TimerWheel = tw.advance();
+void twadv;
+
+// drainDue callback gets (id, wheel).
+tw.drainDue((id, wheel) => {
+    const ii: number = id;
+    const self: TimerWheel = wheel;
+    void ii; void self;
+});
+
+// forEach callback gets (id, slot, wheel).
+tw.forEach((id, slot, wheel) => {
+    const ii: number = id;
+    const ss: number = slot;
+    const self: TimerWheel = wheel;
+    void ii; void ss; void self;
+});
+
+// Iterable of number.
+for (const id of tw) {
+    const ii: number = id;
+    void ii;
+}
+const twspread: number[] = [...tw];
+void twspread;
+
+// @ts-expect-error -- universe must be a number.
+new TimerWheel('1000', 64);
+// @ts-expect-error -- slots must be a number.
+new TimerWheel(1000, 'x');
+// @ts-expect-error -- schedule takes numbers.
+tw.schedule('3', 0);

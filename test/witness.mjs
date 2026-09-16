@@ -48,7 +48,7 @@
  * metric are unchanged; only the measurement is made steadier.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel } from '../O1.js';
 
 const SIZES = [1e3, 1e4, 1e5, 1e6, 1e7];
 const BATCH = 1e6;
@@ -166,6 +166,24 @@ const BQ_CEIL = 1 << 20;      // fixed ceiling headroom the climbing cursor neve
 // DENOMINATOR (the same effect ADR-0004's amendment pinned). The gate is computed over
 // the steady window size >= 1e4; the 1e3 point is DISPLAYED, tagged.
 const BQ_GATE_MIN = 1e4;
+
+// TimerWheel sweep. n is the number of LIVE timers. The op is a steady-state single
+// TICK: drain the current due slot (fire the timers due now) and advance one tick. The
+// wheel is sized with SLOTS ~ n (one timer per slot), so exactly ~1 timer fires per
+// tick and each drainDue + advance is O(1) INDEPENDENT of n -- the bounded-wheel O(1)
+// theorem. The foil is a NAIVE-SCAN scheduler: n pending deadlines in a flat array,
+// where each tick SCANS ALL n to find + fire the due ones -- O(n) per tick. ops/ms is
+// a RATE, so the two use DIFFERENT batches yet flatness + ratio compare directly. This
+// is an O(n) foil (a full factor of n lost per decade), so unlike BucketQueue's O(log n)
+// heap it DOES collapse to the <= 0.55 flatness bar (per ADR-0004 + ADR-0014).
+const TW_SIZES = [1e3, 1e4, 1e5];
+const TW_BATCH = 5e5;         // large: stable timing for the O(1) tick
+const TW_NAIVE_BATCH = 2e3;   // small: an O(n) naive scan at n=1e5 must stay tractable
+// The TimerWheel tick (a drainDue + advance) is a handful of pointer writes, so the
+// size=1e3 point is a pure-L1 micro-case that turbo-spikes as the flatness DENOMINATOR
+// (the same effect ADR-0004's amendment pinned). The gate is computed over the steady
+// window size >= 1e4; the 1e3 point is DISPLAYED, tagged.
+const TW_GATE_MIN = 1e4;
 
 // Global sink: every op feeds it so V8 cannot dead-code-eliminate the batch.
 let SINK = 0;
@@ -519,6 +537,41 @@ function buildBinaryHeapFoil(n) {
         hk[j] = mk;
         up(j);
         SINK += mk;
+    };
+    return { op };
+}
+
+// TimerWheel: a bounded "simple" timing wheel of n LIVE timers, sized with SLOTS >= n
+// (one timer per slot) so exactly ~1 timer is due per tick and each drainDue + advance
+// is O(1) independent of n. Prime one timer per slot, then each op drains the current
+// due slot (re-arming every fired timer at the max delay so the resident set stays n)
+// and advances one tick. It streams FLAT as n grows -- the bounded-wheel O(1) theorem.
+function buildTimerWheel(n) {
+    let S = 1; while (S < n) S *= 2;               // slots >= n (one timer per slot)
+    const w = new TimerWheel(n, S, n);
+    for (let k = 0; k < n; k++) w.schedule(k, k % S); // spread one per slot (k < n <= S)
+    const rearm = (id, wheel) => { wheel.schedule(id, S - 1); SINK += id; }; // re-arm at max delay
+    const op = () => {
+        w.drainDue(rearm); // fire the ~1 timer due at the current tick (O(1))
+        w.advance(1);      // step the clock (the drained slot is now empty -> legal)
+    };
+    return { op };
+}
+
+// Foil: a NAIVE-SCAN scheduler -- n pending absolute deadlines in a flat Float64Array.
+// Each tick SCANS ALL n entries to find + fire the due ones (deadline === now), re-arming
+// each at the max horizon -- O(n) per tick, the linear cost a timing wheel exists to
+// remove. Same initial spread as the wheel; no allocation (the column is preallocated).
+function buildNaiveSchedulerFoil(n) {
+    let S = 1; while (S < n) S *= 2;
+    const deadline = new Float64Array(n);
+    for (let k = 0; k < n; k++) deadline[k] = k % S; // same one-per-slot spread as the wheel
+    let now = 0;
+    const op = () => {
+        for (let k = 0; k < n; k++) {                // O(n): scan ALL pending to find the due ones
+            if (deadline[k] === now) { deadline[k] = now + (S - 1); SINK += k; }
+        }
+        now++;
     };
     return { op };
 }
@@ -972,5 +1025,57 @@ if (!bqAllOk) {
     if (!heapOk) console.error('  violation heap foil flatness ' + fmt(heap.flatness) +
         ' not < BucketQueue flatness ' + fmt(bq.flatness));
     if (!bqRatioOk) console.error('  violation min bq ratio ' + fmt(bqRatio) + 'x < 1.50x');
+    process.exitCode = 1;
+}
+
+// ===========================================================================
+// TimerWheel witness -- worst-case-O(1) tick vs an O(n) naive-scan scheduler
+// ===========================================================================
+const twy = witness(buildTimerWheel, TW_SIZES, TW_BATCH, REPS, TW_GATE_MIN);
+const naiveSched = witness(buildNaiveSchedulerFoil, TW_SIZES, TW_NAIVE_BATCH, REPS, TW_GATE_MIN);
+
+console.log('');
+console.log('O(1) Witness -- TimerWheel tick (drainDue + advance) vs a naive O(n) scan (rate ops/ms, median of ' +
+    REPS + ', gate size >= ' + nStr(TW_GATE_MIN) + ')');
+console.log('');
+console.log('  size      TimerWheel ops/ms  naive ops/ms   ratio');
+console.log('  --------  ----------------   ------------   -----');
+let twRatio = Infinity;
+for (let i = 0; i < TW_SIZES.length; i++) {
+    const a = twy.rows[i].opsPerMs;
+    const b = naiveSched.rows[i].opsPerMs;
+    const ratio = b > 0 ? a / b : Infinity;
+    const gated = TW_SIZES[i] >= TW_GATE_MIN;
+    if (gated && ratio < twRatio) twRatio = ratio; // ratio gate: steady window only
+    const tag = TW_SIZES[i] < TW_GATE_MIN ? '   <- L1 micro-case (shown, not gated)' : '';
+    console.log('  ' + nStr(TW_SIZES[i]).padEnd(8) + '  ' +
+        fmt(a).padStart(16) + '   ' + fmt(b).padStart(12) + '   ' + fmt(ratio).padStart(5) + 'x' + tag);
+}
+
+console.log('');
+console.log('  TimerWheel flatness (size >= ' + nStr(TW_GATE_MIN) + '): ' + fmt(twy.flatness) + '   (gate >= 0.70)');
+console.log('  naive foil flatness (last/first): ' + fmt(naiveSched.flatness) + '   (gate <= 0.55)');
+console.log('  min TimerWheel/naive ratio:       ' + fmt(twRatio) + 'x  (gate >= 1.50x)');
+// NO MAX-single-op line here (unlike MonoDeque / BucketQueue): TimerWheel's schedule /
+// cancel / advance(1) are WORST-CASE O(1) -- a fixed number of pointer writes on the
+// slot FIFO, never a run. drainDue is O(due) but the drain-before-advance contract
+// keeps a slot to one rotation's timers, so there is no amortized spike to expose; the
+// flat line IS the worst-case claim (the O(n) foil is the honest 0.55-collapse rival).
+
+const twOk = twy.flatness >= 0.70;
+const naiveSchedOk = naiveSched.flatness <= 0.55;
+const twRatioOk = twRatio >= 1.5;
+const twAllOk = twOk && naiveSchedOk && twRatioOk;
+
+console.log('');
+console.log('WITNESS TimerWheel ' + (twAllOk ? 'ok' : 'FAIL') +
+    ' tw.flatness=' + fmt(twy.flatness) +
+    ' naive.flatness=' + fmt(naiveSched.flatness) +
+    ' minRatio=' + fmt(twRatio) + 'x');
+
+if (!twAllOk) {
+    if (!twOk) console.error('  violation TimerWheel flatness ' + fmt(twy.flatness) + ' < 0.70');
+    if (!naiveSchedOk) console.error('  violation naive foil flatness ' + fmt(naiveSched.flatness) + ' > 0.55');
+    if (!twRatioOk) console.error('  violation min tw ratio ' + fmt(twRatio) + 'x < 1.50x');
     process.exitCode = 1;
 }

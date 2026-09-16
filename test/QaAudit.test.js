@@ -10,7 +10,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel } from '../O1.js';
 
 const litO1 = (e) => e instanceof Error && /^\[lite-o1]/.test(e.message);
 
@@ -1086,4 +1086,218 @@ test('BucketQueue: clear() voids stale STATIC buckets -- a lower-priority second
     assert.equal(q.extractMin(), 11);
     assert.equal(q.extractMin(), 12);
     assert.ok(bqCrossCheckOk(q));
+});
+
+// ===========================================================================
+// TimerWheel boundary audits (QA pass, member 9 -- private id columns + static
+// per-slot FIFO ring + the drain-before-advance / snapshot-drain contract).
+// Fills gaps left by test/TimerWheel.test.js: the coercion footgun on BOTH
+// mutator args (with a valueOf-spy proving the typeof guard short-circuits
+// BEFORE any coercion runs), the id boundary matrix (0/1/N-1/N/N+1), the
+// degenerate slots=1 wheel, capacity=1 exhaustion, the MAX_TICK ceiling drain
+// edge, duplicate clear(), a re-entrant clear() from inside forEach (an
+// INDEPENDENT re-entrancy case vs. the reviewer's drainDue suite), and one
+// adversarial case: advance() IS legal from inside a drain callback when the
+// node just fired was the LAST draining node (nothing left to strand).
+// ===========================================================================
+
+// A local cross-check helper (dense/sparse invariant + slot FIFO integrity).
+function twCrossCheckOk(w) {
+    for (let i = 0; i < w._size; i++) {
+        const id = w._dense[i];
+        if (w._sparse[id] !== i) return false;
+        if (!w.has(id)) return false;
+        if (w._slotOf[i] >= w._slots) return false;
+    }
+    return true;
+}
+
+// Snapshot every private column + scalar a mutator can touch (byte-identical proofs).
+function twSnapshot(w) {
+    return {
+        size: w._size, now: w._now,
+        dense: w._dense.slice(), sparse: w._sparse.slice(), slotOf: w._slotOf.slice(),
+        next: w._next.slice(), prev: w._prev.slice(),
+        sHead: w._sHead.slice(), sTail: w._sTail.slice(),
+    };
+}
+
+test('ADVERSARIAL: TimerWheel schedule() coercion footgun on BOTH args -- typeof short-circuits BEFORE valueOf runs', () => {
+    const w = new TimerWheel(16, 8, 8);
+    w.schedule(1, 0);
+    const before = twSnapshot(w);
+    let idTouched = 0, delayTouched = 0;
+    const evilId = { valueOf() { idTouched++; return 3; } };
+    const evilDelay = { valueOf() { delayTouched++; return 3; } };
+    /* eslint-disable no-new-wrappers */
+    const badVals = [Symbol('x'), 5n, evilId, new Number(2), NaN, null, undefined, -1, 1.5];
+    /* eslint-enable no-new-wrappers */
+    for (const bad of badVals) {
+        assert.throws(() => w.schedule(bad, 0), litO1, 'id=' + String(bad));
+        // has/cancel are QUERIES: never throw on the same bad value.
+        assert.doesNotThrow(() => w.has(bad));
+        assert.equal(w.has(bad), false);
+        assert.doesNotThrow(() => w.cancel(bad));
+        assert.equal(w.cancel(bad), false);
+    }
+    for (const bad of [Symbol('d'), 5n, evilDelay, NaN, null, undefined, -1, 1.5, 8 /* === slots */]) {
+        assert.throws(() => w.schedule(2, bad), litO1, 'delay=' + String(bad));
+    }
+    // id===universe and delay<0 explicitly, called out by name.
+    assert.throws(() => w.schedule(16, 0), litO1, 'id === universe');
+    assert.throws(() => w.schedule(2, -1), litO1, 'delay < 0');
+    assert.equal(idTouched, 0, 'schedule(evilId, ...) must not call valueOf before rejecting');
+    assert.equal(delayTouched, 0, 'schedule(2, evilDelay) must not call valueOf before rejecting');
+    assert.deepEqual(twSnapshot(w), before, 'a rejected schedule mutated state');
+    assert.ok(twCrossCheckOk(w));
+});
+
+test('TimerWheel: null is never coerced to id 0 / delay 0; -0 aliases id 0 AND delay 0', () => {
+    const w = new TimerWheel(16, 8, 8);
+    assert.equal(w.has(null), false);
+    assert.throws(() => w.schedule(null, 0), litO1);
+    assert.throws(() => w.schedule(0, null), litO1);
+    assert.equal(w.has(0), false); // the rejected null-id schedule never filed id 0
+    w.schedule(-0, -0); // -0 aliases id 0, delay 0 via uint32 coercion
+    assert.equal(w.has(0), true);
+    assert.equal(w._slotOf[w._sparse[0]], 0);
+    assert.ok(twCrossCheckOk(w));
+});
+
+test('TimerWheel: id boundary matrix 0 / 1 / N-1 / N / N+1 on universe=10', () => {
+    const U = 10, w = new TimerWheel(U, 4, U);
+    w.schedule(0, 0);
+    w.schedule(1, 0);
+    w.schedule(U - 1, 0);
+    assert.ok(w.has(0) && w.has(1) && w.has(U - 1));
+    // N: exactly at the ceiling, out of [0, universe).
+    assert.equal(w.has(U), false);
+    assert.equal(w.cancel(U), false);
+    assert.throws(() => w.schedule(U, 0), litO1);
+    // N+1: past the ceiling.
+    assert.equal(w.has(U + 1), false);
+    assert.equal(w.cancel(U + 1), false);
+    assert.throws(() => w.schedule(U + 1, 0), litO1);
+    assert.equal(w.size, 3);
+    assert.ok(twCrossCheckOk(w));
+});
+
+test('TimerWheel: slots=1 degenerate wheel (MASK=0) -- every id lands in the single slot, FIFO holds', () => {
+    const w = new TimerWheel(64, 1, 32); // rounds to 1 slot (already a power of two)
+    assert.equal(w.slots, 1);
+    for (const id of [5, 2, 9, 1]) {
+        assert.throws(() => w.schedule(id, 1), litO1); // delay >= slots(1) always rejected
+        w.schedule(id, 0); // the ONLY legal delay
+    }
+    assert.equal(w.size, 4);
+    const fired = [];
+    w.drainDue((id) => fired.push(id));
+    assert.deepEqual(fired, [5, 2, 9, 1]); // FIFO order preserved in the single slot
+    assert.equal(w.size, 0);
+    // advance(k) over the single slot is always legal once drained (MASK=0 -> every
+    // tick maps back to slot 0).
+    assert.doesNotThrow(() => w.advance(5));
+    assert.equal(w.now, 5);
+    w.schedule(7, 0);
+    assert.throws(() => w.advance(1), litO1); // undrained slot 0 again
+    assert.ok(twCrossCheckOk(w));
+});
+
+test('TimerWheel: capacity=1 -- a NEW id past capacity throws a byte-identical no-op', () => {
+    const w = new TimerWheel(16, 8, 1);
+    w.schedule(0, 0);
+    assert.equal(w.size, 1);
+    const before = twSnapshot(w);
+    assert.throws(() => w.schedule(1, 0), litO1); // full at capacity 1
+    assert.deepEqual(twSnapshot(w), before, 'a full schedule mutated state');
+    assert.equal(w.has(1), false);
+    // the present id 0 stays idempotent-schedulable even while full.
+    assert.doesNotThrow(() => w.schedule(0, 3)); // present -> no-op, delay still validated
+    assert.throws(() => w.schedule(0, 8), litO1); // present id, but a bad delay still throws
+    assert.ok(twCrossCheckOk(w));
+});
+
+test('WHITE-BOX: TimerWheel drainDue still works exactly AT the MAX_TICK-1 boundary', () => {
+    const w = new TimerWheel(4, 4, 4);
+    w._now = 2 ** 53 - 1; // one below the ceiling -- a legal, drainable now
+    w.schedule(1, 0); // (now + 0) & mask -- files into the current slot
+    const fired = [];
+    assert.doesNotThrow(() => w.drainDue((id) => fired.push(id)));
+    assert.deepEqual(fired, [1]);
+    assert.equal(w.now, 2 ** 53 - 1); // drainDue never touches now
+    assert.throws(() => w.advance(1), litO1); // now+1 === 2^53 -> ceiling still fail-closed
+    assert.ok(twCrossCheckOk(w));
+});
+
+test('duplicate clear() is idempotent and leaves the TimerWheel usable', () => {
+    const w = new TimerWheel(32, 8, 16);
+    for (let k = 0; k < 5; k++) w.schedule(k, k & 7);
+    w.clear();
+    w.clear(); // second clear on an already-empty wheel -- must not throw or corrupt
+    assert.equal(w.size, 0);
+    assert.equal(w.now, 0);
+    w.schedule(9, 0);
+    assert.equal(w.has(9), true);
+    assert.equal(w.size, 1);
+    assert.ok(twCrossCheckOk(w));
+});
+
+test('TimerWheel: re-entrant clear() from inside forEach (INDEPENDENT of the drainDue suite) self-terminates safely', () => {
+    const w = new TimerWheel(64, 8, 32);
+    for (let k = 0; k < 6; k++) w.schedule(k, k & 7);
+    let seen = 0;
+    assert.doesNotThrow(() => {
+        w.forEach(() => {
+            seen++;
+            if (seen === 2) w.clear(); // wipes the substrate mid-scan
+        });
+    });
+    assert.ok(seen >= 1 && seen <= 6, 'forEach must not run past the re-entrant clear without OOB');
+    assert.equal(w.size, 0);
+    assert.ok(w.size >= 0, 'size must never go negative');
+    // fully reusable afterward.
+    w.schedule(20, 0);
+    assert.equal(w.has(20), true);
+    assert.ok(twCrossCheckOk(w));
+});
+
+test('ADVERSARIAL: advance() from inside drainDue IS legal for the LAST draining node (nothing left to strand)', () => {
+    // NON-OBVIOUS: "advance() during a drain throws" reads as an absolute rule, but the
+    // guard checks the DRAINING head, which drainDue clears BEFORE calling fn (fn runs
+    // AFTER _removeNode). So on a slot with exactly ONE due timer, by the time fn runs
+    // the DRAINING list is already empty (_sHead[slots] === TW_NIL) -- advance() is safe.
+    // Contrast with the reviewer's 3-timer non-last case, which still throws.
+    const w = new TimerWheel(64, 8, 32);
+    w.schedule(42, 0); // the SOLE due timer this tick
+    let advanced = false;
+    assert.doesNotThrow(() => {
+        w.drainDue((id, wheel) => {
+            assert.equal(id, 42);
+            assert.doesNotThrow(() => wheel.advance(1)); // last draining node -> permitted
+            advanced = true;
+        });
+    });
+    assert.ok(advanced);
+    assert.equal(w.now, 1); // the in-drain advance really committed
+    assert.equal(w.size, 0);
+    assert.ok(twCrossCheckOk(w));
+
+    // Same shape, but the LAST of several: only the FINAL fired id may advance safely;
+    // an EARLIER one in the same drain must still throw (the reviewer's case, re-proven
+    // here as a cross-check that "last" -- not "any" -- is what makes it legal).
+    const w2 = new TimerWheel(64, 8, 32);
+    w2.schedule(1, 0); w2.schedule(2, 0); w2.schedule(3, 0);
+    const results = [];
+    w2.drainDue((id, wheel) => {
+        if (id !== 3) {
+            assert.throws(() => wheel.advance(1), litO1, 'non-last draining node must still reject');
+            results.push('threw:' + id);
+        } else {
+            assert.doesNotThrow(() => wheel.advance(1), 'the LAST draining node must be permitted');
+            results.push('advanced:' + id);
+        }
+    });
+    assert.deepEqual(results, ['threw:1', 'threw:2', 'advanced:3']);
+    assert.equal(w2.now, 1);
+    assert.ok(twCrossCheckOk(w2));
 });

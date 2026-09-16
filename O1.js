@@ -3,10 +3,10 @@
  * that doubles as a teachable textbook: each member solves a real problem AND
  * proves its constant is real (the O(1) Witness -- see test/witness.mjs).
  *
- * v0.8.0 ships eight members -- SparseSet, RingDeque, UnionFind, MonoDeque,
- * MinStack, RandomSet, FreqO1, and BucketQueue -- plus its `VERSION` const. The
- * eight are independent (no shared mutable module state), so a bundler that imports
- * one drops the others (`sideEffects: false`).
+ * v0.9.0 ships nine members -- SparseSet, RingDeque, UnionFind, MonoDeque,
+ * MinStack, RandomSet, FreqO1, BucketQueue, and TimerWheel -- plus its `VERSION`
+ * const. The nine are independent (no shared mutable module state), so a bundler
+ * that imports one drops the others (`sideEffects: false`).
  *
  * The complexity class IS the product: every hot op below is O(1) worst-case and
  * allocates ZERO bytes after construction. The witness harness (never imported
@@ -17,7 +17,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '0.8.0';
+export const VERSION = '0.9.0';
 
 /** Largest universe the Uint32 substrate + the (k >>> 0) key check can honor. */
 const MAX_UNIVERSE = 0x100000000; // 2^32
@@ -1927,5 +1927,468 @@ export class BucketQueue {
     _rewind(p) {
         throw new RangeError('[lite-o1] BucketQueue priority ' + String(p) +
             ' is below the monotone cursor ' + this._cur + ' (extract order must be non-decreasing)');
+    }
+}
+
+/**
+ * NIL for TimerWheel's intrusive per-slot FIFO pointers (`_next` / `_prev` /
+ * `_sHead` / `_sTail`), which store DENSE indices in [0, capacity). 0 is a valid
+ * dense index, so the sentinel is the top uint32 value -- never a legal index (a
+ * dense index reaches 0xFFFFFFFF only at capacity 2^32, a size no host allocates).
+ * It is also always `>= _size`, so the same `head >= _size` test that voids stale
+ * post-clear heads also treats a NIL head as an empty slot.
+ */
+const TW_NIL = 0xFFFFFFFF; // 2^32 - 1
+
+/**
+ * Largest tick a TimerWheel's monotone `now` may reach. `now` is a plain double
+ * counter; 2^53 is the last integer with no larger integer sharing its double, so
+ * once `now + ticks` would reach 2^53 the wheel THROWS rather than let `now` alias
+ * two ticks to one value (the `(now + delay) & MASK` slot math would then misfile).
+ */
+const TW_MAX_TICK = 2 ** 53; // 2^53 (Number.MAX_SAFE_INTEGER + 1)
+
+/**
+ * TimerWheel -- a zero-GC, WORST-CASE O(1) BOUNDED "simple" timing wheel
+ * (Varghese-Lauck 1987, the single-wheel variant -- NOT the hashed / multi-level
+ * "rounds" wheel) over PRIVATE `Uint32Array` columns and a STATIC per-slot ring.
+ *
+ * A timing wheel schedules integer timer ids against a monotone tick clock: a ring
+ * of S slots (S a power of two, MASK = S-1), where scheduling id with delay d files
+ * it into slot `(now + d) & MASK` and it lives there until fired or canceled. `now`
+ * is a monotone tick counter. It is the standalone primitive behind O(1) timer
+ * scheduling (discrete-event simulation, connection-timeout wheels, rate limiters,
+ * game-loop cooldowns) where a binary-heap timer queue would be O(log n) per op.
+ *
+ * BOUNDED delay range -- the honest co-headline. Delay is capped at `slots - 1`:
+ * that is the documented range ceiling (exactly parallel to BucketQueue's priority
+ * ceiling), and space is O(capacity + slots). A "simple" wheel holds exactly one
+ * rotation's timers; a delay >= slots would wrap onto a slot already holding
+ * nearer-future timers and is REJECTED fail-closed. For unbounded delays a
+ * hierarchical / hashed wheel is the right tool (a deferred future member -- see
+ * decisions/0014); a simple wheel is FOR a bounded delay horizon.
+ *
+ * DRAIN-BEFORE-ADVANCE contract -- this is what keeps every hot op worst-case O(1)
+ * with NO max-single-op line (there is NO cursor and NO absolute-deadline column):
+ *   - `slot[now & MASK]` IS the due set (the timers due at the current tick).
+ *   - `drainDue(fn)` fires + removes EXACTLY the timers present in that slot at ENTRY,
+ *     O(due), with SNAPSHOT semantics (fn is (id, wheel), HOISTED so the drain loop
+ *     itself allocates nothing -- fn is user code, the one documented exception). A
+ *     timer (re)scheduled DURING a callback DEFERS to a later drainDue (it never fires
+ *     in the same drain, whatever its position or sibling count -- so a self-reschedule
+ *     at delay 0 fires exactly once this drain then defers, and the drain always
+ *     terminates; the periodic idiom is reschedule at delay >= 1, a future slot). A
+ *     timer canceled DURING a callback before it fires does NOT fire. Re-entrant
+ *     schedule / cancel / clear from inside a callback are all supported (see drainDue:
+ *     the due list is moved into a reserved DRAINING identity at entry, then
+ *     head-drained); re-entrant ADVANCE is the one exception -- it throws `[lite-o1]`
+ *     fail-closed (advancing mid-drain would strand the un-fired due timers).
+ *   - `advance(ticks)` is FAIL-CLOSED: every slot being LEFT BEHIND must be empty
+ *     (drained), else it THROWS `[lite-o1]` as a byte-identical no-op (the check
+ *     precedes the `now` mutation). This prevents a silent misfire on lap and is why
+ *     there is no cursor: a slot always holds exactly one rotation's timers, so the
+ *     slot index alone is unambiguous. `advance(1)` is worst-case O(1) (one emptiness
+ *     check + a counter add); `advance(k)` is O(k) emptiness checks.
+ *
+ * Layout (all PRIVATE, no public SlotPool -- ADR 0003's deferral stands):
+ *   - IDS ride SparseSet's dense + sparse cross-check -- `_dense[i]` is the id at
+ *     dense index i, `_sparse[id]` maps back, membership is
+ *     `_sparse[id] < _size && _dense[_sparse[id]] === id`. The dense index i IS the
+ *     stable node identity the intrusive lists use, so `clear()` is O(1).
+ *   - Per NODE (dense index i): `_slotOf[i]` (which slot the node is in, for cancel's
+ *     head/tail fixup) and `_next[i]` / `_prev[i]` (an intrusive doubly-linked FIFO
+ *     list of dense indices WITHIN a slot; NIL = TW_NIL).
+ *   - Per SLOT (`_sHead` / `_sTail`, a STATIC array of length slots + 1, NO free-list):
+ *     indices 0..slots-1 are the wheel; index `slots` is a reserved DRAINING list
+ *     identity drainDue relabels the due slot into for snapshot semantics (see drainDue).
+ *     `_sHead[s]` / `_sTail[s]` are the FIFO oldest / newest node in slot s; a slot s is
+ *     non-empty iff `_sHead[s] < _size && _slotOf[_sHead[s]] === s`.
+ *
+ * O(1) `clear()` over STATIC slots via the dense cross-check: resets `_size = 0` and
+ * `_now = 0`, zeroing NO store. The static `_sHead` / `_sTail` retain stale dense
+ * indices from the prior generation and are voided by the SAME `i < _size`
+ * cross-check that voids stale sparse entries (the SparseSet gem extended to the slot
+ * heads -- identical to BucketQueue's static buckets).
+ *
+ * ID / DELAY / TICKS model: ids are integers `[0, universe)`; delay is an integer
+ * `[0, slots-1]`; ticks is an integer `[0, 2^32-1]`. Every guard is typeof-first
+ * (`typeof x !== 'number' || (x >>> 0) !== x || x >= bound`) so a Symbol / BigInt
+ * never reaches the coercing `>>>` (which throws a raw `TypeError`) on EITHER the id
+ * or the delay/ticks arg; the cold throw builders name the offender with `String(x)`.
+ * `null` is not zero. `-0` aliases id 0 and delay 0 via the uint32 coercion. Fail
+ * closed on the MUTATORS (schedule / advance throw), ABSENT / never-throw on the
+ * QUERIES (has / cancel).
+ *
+ * Pool sizing (why exhaustion is impossible under contract, yet still fails closed):
+ * at most `capacity` ids are live at once, one node slot per id (`_dense` / `_slotOf`
+ * / `_next` / `_prev` are all capacity-sized), so the `_size === _capacity` guard
+ * rejects a NEW id past capacity as a byte-identical no-op and no node slot is ever
+ * over-allocated. The slots are static (0..slots-1), so there is no slot free-list to
+ * exhaust.
+ */
+export class TimerWheel {
+    /**
+     * @param {number} universe        exclusive id ceiling; integer in [1, 2^32]. Ids are [0, universe).
+     * @param {number} slots           number of wheel slots; integer in [1, 2^31], ROUNDED UP to
+     *                                  the next power of two. Delay is [0, slots-1] (the rounded value).
+     * @param {number} [capacity=universe]  max simultaneously-live timers; integer in [1, universe].
+     */
+    constructor(universe, slots, capacity = universe) {
+        // typeof guard BEFORE any coercion (Number.isInteger never coerces; false on
+        // a Symbol / BigInt), and String(x) in the cold message is Symbol/BigInt-safe.
+        if (typeof universe !== 'number' || !Number.isInteger(universe) ||
+            universe < 1 || universe > MAX_UNIVERSE) {
+            throw new RangeError(
+                '[lite-o1] universe must be an integer in [1, 2^32], got ' + String(universe));
+        }
+        if (typeof slots !== 'number' || !Number.isInteger(slots) ||
+            slots < 1 || slots > MAX_CAPACITY) {
+            throw new RangeError(
+                '[lite-o1] slots must be an integer in [1, 2^31], got ' + String(slots));
+        }
+        if (typeof capacity !== 'number' || !Number.isInteger(capacity) ||
+            capacity < 1 || capacity > universe) {
+            throw new RangeError(
+                '[lite-o1] capacity must be an integer in [1, ' + universe + '], got ' + String(capacity));
+        }
+        const s = _roundPow2(slots);
+        this._universe = universe;
+        this._slots = s;                          // power-of-two slot count (rounded)
+        this._mask = s - 1;                       // wrap mask: (tick & MASK) is the slot
+        this._cap = capacity;
+        // ---- id substrate (dense + sparse cross-check; dense index = node id) ----
+        this._dense = new Uint32Array(capacity);  // dense[i] = the i-th live timer id
+        this._sparse = new Uint32Array(universe); // sparse[id] = dense index (valid iff cross-check)
+        this._slotOf = new Uint32Array(capacity); // slotOf[i] = slot dense[i] sits in
+        this._next = new Uint32Array(capacity);   // next[i]/prev[i] = next/prev dense index in the
+        this._prev = new Uint32Array(capacity);   //   slot's FIFO list (NIL = TW_NIL)
+        this._size = 0;                           // live timer count
+        // ---- static slots (one per slot 0..slots-1; NO free-list) ----
+        // Length s + 1: slots 0..s-1 are the wheel; index s is the reserved DRAINING list
+        // identity drainDue relabels the due slot into (snapshot semantics, see drainDue).
+        this._sHead = new Uint32Array(s + 1).fill(TW_NIL); // FIFO oldest node in slot s
+        this._sTail = new Uint32Array(s + 1).fill(TW_NIL); // FIFO newest node in slot s
+        this._now = 0;                            // monotone tick counter
+    }
+
+    /** Number of live timers. O(1). */
+    get size() { return this._size; }
+
+    /** Max simultaneously-live timers this wheel was sized for. O(1). */
+    get capacity() { return this._cap; }
+
+    /** Exclusive id ceiling; ids are [0, universe). O(1). */
+    get universe() { return this._universe; }
+
+    /** Number of wheel slots (power-of-two, rounded up); delay is [0, slots-1]. O(1). */
+    get slots() { return this._slots; }
+
+    /** The monotone tick counter. O(1). */
+    get now() { return this._now; }
+
+    /**
+     * True iff id is scheduled. O(1): the SparseSet cross-check. A bad id (negative,
+     * fractional, NaN, null, Symbol, BigInt, >= universe) is ABSENT, never a throw.
+     * The `typeof` short-circuits BEFORE `>>>` runs (which coerces + THROWS on a
+     * Symbol / BigInt); `(id >>> 0) !== id` then rejects every non-uint32 number.
+     */
+    has(id) {
+        if (typeof id !== 'number' || (id >>> 0) !== id || id >= this._universe) return false;
+        const i = this._sparse[id];
+        return i < this._size && this._dense[i] === id;
+    }
+
+    /**
+     * Schedule id to fire `delay` ticks from now: file it into slot
+     * `(now + delay) & MASK`. O(1) WORST-CASE, zero-alloc. Fails closed, ALL guards
+     * preceding every write (a byte-identical no-op on any reject): a bad id throws
+     * via _oob; a bad delay (not a uint32 in [0, slots-1]) throws via _badDelay; a
+     * NEW id when full throws via _full. An already-present id is an IDEMPOTENT no-op
+     * (the delay arg is still validated) -- reschedule = cancel then schedule (mirrors
+     * BucketQueue.insert). Guard typeof FIRST on BOTH args so a Symbol / BigInt never
+     * reaches the coercing `>>>`.
+     * @param {number} id     a timer id integer in [0, universe)
+     * @param {number} delay  ticks from now, an integer in [0, slots-1]
+     * @returns {TimerWheel} this
+     */
+    schedule(id, delay) {
+        if (typeof id !== 'number' || (id >>> 0) !== id || id >= this._universe) return this._oob(id);
+        if (typeof delay !== 'number' || (delay >>> 0) !== delay || delay >= this._slots) return this._badDelay(delay);
+        const si = this._sparse[id];
+        if (si < this._size && this._dense[si] === id) return this; // present -> idempotent no-op
+        if (this._size === this._cap) return this._full();
+        this._scheduleOne(id, delay);
+        return this;
+    }
+
+    /**
+     * Cancel id. O(1) WORST-CASE, zero-alloc. Unlink it from its slot FIFO (fixing
+     * _sHead / _sTail via _slotOf) then swap the last dense node into its hole (fixing
+     * that node's intrusive pointers + slot head/tail), so the cross-check + the slot
+     * lists stay exact. Returns true iff id was scheduled; a bad / absent id returns
+     * false and NEVER throws (mirrors the query contract). Guard typeof FIRST.
+     * @param {number} id
+     * @returns {boolean} true iff id was scheduled and removed.
+     */
+    cancel(id) {
+        if (typeof id !== 'number' || (id >>> 0) !== id || id >= this._universe) return false;
+        const i = this._sparse[id];
+        if (i >= this._size || this._dense[i] !== id) return false;
+        this._removeNode(i);
+        return true;
+    }
+
+    /**
+     * Fire + remove EXACTLY the set of timers present in the due slot (`slot[now & MASK]`)
+     * at the moment drainDue is ENTERED, calling fn(id, wheel) per timer in FIFO order.
+     * O(due), zero-alloc. SNAPSHOT semantics; re-entrant schedule / cancel / clear from
+     * inside a callback are supported (advance is the one exception -- see below):
+     *   - A timer (re)scheduled DURING a callback DEFERS to a later drainDue -- it never
+     *     fires in the same drain, regardless of position or sibling count. (So a
+     *     self-reschedule at delay 0 fires exactly ONCE this drain, then defers -> the
+     *     drain always terminates. The periodic idiom is reschedule at delay >= 1, which
+     *     lands in a different, future slot.)
+     *   - A timer canceled DURING a callback before it fires does NOT fire.
+     *   - A `clear()` during a callback self-terminates the drain (the head-drain loop's
+     *     `i >= _size || _slotOf[i] !== draining` guard); the wheel is fully reusable.
+     *   - `advance()` during a callback THROWS `[lite-o1]` fail-closed (advancing while a
+     *     drain is in flight would strand the un-fired due timers -- see advance()).
+     *
+     * Mechanism (zero-alloc): at entry the due slot's whole FIFO list is MOVED into a
+     * reserved DRAINING list identity (`_sHead`/`_sTail` are sized slots + 1; index
+     * `_slots` is DRAINING) and every node in it is relabeled `_slotOf = DRAINING`, so the
+     * REAL due slot goes empty -- new schedules during fn land in the now-empty real slot
+     * (naturally deferred), and cancel() of a still-pending draining node operates on the
+     * DRAINING list correctly. The DRAINING list is then HEAD-DRAINED: re-reading its head
+     * each step (never a captured index) makes it robust to a re-entrant cancel of ANY
+     * not-yet-fired node (including the immediately-following one), and because the
+     * DRAINING list only ever SHRINKS during the walk, termination is guaranteed. Both
+     * passes are O(due). HOISTED fn keeps the loop alloc-free (fn is user code -- the one
+     * documented exception). Empty / stale-after-clear due slots are a no-op via the
+     * `h < _size && _slotOf[h] === slot` cross-check.
+     * @param {(id:number, wheel:TimerWheel)=>void} fn
+     */
+    drainDue(fn) {
+        const slot = this._now & this._mask;
+        const draining = this._slots;               // the reserved DRAINING list identity
+        let h = this._sHead[slot];
+        if (h >= this._size || this._slotOf[h] !== slot) return; // empty / stale -> no-op
+        // Move the due list into the DRAINING identity + relabel each node (O(due)), so the
+        // REAL slot goes empty and re-entrant schedules during fn defer to a later drain.
+        for (let n = h; n !== TW_NIL; n = this._next[n]) this._slotOf[n] = draining;
+        this._sHead[draining] = h;
+        this._sTail[draining] = this._sTail[slot];
+        this._sHead[slot] = TW_NIL;
+        this._sTail[slot] = TW_NIL;
+        // Head-drain the DRAINING list. Re-reading the head each step is robust to a
+        // re-entrant cancel of any pending node; the list only shrinks, so it terminates.
+        // Two guards SELF-TERMINATE a re-entrant clear() (which bulk-zeros _size, touching
+        // NEITHER _sHead[draining] NOR _slotOf), each catching a distinct case -- both
+        // required:
+        //   - `i >= _size` catches a PURE clear(): _size drops to 0 while the abandoned
+        //     draining head keeps its draining label, so the label term alone would still
+        //     fire it and drive `--_size` NEGATIVE (fail-open).
+        //   - `_slotOf[i] !== draining` catches clear() + REPOPULATE in the same callback:
+        //     new schedules lift _size back above the stale head index, so `i >= _size` no
+        //     longer trips, but that dense index now holds a fresh REAL-slot node -- firing
+        //     it would run a just-scheduled timer a tick early (breaking the deferral
+        //     contract). A genuine draining head always has _slotOf === draining (the entry
+        //     relabel sets it; _removeNode's swap-last copies _slotOf[last], and
+        //     _sHead[draining] is only ever set to a draining-labeled node), so neither
+        //     term false-trips a normal / re-entrant-cancel drain. Mirrors forEach's
+        //     re-read-_size self-terminate discipline.
+        for (;;) {
+            const i = this._sHead[draining];
+            if (i === TW_NIL || i >= this._size || this._slotOf[i] !== draining) break;
+            const id = this._dense[i];
+            this._removeNode(i);   // unlink from the DRAINING list + swap-remove dense
+            fn(id, this);          // fired AFTER removal -> a re-entrant cancel(id) is inert
+        }
+    }
+
+    /**
+     * Advance the tick clock by `ticks` (default 1). FAIL-CLOSED: every slot being
+     * LEFT BEHIND (`slot[(now + i) & MASK]` for i in 0..ticks-1) must be EMPTY
+     * (drained), else it THROWS `[lite-o1]` as a BYTE-IDENTICAL no-op -- the emptiness
+     * scan precedes the `now` mutation, so a rejected advance leaves `now` unchanged.
+     * `advance(1)` is worst-case O(1) (one emptiness check + a counter add);
+     * `advance(k)` is O(k) checks. `ticks` must be a clean non-negative uint32 (typeof
+     * FIRST). `now + ticks` is capped at 2^53 via a `>=` ceiling guard (throwing rather
+     * than lose Float precision -- the MonoDeque saturating-counter lesson). Calling
+     * advance() from INSIDE a drainDue callback (an in-flight drain) THROWS `[lite-o1]`
+     * fail-closed: the due slot's un-fired timers are relabeled DRAINING (not visible to
+     * the real-slot emptiness scan), so permitting advance would silently strand them and
+     * defeat drain-before-advance. (schedule / cancel / clear from inside a callback stay
+     * supported -- only advance is fail-closed mid-drain.)
+     * @param {number} [ticks=1]
+     * @returns {TimerWheel} this
+     */
+    advance(ticks = 1) {
+        if (typeof ticks !== 'number' || (ticks >>> 0) !== ticks) return this._badTicks(ticks);
+        const now = this._now;
+        // >= (not >): keep `now` strictly below 2^53 so every tick stays integer-exact
+        // and the `(now + delay) & MASK` slot math never aliases two ticks. Primed by a
+        // white-box test that `now + ticks === 2^53` throws (a `>` would be off-by-one).
+        if (now + ticks >= TW_MAX_TICK) return this._tickCeil();
+        const size = this._size;
+        // FAIL-CLOSED against an IN-FLIGHT drain: a live draining-labeled head at the
+        // reserved DRAINING identity (index _slots) means un-fired due timers are pending
+        // but hidden from the real-slot scan below -- advancing would strand them. After
+        // any completed drain _sHead[_slots] is TW_NIL; a stale head from a pure clear()
+        // has dh >= _size or _slotOf[dh] !== _slots (won't false-trip); during fn on a
+        // non-last draining node it points to the next live draining node (throws -- right);
+        // on the LAST draining node it is TW_NIL (permitted -- nothing left to strand).
+        const dh = this._sHead[this._slots];
+        if (dh !== TW_NIL && dh < size && this._slotOf[dh] === this._slots) return this._draining();
+        const mask = this._mask;
+        // Every slot being left behind must be empty (a live head node at that slot).
+        for (let i = 0; i < ticks; i++) {
+            const slot = (now + i) & mask;
+            const h = this._sHead[slot];
+            if (h < size && this._slotOf[h] === slot) return this._undrained();
+        }
+        this._now = now + ticks;
+        return this;
+    }
+
+    /**
+     * Empty the wheel in O(1): reset the live count and the tick clock -- two scalars,
+     * touching NO backing array. Stale dense/sparse entries fail the has() cross-check,
+     * and stale static slot heads/tails fail the `head < _size && _slotOf[head] === s`
+     * slot cross-check, so no store is ever zeroed (mirrors SparseSet / BucketQueue
+     * clear()). After clear() the tick clock restarts at 0.
+     */
+    clear() {
+        this._size = 0;
+        this._now = 0;
+    }
+
+    /**
+     * Iterate live timers in DENSE STORAGE order (insertion order, permuted by a
+     * cancel / drain swap-remove) -- NOT time order. O(size). Re-reads `_size` each
+     * step, so a re-entrant cancel from inside fn self-terminates rather than reading
+     * out of bounds. A HOISTED callback keeps it allocation-free (the documented O(k)
+     * exception, excluded from the zero-alloc-per-op claims). fn is (id, slot, wheel).
+     * @param {(id:number, slot:number, wheel:TimerWheel)=>void} fn
+     */
+    forEach(fn) {
+        const d = this._dense;
+        const so = this._slotOf;
+        for (let i = 0; i < this._size; i++) fn(d[i], so[i], this);
+    }
+
+    /**
+     * Iterate live timer ids in dense storage order (same order as forEach). O(size).
+     * The ONE per-protocol ALLOCATOR (a {value, done} per step) -- kept OUT of the
+     * zero-alloc claims; use forEach for the alloc-free scan.
+     */
+    *[Symbol.iterator]() {
+        const d = this._dense;
+        for (let i = 0; i < this._size; i++) yield d[i];
+    }
+
+    // ---- private helpers (hot: node/slot surgery; cold: throw builders) ---------
+
+    /**
+     * Schedule a brand-new id at `delay`: append it to slot `(now + delay) & MASK`'s
+     * FIFO tail (newest), creating the list if the slot is empty. Assumes id is
+     * validated, absent, and _size < capacity. Slot emptiness is decided by the
+     * cross-check (`h >= j` catches NIL / never-reused / stale-beyond-live; `_slotOf[h]
+     * !== slot` catches a stale head re-used at a different slot). O(1).
+     * @private
+     */
+    _scheduleOne(id, delay) {
+        const slot = (this._now + delay) & this._mask;
+        const j = this._size;
+        const h = this._sHead[slot];
+        this._dense[j] = id;
+        this._sparse[id] = j;
+        this._slotOf[j] = slot;
+        if (h >= j || this._slotOf[h] !== slot) {
+            // empty slot (NIL / stale): j is the sole node.
+            this._sHead[slot] = j;
+            this._sTail[slot] = j;
+            this._prev[j] = TW_NIL;
+            this._next[j] = TW_NIL;
+        } else {
+            // non-empty: append j at the tail (FIFO newest in this slot).
+            const t = this._sTail[slot];
+            this._prev[j] = t;
+            this._next[j] = TW_NIL;
+            this._next[t] = j;
+            this._sTail[slot] = j;
+        }
+        this._size = j + 1;
+    }
+
+    /**
+     * Remove the node at dense index i: unlink it from its list (the slot in `_slotOf[i]`,
+     * which may be a real wheel slot OR the DRAINING identity), fixing that list's
+     * head/tail, then swap the last live node into index i (fixing that moved node's
+     * intrusive pointers + its list head/tail). O(1). Because the moved node's list is
+     * read from `_slotOf[last]`, it repairs the DRAINING list too, so a swap during a
+     * head-drain leaves the DRAINING head/tail correct.
+     * @private
+     */
+    _removeNode(i) {
+        // Unlink i from its list (real slot or DRAINING).
+        const slot = this._slotOf[i];
+        const p = this._prev[i];
+        const nx = this._next[i];
+        if (p === TW_NIL) this._sHead[slot] = nx; else this._next[p] = nx;
+        if (nx === TW_NIL) this._sTail[slot] = p; else this._prev[nx] = p;
+        // Swap-remove the dense slot (mirrors BucketQueue.extractMin / SparseSet.delete).
+        const last = --this._size;
+        if (i === last) return;
+        const mk = this._dense[last];
+        const ms = this._slotOf[last];
+        this._dense[i] = mk;
+        this._sparse[mk] = i;
+        this._slotOf[i] = ms;
+        const mp = this._prev[last];
+        const mn = this._next[last];
+        this._prev[i] = mp;
+        this._next[i] = mn;
+        if (mp === TW_NIL) this._sHead[ms] = i; else this._next[mp] = i;
+        if (mn === TW_NIL) this._sTail[ms] = i; else this._prev[mn] = i;
+    }
+
+    /** @private */
+    _oob(id) {
+        // String(id) -- NOT '+ id' / a template literal: those THROW on a Symbol,
+        // which would turn a fail-closed reject into a different crash.
+        throw new RangeError('[lite-o1] id out of universe [0, ' + this._universe + '): ' + String(id));
+    }
+
+    /** @private */
+    _badDelay(delay) {
+        throw new RangeError('[lite-o1] delay out of range [0, ' + (this._slots - 1) + ']: ' + String(delay));
+    }
+
+    /** @private */
+    _full() {
+        throw new RangeError('[lite-o1] TimerWheel full (capacity ' + this._cap + ')');
+    }
+
+    /** @private */
+    _badTicks(ticks) {
+        throw new RangeError('[lite-o1] ticks must be an integer in [0, 2^32-1], got ' + String(ticks));
+    }
+
+    /** @private */
+    _tickCeil() {
+        throw new RangeError('[lite-o1] TimerWheel tick ceiling 2^53 reached; call clear() to reuse');
+    }
+
+    /** @private */
+    _undrained() {
+        throw new RangeError('[lite-o1] TimerWheel advance would skip an undrained due slot; ' +
+            'drainDue() before advance() (drain-before-advance)');
+    }
+
+    /** @private */
+    _draining() {
+        throw new RangeError('[lite-o1] TimerWheel advance() during an in-flight drainDue; ' +
+            'advance only between drains (would strand the un-fired due timers)');
     }
 }
