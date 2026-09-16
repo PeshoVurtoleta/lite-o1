@@ -22,7 +22,7 @@
  */
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1 } from '../../O1.js';
 
 const U = 1 << 16;      // universe 65536
 const CAP = 1 << 14;    // capacity 16384
@@ -618,6 +618,110 @@ const randForEachScan = {
     statsOf(s) { return { grows: randGrows(s) }; },
 };
 
+// ===========================================================================
+// FreqO1 scenarios -- private Uint32Array node + bucket pools, all WORST-CASE O(1)
+// zero-alloc (add / increment / popMin / forEach). The bucket-forest surgery is
+// pure pointer arithmetic over recycled typed slots -- no coercion, no heap double.
+// ===========================================================================
+
+const FREQ_U = 1 << 16;   // universe 65536
+const FREQ_CAP = 1 << 14; // capacity 16384
+const FREQ_W = 1 << 12;   // 4096 resident keys -> steady state, never full/empty
+
+/**
+ * The zero-alloc counter for FreqO1 scenarios: the byte lengths of EVERY backing
+ * Uint32Array (the key substrate + the node columns + the bucket pool). Capacity +
+ * universe are fixed at construction, so this NEVER grows -- the delta across the
+ * window must be 0 (the `freqGrows` 0-delta canary; mirrors grows / ringGrows / ...).
+ */
+function freqGrows(s) {
+    const f = s.freq;
+    return f._dense.buffer.byteLength + f._sparse.buffer.byteLength +
+        f._freq.buffer.byteLength + f._bkt.buffer.byteLength +
+        f._nk.buffer.byteLength + f._pk.buffer.byteLength +
+        f._bFreq.buffer.byteLength + f._bPrev.buffer.byteLength +
+        f._bNext.buffer.byteLength + f._bHead.buffer.byteLength +
+        f._bTail.buffer.byteLength + f._bFree.buffer.byteLength;
+}
+
+/** A FreqO1 primed with a bounded resident window of keys (steady-state churn). */
+function freqFill() {
+    const freq = new FreqO1(FREQ_U, FREQ_CAP);
+    for (let i = 0; i < FREQ_W; i++) freq.add(i);
+    return freq;
+}
+
+/**
+ * increment-churn: bump a scrambled resident key each op -- the bucket-forest
+ * surgery (unlink + find/create target bucket + relink + free-if-empty) with no
+ * dense removal. Keys stay in [0, FREQ_W) (< FREQ_CAP), so no op touches the full
+ * edge, and every key is a SMI int -> no coercion, no heap double.
+ */
+const freqIncrementChurn = {
+    name: 'FreqO1 increment-churn',
+    setup() { return { freq: freqFill(), v: 0 }; },
+    hot(s, n) {
+        const freq = s.freq;
+        let v = s.v | 0;
+        for (let i = 0; i < n; i++) {
+            v = (v + 1) | 0;
+            freq.increment((v * 2654435761) & (FREQ_W - 1));
+        }
+        s.v = v | 0;
+    },
+    statsOf(s) { return { grows: freqGrows(s) }; },
+};
+
+/**
+ * popMin-drain: refill the whole resident window in one burst the instant the
+ * structure empties, then popMin one per op -- so the measured window is dominated
+ * by REAL removals (the swap-remove pointer fix-up + empty-bucket free). The
+ * structure oscillates 0 -> FREQ_W (< FREQ_CAP), never full, and every op is
+ * zero-alloc.
+ */
+const freqPopMinDrain = {
+    name: 'FreqO1 popMin-drain (bulk fill then drain)',
+    setup() { return { freq: new FreqO1(FREQ_U, FREQ_CAP), v: 0 }; },
+    hot(s, n) {
+        const freq = s.freq;
+        let v = s.v | 0;
+        for (let i = 0; i < n; i++) {
+            if (freq.size === 0) {
+                for (let k = 0; k < FREQ_W; k++) {
+                    v = (v + 1) | 0;
+                    freq.increment((v * 2654435761) & (FREQ_W - 1)); // spread across buckets
+                }
+            }
+            freq.popMin();
+        }
+        s.v = v | 0;
+    },
+    statsOf(s) { return { grows: freqGrows(s) }; },
+};
+
+/**
+ * forEach-drain: a primed structure drained each op through a HOISTED module-scope
+ * callback (never re-created per op). Mirrors SparseSet's forEachDrain -- proves
+ * forEach itself (the alloc-free scan; the ONE documented per-protocol allocator is
+ * [Symbol.iterator], gated separately by freqMustFailAlloc below) allocates nothing
+ * over its own dedicated, RIGHT-SIZED window (a small bounded resident set).
+ */
+let freqDrainAcc = 0;
+function freqDrainInto(k, fr) { freqDrainAcc = (freqDrainAcc + k + fr) | 0; }
+const freqForEachDrain = {
+    name: 'FreqO1 forEach-drain',
+    setup() {
+        const freq = new FreqO1(FREQ_U, FREQ_CAP);
+        for (let i = 0; i < 256; i++) freq.add(i); // bounded resident set to drain
+        return { freq };
+    },
+    hot(s, n) {
+        const freq = s.freq;
+        for (let i = 0; i < n; i++) freq.forEach(freqDrainInto);
+    },
+    statsOf(s) { return { grows: freqGrows(s) }; },
+};
+
 const scenarios = [
     addChurn, hasHit, deleteChurn, clearRefill, forEachDrain,
     ringFifo, ringLifo, ringInterleave,
@@ -625,6 +729,7 @@ const scenarios = [
     monoPushChurn, monoEvict, monoValueRead,
     minPushChurn, minPopDrain, minExtremeRead, minForEachDrain,
     randSampleRead, randRemoveDrain, randAddChurn, randForEachScan,
+    freqIncrementChurn, freqPopMinDrain, freqForEachDrain,
 ];
 
 /**
@@ -756,6 +861,33 @@ const randMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/**
+ * The FreqO1 teeth: a per-op `[Symbol.iterator]` spread into a FRESH [] each op --
+ * the generator + its per-step {value, done} wrappers + the array MUST trip the gate
+ * (scavenges scale with n), proving the instrument has teeth on the FreqO1 surface
+ * too (its iterator is the ONE documented per-protocol allocator; forEach is the
+ * alloc-free scan). statsOf returns a constant so the failure is the allocation
+ * lanes, not a missing-counter artifact.
+ */
+const freqMustFailAlloc = {
+    name: 'FreqO1 [Symbol.iterator] spread into fresh array (MUST allocate)',
+    setup() {
+        const freq = new FreqO1(256, 256);
+        for (let i = 0; i < 64; i++) freq.add(i);
+        return { freq };
+    },
+    hot(s, n) {
+        const freq = s.freq;
+        let sink = 0;
+        for (let i = 0; i < n; i++) {
+            const arr = [...freq]; // fresh generator + array per op -> heap churn
+            sink += arr.length;
+        }
+        s.sink = sink;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -765,5 +897,5 @@ zgcSuite({
     counters: { grows: 0 },
     maxRetainedKB: 64,
     scenarios,
-    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc],
+    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc],
 });

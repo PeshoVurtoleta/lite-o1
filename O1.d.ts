@@ -306,3 +306,67 @@ export class RandomSet {
     /** Remove and return a uniform-random live member, or `undefined` when empty. Never throws. */
     removeRandom(): number | undefined;
 }
+
+/**
+ * A zero-GC, WORST-CASE O(1) frequency structure over the universe [0, universe) --
+ * the standalone primitive behind O(1) LFU eviction. Integer keys are tracked with
+ * an access count; the least-frequently-used key (lowest count, FIFO tie-break) is
+ * peeked / popped in O(1) with no scan, over private Uint32Array node + bucket
+ * pools (dense/sparse cross-check for keys, a bump + free-stack bucket pool).
+ * add / increment / frequencyOf / has / peekMin / popMin / clear are all O(1)
+ * worst-case and allocate nothing after construction. Lean LFU surface: NO
+ * decrement, NO peekMax, NO delete(k). Fail closed: a bad key throws [lite-o1] on
+ * the mutators add / increment (a new key past capacity, or a bump past
+ * maxFrequency, throws a byte-identical no-op) but is absent for the queries has /
+ * frequencyOf (never throw); peekMin / popMin on an empty structure return
+ * `undefined` and never throw. `frequencyOf` returns 0 for an absent / bad key
+ * (0 = not tracked is the correct frequency). `clear()` is O(1) (resets the count +
+ * the bucket pool; zeroes no store).
+ */
+export class FreqO1 {
+    /**
+     * @param universe  exclusive key ceiling; an integer in [1, 2^32].
+     * @param capacity  max simultaneously-live keys; an integer in [1, universe]. Defaults to universe.
+     * @param maxFreq   the frequency ceiling; an integer in [1, 2^32-2]. Defaults to 2^32-2.
+     */
+    constructor(universe: number, capacity?: number, maxFreq?: number);
+
+    /** Number of live keys. */
+    readonly size: number;
+
+    /** Max simultaneously-live keys this structure was sized for. */
+    readonly capacity: number;
+
+    /** Exclusive key ceiling; keys are [0, universe). */
+    readonly universe: number;
+
+    /** The frequency ceiling; an increment past it throws [lite-o1]. */
+    readonly maxFrequency: number;
+
+    /** True iff k is tracked. Never throws; a bad key is absent. */
+    has(k: number): boolean;
+
+    /** k's current frequency, or 0 if absent / bad. Never throws. */
+    frequencyOf(k: number): number;
+
+    /** Ensure k is tracked at frequency 1 if absent (idempotent no-op if present). Throws [lite-o1] on a bad key or when full. */
+    add(k: number): this;
+
+    /** Record one access to k (insert at 1 if absent, else freq += 1). Throws [lite-o1] on a bad key, when full, or past maxFrequency. */
+    increment(k: number): this;
+
+    /** The least-frequently-used key (FIFO tie-break) without removing it, or `undefined` when empty. Never throws. */
+    peekMin(): number | undefined;
+
+    /** Remove and return the least-frequently-used key, or `undefined` when empty. Never throws. */
+    popMin(): number | undefined;
+
+    /** Empty the structure in O(1) (resets the count + bucket pool; zeroes no store). */
+    clear(): void;
+
+    /** Iterate live keys in dense storage order, alloc-free. fn is (key, frequency, freq). */
+    forEach(fn: (key: number, frequency: number, freq: FreqO1) => void): void;
+
+    /** Iterate live keys in dense storage order. */
+    [Symbol.iterator](): IterableIterator<number>;
+}

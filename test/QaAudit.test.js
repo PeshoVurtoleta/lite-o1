@@ -10,7 +10,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1 } from '../O1.js';
 
 const litO1 = (e) => e instanceof Error && /^\[lite-o1]/.test(e.message);
 
@@ -773,4 +773,169 @@ test('re-entrant sample()/removeRandom() from inside forEach does not throw or c
     // swap semantics, not corruption. The POST-STATE must be self-consistent.
     assert.equal(s.size, 3);
     for (const k of [...s]) assert.equal(s.has(k), true);
+});
+
+// ===========================================================================
+// FreqO1 boundary audits (dense/sparse substrate + the bucket-forest surgery)
+// ===========================================================================
+
+// A local cross-check helper (dense/sparse invariant + freq >= 1 for every live key).
+function freqCrossCheckOk(f) {
+    for (let i = 0; i < f._n; i++) {
+        const key = f._dense[i];
+        if (f._sparse[key] !== i) return false;
+        if (!f.has(key)) return false;
+        if (f._freq[i] < 1) return false;
+    }
+    return true;
+}
+
+// --- adversarial: a Symbol / BigInt / object / boxed Number / NaN key -------
+
+test('ADVERSARIAL: FreqO1 has/frequencyOf must not throw on a Symbol / BigInt key; add/increment reject typeof-first', () => {
+    const f = new FreqO1(100, 8);
+    f.add(0);
+    assert.doesNotThrow(() => f.has(Symbol('k')), 'has(Symbol) must not throw');
+    assert.equal(f.has(Symbol('k')), false);
+    assert.doesNotThrow(() => f.frequencyOf(5n), 'frequencyOf(BigInt) must not throw');
+    assert.equal(f.frequencyOf(5n), 0);
+    // add / increment must fail closed with [lite-o1], not a raw TypeError from coercion.
+    assert.throws(() => f.add(Symbol('k')), litO1, 'add(Symbol) must be [lite-o1]');
+    assert.throws(() => f.add(5n), litO1, 'add(BigInt) must be [lite-o1]');
+    assert.throws(() => f.increment(Symbol('k')), litO1, 'increment(Symbol) must be [lite-o1]');
+    assert.throws(() => f.increment(5n), litO1, 'increment(BigInt) must be [lite-o1]');
+    // none left a phantom key or perturbed state.
+    assert.equal(f.size, 1);
+    assert.ok(freqCrossCheckOk(f));
+});
+
+test('ADVERSARIAL: FreqO1 rejects an object-with-valueOf, a boxed Number, NaN, null, -1, 1.5, >= universe -- typeof-first, byte-identical no-op', () => {
+    const f = new FreqO1(10, 10);
+    f.add(2);
+    const before = f.size;
+    /* eslint-disable no-new-wrappers */
+    for (const bad of [{ valueOf: () => 1 }, { valueOf: () => 1, toString: () => '1' },
+        new Number(1), NaN, null, undefined, -1, 1.5, 10, 11]) {
+        assert.throws(() => f.add(bad), litO1, 'add(' + String(bad) + ')');
+        assert.throws(() => f.increment(bad), litO1, 'increment(' + String(bad) + ')');
+        // queries stay quiet and absent.
+        assert.doesNotThrow(() => f.has(bad));
+        assert.equal(f.has(bad), false);
+        assert.doesNotThrow(() => f.frequencyOf(bad));
+        assert.equal(f.frequencyOf(bad), 0);
+    }
+    /* eslint-enable no-new-wrappers */
+    assert.equal(f.size, before);        // byte-identical: no phantom member
+    assert.equal(f.frequencyOf(2), 1);   // the real key is untouched
+    assert.ok(freqCrossCheckOk(f));
+});
+
+// --- peekMin / popMin / frequencyOf never throw on empty; real undefined ----
+
+test('FreqO1: peekMin/popMin on empty are Object.is-true undefined over 1000 calls, 0 throws', () => {
+    const f = new FreqO1(50, 10);
+    let throws = 0;
+    for (let i = 0; i < 1000; i++) {
+        try {
+            assert.ok(Object.is(f.peekMin(), undefined));
+            assert.ok(Object.is(f.popMin(), undefined));
+        } catch { throws++; }
+    }
+    assert.equal(throws, 0);
+    // even after holding key 0, a post-clear peekMin is real undefined, not a falsy 0.
+    f.add(0);
+    f.clear();
+    assert.ok(Object.is(f.peekMin(), undefined));
+    assert.ok(Object.is(f.popMin(), undefined));
+});
+
+// --- maxFreq ceiling primed exactly AT the boundary -------------------------
+
+test('FreqO1: maxFreq ceiling throw is primed AT the boundary (freq === maxFreq), no wrap', () => {
+    const f = new FreqO1(8, 8, 5);
+    for (let i = 0; i < 4; i++) f.increment(0); // freq 4 (one below the ceiling)
+    assert.equal(f.frequencyOf(0), 4);
+    assert.doesNotThrow(() => f.increment(0));  // -> 5, exactly at the ceiling
+    assert.equal(f.frequencyOf(0), 5);
+    assert.throws(() => f.increment(0), litO1);  // the very next bump throws
+    assert.equal(f.frequencyOf(0), 5);           // no wrap, no change
+    assert.ok(freqCrossCheckOk(f));
+});
+
+// --- -0 aliases key 0 -------------------------------------------------------
+
+test('FreqO1: -0 aliases key 0 (uint32 coercion), increment/peekMin honor it', () => {
+    const f = new FreqO1(8, 4);
+    f.increment(-0);
+    assert.equal(f.size, 1);
+    assert.equal(f.has(0), true);
+    assert.equal(f.frequencyOf(-0), 1);
+    f.increment(-0);
+    assert.equal(f.frequencyOf(0), 2);
+    assert.equal(f.peekMin(), 0);
+    assert.equal(f.popMin(), 0);
+    assert.equal(f.size, 0);
+});
+
+// --- re-entrant mutation from inside forEach / iterator must not corrupt -----
+
+test('FreqO1: re-entrant increment() from inside forEach does not throw or corrupt the cross-check', () => {
+    const f = new FreqO1(64, 16);
+    for (const k of [10, 20, 30, 40]) f.add(k);
+    let throws = 0;
+    const seen = [];
+    assert.doesNotThrow(() => {
+        f.forEach((k) => {
+            seen.push(k);
+            try { f.increment(k); } catch { throws++; } // bump the current key mid-walk
+        });
+    });
+    assert.equal(throws, 0);
+    // forEach re-reads _n each step and increment never changes _n, so the walk
+    // visits exactly the original members; every key is now at frequency 2.
+    assert.equal(seen.length, 4);
+    assert.equal(f.size, 4);
+    for (const k of [10, 20, 30, 40]) assert.equal(f.frequencyOf(k), 2);
+    assert.ok(freqCrossCheckOk(f));
+});
+
+test('FreqO1: re-entrant popMin() from inside forEach shrinks safely, no throw / no OOB', () => {
+    const N = 200;
+    const f = new FreqO1(N, N);
+    for (let k = 0; k < N; k++) f.add(k);
+    let throws = 0;
+    let iterations = 0;
+    const startSize = f.size;
+    f.forEach(() => {
+        iterations++;
+        try { f.popMin(); } catch { throws++; } // shrinks _n underneath the loop
+    });
+    assert.equal(throws, 0, 'popMin() from inside forEach must never throw');
+    // forEach re-reads _n each step, so a shrinking structure self-terminates early
+    // rather than reading out of bounds.
+    assert.ok(iterations >= 1 && iterations <= startSize, 'iterations ' + iterations + ' out of bounds');
+    assert.ok(f.size < startSize, 'popMin() from inside forEach must have shrunk the structure');
+    assert.ok(freqCrossCheckOk(f), 'cross-check broken after re-entrant popMin() during forEach');
+});
+
+test('ADVERSARIAL: popMin() called from inside a for-of ([Symbol.iterator]) walk stays memory-safe', () => {
+    const N = 100;
+    const f = new FreqO1(N, N);
+    for (let k = 0; k < N; k++) f.add(k);
+    const startSize = f.size;
+    let visited = 0;
+    let threw = false;
+    try {
+        for (const _k of f) {
+            void _k;
+            visited++;
+            f.popMin(); // mutates the SAME dense array the generator is walking
+            if (visited > startSize + 5) break; // hard stop: never trust an untested generator
+        }
+    } catch {
+        threw = true;
+    }
+    assert.equal(threw, false, 'for-of + re-entrant popMin() must not throw');
+    assert.ok(visited <= startSize, 'for-of walk ran past the original member count: ' + visited);
+    assert.ok(freqCrossCheckOk(f), 'cross-check broken after re-entrant popMin() during for-of');
 });

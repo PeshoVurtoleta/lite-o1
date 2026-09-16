@@ -48,7 +48,7 @@
  * metric are unchanged; only the measurement is made steadier.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1 } from '../O1.js';
 
 const SIZES = [1e3, 1e4, 1e5, 1e6, 1e7];
 const BATCH = 1e6;
@@ -122,6 +122,21 @@ const NAIVE_PICK_BATCH = 300;   // small: an O(n) Set walk at n=1e5 must stay tr
 // ops/ms isolates the constant. This is NOT a widened gate: the 0.70 floor is
 // unchanged; only the DOMAIN is pinned. The 1e3 point is still DISPLAYED, tagged.
 const RAND_GATE_MIN = 1e4;
+
+// FreqO1 sweep. n is the set SIZE (live keys). The foil is a naive frequency table
+// (a plain Uint32Array of per-key counts) whose "least-frequently-used" query must
+// LINEARLY SCAN all n counts each step (O(n)/query) -- it has no bucket forest -- so
+// it degrades while FreqO1's peekMin() (a single head-of-min-bucket read) stays flat.
+// ops/ms is a RATE, so the two use DIFFERENT batches (an O(n) scan at n=1e5 must stay
+// tractable) yet flatness + ratio compare directly.
+const FREQ_SIZES = [1e3, 1e4, 1e5];
+const FREQ_BATCH = 5e5;         // large: stable timing for the worst-case-O(1) op
+const NAIVE_LFU_BATCH = 300;    // small: an O(n) min-scan at n=1e5 must stay tractable
+// The FreqO1 hot op (increment a walking key + peekMin) is a handful of pointer
+// writes + one read, so the size=1e3 point is a pure-L1 micro-case that turbo-spikes
+// as the flatness DENOMINATOR (the same effect ADR-0004's amendment pinned). The gate
+// is computed over the steady window size >= 1e4; the 1e3 point is DISPLAYED, tagged.
+const FREQ_GATE_MIN = 1e4;
 
 // Global sink: every op feeds it so V8 cannot dead-code-eliminate the batch.
 let SINK = 0;
@@ -376,6 +391,42 @@ function buildNaiveSetPick(n) {
         idx = 0;
         set.forEach(walk); // O(n): no random access, must walk every element
         SINK += picked;
+    };
+    return { op };
+}
+
+// FreqO1: a frequency structure of SIZE n. Each op records one access to a walking
+// key (increment) and reads the least-frequently-used key (peekMin) -- both
+// WORST-CASE O(1) (a fixed number of pointer writes + a head-of-min-bucket read,
+// independent of n) -- so the whole op streams flat as n grows.
+function buildFreqO1(n) {
+    const f = new FreqO1(n, n);
+    for (let k = 0; k < n; k++) f.add(k); // all at frequency 1
+    let key = 0;
+    const op = () => {
+        f.increment(key);
+        if (f.peekMin() >= 0) SINK++;
+        key++;
+        if (key >= n) key = 0;
+    };
+    return { op };
+}
+
+// Foil: a naive frequency table -- a plain Uint32Array of per-key counts with NO
+// bucket forest. Each op bumps one count and then LINEARLY SCANS all n counts to
+// find the current minimum (the LFU key), O(n) per query, so ops/ms collapses as n
+// grows -- the exact trap the bucket forest exists to kill.
+function buildNaiveLfuFoil(n) {
+    const freq = new Uint32Array(n).fill(1);
+    let key = 0;
+    const op = () => {
+        freq[key]++;
+        let best = 0;
+        let bestF = freq[0];
+        for (let j = 1; j < n; j++) if (freq[j] < bestF) { bestF = freq[j]; best = j; } // O(n) scan
+        SINK += best;
+        key++;
+        if (key >= n) key = 0;
     };
     return { op };
 }
@@ -690,5 +741,55 @@ if (!randAllOk) {
     if (!rsetOk) console.error('  violation RandomSet flatness ' + fmt(rset.flatness) + ' < 0.70');
     if (!naivePickOk) console.error('  violation naive foil flatness ' + fmt(naivePick.flatness) + ' > 0.55');
     if (!randRatioOk) console.error('  violation min rand ratio ' + fmt(randRatio) + 'x < 1.50x');
+    process.exitCode = 1;
+}
+
+// ===========================================================================
+// FreqO1 witness -- worst-case-O(1) peekMin() vs a naive O(n) min-scan foil
+// ===========================================================================
+const freq = witness(buildFreqO1, FREQ_SIZES, FREQ_BATCH, REPS, FREQ_GATE_MIN);
+const naiveLfu = witness(buildNaiveLfuFoil, FREQ_SIZES, NAIVE_LFU_BATCH, REPS, FREQ_GATE_MIN);
+
+console.log('');
+console.log('O(1) Witness -- FreqO1 increment + peekMin vs a naive min-scan (rate ops/ms, median of ' +
+    REPS + ', gate size >= ' + nStr(FREQ_GATE_MIN) + ')');
+console.log('');
+console.log('  size      FreqO1 ops/ms      naive ops/ms   ratio');
+console.log('  --------  ----------------   ------------   -----');
+let freqRatio = Infinity;
+for (let i = 0; i < FREQ_SIZES.length; i++) {
+    const a = freq.rows[i].opsPerMs;
+    const b = naiveLfu.rows[i].opsPerMs;
+    const ratio = b > 0 ? a / b : Infinity;
+    const gated = FREQ_SIZES[i] >= FREQ_GATE_MIN;
+    if (gated && ratio < freqRatio) freqRatio = ratio; // ratio gate: steady window only
+    const tag = FREQ_SIZES[i] < FREQ_GATE_MIN ? '   <- L1 micro-case (shown, not gated)' : '';
+    console.log('  ' + nStr(FREQ_SIZES[i]).padEnd(8) + '  ' +
+        fmt(a).padStart(16) + '   ' + fmt(b).padStart(12) + '   ' + fmt(ratio).padStart(5) + 'x' + tag);
+}
+
+console.log('');
+console.log('  FreqO1 flatness (size >= ' + nStr(FREQ_GATE_MIN) + '): ' + fmt(freq.flatness) + '   (gate >= 0.70)');
+console.log('  naive foil flatness (last/first): ' + fmt(naiveLfu.flatness) + '   (gate <= 0.55)');
+console.log('  min FreqO1/naive ratio:           ' + fmt(freqRatio) + 'x  (gate >= 1.50x)');
+// NO MAX-single-op line here (unlike MonoDeque): FreqO1's increment / peekMin / popMin
+// are WORST-CASE O(1) -- a fixed number of pointer writes on the bucket forest, never
+// a run. There is no amortized spike to expose; the flat line IS the worst-case claim.
+
+const freqOk = freq.flatness >= 0.70;
+const naiveLfuOk = naiveLfu.flatness <= 0.55;
+const freqRatioOk = freqRatio >= 1.5;
+const freqAllOk = freqOk && naiveLfuOk && freqRatioOk;
+
+console.log('');
+console.log('WITNESS FreqO1 ' + (freqAllOk ? 'ok' : 'FAIL') +
+    ' freq.flatness=' + fmt(freq.flatness) +
+    ' naive.flatness=' + fmt(naiveLfu.flatness) +
+    ' minRatio=' + fmt(freqRatio) + 'x');
+
+if (!freqAllOk) {
+    if (!freqOk) console.error('  violation FreqO1 flatness ' + fmt(freq.flatness) + ' < 0.70');
+    if (!naiveLfuOk) console.error('  violation naive foil flatness ' + fmt(naiveLfu.flatness) + ' > 0.55');
+    if (!freqRatioOk) console.error('  violation min freq ratio ' + fmt(freqRatio) + 'x < 1.50x');
     process.exitCode = 1;
 }

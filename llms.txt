@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-Version: 0.6.0
+Version: 0.7.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -13,9 +13,9 @@ op is O(1) worst-case (or O(1)-amortized where stated) and allocates zero bytes
 after construction, and a shipped witness harness demonstrates the flat
 throughput curve against a built-in foil.
 
-v0.6.0 ships six members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
-and RandomSet. They share no mutable module state, so a bundler that imports one
-drops the others (tree-shakeable).
+v0.7.0 ships seven members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
+RandomSet, and FreqO1. They share no mutable module state, so a bundler that
+imports one drops the others (tree-shakeable).
 
 ## Exports (from the single main file O1.js)
 
@@ -28,7 +28,9 @@ drops the others (tree-shakeable).
   a running min / max.
 - `RandomSet` -- class. A zero-GC O(1) integer set (SparseSet substrate) with
   WORST-CASE O(1) uniform sample() + removeRandom().
-- `VERSION` -- string, '0.6.0'.
+- `FreqO1` -- class. A zero-GC WORST-CASE O(1) LFU frequency structure with
+  add() / increment() / peekMin() / popMin() over a private bucket forest.
+- `VERSION` -- string, '0.7.0'.
 
 ## SparseSet
 
@@ -304,6 +306,77 @@ DEFAULT-seeded RandomSets holding the same members produce IDENTICAL
 sample()/removeRandom() sequences -- pass distinct seeds to decorrelate. A given
 seed fully reproduces its stream. -0 aliases key 0 via the uint32 coercion.
 
+## FreqO1
+
+    new FreqO1(universe, capacity = universe, maxFreq = 2**32 - 2)
+
+- A WORST-CASE O(1) frequency structure -- the standalone primitive behind O(1) LFU
+  eviction. Integer keys [0, universe) are tracked with an access COUNT; the
+  least-frequently-used key (lowest count, FIFO tie-break) is peeked / popped in
+  O(1) with NO scan.
+- universe: exclusive key ceiling; integer in [1, 2^32]. Keys are integers in
+  [0, universe).
+- capacity: max simultaneously-live keys; integer in [1, universe], default universe.
+- maxFreq: the frequency ceiling; integer in [1, 2^32-2], default 2^32-2. Counts live
+  in a Uint32 slot, so the ceiling is 2^32-2 (leaving room for the freq+1 write); an
+  increment past maxFreq throws [lite-o1] rather than wrap.
+- Constructor throws a [lite-o1] RangeError on a bad universe / capacity / maxFreq
+  (typeof-guarded FIRST so a Symbol / BigInt never reaches coercion; String(x) message).
+- Substrate (all PRIVATE Uint32Array columns; NO public SlotPool -- ADR 0003's
+  deferral stands, FreqO1 owns its own node pool + stays self-contained): KEYS ride
+  SparseSet's dense + sparse cross-check (dense index = the stable node id). Per KEY:
+  freq, bucket-of, and next/prev intrusive DOUBLY-linked list within a bucket (FIFO).
+  Per BUCKET (a 1-based bump + free-stack pool, bucket 0 = NIL): the frequency it
+  represents, prev/next in a list sorted ASCENDING by frequency, and FIFO head/tail
+  key nodes. `_head` = the min-frequency bucket, so peekMin / popMin are O(1).
+
+Hot surface (all WORST-CASE O(1), zero allocation):
+
+- add(k) -> this          Ensure k is tracked at frequency 1 if absent; IDEMPOTENT
+                          no-op if already present (does NOT bump). Fail closed: a bad
+                          key throws [lite-o1]; a NEW key past capacity throws.
+- increment(k) -> this    Record one access: insert at frequency 1 if absent, else
+                          frequency += 1. Fail closed: a bad key throws; a NEW key
+                          past capacity throws; a bump past maxFreq throws. Every
+                          throw is a byte-identical no-op.
+- frequencyOf(k) -> number  k's current frequency, or 0 if absent / bad key. NEVER
+                          throws (0 = not tracked is the correct frequency).
+- has(k) -> boolean       True iff k is tracked. A bad key is ABSENT, never throws.
+- peekMin() -> number|undefined  The least-frequently-used key (lowest frequency;
+                          FIFO tie-break -- earliest-inserted in that bucket) WITHOUT
+                          removing it. undefined on empty, NEVER throws.
+- popMin() -> number|undefined  Remove AND return the least-frequently-used key (same
+                          selection as peekMin). undefined on empty, NEVER throws.
+- size (getter)          Live key count.
+- capacity (getter)      Max simultaneously-live keys as constructed.
+- universe (getter)      Exclusive key ceiling.
+- maxFrequency (getter)  The frequency ceiling.
+- clear() -> void        O(1): resets the live count + the bucket-list head + the
+                          bucket pool (bump + free stack) -- four scalars, touches NO
+                          store (stale dense/sparse fail the has() cross-check).
+- forEach(fn) -> void    O(size) alloc-free scan in DENSE STORAGE order (insertion
+                          order, permuted by a popMin swap-remove -- NOT frequency
+                          order); fn is (key, frequency, freq). Re-reads size each
+                          step, so a re-entrant popMin self-terminates.
+- [Symbol.iterator]()    O(size) scan, same order; ALLOCATES per protocol -- use
+                          forEach for the alloc-free scan.
+
+Lean LFU surface (LOCKED): NO decrement, NO peekMax, NO delete(k). Fail closed on
+the MUTATORS (add / increment throw [lite-o1] on a bad key, typeof-guarded before
+the coercing >>>; null is not zero); ABSENT on the QUERIES (has / frequencyOf never
+throw). peekMin / popMin on an empty structure return undefined (never throw).
+
+Bucket-pool sizing (why free-list exhaustion cannot occur): non-empty buckets
+partition the live keys by frequency, so at REST there are <= size <= capacity of
+them. A single increment TRANSIENTLY creates the target bucket BEFORE freeing an
+emptied source, peaking at size + 1 <= capacity + 1. The pool therefore holds
+capacity + 1 usable buckets, so exhaustion CANNOT happen under the contract; the
+_poolExhausted throw is a fail-closed guard, defense in depth, never reached.
+
+Worst-case honesty: like MinStack / RandomSet, every hot op is WORST-CASE O(1) (a
+fixed number of pointer writes on the bucket forest, never a run) -- so the witness
+prints NO MAX-single-op line; the flat line IS the worst-case claim.
+
 ## Design bounds
 
 - SparseSet valid key: integer in [0, universe).
@@ -329,10 +402,19 @@ seed fully reproduces its stream. -0 aliases key 0 via the uint32 coercion.
   undefined on empty (never throw). High-bits index map (not s % n); residual
   multiply-bias <= n/2^32 disclosed, no rejection sampling. forEach / [Symbol.iterator]
   are the O(size) scan exceptions (iterator allocates).
+- FreqO1 valid key: integer in [0, universe); fixed capacity, no growth. Fail closed
+  on the mutators add / increment (throws [lite-o1]; null is never coerced to key 0),
+  absent on the queries has / frequencyOf (never throw, frequencyOf returns 0). maxFreq
+  ceiling in [1, 2^32-2]; an increment past it throws (no wrap). add / increment /
+  frequencyOf / has / peekMin / popMin are WORST-CASE O(1); peekMin / popMin undefined
+  on empty. FIFO tie-break at equal frequency. Bucket pool sized to capacity + 1 (the
+  transient peak), so exhaustion cannot occur; the guard is defense in depth. forEach /
+  [Symbol.iterator] scan in dense storage order (iterator allocates). NO decrement, NO
+  peekMax, NO delete(k).
 
 ## Scripts
 
-- npm test           -- 246 node:test cases (contract + boundary + differential fuzz).
+- npm test           -- 290 node:test cases (contract + boundary + differential fuzz).
 - npm run test:types -- tsc --noEmit against O1.d.ts.
 - npm run torture    -- lite-leak + lite-gc-profiler: 0 B/op, 0 major GC, leak-free.
 - npm run witness    -- O(1) throughput-invariance harness + foils + flatness gate.
@@ -379,6 +461,14 @@ seed fully reproduces its stream. -0 aliases key 0 via the uint32 coercion.
   gated; the 0.70 floor is unchanged, only the domain is pinned). RandomSet flatness
   >= 0.70; naive foil flatness <= 0.55; RandomSet/naive ratio >= 1.5x. NO
   MAX-single-op line: sample/removeRandom are worst-case O(1) (no rejection loop).
+- FreqO1: size-sweep [1e3, 1e4, 1e5], WORST-CASE-O(1) increment + peekMin vs a NAIVE
+  frequency table (a plain Uint32Array of per-key counts) that LINEARLY SCANS all n
+  counts each step to find the LFU key (O(n)/query). ops/ms is a rate (freq batch 5e5,
+  naive batch 300). Gated over the steady window size >= 1e4 (the 1e3 point is a
+  pure-L1 micro-case shown but not gated; the 0.70 floor is unchanged, only the domain
+  is pinned). FreqO1 flatness >= 0.70; naive foil flatness <= 0.55; FreqO1/naive ratio
+  >= 1.5x. NO MAX-single-op line: add / increment / peekMin / popMin are worst-case
+  O(1) (a fixed number of pointer writes, no run).
 
 ## Not yet shipped
 
@@ -388,5 +478,7 @@ variant. SparseSet holds membership, not payloads (store values in a parallel So
 column or @zakkster/lite-arena); RingDeque holds numbers only; UnionFind holds
 disjoint-set connectivity over [0, n), not payloads; MonoDeque holds numeric
 window extremes only, MinStack holds numeric stack values + their running
-extreme only, and RandomSet holds integer membership + uniform sampling over
-[0, universe) (queue integer handles for object payloads).
+extreme only, RandomSet holds integer membership + uniform sampling over
+[0, universe), and FreqO1 holds integer keys + their access FREQUENCY over
+[0, universe) -- an LFU primitive, not a full cache (queue integer handles for
+object payloads).

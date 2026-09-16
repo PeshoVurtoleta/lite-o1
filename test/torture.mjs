@@ -39,7 +39,7 @@ async function main() {
     const { GcProfiler, checkNoGc, measureAllocs } =
         await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet } = await import('../O1.js');
+    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1 } = await import('../O1.js');
 
     const U = 1 << 16;      // universe 65536
     const CAP = 1 << 14;    // capacity 16384
@@ -124,6 +124,17 @@ async function main() {
             rs.removeRandom();
             rs.delete(i & 1023);
             tracker.track(rs, noop, 'randomset', { audit: true });
+            // FreqO1 owns only its private Uint32Array node + bucket pools; nothing
+            // external to release. Its arrays hold numbers, so a reclaimed instance
+            // is the desired outcome, proven by size()->0. Exercise add/increment/
+            // frequencyOf/peekMin/popMin before tracking.
+            const fq = new FreqO1(1024, 256);
+            fq.add(i & 1023);
+            fq.increment((i + 1) & 1023);
+            fq.frequencyOf(i & 1023);
+            fq.peekMin();
+            fq.popMin();
+            tracker.track(fq, noop, 'freqo1', { audit: true });
         }
         return tracker.size();
     }
@@ -251,6 +262,27 @@ async function main() {
     const randBpc = randAllocRes.bytesPerCall === null ? 0 : randAllocRes.bytesPerCall;
     const randAllocBytes = Math.max(0, Math.round(randBpc));
     const randAllocOk = randAllocBytes === 0;
+
+    // FreqO1 hot path: a bounded resident LFU structure. Each step increments a
+    // walking key (bucket-forest surgery: unlink + find/create target + relink +
+    // free-if-empty), pops the least-frequently-used key (removeMin swap-remove +
+    // pointer fix-up) then re-adds the popped key -- so size returns to FREQ_W every
+    // step and no op touches full/empty. Every op is WORST-CASE O(1), zero-alloc (the
+    // node + bucket pools recycle typed slots only, never a JS allocation).
+    const FREQ_W = 1 << 12;              // 4096 resident keys, < CAP so never full
+    const freq = new FreqO1(U, CAP);
+    for (let k = 0; k < FREQ_W; k++) freq.add(k); // prime a bounded resident window
+    let fv = 0;
+    const freqStep = () => {
+        fv = (fv + 1) | 0;
+        freq.increment((fv * 2654435761) & (FREQ_W - 1)); // scramble -> real bucket churn
+        const k = freq.popMin();       // remove the LFU key (size FREQ_W-1)
+        freq.add(k);                   // re-add it at frequency 1 (size FREQ_W)
+    };
+    const freqAllocRes = measureAllocs(freqStep, { iterations: 100000, batches: 8 });
+    const freqBpc = freqAllocRes.bytesPerCall === null ? 0 : freqAllocRes.bytesPerCall;
+    const freqAllocBytes = Math.max(0, Math.round(freqBpc));
+    const freqAllocOk = freqAllocBytes === 0;
     // "0 B/op" resolved at the sampling floor: heapUsed deltas are quantized and
     // noisy, so a truly non-allocating op reads a sub-byte figure (a lone blip
     // in one batch / iterations). Round to the nearest byte -- any per-op
@@ -270,6 +302,7 @@ async function main() {
         monoStep();
         minStep();
         randStep();
+        freqStep();
         if ((i & 8191) === 0) {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
         }
@@ -318,6 +351,15 @@ async function main() {
         rand.forEach(cb);
         rand.clear();
     }
+    // FreqO1 fill (with increment spread -> bucket churn) + popMin drain + forEach +
+    // O(1) clear cycles -- exercises the bucket-forest surgery, the swap-remove
+    // pointer fix-up, the alloc-free scan, and clear. The drain empties it each cycle.
+    for (let f = 0; f < 1024; f++) {
+        for (let k = 0; k < 512; k++) { freq.add(k); freq.increment((k * 2654435761) & 511); }
+        freq.forEach(cb);
+        while (freq.size > 0) SINK += freq.popMin() >= 0 ? 1 : 0;
+        freq.clear();
+    }
     await new Promise((r) => setTimeout(r, 50));
     const s2 = gc.summary();
     const report = checkNoGc(s2, { maxMajor: 0, maxPauseMs: 2 });
@@ -346,6 +388,9 @@ async function main() {
         for (let k = 0; k < CAP; k++) rand.add(k);
         while (rand.size > 0) rand.removeRandom();
         rand.clear();
+        for (let k = 0; k < CAP; k++) freq.add(k);
+        while (freq.size > 0) freq.popMin();
+        freq.clear();
     }
     globalThis.gc();
     const abAfter = process.memoryUsage().arrayBuffers;
@@ -355,7 +400,7 @@ async function main() {
     // ---- verdict + GATE line ----------------------------------------------
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
         findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && monoAllocOk &&
-        minAllocOk && randAllocOk && abOk;
+        minAllocOk && randAllocOk && freqAllocOk && abOk;
 
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
@@ -364,7 +409,8 @@ async function main() {
         ' maxMs=' + s2.gc.maxMs.toFixed(2) +
         ' | alloc=' + allocBytes + ' B/op (SparseSet) ' + ringAllocBytes + ' B/op (RingDeque) ' +
         ufAllocBytes + ' B/op (UnionFind) ' + monoAllocBytes + ' B/op (MonoDeque) ' +
-        minAllocBytes + ' B/op (MinStack) ' + randAllocBytes + ' B/op (RandomSet)' +
+        minAllocBytes + ' B/op (MinStack) ' + randAllocBytes + ' B/op (RandomSet) ' +
+        freqAllocBytes + ' B/op (FreqO1)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
         ' (tracked=' + trackedMid + ' sink=' + SINK + ' abGrowth=' + abDelta + ')');
 
@@ -381,6 +427,7 @@ async function main() {
         if (!monoAllocOk) console.error('  alloc ' + monoAllocBytes + ' B/op MonoDeque (raw bytesPerCall ' + monoBpc + ')');
         if (!minAllocOk) console.error('  alloc ' + minAllocBytes + ' B/op MinStack (raw bytesPerCall ' + minBpc + ')');
         if (!randAllocOk) console.error('  alloc ' + randAllocBytes + ' B/op RandomSet (raw bytesPerCall ' + randBpc + ')');
+        if (!freqAllocOk) console.error('  alloc ' + freqAllocBytes + ' B/op FreqO1 (raw bytesPerCall ' + freqBpc + ')');
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;
     }

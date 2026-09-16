@@ -3,10 +3,10 @@
  * that doubles as a teachable textbook: each member solves a real problem AND
  * proves its constant is real (the O(1) Witness -- see test/witness.mjs).
  *
- * v0.6.0 ships six members -- SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
- * and RandomSet -- plus its `VERSION` const. The six are independent (no shared
- * mutable module state), so a bundler that imports one drops the others
- * (`sideEffects: false`).
+ * v0.7.0 ships seven members -- SparseSet, RingDeque, UnionFind, MonoDeque,
+ * MinStack, RandomSet, and FreqO1 -- plus its `VERSION` const. The seven are
+ * independent (no shared mutable module state), so a bundler that imports one
+ * drops the others (`sideEffects: false`).
  *
  * The complexity class IS the product: every hot op below is O(1) worst-case and
  * allocates ZERO bytes after construction. The witness harness (never imported
@@ -17,7 +17,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '0.6.0';
+export const VERSION = '0.7.0';
 
 /** Largest universe the Uint32 substrate + the (k >>> 0) key check can honor. */
 const MAX_UNIVERSE = 0x100000000; // 2^32
@@ -1144,5 +1144,404 @@ export class RandomSet {
     /** @private */
     _full() {
         throw new RangeError('[lite-o1] RandomSet full (capacity ' + this._cap + ')');
+    }
+}
+
+/**
+ * Largest frequency a live key can reach. Counts live in a `Uint32Array` slot, so
+ * the ceiling is 2^32-2 (NOT 2^32-1): the increment hot body writes `freq + 1`, so
+ * capping the reachable value at 2^32-2 keeps that bump inside the uint32 domain --
+ * a bump that WOULD exceed maxFrequency throws `[lite-o1]` rather than wrap. There
+ * is no 0-is-absent sentinel on `_freq`: the dense/sparse cross-check (not a freq
+ * value) decides liveness, so a live key's frequency is simply >= 1.
+ */
+const MAX_FREQ = 0xFFFFFFFE; // 2^32 - 2
+
+/**
+ * NIL for the intrusive KEY-list pointers (`_nk` / `_pk` / `_bHead` / `_bTail`),
+ * which store DENSE indices in [0, capacity). 0 is a valid dense index, so the
+ * sentinel is the top uint32 value -- never a legal index (a dense index reaches
+ * 0xFFFFFFFF only at capacity 2^32, a size no host can allocate). Buckets are
+ * 1-based instead, so bucket 0 is the NIL for the bucket-list pointers.
+ */
+const FREQ_NIL = 0xFFFFFFFF; // 2^32 - 1
+
+/**
+ * FreqO1 -- a zero-GC, WORST-CASE O(1) frequency structure: the standalone
+ * primitive behind O(1) LFU eviction. Integer keys [0, universe) are tracked with
+ * an access COUNT; the least-frequently-used key (lowest count, FIFO tie-break) is
+ * peeked or popped in O(1) with NO scan.
+ *
+ * The layout is the classic O(1)-LFU bucket forest, made pointer-free over PRIVATE
+ * `Uint32Array` columns (no public SlotPool -- ADR 0003's deferral stands; FreqO1
+ * owns its own node pool and stays self-contained + tree-shakeable):
+ *
+ *   - KEYS ride SparseSet's dense + sparse cross-check substrate -- `_dense[i]` is
+ *     the key at dense index i (i in [0, _n)), `_sparse[k]` maps k back, membership
+ *     is `_sparse[k] < _n && _dense[_sparse[k]] === k`. The dense index i IS the
+ *     stable node identity used by the intrusive lists. clear() then resets a single
+ *     count in O(1), zeroing no store (the cross-check voids stale entries).
+ *   - Per KEY (indexed by dense index i): `_freq[i]` (its count, >= 1), `_bkt[i]`
+ *     (the bucket it sits in), and `_nk[i]` / `_pk[i]` (an intrusive DOUBLY-linked
+ *     list of dense indices WITHIN a bucket, FIFO oldest -> newest; NIL = FREQ_NIL).
+ *   - Per BUCKET (a 1-based pool, bucket 0 = NIL): `_bFreq[b]` (the frequency this
+ *     bucket represents), `_bPrev[b]` / `_bNext[b]` (buckets in a doubly-linked list
+ *     sorted ASCENDING by frequency), and `_bHead[b]` / `_bTail[b]` (the FIFO oldest
+ *     / newest key node, for O(1) head-pop + O(1) tail-append). `_head` is the head
+ *     of the bucket list -- the MIN-frequency bucket -- so peekMin/popMin are O(1).
+ *
+ * The bucket pool is a bump pointer (`_bBump`) plus a free stack (`_bFree`), the
+ * same discipline SparseSet uses for keys: allocate from the free stack, else bump;
+ * free by pushing back; clear() resets `_bBump = 1` and empties the free stack in
+ * O(1) (a bucket's fields are always re-initialised on allocation, so stale bytes
+ * never leak). SIZING: the non-empty buckets partition the live keys by frequency,
+ * so at REST there are <= _n <= capacity of them; a single increment TRANSIENTLY
+ * creates the target bucket BEFORE freeing an emptied source, peaking at _n + 1 <=
+ * capacity + 1. The pool therefore holds capacity + 1 usable buckets -- so
+ * exhaustion CANNOT happen under the contract; `_poolExhausted` is a fail-closed
+ * guard, defense in depth, never reached.
+ *
+ * Lean LFU surface -- NO decrement, NO peekMax, NO delete(k):
+ *   - add(k) ensures k is tracked at frequency 1 if absent (idempotent no-op if
+ *     already present -- it does NOT bump); increment(k) records one access (insert
+ *     at 1 if absent, else freq += 1); frequencyOf(k) reads the count (0 if
+ *     absent/bad, NEVER throws -- 0 = not tracked is the correct frequency);
+ *     has(k) is membership (a bad key is absent, never throws); peekMin() /
+ *     popMin() read / remove the LFU key. All WORST-CASE O(1), zero-alloc.
+ *
+ * Fail closed, mirroring the suite: a bad key (non-integer, NaN, null, Symbol,
+ * BigInt, >= universe) throws `[lite-o1]` on the MUTATORS add / increment
+ * (typeof-guarded BEFORE the coercing `>>>`, so a Symbol / BigInt never reaches
+ * arithmetic; `null` is not zero), but is merely ABSENT for the QUERIES has /
+ * frequencyOf (never throw). add / increment of a NEW key past capacity throw a
+ * byte-identical no-op; an increment past maxFrequency throws a byte-identical
+ * no-op. peekMin() / popMin() on an EMPTY structure return `undefined`, never throw.
+ */
+export class FreqO1 {
+    /**
+     * @param {number} universe   exclusive key ceiling; integer in [1, 2^32].
+     * @param {number} [capacity=universe]  max simultaneously-live keys; integer in [1, universe].
+     * @param {number} [maxFreq=2**32-2]    the frequency ceiling; integer in [1, 2^32-2].
+     */
+    constructor(universe, capacity = universe, maxFreq = MAX_FREQ) {
+        // typeof guard BEFORE any coercion (Number.isInteger never coerces; false on
+        // a Symbol / BigInt), and String(x) in the cold message is Symbol/BigInt-safe.
+        if (typeof universe !== 'number' || !Number.isInteger(universe) ||
+            universe < 1 || universe > MAX_UNIVERSE) {
+            throw new RangeError(
+                '[lite-o1] universe must be an integer in [1, 2^32], got ' + String(universe));
+        }
+        if (typeof capacity !== 'number' || !Number.isInteger(capacity) ||
+            capacity < 1 || capacity > universe) {
+            throw new RangeError(
+                '[lite-o1] capacity must be an integer in [1, ' + universe + '], got ' + String(capacity));
+        }
+        if (typeof maxFreq !== 'number' || !Number.isInteger(maxFreq) ||
+            maxFreq < 1 || maxFreq > MAX_FREQ) {
+            throw new RangeError(
+                '[lite-o1] maxFreq must be an integer in [1, 2^32-2], got ' + String(maxFreq));
+        }
+        this._universe = universe;
+        this._cap = capacity;
+        this._maxFreq = maxFreq;
+        // ---- key substrate (dense + sparse cross-check; dense index = node id) ----
+        this._dense = new Uint32Array(capacity);  // dense[i] = the i-th live key
+        this._sparse = new Uint32Array(universe); // sparse[k] = dense index (valid iff cross-check)
+        this._freq = new Uint32Array(capacity);   // freq[i] = frequency of dense[i] (>= 1)
+        this._bkt = new Uint32Array(capacity);    // bkt[i]  = bucket (1-based) dense[i] sits in
+        this._nk = new Uint32Array(capacity);     // nk[i]/pk[i] = next/prev dense index in the
+        this._pk = new Uint32Array(capacity);     //   bucket's FIFO key list (NIL = FREQ_NIL)
+        this._n = 0;                              // live key count
+        // ---- bucket pool (1-based; index 0 = NIL; capacity+1 usable, see sizing) ----
+        const bCap = capacity + 1;               // max simultaneously-live buckets (transient peak)
+        this._bCap = bCap;
+        this._bFreq = new Uint32Array(bCap + 1);  // bFreq[b] = frequency this bucket represents
+        this._bPrev = new Uint32Array(bCap + 1);  // bucket list (ascending by frequency), NIL = 0
+        this._bNext = new Uint32Array(bCap + 1);
+        this._bHead = new Uint32Array(bCap + 1);  // bHead[b] = FIFO oldest key node (dense index)
+        this._bTail = new Uint32Array(bCap + 1);  // bTail[b] = FIFO newest key node (dense index)
+        this._bFree = new Uint32Array(bCap);      // free stack of returned bucket ids
+        this._bFreeTop = 0;                       // free-stack pointer
+        this._bBump = 1;                          // next never-allocated bucket id (1-based bump)
+        this._head = 0;                           // head of the bucket list = MIN-freq bucket (0 = empty)
+    }
+
+    /** Number of live keys. O(1). */
+    get size() { return this._n; }
+
+    /** Max simultaneously-live keys this structure was sized for. O(1). */
+    get capacity() { return this._cap; }
+
+    /** Exclusive key ceiling; keys are [0, universe). O(1). */
+    get universe() { return this._universe; }
+
+    /** The frequency ceiling; an increment past it throws [lite-o1]. O(1). */
+    get maxFrequency() { return this._maxFreq; }
+
+    /**
+     * True iff k is tracked. O(1): the SparseSet cross-check. A bad key (negative,
+     * fractional, NaN, null, Symbol, BigInt, >= universe) is ABSENT, never a throw.
+     * The `typeof` short-circuits BEFORE `>>>` runs (which coerces + THROWS on a
+     * Symbol / BigInt); `(k >>> 0) !== k` then rejects every non-uint32 number.
+     */
+    has(k) {
+        if (typeof k !== 'number' || (k >>> 0) !== k || k >= this._universe) return false;
+        const i = this._sparse[k];
+        return i < this._n && this._dense[i] === k;
+    }
+
+    /**
+     * k's current frequency, or 0 if k is absent or a bad key. O(1). NEVER throws
+     * (mirrors the never-throw query contract): 0 = "not tracked" IS the correct
+     * frequency semantics -- an untracked key has been accessed zero times.
+     * @returns {number}
+     */
+    frequencyOf(k) {
+        if (typeof k !== 'number' || (k >>> 0) !== k || k >= this._universe) return 0;
+        const i = this._sparse[k];
+        return (i < this._n && this._dense[i] === k) ? this._freq[i] : 0;
+    }
+
+    /**
+     * Ensure k is tracked at frequency 1 if absent; IDEMPOTENT no-op if already
+     * present (it does NOT bump -- use increment for that). O(1). Fails closed: a
+     * bad key throws via _oob; a NEW key when full throws via _full (byte-identical
+     * no-op -- the throw precedes every write).
+     * @returns {FreqO1} this
+     */
+    add(k) {
+        if (typeof k !== 'number' || (k >>> 0) !== k || k >= this._universe) return this._oob(k);
+        const si = this._sparse[k];
+        if (si < this._n && this._dense[si] === k) return this; // present -> no-op
+        if (this._n === this._cap) return this._full();
+        this._insertOne(k);
+        return this;
+    }
+
+    /**
+     * Record one access to k: insert at frequency 1 if absent, else frequency += 1.
+     * O(1) WORST-CASE (the bucket surgery is a fixed number of pointer writes -- no
+     * run, no scan). Fails closed: a bad key throws via _oob; a NEW key past
+     * capacity throws via _full; a bump that would pass maxFrequency throws via
+     * _freqCeil. Every throw precedes all state writes -> a byte-identical no-op.
+     * @returns {FreqO1} this
+     */
+    increment(k) {
+        if (typeof k !== 'number' || (k >>> 0) !== k || k >= this._universe) return this._oob(k);
+        const si = this._sparse[k];
+        if (si < this._n && this._dense[si] === k) {
+            // present: bump frequency f -> f+1.
+            const f = this._freq[si];
+            if (f >= this._maxFreq) return this._freqCeil(); // byte-identical no-op
+            const nf = f + 1;
+            const b = this._bkt[si];
+            // Find or create the target bucket (frequency f+1), which is the bucket
+            // directly AFTER b in ascending order iff it already exists.
+            let t = this._bNext[b];
+            if (t === 0 || this._bFreq[t] !== nf) {
+                // Allocate BEFORE any mutation -> if the pool guard fires (it cannot
+                // under the contract), the whole increment is a byte-identical no-op.
+                t = this._allocBucket(nf);
+                const nx = this._bNext[b];
+                this._bPrev[t] = b;
+                this._bNext[t] = nx;
+                this._bNext[b] = t;
+                if (nx !== 0) this._bPrev[nx] = t;
+            }
+            // Unlink si from b's key list.
+            const p = this._pk[si];
+            const nx2 = this._nk[si];
+            if (p === FREQ_NIL) this._bHead[b] = nx2; else this._nk[p] = nx2;
+            if (nx2 === FREQ_NIL) this._bTail[b] = p; else this._pk[nx2] = p;
+            // Move si into t (append at tail -> FIFO newest at this frequency).
+            this._freq[si] = nf;
+            this._bkt[si] = t;
+            const tt = this._bTail[t];
+            this._pk[si] = tt;
+            this._nk[si] = FREQ_NIL;
+            if (tt === FREQ_NIL) this._bHead[t] = si; else this._nk[tt] = si;
+            this._bTail[t] = si;
+            // If b is now empty, unlink it from the bucket list and free it.
+            if (this._bHead[b] === FREQ_NIL) {
+                const bp = this._bPrev[b];
+                const bn = this._bNext[b];
+                if (bp === 0) this._head = bn; else this._bNext[bp] = bn;
+                if (bn !== 0) this._bPrev[bn] = bp;
+                this._bFree[this._bFreeTop++] = b;
+            }
+            return this;
+        }
+        // absent: insert at frequency 1 (same as add).
+        if (this._n === this._cap) return this._full();
+        this._insertOne(k);
+        return this;
+    }
+
+    /**
+     * The least-frequently-used key (lowest frequency; FIFO tie-break -- the
+     * earliest-inserted key in that frequency bucket) WITHOUT removing it. O(1) --
+     * the FIFO head of the min-frequency bucket, which is the head of the bucket
+     * list. `undefined` on an empty structure, NEVER throws.
+     * @returns {number|undefined}
+     */
+    peekMin() {
+        if (this._n === 0) return undefined;
+        return this._dense[this._bHead[this._head]];
+    }
+
+    /**
+     * Remove AND return the least-frequently-used key (same selection as peekMin).
+     * O(1) WORST-CASE. `undefined` on an empty structure, NEVER throws. The victim's
+     * dense slot is filled by the swap-last-into-hole delete uses (with the moved
+     * node's intrusive pointers fixed up), so the cross-check + the bucket lists stay
+     * exact; an emptied min-bucket is unlinked and returned to the pool.
+     * @returns {number|undefined}
+     */
+    popMin() {
+        if (this._n === 0) return undefined;
+        const b = this._head;
+        const victim = this._bHead[b];      // FIFO oldest node in the min bucket
+        const key = this._dense[victim];
+        // Unlink victim (the head) from bucket b.
+        const nx = this._nk[victim];
+        this._bHead[b] = nx;
+        if (nx === FREQ_NIL) {
+            // b is now empty: it was the head (min), so its prev is 0 -- unlink + free.
+            this._bTail[b] = FREQ_NIL;
+            const bn = this._bNext[b];
+            this._head = bn;
+            if (bn !== 0) this._bPrev[bn] = 0;
+            this._bFree[this._bFreeTop++] = b;
+        } else {
+            this._pk[nx] = FREQ_NIL;
+        }
+        // Swap-remove the victim's dense slot (mirrors delete's swap-last).
+        const last = --this._n;
+        if (victim !== last) {
+            const mk = this._dense[last];
+            this._dense[victim] = mk;
+            this._sparse[mk] = victim;
+            this._freq[victim] = this._freq[last];
+            const mb = this._bkt[last];
+            this._bkt[victim] = mb;
+            const mp = this._pk[last];
+            const mn = this._nk[last];
+            this._pk[victim] = mp;
+            this._nk[victim] = mn;
+            if (mp === FREQ_NIL) this._bHead[mb] = victim; else this._nk[mp] = victim;
+            if (mn === FREQ_NIL) this._bTail[mb] = victim; else this._pk[mn] = victim;
+        }
+        return key;
+    }
+
+    /**
+     * Empty the structure in O(1): reset the live count, the bucket-list head, and
+     * the bucket pool (bump + free stack) -- four scalars, touching NO backing
+     * array. Stale dense/sparse entries fail the has() cross-check, and every bucket
+     * re-initialises its fields on allocation, so no store is ever zeroed (mirrors
+     * SparseSet.clear()).
+     */
+    clear() {
+        this._n = 0;
+        this._head = 0;
+        this._bBump = 1;
+        this._bFreeTop = 0;
+    }
+
+    /**
+     * Iterate live keys in DENSE STORAGE order (insertion order, permuted by a
+     * popMin swap-remove) -- the same alloc-free discipline SparseSet / RandomSet
+     * use, NOT frequency order. O(size). Re-reads `_n` each step, so a re-entrant
+     * popMin from inside fn self-terminates rather than reading out of bounds.
+     * @param {(key:number, frequency:number, freq:FreqO1)=>void} fn
+     */
+    forEach(fn) {
+        const d = this._dense;
+        const f = this._freq;
+        for (let i = 0; i < this._n; i++) fn(d[i], f[i], this);
+    }
+
+    /**
+     * Iterate live keys in dense storage order (same order as forEach). O(size).
+     * The ONE per-protocol ALLOCATOR (a {value, done} per step) -- kept OUT of the
+     * zero-alloc claims; use forEach for the alloc-free scan.
+     */
+    *[Symbol.iterator]() {
+        const d = this._dense;
+        for (let i = 0; i < this._n; i++) yield d[i];
+    }
+
+    // ---- private helpers (hot: node/bucket surgery; cold: throw builders) ------
+
+    /**
+     * Insert a brand-new key at frequency 1: append it to the frequency-1 bucket
+     * (which, if it exists, is always the head of the bucket list) or create that
+     * bucket at the front. Assumes k is validated, absent, and _n < capacity. The
+     * bucket alloc (if any) precedes the dense write, so a pool-guard throw leaves
+     * `_n` untouched -- a byte-identical no-op. O(1).
+     * @private
+     */
+    _insertOne(k) {
+        let b = this._head;
+        if (b === 0 || this._bFreq[b] !== 1) {
+            // no frequency-1 bucket yet -> create one at the FRONT (freq 1 is the min).
+            b = this._allocBucket(1);
+            this._bPrev[b] = 0;
+            this._bNext[b] = this._head;
+            if (this._head !== 0) this._bPrev[this._head] = b;
+            this._head = b;
+        }
+        const i = this._n++;
+        this._dense[i] = k;
+        this._sparse[k] = i;
+        this._freq[i] = 1;
+        this._bkt[i] = b;
+        // append i to b's key list tail (FIFO newest).
+        const tail = this._bTail[b];
+        this._pk[i] = tail;
+        this._nk[i] = FREQ_NIL;
+        if (tail === FREQ_NIL) this._bHead[b] = i; else this._nk[tail] = i;
+        this._bTail[b] = i;
+    }
+
+    /**
+     * Allocate a bucket carrying `freq`: pop the free stack, else bump. Re-inits the
+     * bucket's key-list head/tail to empty. O(1). Fails closed via _poolExhausted if
+     * both are spent -- which CANNOT happen (the pool holds capacity + 1 usable
+     * buckets, >= the transient peak); the guard is defense in depth.
+     * @private
+     * @returns {number} the bucket id (1-based)
+     */
+    _allocBucket(freq) {
+        let b;
+        if (this._bFreeTop > 0) b = this._bFree[--this._bFreeTop];
+        else if (this._bBump <= this._bCap) b = this._bBump++;
+        else return this._poolExhausted();
+        this._bFreq[b] = freq;
+        this._bHead[b] = FREQ_NIL;
+        this._bTail[b] = FREQ_NIL;
+        return b;
+    }
+
+    /** @private */
+    _oob(k) {
+        // String(k) -- NOT '+ k' / a template literal: those THROW on a Symbol,
+        // which would turn a fail-closed reject into a different crash.
+        throw new RangeError('[lite-o1] key out of universe [0, ' + this._universe + '): ' + String(k));
+    }
+
+    /** @private */
+    _full() {
+        throw new RangeError('[lite-o1] FreqO1 full (capacity ' + this._cap + ')');
+    }
+
+    /** @private */
+    _freqCeil() {
+        throw new RangeError('[lite-o1] FreqO1 frequency ceiling ' + this._maxFreq + ' reached');
+    }
+
+    /** @private -- unreachable under the contract (pool sized to the transient peak). */
+    _poolExhausted() {
+        throw new RangeError('[lite-o1] FreqO1 bucket pool exhausted (capacity ' + this._cap + ')');
     }
 }

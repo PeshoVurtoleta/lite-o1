@@ -246,6 +246,48 @@ members x 1e6 draws, deterministic).
 
 ---
 
+### FreqO1 (v0.7.0)
+
+Frequency structure over a known, bounded `[0, universe)` -- the standalone
+WORST-CASE O(1) primitive behind O(1) LFU eviction. `add` / `increment` track an
+access COUNT per key; `peekMin` / `popMin` read / remove the least-frequently-used
+key (lowest count, FIFO tie-break) with NO scan, over a private bucket forest
+(dense/sparse keys + a bump + free-stack bucket pool).
+
+**Reach for it when:**
+
+- You are building an LFU (least-frequently-used) eviction policy and need the
+  victim -- the lowest-frequency key, oldest-first on ties -- in strict WORST-CASE
+  O(1), and you were about to scan all keys for the minimum count (O(n)/eviction).
+- You need to count accesses to integer keys in a fixed, bounded range and always
+  know the current minimum (hot/cold classification, rate-limited admission, a
+  frequency sketch over entity ids / handles).
+- You need zero per-op allocation and a HARD per-op budget (add / increment /
+  peekMin / popMin are worst-case O(1) -- no run, no amortized spike).
+
+**Avoid it when:**
+
+- You need a full LFU CACHE (key -> value with capacity eviction) -- FreqO1 is the
+  frequency PRIMITIVE, not the cache: it holds counts, not payloads. Keep the values
+  in a parallel SoA column or `@zakkster/lite-arena` and let FreqO1 pick the victim.
+- You need to DECREMENT a count, read the MOST-frequently-used key (`peekMax`), or
+  `delete(k)` a specific key -- the surface is deliberately lean (none of those
+  ship). Aging is a caller concern (rebuild, or clear + refill).
+- Keys are strings, objects, or sparse integers over a huge / unbounded domain --
+  the `sparse` array is universe-sized; the same SparseSet caveat applies.
+- You cannot bound the number of live keys up front (it fails closed past capacity),
+  or a single key's access count could exceed `maxFrequency` (an increment past it
+  throws rather than wrap -- pick a `maxFreq` your workload stays under).
+
+**Measure it:** `npm run witness` -- FreqO1 `increment` + `peekMin` flatness
+`>= 0.70` across the size sweep `[1e4..1e5]` (the 1e3 point is a pure-L1 micro-case,
+shown but not gated) while a naive frequency-table min-scan foil collapses
+(`<= 0.55`), ratio `>= 1.5x`. There is deliberately NO MAX-single-op line: every hot
+op is worst-case O(1) (a fixed number of pointer writes on the bucket forest), so
+there is no amortized spike to expose -- the flat line IS the worst-case claim.
+
+---
+
 ## Roadmap members (not yet shipped)
 
 Placeholders so the decision axes are visible early; each fills in on release.

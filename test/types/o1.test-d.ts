@@ -5,7 +5,7 @@
  * fails `npm run test:types`. Not executed; only type-checked.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, VERSION } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, VERSION } from '../../O1.js';
 
 // VERSION is a string.
 const v: string = VERSION;
@@ -295,3 +295,62 @@ new RandomSet('1000');
 new RandomSet(1000, 256, 'seed');
 // @ts-expect-error -- add takes a number.
 rs.add('3');
+
+// --- FreqO1 ----------------------------------------------------------------
+
+// Constructor: universe required; capacity + maxFreq optional (both numbers).
+const fq: FreqO1 = new FreqO1(1000);
+const fqCap: FreqO1 = new FreqO1(1000, 256);
+const fqMax: FreqO1 = new FreqO1(1000, 256, 1024);
+void fqCap; void fqMax;
+
+// Getters: size / capacity / universe / maxFrequency are readonly numbers.
+const fqsize: number = fq.size;
+const fqcap: number = fq.capacity;
+const fquniv: number = fq.universe;
+const fqmaxf: number = fq.maxFrequency;
+void fqsize; void fqcap; void fquniv; void fqmaxf;
+
+// @ts-expect-error -- size is readonly.
+fq.size = 5;
+// @ts-expect-error -- capacity is readonly.
+fq.capacity = 5;
+// @ts-expect-error -- universe is readonly.
+fq.universe = 5;
+// @ts-expect-error -- maxFrequency is readonly.
+fq.maxFrequency = 5;
+
+// add / increment -> this (chainable); has -> boolean; frequencyOf -> number.
+const chainedFq: FreqO1 = fq.add(1).increment(2);
+const fqhas: boolean = fq.has(1);
+const fqfreq: number = fq.frequencyOf(1);
+const fqcleared: void = fq.clear();
+void chainedFq; void fqhas; void fqfreq; void fqcleared;
+
+// peekMin / popMin -> number | undefined.
+const fqpeek: number | undefined = fq.peekMin();
+const fqpop: number | undefined = fq.popMin();
+void fqpeek; void fqpop;
+
+// forEach callback gets (key, frequency, freq).
+fq.forEach((k, frequency, freq) => {
+    const kk: number = k;
+    const ff: number = frequency;
+    const self: FreqO1 = freq;
+    void kk; void ff; void self;
+});
+
+// Iterable of number.
+for (const k of fq) {
+    const kk: number = k;
+    void kk;
+}
+const fqspread: number[] = [...fq];
+void fqspread;
+
+// @ts-expect-error -- universe must be a number.
+new FreqO1('1000');
+// @ts-expect-error -- maxFreq must be a number.
+new FreqO1(1000, 256, 'max');
+// @ts-expect-error -- increment takes a number.
+fq.increment('3');

@@ -32,6 +32,104 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   produce byte-identical workload trace hashes, using the repo's own Numerical
   Recipes LCG -- no new PRNG introduced).
 
+## [0.7.0] - 2026-09-16
+
+The seventh member of the O(1) family: a WORST-CASE O(1) frequency structure -- the
+standalone primitive behind O(1) LFU eviction. Tree-shakeable alongside SparseSet,
+RingDeque, UnionFind, MonoDeque, MinStack, and RandomSet (the seven share no mutable
+module state).
+
+### Added
+
+- **`FreqO1(universe, capacity = universe, maxFreq = 2**32 - 2)`** -- a zero-GC,
+  WORST-CASE O(1) frequency structure over PRIVATE `Uint32Array` node + bucket pools
+  (NO public SlotPool export; ADR 0003's SlotPool deferral STANDS -- FreqO1 owns its
+  own pool and stays self-contained + tree-shakeable):
+  - Layout: KEYS ride SparseSet's dense + sparse cross-check (the dense index is the
+    stable node id), so `clear()` is O(1). Per KEY: frequency, bucket-of, and an
+    intrusive DOUBLY-linked FIFO list within a bucket. Per BUCKET (a 1-based bump +
+    free-stack pool): the frequency it represents, prev/next in a list sorted
+    ASCENDING by frequency, and FIFO head/tail nodes; the list head is the
+    min-frequency bucket, so `peekMin` / `popMin` are O(1).
+  - `add(k) -> this` -- ensure k is tracked at frequency 1 if absent; IDEMPOTENT
+    no-op if already present (does NOT bump).
+  - `increment(k) -> this` -- record one access: insert at frequency 1 if absent,
+    else frequency += 1. O(1) WORST-CASE.
+  - `frequencyOf(k) -> number` -- k's frequency, or 0 if absent / bad key. NEVER
+    throws (0 = not tracked is the correct frequency semantics).
+  - `has(k) -> boolean` -- membership; a bad key is ABSENT, never throws.
+  - `peekMin() -> number|undefined` / `popMin() -> number|undefined` -- read / remove
+    the least-frequently-used key (lowest frequency; FIFO / insertion-order tie-break
+    -- the earliest-inserted key in that frequency bucket). `undefined` on empty,
+    NEVER throw. O(1) WORST-CASE.
+  - `size` / `capacity` / `universe` / `maxFrequency` getters. `clear()` is O(1):
+    resets the live count + the bucket-list head + the bucket pool (bump + free stack)
+    -- four scalars, touches NO store.
+  - `forEach(fn)` -- an O(size) alloc-free scan in DENSE STORAGE order (NOT frequency
+    order; fn is (key, frequency, freq)), re-reading `size` each step so a re-entrant
+    `popMin` self-terminates. `[Symbol.iterator]` -- an O(size) scan in the same order
+    that ALLOCATES per protocol, kept out of the zero-alloc claims.
+  - Lean LFU surface: NO decrement, NO peekMax, NO delete(k). `MAX_FREQ = 2**32 - 2`
+    (counts live in a Uint32 slot, so the ceiling leaves room for the `freq + 1`
+    write); an increment past `maxFrequency` throws `[lite-o1]` rather than wrap.
+    Fail closed: a bad key throws `[lite-o1]` on the MUTATORS add / increment
+    (typeof-guarded BEFORE the coercing `>>>`, so a Symbol / BigInt never triggers a
+    raw `TypeError`; `null` is not zero), but is ABSENT for the QUERIES has /
+    frequencyOf (never throw). A NEW key past capacity, or a bump past maxFrequency,
+    throws a byte-identical no-op. Bucket-pool sizing: non-empty buckets partition the
+    live keys, so at rest there are <= size <= capacity of them; a single increment
+    transiently peaks at size + 1 <= capacity + 1, so the pool holds capacity + 1
+    usable buckets and exhaustion CANNOT occur under the contract (the
+    `_poolExhausted` throw is a fail-closed guard, never reached).
+- **`FreqO1` type surface** in `O1.d.ts` (constructor + four getters + the six methods
+  + forEach + iterator), exercised by `test/types/o1.test-d.ts`.
+- **`test/FreqO1.test.js`** -- contract (every method, return types) + boundary
+  (universe=1, capacity=1, empty, full, single key, key at 0 and universe-1,
+  all-same-frequency, deep-frequency chains, the maxFreq / maxFreq=1 ceilings,
+  fanned-out distinct frequencies) + a >= 1e6-op interleaved
+  add / increment / frequencyOf / peekMin / popMin differential fuzz vs a
+  brute-force ORACLE (a Map of key -> {freq, tick} + a min-scan), 0 divergences,
+  asserting popMin returns lowest-freq / earliest-arrival on ties throughout.
+- **`test/QaAudit.test.js`** -- a FreqO1 adversarial block: Symbol / BigInt /
+  object-with-valueOf / boxed Number / NaN / null / -1 / 1.5 / >= universe rejected
+  typeof-first on the mutators with a byte-identical no-op state; frequencyOf / has /
+  peekMin / popMin never throw on bad / empty; re-entrant increment / popMin from
+  inside forEach and a for-of walk stay memory-safe; the maxFreq ceiling throw primed
+  exactly at the boundary; -0 aliasing key 0.
+
+### Proof
+
+- **Torture** (`node --expose-gc test/torture.mjs`): FreqO1 added to every phase --
+  0 B/op on the hot path (increment + popMin churn -- a `freqBpc` metric),
+  `maxMajor` 0, `maxPauseMs <= 2`, arrayBuffers delta <= 0, `tracker.size()` back to
+  0 after the retention churn. The run proves 0 B/op across ALL SEVEN members.
+- **Witness** (`node test/witness.mjs`): FreqO1 `increment` + `peekMin` stays FLAT
+  from size 1e3 to 1e5 vs a naive frequency table that linearly scans all n counts to
+  find the LFU key (O(n)/query). Flatness >= 0.70 (steady window size >= 1e4), foil
+  flatness <= 0.55, ratio >= 1.5x. NO MAX-single-op line (worst-case O(1)).
+- **Perf gate** (`npm run test:perf`): three new zero-alloc scenarios
+  (increment-churn, popMin-drain, forEach-drain) with a `freqGrows` 0-delta canary on
+  ALL backing `Uint32Array` columns (the key substrate + node columns + bucket pool),
+  plus an iterator-into-fresh-array `mustFail` teeth case.
+
+### Changed
+
+- `VERSION` -> `'0.7.0'`; `package.json` version + description + keywords (`lfu`,
+  `lfu-cache`, `frequency`, `frequency-counter`). The three version sites
+  (`package.json` / `VERSION` / `llms.txt`) move together. The SparseSet / RingDeque /
+  UnionFind / MonoDeque / MinStack / RandomSet class bodies are BYTE-IDENTICAL -- only
+  the `O1.js` header comment, the `VERSION` const, and their `VERSION` test assertions
+  changed.
+
+### ADR
+
+- [`0012`](./decisions/0012-freqo1.md) -- the private-node-pool decision (and why
+  ADR 0003's SlotPool deferral stands), the FIFO tie-break, the lean LFU surface, the
+  `MAX_FREQ = 2**32 - 2` ceiling, the bucket-pool sizing proof (exhaustion cannot
+  occur under the contract), and the memory-cost note.
+
+[0.7.0]: https://www.npmjs.com/package/@zakkster/lite-o1/v/0.7.0
+
 ## [0.6.0] - 2026-09-16
 
 The sixth member of the O(1) family: an integer set that ALSO samples a
