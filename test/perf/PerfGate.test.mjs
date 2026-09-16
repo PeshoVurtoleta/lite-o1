@@ -22,7 +22,7 @@
  */
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog } from '../../O1.js';
 
 const U = 1 << 16;      // universe 65536
 const CAP = 1 << 14;    // capacity 16384
@@ -1133,6 +1133,124 @@ const htwForEachDrain = {
     statsOf(s) { return { grows: htwGrows(s) }; },
 };
 
+// ===========================================================================
+// RingLog scenarios -- ONE fixed Float64Array ring, all WORST-CASE O(1) zero-alloc
+// (push-overwrite / get / oldest / newest / forEach). The lossy overwrite-oldest push
+// + the & MASK wrap are pure typed-slot arithmetic -- no coercion, no heap double.
+// ===========================================================================
+
+const RL_CAP = 1 << 14;  // 16384 (power of two, so capacity getter == this)
+const RL_FILL = 1 << 13; // 8192 resident window for the get/forEach scenarios
+
+/**
+ * The zero-alloc counter for RingLog scenarios: the single backing Float64Array's
+ * ArrayBuffer byte length. Capacity is fixed at construction, so this NEVER grows --
+ * the delta across the window must be 0 (the `ringLogGrows` 0-delta canary; mirrors
+ * grows / ringGrows / ... / htwGrows).
+ */
+function ringLogGrows(s) {
+    return s.rl._buf.buffer.byteLength;
+}
+
+/** A RingLog primed to STEADY FULL (every further push takes the overwrite branch). */
+function ringLogFull() {
+    const rl = new RingLog(RL_CAP);
+    for (let i = 0; i < RL_CAP; i++) rl.push(i);
+    return rl;
+}
+
+/**
+ * fill-churn: fresh values into a log that CYCLES between empty and full via an O(1)
+ * clear() when it fills -- so the measured window is dominated by the NOT-full push
+ * branch (append + count++), the mirror of RingDeque's fill path. Every value is a
+ * SMI int (int32-wrapped counter) -> no coercion, no heap double.
+ */
+const ringLogFillChurn = {
+    name: 'RingLog fill-churn (append then O(1) clear at full)',
+    setup() { return { rl: new RingLog(RL_CAP), v: 0, n: 0 }; },
+    hot(s, n) {
+        const rl = s.rl;
+        let v = s.v | 0;
+        let live = s.n | 0;
+        for (let i = 0; i < n; i++) {
+            if (live === RL_CAP) { rl.clear(); live = 0; }
+            rl.push(v);
+            v = (v + 1) | 0;
+            live = (live + 1) | 0;
+        }
+        s.v = v | 0;
+        s.n = live | 0;
+    },
+    statsOf(s) { return { grows: ringLogGrows(s) }; },
+};
+
+/**
+ * steady-overwrite-churn: a log at STEADY FULL -- every push takes the overwrite-oldest
+ * branch (read-oldest + one overwrite + head advance), the worst-case-O(1) hot body.
+ * The returned evicted value is folded into an int32 acc so it is never dead-code-
+ * eliminated and never promoted to a heap double.
+ */
+const ringLogOverwriteChurn = {
+    name: 'RingLog steady-overwrite-churn (full: push overwrites + returns evicted)',
+    setup() { return { rl: ringLogFull(), v: 0, acc: 0 }; },
+    hot(s, n) {
+        const rl = s.rl;
+        let v = s.v | 0;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) {
+            v = (v + 1) | 0;
+            acc = (acc + (rl.push((v * 2654435761) & 0x7fffffff) | 0)) | 0;
+        }
+        s.v = v | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: ringLogGrows(s) }; },
+};
+
+/** get-scan: a primed log; every op a single oldest-relative get(i) + oldest/newest read, int32 acc. */
+const ringLogGetScan = {
+    name: 'RingLog get + oldest + newest read',
+    setup() {
+        const rl = new RingLog(RL_CAP);
+        for (let i = 0; i < RL_FILL; i++) rl.push(i);
+        return { rl, i: 0, acc: 0 };
+    },
+    hot(s, n) {
+        const rl = s.rl;
+        let idx = s.i | 0;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) {
+            acc = (acc + (rl.get(idx & (RL_FILL - 1)) | 0) + (rl.oldest() | 0) + (rl.newest() | 0)) | 0;
+            idx = (idx + 1) | 0;
+        }
+        s.i = idx | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: ringLogGrows(s) }; },
+};
+
+/**
+ * forEach-drain: a primed log scanned each op through a HOISTED module-scope callback
+ * (never re-created per op). Mirrors SparseSet's forEachDrain -- proves forEach itself
+ * (the alloc-free oldest->newest scan; the ONE per-protocol allocator is
+ * [Symbol.iterator], gated separately by ringLogMustFailAlloc) allocates nothing.
+ */
+let ringLogDrainAcc = 0;
+function ringLogDrainInto(v) { ringLogDrainAcc = (ringLogDrainAcc + v) | 0; }
+const ringLogForEachDrain = {
+    name: 'RingLog forEach-drain',
+    setup() {
+        const rl = new RingLog(RL_CAP);
+        for (let i = 0; i < 256; i++) rl.push((i * 2654435761) & 0x7fffffff); // bounded resident window to scan
+        return { rl };
+    },
+    hot(s, n) {
+        const rl = s.rl;
+        for (let i = 0; i < n; i++) rl.forEach(ringLogDrainInto);
+    },
+    statsOf(s) { return { grows: ringLogGrows(s) }; },
+};
+
 const scenarios = [
     addChurn, hasHit, deleteChurn, clearRefill, forEachDrain,
     ringFifo, ringLifo, ringInterleave,
@@ -1144,6 +1262,7 @@ const scenarios = [
     bqInsertChurn, bqExtractDrain, bqDecreaseKeyChurn, bqForEachDrain,
     twScheduleChurn, twDrainDrain, twCancelChurn, twAdvanceTick, twForEachDrain,
     htwScheduleChurn, htwDrainCascade, htwCancelChurn, htwAdvanceTick, htwForEachDrain,
+    ringLogFillChurn, ringLogOverwriteChurn, ringLogGetScan, ringLogForEachDrain,
 ];
 
 /**
@@ -1383,6 +1502,33 @@ const htwMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/**
+ * The RingLog teeth: a per-op `[Symbol.iterator]` spread into a FRESH [] each op -- the
+ * generator + its per-step {value, done} wrappers + the array MUST trip the gate
+ * (scavenges scale with n), proving the instrument has teeth on the RingLog surface too
+ * (its iterator is the ONE documented per-protocol allocator; forEach is the alloc-free
+ * scan). statsOf returns a constant so the failure is the allocation lanes, not a
+ * missing-counter artifact.
+ */
+const ringLogMustFailAlloc = {
+    name: 'RingLog [Symbol.iterator] spread into fresh array (MUST allocate)',
+    setup() {
+        const rl = new RingLog(256);
+        for (let i = 0; i < 64; i++) rl.push((i * 2654435761) & 0x7fffffff);
+        return { rl };
+    },
+    hot(s, n) {
+        const rl = s.rl;
+        let sink = 0;
+        for (let i = 0; i < n; i++) {
+            const arr = [...rl]; // fresh generator + array per op -> heap churn
+            sink += arr.length;
+        }
+        s.sink = sink;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -1392,5 +1538,5 @@ zgcSuite({
     counters: { grows: 0 },
     maxRetainedKB: 64,
     scenarios,
-    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc, twMustFailAlloc, htwMustFailAlloc],
+    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc, twMustFailAlloc, htwMustFailAlloc, ringLogMustFailAlloc],
 });

@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-Version: 1.0.0
+Version: 1.1.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -13,9 +13,10 @@ op is O(1) worst-case (or O(1)-amortized where stated) and allocates zero bytes
 after construction, and a shipped witness harness demonstrates the flat
 throughput curve against a built-in foil.
 
-v1.0.0 ships ten members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
-RandomSet, FreqO1, BucketQueue, TimerWheel, and HierarchicalTimerWheel. They share
-no mutable module state, so a bundler that imports one drops the others (tree-shakeable).
+v1.1.0 ships eleven members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
+RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, and RingLog. They
+share no mutable module state, so a bundler that imports one drops the others
+(tree-shakeable). 1.1.0 is additive + backward-compatible: it only adds RingLog.
 
 ## Exports (from the single main file O1.js)
 
@@ -41,7 +42,12 @@ no mutable module state, so a bundler that imports one drops the others (tree-sh
   with schedule() / cancel() / drainDue() / advance() over private id columns + a
   Float64 expiry column + static per-list FIFO rings; coarse timers cascade down to
   finer levels by INDEX as the clock advances.
-- `VERSION` -- string, '1.0.0'.
+- `RingLog` -- class. A zero-GC WORST-CASE O(1) fixed-capacity LOSSY overwrite-oldest
+  ring log ("keep the last N") over ONE Float64Array. push() never blocks / never
+  throws on full -- it OVERWRITES the oldest entry and RETURNS it (undefined until
+  full). Read-only snapshot surface get() / oldest() / newest() / forEach() / iterate;
+  NO drain (inverts RingDeque's fail-closed policy).
+- `VERSION` -- string, '1.1.0'.
 
 ## SparseSet
 
@@ -620,6 +626,58 @@ Id / delay / ticks model: ids integer [0, universe); delay integer [0, 2^26); ti
 advance throw), ABSENT on the QUERIES (has / cancel never throw). Re-entrant advance is the
 one drainDue-callback exception -- it throws [lite-o1] (schedule / cancel / clear stay legal).
 
+## RingLog
+
+    new RingLog(capacity)
+
+- A WORST-CASE O(1) fixed-capacity LOSSY overwrite-oldest ring log -- "keep the last N".
+  push never blocks and never throws on full: a full push OVERWRITES the oldest entry
+  and RETURNS it. This INVERTS RingDeque's fail-closed-on-full policy; the two are a
+  teaching pair (lossy-overwrite vs fail-closed-at-capacity). It mirrors RingDeque's
+  substrate EXACTLY -- ONE Float64Array, head (index of the oldest) + count, power-of-two
+  capacity, branchless & MASK wrap.
+- capacity: requested max entries; integer in [1, 2^31]. ROUNDS UP to the next power of
+  two (>= requested); the capacity getter reports the rounded value.
+- Constructor throws a [lite-o1] RangeError on a non-integer / out-of-range / non-number
+  arg (typeof-guarded before any coercion; message via String(x)).
+- Substrate: ONE Float64Array (numeric values only). The physical slot for logical offset
+  i from the oldest is buf[(head + i) & MASK], MASK = capacity - 1; wrap is a single &
+  (power-of-two modulo), no branch. Object payloads are the caller's problem: push an
+  integer handle and keep the payload in a parallel SoA column keyed by it.
+
+Hot surface (all WORST-CASE O(1), zero allocation):
+
+- push(v) -> number|undefined  Append v as the NEWEST entry. Returns the EVICTED oldest
+                        value when the log was FULL (v overwrote it), or undefined while
+                        the log is still filling. NEVER throws when full (it overwrites);
+                        throws [lite-o1] on a non-clean value (typeof guard FIRST; a full
+                        bad push is a byte-identical no-op). The return value is the
+                        signature feature -- a rolling-aggregate hook (subtract-evicted,
+                        add-new). WORST-CASE O(1): a full push is a single read + a single
+                        overwrite + a head advance, never a run -> NO amortized spike, NO
+                        max-single-op line (RingLog is in the worst-case cohort).
+- get(i) -> number|undefined   The entry at OLDEST-relative index i (0 oldest .. size-1
+                        newest). O(1). A non-integer or out-of-range i returns undefined,
+                        NEVER throws (typeof-first so a Symbol / BigInt never coerces).
+- oldest() -> number|undefined The OLDEST live entry. O(1). undefined on empty.
+- newest() -> number|undefined The NEWEST live entry. O(1). undefined on empty.
+- size / capacity (rounded) / isFull (getters). isFull is count === capacity.
+- clear() -> void       O(1): resets head + count, touches NO store (numbers retain no
+                        references, so nothing to zero -- mirrors RingDeque).
+- forEach(fn) -> void   O(size) alloc-free scan OLDEST -> NEWEST; fn is (value, index, log).
+- [Symbol.iterator]()   O(size) scan OLDEST -> NEWEST; the ONE per-protocol ALLOCATOR --
+                        use forEach for the alloc-free scan.
+
+Value contract (LOCKED, IDENTICAL to RingDeque): a pushed value must be typeof 'number'
+AND not NaN. Rejected (throws [lite-o1]): null, undefined, string, Symbol, BigInt, object
+(incl. one with a numeric valueOf), NaN. Accepted: any finite number, and +Infinity /
+-Infinity. The typeof guard runs FIRST so a Symbol / BigInt never reaches arithmetic.
+
+Read-only vs consumable (LOCKED): RingLog is a rolling window you READ (a snapshot
+surface), NOT a queue you CONSUME -- there is deliberately NO popOldest / drain. Reach
+for RingDeque when you need to drain entries or fail closed at capacity; reach for RingLog
+when you want to keep only the last N and never block.
+
 ## Design bounds
 
 - SparseSet valid key: integer in [0, universe).
@@ -689,10 +747,19 @@ one drainDue-callback exception -- it throws [lite-o1] (schedule / cancel / clea
   FIFO within-list order. Static 449 lists, no free-list. forEach (id, expiry, wheel) /
   [Symbol.iterator] scan in dense storage order (iterator allocates). schedule of a present
   id is an idempotent no-op. The foil is a FAIR 4-ary min-heap (O(log n)), not a strawman.
+- RingLog valid value: typeof 'number' and not NaN (+/-Infinity accepted); fixed capacity
+  (power-of-two, rounded up), no growth. LOSSY overwrite-oldest: push NEVER blocks / throws
+  on full -- it overwrites the oldest and RETURNS it (undefined until full); fail closed on
+  the VALUE only (a non-number / NaN throws [lite-o1] a byte-identical no-op; null never
+  coerced). READ-ONLY snapshot surface (get / oldest / newest / forEach / iterate); NO
+  popOldest / drain (inverts RingDeque's fail-closed policy -- two honest members, not one).
+  push / get / oldest / newest are WORST-CASE O(1); get out-of-range / non-int returns
+  undefined, oldest / newest undefined on empty (never throw). forEach / [Symbol.iterator]
+  scan oldest -> newest (iterator allocates).
 
 ## Scripts
 
-- npm test           -- 478 node:test cases (contract + boundary + differential fuzz).
+- npm test           -- 503 node:test cases (contract + boundary + differential fuzz).
 - npm run test:types -- tsc --noEmit against O1.d.ts.
 - npm run torture    -- lite-leak + lite-gc-profiler: 0 B/op, 0 major GC, leak-free.
 - npm run witness    -- O(1) throughput-invariance harness + foils + flatness gate.
@@ -782,12 +849,11 @@ one drainDue-callback exception -- it throws [lite-o1] (schedule / cancel / clea
 
 ## Not yet shipped
 
-The public API is STABLE at 1.0.0. Not in this release, planned for later:
-SlotPool (a free-list slot allocator with generational ABA-safe handles), and the
-post-1.0 roster -- RingLog (a lossy overwrite-oldest ring), CuckooMap / Hopscotch
-(a general-key worst-case-O(1) map), and SparseTable / StaticRMQ (an O(1)-query
-static range-minimum table). A RingLog / overwrite-oldest RingDeque preset is the
-same deferred variant. SparseSet holds membership, not payloads (store values in a parallel SoA
+The public API is STABLE; 1.1.0 adds RingLog (additive, backward-compatible -- the prior
+ten members are unchanged). Not in this release, planned for later: SlotPool (a free-list
+slot allocator with generational ABA-safe handles), CuckooMap / Hopscotch (a general-key
+worst-case-O(1) map), and SparseTable / StaticRMQ (an O(1)-query static range-minimum
+table). SparseSet holds membership, not payloads (store values in a parallel SoA
 column or @zakkster/lite-arena); RingDeque holds numbers only; UnionFind holds
 disjoint-set connectivity over [0, n), not payloads; MonoDeque holds numeric
 window extremes only, MinStack holds numeric stack values + their running
@@ -800,4 +866,6 @@ holds integer timer IDS over [0, universe) filed against a delay in [0, slots-1]
 BOUNDED simple wheel, one rotation deep -- and HierarchicalTimerWheel holds integer timer
 IDS over [0, universe) filed against a delay in [0, 2^26) -- a BOUNDED CASCADING four-level
 wheel, not an UNbounded one (a fully unbounded / hashed wheel remains a deferred future
-member; both wheels schedule integer handles for object payloads, not payloads directly).
+member; both wheels schedule integer handles for object payloads, not payloads directly);
+and RingLog holds numbers only, a LOSSY rolling window you READ (keep the last N,
+overwrite-oldest) -- NOT a consumable queue (reach for RingDeque to drain / fail closed).

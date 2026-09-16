@@ -13,18 +13,19 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, VERSION } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, VERSION } from '../O1.js';
 import * as O1Module from '../O1.js';
 
 const litO1 = (e) => e instanceof Error && /^\[lite-o1]/.test(e.message);
 
-// The ten shipped member class names, frozen at v1.0.0. This list is the
+// The eleven shipped member class names (RingLog added at v1.1.0). This list is the
 // regression guard itself: it does NOT read O1.js to discover members, so
 // adding/removing/renaming a member without touching this test -- or without
 // updating the docs below -- is exactly the drift this test exists to catch.
-const TEN_MEMBERS = [
+const ELEVEN_MEMBERS = [
     'SparseSet', 'RingDeque', 'UnionFind', 'MonoDeque', 'MinStack',
     'RandomSet', 'FreqO1', 'BucketQueue', 'TimerWheel', 'HierarchicalTimerWheel',
+    'RingLog',
 ];
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -1416,38 +1417,40 @@ test('HierarchicalTimerWheel: maxDelay (2^26-1) accepted, 2^26 throws; capacity=
 });
 
 // ===========================================================================
-// Cross-file "ten members" regression guard. The 1.0.0 docs capstone froze
-// the roster at ten; this test fails if a future session adds/removes a
-// member from O1.js without also updating README.md / GUIDE.md / llms.txt,
-// or vice versa (docs claim ten but the module does not export ten).
+// Cross-file "eleven members" regression guard. v1.1.0 grew the roster to
+// eleven (RingLog); this test fails if a future session adds/removes a member
+// from O1.js without also updating README.md / GUIDE.md / llms.txt, or vice
+// versa (docs claim eleven but the module does not export eleven).
 // ===========================================================================
 
-test('O1.js exports exactly the ten frozen members plus VERSION -- no more, no fewer', () => {
-    for (const name of TEN_MEMBERS) {
+test('O1.js exports exactly the eleven frozen members plus VERSION -- no more, no fewer', () => {
+    for (const name of ELEVEN_MEMBERS) {
         assert.equal(typeof O1Module[name], 'function', name + ' must be an exported class/function');
     }
     const exportedNames = Object.keys(O1Module).sort();
-    const expected = [...TEN_MEMBERS, 'VERSION'].sort();
-    assert.deepEqual(exportedNames, expected, 'O1.js export surface drifted from the frozen ten-member + VERSION list');
+    const expected = [...ELEVEN_MEMBERS, 'VERSION'].sort();
+    assert.deepEqual(exportedNames, expected, 'O1.js export surface drifted from the frozen eleven-member + VERSION list');
 });
 
-test('README.md, GUIDE.md, and llms.txt all describe the roster as "ten members" (case-insensitive), never a stale count', () => {
+test('README.md, GUIDE.md, and llms.txt all describe the roster as "eleven members" (case-insensitive), never a stale count', () => {
     const files = ['README.md', 'GUIDE.md', 'llms.txt'];
     for (const f of files) {
         const text = readFileSync(join(ROOT, f), 'utf8');
-        assert.match(text, /ten members?/i, f + ' must describe the roster as "ten member(s)" somewhere');
-        // Stale roster-size prose from earlier releases must not survive verbatim
-        // (word-boundary match so "the other nine [members]" style phrasing --
-        // which is CORRECT at ten members, since each import drops nine others
-        // -- is not a false positive).
+        assert.match(text, /eleven members?/i, f + ' must describe the roster as "eleven member(s)" somewhere');
+        // Stale roster-size prose from earlier releases must not survive verbatim.
+        // NOTE: "ten members" is NOT rejected here -- the repo-only benchmark suite
+        // deliberately still profiles TEN members (RingLog is out of the bench, like
+        // FreqO1/BucketQueue/the wheels), so "ten members x 8 dimensions = 80 cells"
+        // is a CORRECT, current phrase. The stale roster counts are nine (pre-HTW)
+        // and the stale 72-cell benchmark size.
         assert.doesNotMatch(text, /\bnine members\b/i, f + ' must not still say "nine members"');
         assert.doesNotMatch(text, /\b72 cells\b/, f + ' must not still say the stale 72-cell benchmark count');
     }
 });
 
-test('every TEN_MEMBERS name appears in the GUIDE.md picker table and decision flowchart', () => {
+test('every ELEVEN_MEMBERS name appears in the GUIDE.md picker table and decision flowchart', () => {
     const guide = readFileSync(join(ROOT, 'GUIDE.md'), 'utf8');
-    for (const name of TEN_MEMBERS) {
+    for (const name of ELEVEN_MEMBERS) {
         const count = (guide.match(new RegExp('\\b' + name + '\\b', 'g')) || []).length;
         assert.ok(count >= 2, name + ' must appear at least twice in GUIDE.md (flowchart leaf + picker table row), found ' + count);
     }

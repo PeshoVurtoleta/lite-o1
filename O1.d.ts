@@ -560,3 +560,58 @@ export class HierarchicalTimerWheel {
     /** Iterate live timer ids in dense storage order. */
     [Symbol.iterator](): IterableIterator<number>;
 }
+
+/**
+ * RingLog -- a zero-GC, WORST-CASE O(1) fixed-capacity LOSSY ring log over ONE
+ * Float64Array (numeric values only). "Keep the last N": push never blocks and never
+ * throws on full -- a push into a full log OVERWRITES the oldest entry and RETURNS it
+ * (the signature feature; `undefined` until the log first fills). This INVERTS
+ * RingDeque's fail-closed-on-full policy. Requested capacity rounds UP to the next
+ * power of two (the getter reports the rounded value); the ring wraps by a single
+ * `& (capacity - 1)`. Read-only snapshot surface -- get / oldest / newest / forEach /
+ * iterate; NO popOldest / drain (read it, do not consume it). Fail closed on the
+ * VALUE (a non-number or NaN throws [lite-o1] a byte-identical no-op; +/-Infinity
+ * accepted), never on capacity. get / oldest / newest never throw (undefined out of
+ * range / on empty). clear() is O(1) and touches no store.
+ */
+export class RingLog {
+    /**
+     * @param capacity  requested max entries; an integer in [1, 2^31]. Rounded UP to
+     *                  the next power of two.
+     */
+    constructor(capacity: number);
+
+    /** Number of live entries. */
+    readonly size: number;
+
+    /** Max entries this log holds (power-of-two, rounded up from requested). */
+    readonly capacity: number;
+
+    /** True iff the log is full (every further push overwrites the oldest). */
+    readonly isFull: boolean;
+
+    /**
+     * Append v as the newest entry. Worst-case O(1). Returns the EVICTED oldest value
+     * when the log was full (v overwrote it), or `undefined` while still filling.
+     * Never throws when full (it overwrites); throws [lite-o1] on a bad value.
+     */
+    push(v: number): number | undefined;
+
+    /** The entry at oldest-relative index i (0 oldest .. size-1 newest), or `undefined` out of range / non-integer. Never throws. */
+    get(i: number): number | undefined;
+
+    /** The oldest live entry, or `undefined` when empty. Never throws. */
+    oldest(): number | undefined;
+
+    /** The newest live entry, or `undefined` when empty. Never throws. */
+    newest(): number | undefined;
+
+    /** Empty the log in O(1) (resets head + count; zeroes no store). */
+    clear(): void;
+
+    /** Iterate live entries oldest -> newest, alloc-free. fn is (value, index, log). */
+    forEach(fn: (value: number, index: number, log: RingLog) => void): void;
+
+    /** Iterate live entries oldest -> newest. Allocates per protocol. */
+    [Symbol.iterator](): IterableIterator<number>;
+}

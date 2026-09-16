@@ -3,10 +3,10 @@
  * that doubles as a teachable textbook: each member solves a real problem AND
  * proves its constant is real (the O(1) Witness -- see test/witness.mjs).
  *
- * v1.0.0 ships ten members -- SparseSet, RingDeque, UnionFind, MonoDeque,
- * MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, and HierarchicalTimerWheel
- * -- plus its `VERSION` const. The ten are independent (no shared mutable module
- * state), so a bundler that imports one drops the others (`sideEffects: false`).
+ * v1.1.0 ships eleven members -- SparseSet, RingDeque, UnionFind, MonoDeque,
+ * MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, and
+ * RingLog -- plus its `VERSION` const. The eleven are independent (no shared mutable
+ * module state), so a bundler that imports one drops the others (`sideEffects: false`).
  *
  * The complexity class IS the product: every hot op below is O(1) worst-case and
  * allocates ZERO bytes after construction. The witness harness (never imported
@@ -17,7 +17,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.0.0';
+export const VERSION = '1.1.0';
 
 /** Largest universe the Uint32 substrate + the (k >>> 0) key check can honor. */
 const MAX_UNIVERSE = 0x100000000; // 2^32
@@ -2872,5 +2872,175 @@ export class HierarchicalTimerWheel {
     _advancing() {
         throw new RangeError('[lite-o1] HierarchicalTimerWheel advance() during an in-flight drain/advance; ' +
             'advance only between drains (would strand the un-fired due timers)');
+    }
+}
+
+/**
+ * RingLog -- a zero-GC, WORST-CASE O(1) fixed-capacity LOSSY ring log over ONE
+ * `Float64Array` (numeric values only). "Keep the last N": push never blocks and
+ * never throws on full -- a push into a full log OVERWRITES the oldest entry and
+ * RETURNS it. This INVERTS RingDeque's fail-closed-on-full policy (decisions/0005
+ * flagged this overwrite-oldest preset as the deferred variant; decisions/0016
+ * realizes it as a distinct class). It mirrors RingDeque's substrate EXACTLY -- one
+ * `Float64Array`, a `_head` (index of the OLDEST live entry) + `_count`
+ * representation, power-of-two capacity, branchless `& MASK` wrap -- and offers a
+ * READ-ONLY snapshot surface (get / oldest / newest / forEach / iterate). There is
+ * deliberately NO popOldest / drain: a RingLog is a rolling window you READ, not a
+ * queue you CONSUME (reach for RingDeque to drain / fail-closed).
+ *
+ * The physical slot for logical offset `i` from the oldest is:
+ *
+ *     buf[(head + i) & MASK]      MASK = capacity - 1
+ *
+ * `capacity` is a power of two (the requested capacity ROUNDS UP; the getter reports
+ * the rounded value), so the wrap is a single `& MASK` -- no branch, no division.
+ *
+ * push(v) is the signature op -- WORST-CASE O(1), branchless, and its RETURN VALUE
+ * is the feature:
+ *   - NOT full (`_count < cap`): append at `(head + count) & MASK`, count++,
+ *     return `undefined` (nothing evicted yet).
+ *   - FULL (`_count === cap`): read the oldest at `head` as the evicted value,
+ *     overwrite that slot with `v`, advance `head = (head + 1) & MASK` (count stays
+ *     == cap -- `v` is now the newest, the oldest advanced), and RETURN the evicted
+ *     value. This makes push a rolling aggregate hook (subtract-evicted, add-new).
+ * Because a full push is a single overwrite (never a run), push is WORST-CASE O(1)
+ * -- RingLog joins the worst-case cohort: NO amortized spike, NO max-single-op line.
+ *
+ * Fail closed on the VALUE, never on capacity: a push of a non-clean value (not a
+ * number, or NaN) throws `[lite-o1]` as a byte-identical no-op (no store touched, no
+ * counter moved -- the throw precedes every write); `+/-Infinity` are clean numbers
+ * and are ACCEPTED. The typeof guard runs FIRST so a Symbol / BigInt never reaches
+ * arithmetic (`>>>` / `+` / a template literal THROW a raw TypeError on those); the
+ * cold builder names the value via `String(v)`, Symbol/BigInt-safe. null is never
+ * coerced to 0.
+ *
+ * The reads never throw: get(i) is OLDEST-relative (i=0 oldest .. size-1 newest) and
+ * returns `undefined` for a non-integer or out-of-range i (never throws, mirrors the
+ * suite's never-throw query contract); oldest() / newest() return `undefined` on an
+ * empty log. The sentinel is unambiguous because every stored value is a real number.
+ *
+ * clear() is O(1) and touches NOTHING: `head = 0; count = 0`. The stale numbers left
+ * in the buffer are unreachable (every read is bounded by `count`) and being numbers
+ * retain no references, so there is nothing to zero (mirrors RingDeque / SparseSet).
+ *
+ * Object payloads are the caller's problem: push an integer handle and keep the
+ * payload in a parallel SoA column keyed by that handle (mirrors the whole family).
+ */
+export class RingLog {
+    /**
+     * @param {number} capacity  requested max entries; an integer in [1, 2^31].
+     *                           Rounded UP to the next power of two.
+     */
+    constructor(capacity) {
+        // typeof guard BEFORE any coercion: Number.isInteger never coerces (false
+        // on a Symbol/BigInt), and String(x) in the cold message is Symbol-safe.
+        if (typeof capacity !== 'number' || !Number.isInteger(capacity) ||
+            capacity < 1 || capacity > MAX_CAPACITY) {
+            throw new RangeError(
+                '[lite-o1] RingLog capacity must be an integer in [1, 2^31], got ' + String(capacity));
+        }
+        const cap = _roundPow2(capacity);
+        this._buf = new Float64Array(cap); // the ring buffer (numeric slots)
+        this._cap = cap;                   // power-of-two capacity (rounded)
+        this._mask = cap - 1;              // wrap mask: (i & MASK) is the physical slot
+        this._head = 0;                    // index of the OLDEST live entry
+        this._count = 0;                   // number of live entries
+    }
+
+    /** Number of live entries. O(1). */
+    get size() { return this._count; }
+
+    /** Max entries this log can hold (power-of-two, rounded up from requested). O(1). */
+    get capacity() { return this._cap; }
+
+    /** True iff the log is full (every further push overwrites the oldest). O(1). */
+    get isFull() { return this._count === this._cap; }
+
+    /**
+     * Append v as the NEWEST entry. WORST-CASE O(1), branchless, zero allocation.
+     * Returns the EVICTED oldest value when the log was FULL (v overwrote it), or
+     * `undefined` while the log is still filling (nothing evicted). Fail closed on
+     * the value: a non-clean value throws via _bad (a byte-identical no-op); a full
+     * log NEVER throws -- it overwrites. Guard typeof FIRST so a Symbol / BigInt
+     * never reaches the arithmetic below.
+     * @param {number} v  a clean number (not NaN; +/-Infinity accepted)
+     * @returns {number|undefined}  the evicted oldest value, or undefined until full
+     */
+    push(v) {
+        if (typeof v !== 'number' || v !== v) return this._bad(v); // v !== v -> NaN
+        if (this._count === this._cap) {
+            const h = this._head;
+            const ev = this._buf[h];               // the oldest, about to be evicted
+            this._buf[h] = v;                      // overwrite it with the newest
+            this._head = (h + 1) & this._mask;     // oldest advances one slot
+            return ev;                             // count stays == cap
+        }
+        this._buf[(this._head + this._count) & this._mask] = v;
+        this._count++;
+        return undefined;
+    }
+
+    /**
+     * The entry at OLDEST-relative index i (i=0 oldest .. size-1 newest). O(1).
+     * Returns `undefined` for a non-integer or out-of-range i -- NEVER throws
+     * (mirrors the never-throw query contract). typeof-first so a Symbol / BigInt
+     * never reaches the arithmetic.
+     * @param {number} i
+     * @returns {number|undefined}
+     */
+    get(i) {
+        if (typeof i !== 'number' || (i | 0) !== i || i < 0 || i >= this._count) return undefined;
+        return this._buf[(this._head + i) & this._mask];
+    }
+
+    /** The OLDEST live entry without removing it. O(1). `undefined` on empty. */
+    oldest() {
+        if (this._count === 0) return undefined;
+        return this._buf[this._head];
+    }
+
+    /** The NEWEST live entry without removing it. O(1). `undefined` on empty. */
+    newest() {
+        if (this._count === 0) return undefined;
+        return this._buf[(this._head + this._count - 1) & this._mask];
+    }
+
+    /**
+     * Empty the log in O(1). Resets head + count only -- the buffer is left
+     * UNTOUCHED. The stale numbers are unreachable (reads are bounded by count) and
+     * retain no references, so there is nothing to zero (mirrors RingDeque).
+     */
+    clear() { this._head = 0; this._count = 0; }
+
+    /**
+     * Iterate live entries OLDEST -> NEWEST, alloc-free. O(size). A HOISTED callback
+     * makes this a zero-allocation scan.
+     * @param {(value:number, index:number, log:RingLog)=>void} fn
+     */
+    forEach(fn) {
+        const buf = this._buf;
+        const mask = this._mask;
+        const head = this._head;
+        const count = this._count;
+        for (let i = 0; i < count; i++) fn(buf[(head + i) & mask], i, this);
+    }
+
+    /** Iterate live entries OLDEST -> NEWEST. O(size). Allocates per protocol. */
+    *[Symbol.iterator]() {
+        const buf = this._buf;
+        const mask = this._mask;
+        const head = this._head;
+        const count = this._count;
+        for (let i = 0; i < count; i++) yield buf[(head + i) & mask];
+    }
+
+    // ---- cold path only: throw builder (string concat lives here, off the hot body) ----
+
+    /** @private */
+    _bad(v) {
+        // String(v) -- NOT '+ v' / a template literal: those THROW on a Symbol or
+        // BigInt, which would turn a fail-closed reject into a different crash.
+        throw new TypeError(
+            '[lite-o1] RingLog value must be a number and not NaN, got ' + String(v));
     }
 }

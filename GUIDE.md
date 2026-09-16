@@ -1,7 +1,7 @@
 # lite-o1 -- which structure to pick (GUIDE)
 
 A repo-only decision guide for the O(1) family: which member, reach-for / avoid,
-and how to measure the constant yourself. At v1.0.0 the family is STABLE at ten
+and how to measure the constant yourself. At v1.1.0 the family is STABLE at eleven
 members and this guide is complete for them -- still open (a new section lands with
 each future member), but no longer a skeleton. It is NOT an API encyclopedia (that
 is the README + `O1.d.ts`); it answers "which member, and is my constant real?"
@@ -23,7 +23,7 @@ flatness floor for YOUR workload -- run `npm run witness` and read the shape.
 
 ## Which member? (decision flowchart)
 
-ASCII, routes on the discriminating questions. Every leaf is one of the ten
+ASCII, routes on the discriminating questions. Every leaf is one of the eleven
 members; `(wc)` = worst-case O(1), `(am)` = amortized O(1).
 
 ```
@@ -38,6 +38,8 @@ START -- what is the SHAPE of your workload?
 +-- A LINEAR sequence of NUMBERS you push/pop (stack or queue)?
 |     |
 |     +-- need the running MIN or MAX of the WHOLE live stack? -> MinStack (wc)
+|     +-- "keep the last N": never block, OVERWRITE the oldest on full,
+|     |   a rolling window you READ (not a queue you drain)? -> RingLog (wc)
 |     +-- FIFO / LIFO push+pop at either end, no extreme query? -> RingDeque (wc)
 |
 +-- The MIN or MAX of a SLIDING WINDOW over a numeric stream? -> MonoDeque (am)
@@ -57,7 +59,7 @@ START -- what is the SHAPE of your workload?
 ```
 
 Budget rule of thumb: if you cannot tolerate ANY per-op spike (hard-real-time on
-the WORST single op), stay on the six `(wc)` members. The four `(am)` members
+the WORST single op), stay on the seven `(wc)` members. The four `(am)` members
 (UnionFind, MonoDeque, BucketQueue, HierarchicalTimerWheel) buy their constant with
 an amortized average and wear an honest worst-single-op tail -- read the MAX-single-op
 line the witness prints, and the per-member "avoid it when" notes below.
@@ -78,6 +80,7 @@ One row per member; pick by the left column, confirm with the discriminator.
 | a priority queue over SMALL BOUNDED INTEGER priorities       | BucketQueue            | amortized   | monotone Dial; O(1) decreaseKey; below-cursor insert throws  |
 | timers over a delay horizon that fits ONE rotation           | TimerWheel             | worst-case  | simple Varghese-Lauck wheel; drain-before-advance, no spike  |
 | timers over a WIDE but bounded delay horizon (< 2^26)        | HierarchicalTimerWheel | amortized   | cascading tvec wheel; O(1) amortized, periodic cascade spike |
+| "keep the last N" numbers, never block, overwrite the oldest  | RingLog                | worst-case  | lossy overwrite-oldest ring; push returns the evicted; read-only, no drain |
 
 ---
 
@@ -485,16 +488,64 @@ witness gates the cascade spike at `>= 8x` the typical tick (the amortized-hones
 
 ---
 
+### RingLog (v1.1.0)
+
+Fixed-capacity LOSSY overwrite-oldest ring log of NUMBERS over one circular
+`Float64Array` (head + count, power-of-two capacity, `& MASK` wrap -- RingDeque's
+exact substrate). "Keep the last N": `push(v)` never blocks and never throws on full
+-- a full push OVERWRITES the oldest entry and RETURNS it (`undefined` until the log
+first fills). A READ-ONLY snapshot surface (`get` / `oldest` / `newest` / `forEach` /
+iterate); no drain. WORST-CASE O(1) push (a single read + overwrite + head advance,
+never a run), so it wears NO max-single-op line.
+
+**Reach for it when:**
+
+- You want to keep only the LAST N numbers of a stream and never block -- rolling
+  telemetry / metrics windows, a recent-events / audit ring, the last N samples of a
+  signal, a crash-dump breadcrumb log -- and dropping the oldest on overflow is the
+  DESIRED behavior, not a bug.
+- You want the eviction for free: `push` RETURNS the evicted oldest value, so a
+  rolling aggregate is subtract-evicted + add-new with no rescan (the signature trick).
+- You need a HARD per-op budget with zero per-op allocation: push is worst-case O(1),
+  never an amortized spike.
+- The values are numbers (or integer handles into a parallel store).
+
+**Avoid it when:**
+
+- You need to CONSUME entries (drain / pop the oldest) or must NOT lose data on
+  overflow -- reach for RingDeque, which is a real queue and fails closed (throws) on
+  a full push instead of overwriting. RingLog is a window you READ, not a queue you
+  drain.
+- You need the running MIN / MAX of the window (reach for MonoDeque) or of a stack
+  (MinStack) -- RingLog answers only "the last N entries", not any aggregate but the
+  ones you compute yourself via `forEach` / the push-return hook.
+- You need to queue non-numbers (queue their integer handles instead) or want NaN to
+  be storable (it is rejected; `+/-Infinity` are accepted).
+
+**RingDeque vs RingLog** (the teaching pair): both are one-`Float64Array` power-of-two
+rings with the identical numeric value contract. They differ ONLY in the full-push
+policy -- RingDeque FAILS CLOSED (a full push throws, no data lost, you drain with
+`popFront` / `popBack`), RingLog is LOSSY (a full push overwrites the oldest and
+returns it, you never drain). Pick RingDeque when every entry matters and you consume
+them; pick RingLog when only the last N matter and you never want to block.
+
+**Measure it:** `npm run witness` -- RingLog overwrite-push flatness `>= 0.70` across
+the size sweep `[1e4..1e5]` (the 1e3 point is a pure-L1 micro-case, shown but not
+gated) while a naive Array bounded-log foil (`push` then `shift()` when over capacity,
+O(n) per op) collapses (`<= 0.55`), ratio `>= 1.5x`. There is deliberately NO
+MAX-single-op line: push is worst-case O(1) (a single overwrite, never a run), so
+there is no amortized spike to expose -- the flat line IS the worst-case claim.
+
+---
+
 ## Roadmap members (not yet shipped, planned)
 
-The public API is stable at v1.0.0's ten members; these are planned, not shipped.
+The public API is stable at v1.1.0's eleven members; these are planned, not shipped.
 Placeholders so the decision axes are visible early; each fills in on release.
 
 - **SlotPool** -- free-list slot allocator with generational (ABA-safe) handles.
   Reach for it as the SoA substrate; reconcile against `@zakkster/lite-arena`
   before picking one.
-- **RingLog** -- a lossy overwrite-oldest ring (keep the last N, drop the oldest);
-  the "overwrite-oldest RingDeque preset" the RingDeque notes defer to.
 - **CuckooMap / Hopscotch** -- a general-key (not integer-bounded) worst-case-O(1)
   map, for when the key space is not a small bounded integer range.
 - **SparseTable / StaticRMQ** -- an O(1)-query static range-minimum table (build
@@ -517,8 +568,9 @@ The witness is one axis (throughput invariance). The repo-only **eight-dimension
 benchmark suite** (`benchmark/`, not in the published tarball) profiles every member
 against its JS built-in on the axes a single ops/ms number hides -- latency tails,
 amortized drift, memory, cache proxy, bundle size, GC pressure, key-type / load-factor
-scaling, and workload micro-benches. At v1.0.0 that is **ten members x 8 dimensions
-= 80 cells**:
+scaling, and workload micro-benches. The bench profiles the ten pre-RingLog members
+(RingLog, added at v1.1.0, is out of the repo-only bench, like FreqO1 / BucketQueue /
+the timing wheels): **ten members x 8 dimensions = 80 cells**:
 
 ```bash
 npm run bench          # all 80 (member x dimension) cells, one child process each

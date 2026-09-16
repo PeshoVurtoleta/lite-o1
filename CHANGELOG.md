@@ -8,6 +8,63 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.1.0] - 2026-09-16
+
+### Added
+
+- **`RingLog` -- the eleventh member: a zero-GC, WORST-CASE O(1) fixed-capacity LOSSY
+  overwrite-oldest ring log ("keep the last N").** It mirrors `RingDeque`'s substrate
+  exactly (ONE `Float64Array`, `_head` + `_count`, power-of-two capacity, branchless
+  `& MASK` wrap) but INVERTS its full-push policy: `push(v)` never blocks and never
+  throws on full -- it OVERWRITES the oldest entry and RETURNS it (`undefined` until the
+  log first fills), the signature feature (a rolling-aggregate hook: subtract-evicted,
+  add-new). Because a full push is a single read + overwrite + head advance (never a
+  run), push is WORST-CASE O(1) -- RingLog joins the worst-case cohort with NO amortized
+  spike and NO max-single-op line. Read-only snapshot surface: `get(i)` (oldest-relative,
+  `undefined` out of range / non-int, never throws), `oldest()` / `newest()` (`undefined`
+  on empty), `forEach` (alloc-free, oldest -> newest), `[Symbol.iterator]` (allocates per
+  protocol), and getters `size` / `capacity` (rounded) / `isFull`. Deliberately NO
+  popOldest / drain -- reach for `RingDeque` to consume / fail closed; the two are an
+  honest teaching pair (lossy-overwrite vs fail-closed-at-capacity). Fail closed on the
+  VALUE only (a non-number or NaN throws `[lite-o1]` a byte-identical no-op; `+/-Infinity`
+  accepted; `null` never coerced), never on capacity. Realizes the overwrite-oldest preset
+  deferred in [`decisions/0005`](./decisions/0005-ring-capacity-fail-closed.md); see the
+  settled calls in [`decisions/0016`](./decisions/0016-ringlog.md).
+- **`test/RingLog.test.js`** -- full behavioral suite: constructor rounding + RangeError
+  cases, push-returns-`undefined`-while-filling / push-returns-exact-evicted-when-full,
+  the full -> overwrite transition + the `& MASK` wrap boundary (white-box: push
+  `2*cap+3` values, `_head` / oldest / newest / `get(i)` all asserted), the typeof-guard
+  (Symbol / BigInt / object-with-valueOf / string / null / NaN throw a byte-identical
+  no-op; `+/-Infinity` accepted), reads-on-empty + get-out-of-range -> `undefined`,
+  forEach / iterator order, a byte-identical `clear()` proof, and a **>= 1e5-op
+  differential fuzz** vs an Array-based lossy-ring oracle (return value + size / oldest /
+  newest / `get(i)` / snapshot parity every step, non-vacuous).
+- RingLog wired into the gates: a `ringLog` lane in `test/torture.mjs` (steady-full
+  overwrite hot loop at 0 B/op + a fill/clear retention cycle), four scenarios +
+  a `ringLogGrows` 0-delta canary + a `[Symbol.iterator]` must-fail in
+  `test/perf/PerfGate.test.mjs`, and a `buildRingLog` witness vs a naive Array
+  bounded-log foil (O(n) `shift`, collapses) in `test/witness.mjs`.
+
+### Changed
+
+- Version bumped **1.0.0 -> 1.1.0** (additive, backward-compatible -- the prior ten
+  members are byte-identical; the sole `O1.js` edits are the header member-count, the
+  `VERSION` string, and the appended `RingLog` class). `VERSION` const / `package.json` /
+  `llms.txt` in lockstep, enforced by the version-trinity test. New keywords (ring-log,
+  overwrite-oldest, lossy-ring, event-log, audit-log, telemetry, recent-n, circular-log).
+
+### Docs
+
+- `GUIDE.md` gains a RingLog flowchart leaf (no dead branch), a picker-table row, a
+  `### RingLog (v1.1.0)` per-member section, and a RingDeque-vs-RingLog note (fail-closed
+  vs lossy-overwrite); intro count/version -> eleven / v1.1.0.
+- `README.md` integrates RingLog across the spine (positioning + what-you-get, a
+  Zero-GC-design allocation table, API reference + a constants note, GOOD-FOR / NOT-FOR
+  bullets incl. the RingDeque-vs-RingLog distinction, testing count); the repo-only
+  benchmark matrix + its 80-cell numbers are unchanged (RingLog stays out of the bench).
+- `llms.txt` -> Version 1.1.0, eleven members, `VERSION -- '1.1.0'`, a RingLog surface
+  section, and a roadmap that no longer lists RingLog as planned.
+
 ## [1.0.0] - 2026-09-16
 
 ### Added

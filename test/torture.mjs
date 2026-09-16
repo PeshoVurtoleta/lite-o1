@@ -39,7 +39,7 @@ async function main() {
     const { GcProfiler, checkNoGc, measureAllocs } =
         await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel } = await import('../O1.js');
+    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog } = await import('../O1.js');
 
     const U = 1 << 16;      // universe 65536
     const CAP = 1 << 14;    // capacity 16384
@@ -173,6 +173,17 @@ async function main() {
             htw.drainDue(noop);
             htw.advance(1);
             tracker.track(htw, noop, 'hierarchicaltimerwheel', { audit: true });
+            // RingLog owns only its Float64Array; nothing external to release. Its
+            // buffer holds numbers, so it retains no references either -- a reclaimed
+            // instance is the desired outcome, proven by size()->0. Exercise the
+            // push-overwrite + snapshot surface before tracking.
+            const rl = new RingLog(256);
+            rl.push(i & 255);
+            rl.push((i + 1) & 255);
+            rl.oldest();
+            rl.newest();
+            rl.get(0);
+            tracker.track(rl, noop, 'ringlog', { audit: true });
         }
         return tracker.size();
     }
@@ -397,6 +408,32 @@ async function main() {
     const htwAllocBytes = Math.max(0, Math.round(htwBpc));
     const htwAllocOk = htwAllocBytes === 0;
     const htwNoop = () => {};
+
+    // RingLog hot path: a bounded resident log at STEADY FULL state -- each step pushes
+    // one scrambled value (which overwrites the oldest and returns it) then reads the
+    // oldest + newest + a get(i) snapshot. Prefilled to capacity, so EVERY push takes
+    // the full-overwrite branch (the worst-case-O(1) hot body: read-oldest + one
+    // overwrite + head advance). Values are SMI ints (int32-wrapped scramble) -> no
+    // coercion, no heap double. The push return value is folded into an int sink so V8
+    // cannot elide the eviction read.
+    const RL_CAP = 1 << 14;              // 16384 (power of two)
+    const ringLog = new RingLog(RL_CAP);
+    for (let k = 0; k < RL_CAP; k++) ringLog.push(k); // prime to steady FULL
+    let rlv = 0;
+    let rlSink = 0;
+    const ringLogStep = () => {
+        rlv = (rlv + 1) | 0;
+        const ev = ringLog.push((rlv * 2654435761) & 0x7fffffff); // full -> overwrite+evict
+        rlSink = (rlSink + (ev | 0)) | 0;
+        ringLog.oldest();
+        ringLog.newest();
+        ringLog.get(rlv & (RL_CAP - 1));
+    };
+    const ringLogAllocRes = measureAllocs(ringLogStep, { iterations: 100000, batches: 8 });
+    const ringLogBpc = ringLogAllocRes.bytesPerCall === null ? 0 : ringLogAllocRes.bytesPerCall;
+    const ringLogAllocBytes = Math.max(0, Math.round(ringLogBpc));
+    const ringLogAllocOk = ringLogAllocBytes === 0;
+
     // "0 B/op" resolved at the sampling floor: heapUsed deltas are quantized and
     // noisy, so a truly non-allocating op reads a sub-byte figure (a lone blip
     // in one batch / iterations). Round to the nearest byte -- any per-op
@@ -420,6 +457,7 @@ async function main() {
         buckStep();
         twStep();
         htwStep();
+        ringLogStep();
         if ((i & 8191) === 0) {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
         }
@@ -513,6 +551,15 @@ async function main() {
         // drain 1024 ticks: crosses 4 level-0 wraps (cascades) and fires every timer
         for (let t = 0; t < 1024; t++) { htw.drainDue(htwNoop); htw.advance(1); }
     }
+    // RingLog fill (past capacity -> real overwrite churn) + forEach scan + O(1) clear
+    // cycles -- exercises the push-overwrite hot body, the alloc-free oldest->newest
+    // scan, and clear. The 2*RL_CAP fill overwrites the whole buffer each cycle, so the
+    // & MASK wrap and the head advance are both exercised; clear() zeroes nothing.
+    for (let f = 0; f < 1024; f++) {
+        for (let k = 0; k < 512; k++) SINK += (ringLog.push((k * 2654435761) & 0x7fffffff) | 0);
+        ringLog.forEach(cb);
+        ringLog.clear();
+    }
     await new Promise((r) => setTimeout(r, 50));
     const s2 = gc.summary();
     const report = checkNoGc(s2, { maxMajor: 0, maxPauseMs: 2 });
@@ -555,6 +602,8 @@ async function main() {
         for (let k = 0; k < CAP; k++) htw.schedule(k, 0); // all due at tick 0 (level-0 slot 0)
         htw.drainDue(htwNoop);                            // drain slot 0 -> size 0
         htw.clear();
+        for (let k = 0; k < CAP; k++) ringLog.push(k); // fill to capacity (overwrites once full)
+        ringLog.clear();                               // O(1): the reused buffer grows no store
     }
     globalThis.gc();
     const abAfter = process.memoryUsage().arrayBuffers;
@@ -564,7 +613,8 @@ async function main() {
     // ---- verdict + GATE line ----------------------------------------------
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
         findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && monoAllocOk &&
-        minAllocOk && randAllocOk && freqAllocOk && buckAllocOk && twAllocOk && htwAllocOk && abOk;
+        minAllocOk && randAllocOk && freqAllocOk && buckAllocOk && twAllocOk && htwAllocOk &&
+        ringLogAllocOk && abOk;
 
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
@@ -576,9 +626,10 @@ async function main() {
         minAllocBytes + ' B/op (MinStack) ' + randAllocBytes + ' B/op (RandomSet) ' +
         freqAllocBytes + ' B/op (FreqO1) ' + buckAllocBytes + ' B/op (BucketQueue) ' +
         twAllocBytes + ' B/op (TimerWheel) ' +
-        htwAllocBytes + ' B/op (HierarchicalTimerWheel)' +
+        htwAllocBytes + ' B/op (HierarchicalTimerWheel) ' +
+        ringLogAllocBytes + ' B/op (RingLog)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
-        ' (tracked=' + trackedMid + ' sink=' + SINK + ' abGrowth=' + abDelta + ')');
+        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' abGrowth=' + abDelta + ')');
 
     if (!ok) {
         if (!trackedOk) console.error('  vacuous: tracker held ' + trackedMid + ' instances (expected > 0)');
@@ -597,6 +648,7 @@ async function main() {
         if (!buckAllocOk) console.error('  alloc ' + buckAllocBytes + ' B/op BucketQueue (raw bytesPerCall ' + buckBpc + ')');
         if (!twAllocOk) console.error('  alloc ' + twAllocBytes + ' B/op TimerWheel (raw bytesPerCall ' + twBpc + ')');
         if (!htwAllocOk) console.error('  alloc ' + htwAllocBytes + ' B/op HierarchicalTimerWheel (raw bytesPerCall ' + htwBpc + ')');
+        if (!ringLogAllocOk) console.error('  alloc ' + ringLogAllocBytes + ' B/op RingLog (raw bytesPerCall ' + ringLogBpc + ')');
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;
     }

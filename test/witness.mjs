@@ -48,7 +48,7 @@
  * metric are unchanged; only the measurement is made steadier.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog } from '../O1.js';
 
 const SIZES = [1e3, 1e4, 1e5, 1e6, 1e7];
 const BATCH = 1e6;
@@ -1254,5 +1254,102 @@ if (!hwAllOk) {
         ' not < HierWheel flatness ' + fmt(hw.flatness));
     if (!hwRatioOk) console.error('  violation min hw ratio ' + fmt(hwRatio) + 'x < 1.50x');
     if (!hwSpikeOk) console.error('  violation cascade spike ' + fmt(hwSpike.ratio) + 'x < 8x (must wear the max-single-op line)');
+    process.exitCode = 1;
+}
+
+// ===========================================================================
+// RingLog witness -- worst-case-O(1) overwrite-push vs a naive Array bounded-log foil
+// ===========================================================================
+// n is the log CAPACITY. The op is a steady-FULL push: overwrite the oldest entry and
+// return it -- a single read + a single overwrite + a head advance, O(1) INDEPENDENT of
+// n. The foil is a plain Array bounded log: `arr.push(v)` then `arr.shift()` once it
+// exceeds the cap -- the shift re-indexes the whole backing array (O(n) per op), the
+// exact trap RingLog's ring kills. ops/ms is a RATE, so the log (batch 5e5) and the foil
+// (batch 2e3) use DIFFERENT batches yet flatness + ratio compare directly. This is a TRUE
+// O(n) foil (a full factor of n lost per decade), so it collapses to the <= 0.55 bar.
+const RL_SIZES = [1e3, 1e4, 1e5];
+const RL_BATCH = 5e5;        // large: stable timing for the O(1) overwrite push
+const RL_FOIL_BATCH = 2e3;   // small: an O(n) Array shift at n=1e5 must stay tractable
+// The RingLog overwrite push is a handful of typed-slot writes, so the size=1e3 point is a
+// pure-L1 micro-case that turbo-spikes as the flatness DENOMINATOR (the same effect
+// ADR-0004's amendment pinned). The gate is computed over the steady window size >= 1e4;
+// the 1e3 point is DISPLAYED, tagged.
+const RL_GATE_MIN = 1e4;
+
+// RingLog: prime a log of capacity n to STEADY FULL, then each op pushes one value
+// (overwriting the oldest and returning it). Every push takes the worst-case-O(1)
+// overwrite branch; the ring's contiguous Float64Array streams flat as n grows.
+function buildRingLog(n) {
+    const l = new RingLog(n);
+    for (let k = 0; k < n; k++) l.push(k); // prime to full
+    let v = 0;
+    const op = () => {
+        v = (v + 1) | 0;
+        SINK += l.push(v); // full -> overwrites the oldest, returns the evicted value
+    };
+    return { op };
+}
+
+// Foil: a plain Array as a bounded "keep the last n" log via push + shift-when-over-cap.
+// `shift` re-indexes the whole backing array -- O(n) -- so ops/ms collapses as n grows,
+// the exact trap RingLog's overwrite-in-place ring exists to kill.
+function buildNaiveArrayLogFoil(n) {
+    const arr = new Array(n);
+    for (let k = 0; k < n; k++) arr[k] = k; // prime to full
+    let v = 0;
+    const op = () => {
+        v = (v + 1) | 0;
+        arr.push(v);   // grows to n+1
+        SINK += arr.shift(); // O(n): every element slides down one index, back to n
+    };
+    return { op };
+}
+
+const rl = witness(buildRingLog, RL_SIZES, RL_BATCH, REPS, RL_GATE_MIN);
+const arrLog = witness(buildNaiveArrayLogFoil, RL_SIZES, RL_FOIL_BATCH, REPS, RL_GATE_MIN);
+
+console.log('');
+console.log('O(1) Witness -- RingLog overwrite push vs a naive Array bounded log (rate ops/ms, median of ' +
+    REPS + ', gate size >= ' + nStr(RL_GATE_MIN) + ')');
+console.log('');
+console.log('  size      RingLog ops/ms     Array ops/ms   ratio');
+console.log('  --------  ----------------   ------------   -----');
+let rlRatio = Infinity;
+for (let i = 0; i < RL_SIZES.length; i++) {
+    const a = rl.rows[i].opsPerMs;
+    const b = arrLog.rows[i].opsPerMs;
+    const ratio = b > 0 ? a / b : Infinity;
+    const gated = RL_SIZES[i] >= RL_GATE_MIN;
+    if (gated && ratio < rlRatio) rlRatio = ratio; // ratio gate: steady window only
+    const tag = RL_SIZES[i] < RL_GATE_MIN ? '   <- L1 micro-case (shown, not gated)' : '';
+    console.log('  ' + nStr(RL_SIZES[i]).padEnd(8) + '  ' +
+        fmt(a).padStart(16) + '   ' + fmt(b).padStart(12) + '   ' + fmt(ratio).padStart(5) + 'x' + tag);
+}
+
+console.log('');
+console.log('  RingLog flatness (size >= ' + nStr(RL_GATE_MIN) + '): ' + fmt(rl.flatness) + '   (gate >= 0.70)');
+console.log('  Array foil flatness (last/first): ' + fmt(arrLog.flatness) + '   (gate <= 0.55)');
+console.log('  min RingLog/Array ratio:          ' + fmt(rlRatio) + 'x  (gate >= 1.50x)');
+// NO MAX-single-op line here (unlike MonoDeque / BucketQueue / HierarchicalTimerWheel):
+// RingLog's push is WORST-CASE O(1) -- a full push is a single read + a single overwrite
+// + a head advance, never a run and never a cascade. There is no amortized spike to
+// expose; the flat line IS the worst-case claim (the O(n) Array foil is the honest
+// 0.55-collapse rival).
+
+const rlOk = rl.flatness >= 0.70;
+const arrLogOk = arrLog.flatness <= 0.55;
+const rlRatioOk = rlRatio >= 1.5;
+const rlAllOk = rlOk && arrLogOk && rlRatioOk;
+
+console.log('');
+console.log('WITNESS RingLog ' + (rlAllOk ? 'ok' : 'FAIL') +
+    ' rl.flatness=' + fmt(rl.flatness) +
+    ' arr.flatness=' + fmt(arrLog.flatness) +
+    ' minRatio=' + fmt(rlRatio) + 'x');
+
+if (!rlAllOk) {
+    if (!rlOk) console.error('  violation RingLog flatness ' + fmt(rl.flatness) + ' < 0.70');
+    if (!arrLogOk) console.error('  violation Array foil flatness ' + fmt(arrLog.flatness) + ' > 0.55');
+    if (!rlRatioOk) console.error('  violation min RingLog ratio ' + fmt(rlRatio) + 'x < 1.50x');
     process.exitCode = 1;
 }
