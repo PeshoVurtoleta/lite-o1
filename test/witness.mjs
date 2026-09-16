@@ -48,7 +48,7 @@
  * metric are unchanged; only the measurement is made steadier.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1 } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue } from '../O1.js';
 
 const SIZES = [1e3, 1e4, 1e5, 1e6, 1e7];
 const BATCH = 1e6;
@@ -137,6 +137,35 @@ const NAIVE_LFU_BATCH = 300;    // small: an O(n) min-scan at n=1e5 must stay tr
 // as the flatness DENOMINATOR (the same effect ADR-0004's amendment pinned). The gate
 // is computed over the steady window size >= 1e4; the 1e3 point is DISPLAYED, tagged.
 const FREQ_GATE_MIN = 1e4;
+
+// BucketQueue sweep. n is the number of LIVE keys. The op is a steady-state monotone
+// churn (extractMin + re-insert one bounded window ahead of the cursor), so the
+// live-key working set is n while the active bucket span stays a bounded window W --
+// each extractMin is AMORTIZED O(1) (the cursor's total forward travel is charged once
+// across the drain, and W bounds the active bucket range). The foil is an ALLOC-FREE
+// binary MIN-HEAP (a parallel priority + key column) driven by the SAME monotone
+// trace: its extract sifts DOWN O(log n) per op, so it is O(log n) while the bucket
+// queue is O(1). ops/ms is a RATE, so the two use the same batch and compare directly.
+//
+// FOIL-GATE NOTE (honest, per ADR-0004 + ADR-0013): the O(n) foils elsewhere (native
+// Set, Array.shift, a full-window rescan) collapse to <= 0.55 flatness because they
+// lose a whole factor of n per decade. A binary heap is O(log n), which decays only
+// ~log(n_lo)/log(n_hi) per decade (~0.8) -- it CANNOT reach a 0.55 flatness bar over a
+// legitimate steady window, and pretending otherwise would require an unreliable
+// small-n denominator. So BucketQueue is gated on its OWN flatness (>= 0.70, genuinely
+// O(1)) plus a sustained BucketQueue/heap throughput ratio (>= 1.5x -- the constant-
+// factor win of O(1) over O(log n)); the heap's gentler flatness is REPORTED (and
+// asserted merely to be LESS flat than the bucket queue), not held to the O(n) bar.
+const BQ_SIZES = [1e3, 1e4, 1e5];
+const BQ_BATCH = 5e5;         // large: stable timing for the amortized-O(1) churn
+const HEAP_BATCH = 5e5;       // the O(log n) heap stays tractable at n=1e5
+const BQ_WINDOW = 64;         // bounded active-bucket span W (keeps the cursor churn O(1))
+const BQ_CEIL = 1 << 20;      // fixed ceiling headroom the climbing cursor never exhausts in a batch
+// The BucketQueue op (an extractMin + one insert) is a handful of pointer writes, so
+// the size=1e3 point is a pure-L1 micro-case that turbo-spikes as the flatness
+// DENOMINATOR (the same effect ADR-0004's amendment pinned). The gate is computed over
+// the steady window size >= 1e4; the 1e3 point is DISPLAYED, tagged.
+const BQ_GATE_MIN = 1e4;
 
 // Global sink: every op feeds it so V8 cannot dead-code-eliminate the batch.
 let SINK = 0;
@@ -429,6 +458,94 @@ function buildNaiveLfuFoil(n) {
         if (key >= n) key = 0;
     };
     return { op };
+}
+
+// BucketQueue: a monotone priority queue of SIZE n, churned in steady state. Prime n
+// keys across a bounded window of BQ_WINDOW buckets, then each op extractMin-removes
+// the min key and re-inserts it BQ_WINDOW-1 buckets ahead of the cursor (always >=
+// cursor -> the monotone contract never trips). The live-key set stays n and the
+// active bucket span stays BQ_WINDOW, so the cursor climbs slowly within the fixed
+// BQ_CEIL headroom (never exhausted in a batch) and each op is AMORTIZED O(1) -- it
+// streams flat as n grows, exercising the bucket head-pop + swap-remove + slow cursor
+// advance with no cache-cold full refill to confound the timing.
+function buildBucketQueue(n) {
+    const q = new BucketQueue(n, BQ_CEIL, n);
+    for (let k = 0; k < n; k++) q.insert(k, k % BQ_WINDOW); // spread across a bounded window
+    const op = () => {
+        const k = q.extractMin();
+        q.insert(k, q.cursor + (BQ_WINDOW - 1)); // re-insert at the far end of the window
+        SINK += k;
+    };
+    return { op };
+}
+
+// Foil: an ALLOC-FREE binary MIN-HEAP (parallel priority + key columns) driven by the
+// IDENTICAL monotone trace -- extractMin sifts DOWN O(log n), then the drained key is
+// re-inserted one window ahead and sifts UP O(log n). Per-op cost is O(log n), so
+// ops/ms decays as n grows (the log-n gap the O(1) bucketed frontier closes when
+// priorities are small bounded integers). No allocation: both columns are preallocated.
+function buildBinaryHeapFoil(n) {
+    const hp = new Float64Array(n + 1); // 1-based binary min-heap: priorities
+    const hk = new Uint32Array(n + 1);  // parallel keys
+    let size = 0;
+    const up = (i) => {
+        while (i > 1) {
+            const p = i >> 1;
+            if (hp[p] <= hp[i]) break;
+            const tp = hp[p]; hp[p] = hp[i]; hp[i] = tp;
+            const tk = hk[p]; hk[p] = hk[i]; hk[i] = tk;
+            i = p;
+        }
+    };
+    for (let k = 0; k < n; k++) { const i = ++size; hp[i] = k % BQ_WINDOW; hk[i] = k; up(i); }
+    const op = () => {
+        const mp = hp[1];
+        const mk = hk[1];
+        hp[1] = hp[size]; hk[1] = hk[size]; size--;
+        let i = 1;
+        for (;;) {                                // sift down
+            const l = i << 1;
+            const r = l | 1;
+            let s = i;
+            if (l <= size && hp[l] < hp[s]) s = l;
+            if (r <= size && hp[r] < hp[s]) s = r;
+            if (s === i) break;
+            const tp = hp[s]; hp[s] = hp[i]; hp[i] = tp;
+            const tk = hk[s]; hk[s] = hk[i]; hk[i] = tk;
+            i = s;
+        }
+        const j = ++size;                         // re-insert one window ahead
+        hp[j] = mp + (BQ_WINDOW - 1);
+        hk[j] = mk;
+        up(j);
+        SINK += mk;
+    };
+    return { op };
+}
+
+// BucketQueue amortized honesty: a single extractMin is O(1) AMORTIZED, not
+// worst-case. When the cursor must jump across a long run of empty buckets to reach
+// the next key, that single extractMin is O(gap) worst-case, while a typical
+// extractMin (the next key is in the current bucket) is O(1). Timing both makes the
+// hidden spike visible: the worst single op is a tall bar, the typical one a sliver.
+// (Measured separately so it never perturbs the batch timing.)
+function bucketMaxSingleOpMs(gap) {
+    const q = new BucketQueue(4, BQ_CEIL, 4);
+    q.insert(0, 0);
+    q.insert(1, gap);          // one lone key `gap` buckets away
+    q.extractMin();            // drain priority 0; cursor sits at 0
+    const t0 = performance.now();
+    q.extractMin();            // cursor JUMPS 0 -> gap across ~gap empty buckets: O(gap)
+    const worst = performance.now() - t0;
+
+    const q2 = new BucketQueue(4, BQ_CEIL, 4);
+    q2.insert(0, 0);
+    q2.insert(1, 0);           // both in bucket 0
+    q2.extractMin();
+    const t1 = performance.now();
+    q2.extractMin();           // next key is in the current bucket -> no cursor move: O(1)
+    const typical = performance.now() - t1;
+    return { worst, typical };
 }
 
 // MonoDeque amortized honesty: a single push is O(1) AMORTIZED, not worst-case.
@@ -791,5 +908,69 @@ if (!freqAllOk) {
     if (!freqOk) console.error('  violation FreqO1 flatness ' + fmt(freq.flatness) + ' < 0.70');
     if (!naiveLfuOk) console.error('  violation naive foil flatness ' + fmt(naiveLfu.flatness) + ' > 0.55');
     if (!freqRatioOk) console.error('  violation min freq ratio ' + fmt(freqRatio) + 'x < 1.50x');
+    process.exitCode = 1;
+}
+
+// ===========================================================================
+// BucketQueue witness -- amortized-O(1) extractMin vs an O(log n) binary-heap foil
+// ===========================================================================
+const bq = witness(buildBucketQueue, BQ_SIZES, BQ_BATCH, REPS, BQ_GATE_MIN);
+const heap = witness(buildBinaryHeapFoil, BQ_SIZES, HEAP_BATCH, REPS, BQ_GATE_MIN);
+
+console.log('');
+console.log('O(1) Witness -- BucketQueue extractMin vs a binary min-heap (rate ops/ms, median of ' +
+    REPS + ', gate size >= ' + nStr(BQ_GATE_MIN) + ')');
+console.log('');
+console.log('  size      BucketQueue ops/ms heap ops/ms    ratio');
+console.log('  --------  ----------------   ------------   -----');
+let bqRatio = Infinity;
+for (let i = 0; i < BQ_SIZES.length; i++) {
+    const a = bq.rows[i].opsPerMs;
+    const b = heap.rows[i].opsPerMs;
+    const ratio = b > 0 ? a / b : Infinity;
+    const gated = BQ_SIZES[i] >= BQ_GATE_MIN;
+    if (gated && ratio < bqRatio) bqRatio = ratio; // ratio gate: steady window only
+    const tag = BQ_SIZES[i] < BQ_GATE_MIN ? '   <- L1 micro-case (shown, not gated)' : '';
+    console.log('  ' + nStr(BQ_SIZES[i]).padEnd(8) + '  ' +
+        fmt(a).padStart(16) + '   ' + fmt(b).padStart(12) + '   ' + fmt(ratio).padStart(5) + 'x' + tag);
+}
+
+// Amortized-honesty: report the MAX single-op time (a cursor jump across a long run
+// of empty buckets, O(gap)) beside a typical O(1) extractMin. A hidden worst-case
+// spike shows here as a tall bar even though the amortized ops/ms line stays flat
+// (like MonoDeque / UnionFind -- BucketQueue is an AMORTIZED member).
+const BQ_SPIKE_GAP = (BQ_CEIL - 1) | 0;
+const bqSpike = bucketMaxSingleOpMs(BQ_SPIKE_GAP);
+
+console.log('');
+console.log('  BucketQueue flatness (size >= ' + nStr(BQ_GATE_MIN) + '): ' + fmt(bq.flatness) + '   (gate >= 0.70)');
+console.log('  heap foil flatness (last/first):   ' + fmt(heap.flatness) +
+    '   (O(log n): decays gently, gate < BucketQueue flatness -- see note)');
+console.log('  min BucketQueue/heap ratio:        ' + fmt(bqRatio) + 'x  (gate >= 1.50x)');
+console.log('  MAX single extractMin (O(gap) cursor jump, gap=' + nStr(BQ_SPIKE_GAP) +
+    '): ' + bqSpike.worst.toFixed(4) + ' ms   vs typical O(1) extractMin: ' +
+    bqSpike.typical.toFixed(4) + ' ms   (amortized, not worst-case -- reported, NOT gated)');
+
+// Gate: BucketQueue is genuinely O(1)-amortized (flatness >= 0.70), it beats the heap
+// by a sustained constant factor (ratio >= 1.5x), and the O(log n) heap is measurably
+// LESS flat than the O(1) bucket queue (the honest log-n foil bar -- NOT the O(n)
+// foils' 0.55 collapse, which a log-n foil cannot reach over a steady window; see the
+// FOIL-GATE NOTE above + ADR-0013).
+const bqOk = bq.flatness >= 0.70;
+const heapOk = heap.flatness < bq.flatness;
+const bqRatioOk = bqRatio >= 1.5;
+const bqAllOk = bqOk && heapOk && bqRatioOk;
+
+console.log('');
+console.log('WITNESS BucketQueue ' + (bqAllOk ? 'ok' : 'FAIL') +
+    ' bq.flatness=' + fmt(bq.flatness) +
+    ' heap.flatness=' + fmt(heap.flatness) +
+    ' minRatio=' + fmt(bqRatio) + 'x');
+
+if (!bqAllOk) {
+    if (!bqOk) console.error('  violation BucketQueue flatness ' + fmt(bq.flatness) + ' < 0.70');
+    if (!heapOk) console.error('  violation heap foil flatness ' + fmt(heap.flatness) +
+        ' not < BucketQueue flatness ' + fmt(bq.flatness));
+    if (!bqRatioOk) console.error('  violation min bq ratio ' + fmt(bqRatio) + 'x < 1.50x');
     process.exitCode = 1;
 }

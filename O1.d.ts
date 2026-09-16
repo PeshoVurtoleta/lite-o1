@@ -370,3 +370,75 @@ export class FreqO1 {
     /** Iterate live keys in dense storage order. */
     [Symbol.iterator](): IterableIterator<number>;
 }
+
+/**
+ * A zero-GC, AMORTIZED O(1) monotone integer priority queue ("Dial" / bucket queue)
+ * over private Uint32Array key columns (dense/sparse cross-check + per-key priority +
+ * an intrusive FIFO list) and a STATIC per-priority bucket array (indexed 0..ceiling,
+ * NO free-list). Keys are integers [0, universe); priorities are integers [0, ceiling]
+ * (space is O(ceiling)). MONOTONE contract: extractMin drains in NON-DECREASING
+ * priority order and the internal cursor never rewinds -- an insert below the cursor,
+ * or a decreaseKey to a priority below the cursor, throws [lite-o1] fail-closed. This
+ * bounds the cursor's total travel to ceiling+1, so extractMin amortizes to O(1) (a
+ * single extractMin is O(gap) worst-case). insert / decreaseKey / extractMin / peekMin
+ * / priorityOf / has / clear are amortized O(1) and allocate nothing after
+ * construction. Fail closed: a bad key or priority throws [lite-o1] on the mutators
+ * insert / decreaseKey (a NEW key past capacity, or a priority below the cursor, throws
+ * a byte-identical no-op) but is absent for the queries has / priorityOf (never throw);
+ * an already-present key is an idempotent insert no-op, and an absent key or a
+ * non-strict decrease is a decreaseKey no-op. priorityOf returns -1 for an absent / bad
+ * key. peekMin / extractMin on an empty queue return `undefined` and never throw.
+ * `clear()` is O(1) (resets the count + the cursor; the static buckets are voided by
+ * the cross-check). forEach / [Symbol.iterator] iterate in DENSE STORAGE order (NOT
+ * priority order); the iterator allocates per protocol.
+ */
+export class BucketQueue {
+    /**
+     * @param universe  exclusive key ceiling; an integer in [1, 2^32]. Keys are [0, universe).
+     * @param ceiling   inclusive max priority; an integer in [0, 2^31-1]. Priorities are [0, ceiling].
+     * @param capacity  max simultaneously-live keys; an integer in [1, universe]. Defaults to universe.
+     */
+    constructor(universe: number, ceiling: number, capacity?: number);
+
+    /** Number of live keys. */
+    readonly size: number;
+
+    /** Max simultaneously-live keys this queue was sized for. */
+    readonly capacity: number;
+
+    /** Exclusive key ceiling; keys are [0, universe). */
+    readonly universe: number;
+
+    /** Inclusive priority ceiling; priorities are [0, ceiling]. */
+    readonly ceiling: number;
+
+    /** The monotone cursor (frontier priority); never rewinds. */
+    readonly cursor: number;
+
+    /** True iff k is tracked. Never throws; a bad key is absent. */
+    has(k: number): boolean;
+
+    /** k's current priority, or -1 if absent / bad. Never throws. */
+    priorityOf(k: number): number;
+
+    /** Insert k at priority p. Idempotent no-op if present. Throws [lite-o1] on a bad key / bad priority / priority below the cursor / when full. */
+    insert(k: number, p: number): this;
+
+    /** Lower k's priority to newPrio. No-op if absent or not a strict decrease. Throws [lite-o1] on a bad key / bad priority / newPrio below the cursor. */
+    decreaseKey(k: number, newPrio: number): this;
+
+    /** The minimum-priority key (FIFO tie-break) without removing it, or `undefined` when empty. Never throws. */
+    peekMin(): number | undefined;
+
+    /** Remove and return the minimum-priority key (advances the cursor), or `undefined` when empty. Never throws. */
+    extractMin(): number | undefined;
+
+    /** Empty the queue in O(1) (resets the count + cursor; zeroes no store). */
+    clear(): void;
+
+    /** Iterate live keys in dense storage order, alloc-free. fn is (key, priority, queue). */
+    forEach(fn: (key: number, priority: number, queue: BucketQueue) => void): void;
+
+    /** Iterate live keys in dense storage order. */
+    [Symbol.iterator](): IterableIterator<number>;
+}

@@ -3,10 +3,10 @@
  * that doubles as a teachable textbook: each member solves a real problem AND
  * proves its constant is real (the O(1) Witness -- see test/witness.mjs).
  *
- * v0.7.0 ships seven members -- SparseSet, RingDeque, UnionFind, MonoDeque,
- * MinStack, RandomSet, and FreqO1 -- plus its `VERSION` const. The seven are
- * independent (no shared mutable module state), so a bundler that imports one
- * drops the others (`sideEffects: false`).
+ * v0.8.0 ships eight members -- SparseSet, RingDeque, UnionFind, MonoDeque,
+ * MinStack, RandomSet, FreqO1, and BucketQueue -- plus its `VERSION` const. The
+ * eight are independent (no shared mutable module state), so a bundler that imports
+ * one drops the others (`sideEffects: false`).
  *
  * The complexity class IS the product: every hot op below is O(1) worst-case and
  * allocates ZERO bytes after construction. The witness harness (never imported
@@ -17,7 +17,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '0.7.0';
+export const VERSION = '0.8.0';
 
 /** Largest universe the Uint32 substrate + the (k >>> 0) key check can honor. */
 const MAX_UNIVERSE = 0x100000000; // 2^32
@@ -1543,5 +1543,389 @@ export class FreqO1 {
     /** @private -- unreachable under the contract (pool sized to the transient peak). */
     _poolExhausted() {
         throw new RangeError('[lite-o1] FreqO1 bucket pool exhausted (capacity ' + this._cap + ')');
+    }
+}
+
+/**
+ * Largest priority CEILING a BucketQueue can honor. The per-bucket `_bHead` /
+ * `_bTail` arrays are length `ceiling + 1`, so the ceiling is bounded to 2^31-1 --
+ * the last integer for which `ceiling + 1` is a legal `Uint32Array` length (2^31).
+ * This is a TYPE bound, not a practical size: a ceiling near 2^31 is an ~8 GiB
+ * bucket column, an O(ceiling) space cost no host allocates (the documented
+ * space co-headline). The ceiling is a fail-closed guard, not a recommendation.
+ */
+const MAX_CEILING = 0x7FFFFFFF; // 2^31 - 1
+
+/**
+ * NIL for BucketQueue's intrusive pointers (`_nk` / `_pk` / `_bHead` / `_bTail`),
+ * which store DENSE indices in [0, capacity). 0 is a valid dense index, so the
+ * sentinel is the top uint32 value -- never a legal index (a dense index reaches
+ * 0xFFFFFFFF only at capacity 2^32, a size no host allocates). It is also always
+ * `>= _n`, so the same `head >= _n` test that voids stale post-clear heads also
+ * treats a NIL head as an empty bucket.
+ */
+const BQ_NIL = 0xFFFFFFFF; // 2^32 - 1
+
+/**
+ * BucketQueue (a "Dial" / bucket priority queue) -- a zero-GC, AMORTIZED O(1)
+ * monotone integer priority queue over PRIVATE `Uint32Array` columns and a STATIC
+ * bucket-per-priority array. It is the standalone primitive behind Dial's algorithm
+ * (Dijkstra with a bucketed frontier over small integer priorities): insert a key at
+ * an integer priority, decreaseKey it downward, and extractMin drains keys in
+ * NON-DECREASING priority order.
+ *
+ * MONOTONE contract (this is what buys the amortized O(1)): the extract order is
+ * non-decreasing and the internal `cursor` -- the frontier priority -- NEVER rewinds.
+ * An insert at a priority BELOW the cursor, or a decreaseKey to a new priority below
+ * the cursor, THROWS `[lite-o1]` fail-closed (a byte-identical no-op). Because the
+ * cursor only moves forward, its total travel across a full drain is at most
+ * `ceiling + 1`, so the per-extractMin bucket scan amortizes to O(1) even though a
+ * single extractMin is O(gap) worst-case (the honest amortized-not-worst-case
+ * asterisk, like MonoDeque / UnionFind).
+ *
+ * Layout (all PRIVATE, no public SlotPool -- ADR 0003's deferral stands):
+ *   - KEYS ride SparseSet's dense + sparse cross-check -- `_dense[i]` is the key at
+ *     dense index i, `_sparse[k]` maps k back, membership is
+ *     `_sparse[k] < _n && _dense[_sparse[k]] === k`. The dense index i IS the stable
+ *     node identity the intrusive lists use, so `clear()` is O(1).
+ *   - Per KEY (indexed by dense index i): `_prio[i]` (its priority == its bucket
+ *     index), and `_nk[i]` / `_pk[i]` (an intrusive DOUBLY-linked FIFO list of dense
+ *     indices WITHIN a bucket, oldest -> newest; NIL = BQ_NIL).
+ *   - Per BUCKET (a STATIC array indexed by priority 0..ceiling, NO free-list):
+ *     `_bHead[p]` / `_bTail[p]` (the FIFO oldest / newest key node in bucket p, for
+ *     O(1) head-pop + O(1) tail-append). `_cur` is the monotone cursor: extractMin /
+ *     peekMin advance it FORWARD over emptied buckets to the min non-empty bucket.
+ *
+ * O(1) CLEAR over static buckets: `clear()` resets two scalars (`_n = 0`, `_cur = 0`)
+ * and zeroes NO store -- but the static `_bHead` / `_bTail` retain stale dense indices
+ * from the prior generation. They are voided by the SAME `i < _n` cross-check that
+ * voids stale sparse entries: a bucket p is non-empty iff `_bHead[p] < _n &&
+ * _prio[_bHead[p]] === p`. A stale head is either `>= _n` (never re-used) or points to
+ * a node no longer at priority p, so it reads as empty; and a head that passes both
+ * tests was provably (re-)inserted into bucket p this generation, so it is genuinely
+ * the current head. This makes the static buckets safe with no per-bucket reset.
+ *
+ * Surface: `insert(key, prio) -> this` (throws on a bad key / bad prio / prio below
+ * the cursor / full; an already-present key is an IDEMPOTENT no-op -- lower it with
+ * decreaseKey); `decreaseKey(key, newPrio) -> this` (throws on a bad key / bad prio /
+ * newPrio below the cursor; an ABSENT key, or a newPrio that is not a strict decrease,
+ * is a documented no-op -- the conventional relaxation semantics); `extractMin() ->
+ * key|undefined` (removes the min-priority key, FIFO on ties; advances the cursor;
+ * `undefined` on empty, NEVER throws); `peekMin() -> key|undefined`; `priorityOf(key)
+ * -> number` (the priority, or -1 if absent / bad -- NEVER throws); `has(key) ->
+ * boolean`; `size` / `capacity` / `universe` / `ceiling` / `cursor` getters;
+ * `clear() -> void`; `forEach(fn)` + `[Symbol.iterator]` (DENSE STORAGE order, NOT
+ * priority order).
+ *
+ * KEY / PRIORITY model: keys are integers [0, universe); priorities are integers
+ * [0, ceiling]. Both guards are typeof-first (`typeof x !== 'number' ||
+ * (x >>> 0) !== x || x >= bound`) so a Symbol / BigInt never reaches the coercing
+ * `>>>`; the cold throw builders name the offender with `String(x)`. `null` is not
+ * zero (`(null >>> 0) === null` is false). Fail closed on the MUTATORS (insert /
+ * decreaseKey throw), ABSENT on the QUERIES (has / priorityOf never throw).
+ *
+ * Pool sizing (why exhaustion is impossible under contract, yet still fails closed):
+ * at most `capacity` keys are live at once, one node slot per key (`_dense` / `_prio`
+ * / `_nk` / `_pk` are all capacity-sized), so the `_n === _cap` guard rejects a NEW
+ * key past capacity as a byte-identical no-op and no node slot is ever over-allocated.
+ * The buckets are static (0..ceiling), so there is no bucket free-list to exhaust.
+ */
+export class BucketQueue {
+    /**
+     * @param {number} universe        exclusive key ceiling; integer in [1, 2^32].
+     * @param {number} ceiling         inclusive max priority; integer in [0, 2^31-1].
+     *                                  Priorities are [0, ceiling]; space is O(ceiling).
+     * @param {number} [capacity=universe]  max simultaneously-live keys; integer in [1, universe].
+     */
+    constructor(universe, ceiling, capacity = universe) {
+        // typeof guard BEFORE any coercion (Number.isInteger never coerces; false on
+        // a Symbol / BigInt), and String(x) in the cold message is Symbol/BigInt-safe.
+        if (typeof universe !== 'number' || !Number.isInteger(universe) ||
+            universe < 1 || universe > MAX_UNIVERSE) {
+            throw new RangeError(
+                '[lite-o1] universe must be an integer in [1, 2^32], got ' + String(universe));
+        }
+        if (typeof ceiling !== 'number' || !Number.isInteger(ceiling) ||
+            ceiling < 0 || ceiling > MAX_CEILING) {
+            throw new RangeError(
+                '[lite-o1] ceiling must be an integer in [0, 2^31-1], got ' + String(ceiling));
+        }
+        if (typeof capacity !== 'number' || !Number.isInteger(capacity) ||
+            capacity < 1 || capacity > universe) {
+            throw new RangeError(
+                '[lite-o1] capacity must be an integer in [1, ' + universe + '], got ' + String(capacity));
+        }
+        this._universe = universe;
+        this._ceiling = ceiling;
+        this._ceilP1 = ceiling + 1;               // prio is valid iff prio < _ceilP1 (i.e. <= ceiling)
+        this._cap = capacity;
+        // ---- key substrate (dense + sparse cross-check; dense index = node id) ----
+        this._dense = new Uint32Array(capacity);  // dense[i] = the i-th live key
+        this._sparse = new Uint32Array(universe); // sparse[k] = dense index (valid iff cross-check)
+        this._prio = new Uint32Array(capacity);   // prio[i] = priority of dense[i] == its bucket index
+        this._nk = new Uint32Array(capacity);     // nk[i]/pk[i] = next/prev dense index in the
+        this._pk = new Uint32Array(capacity);     //   bucket's FIFO key list (NIL = BQ_NIL)
+        this._n = 0;                              // live key count
+        // ---- static buckets (one per priority 0..ceiling; NO free-list) ----
+        this._bHead = new Uint32Array(this._ceilP1).fill(BQ_NIL); // FIFO oldest node in bucket p
+        this._bTail = new Uint32Array(this._ceilP1).fill(BQ_NIL); // FIFO newest node in bucket p
+        this._cur = 0;                            // monotone cursor: the frontier priority (never rewinds)
+    }
+
+    /** Number of live keys. O(1). */
+    get size() { return this._n; }
+
+    /** Max simultaneously-live keys this queue was sized for. O(1). */
+    get capacity() { return this._cap; }
+
+    /** Exclusive key ceiling; keys are [0, universe). O(1). */
+    get universe() { return this._universe; }
+
+    /** Inclusive priority ceiling; priorities are [0, ceiling]. O(1). */
+    get ceiling() { return this._ceiling; }
+
+    /** The monotone cursor (frontier priority); never rewinds. O(1). */
+    get cursor() { return this._cur; }
+
+    /**
+     * True iff k is tracked. O(1): the SparseSet cross-check. A bad key (negative,
+     * fractional, NaN, null, Symbol, BigInt, >= universe) is ABSENT, never a throw.
+     * The `typeof` short-circuits BEFORE `>>>` runs (which coerces + THROWS on a
+     * Symbol / BigInt); `(k >>> 0) !== k` then rejects every non-uint32 number.
+     */
+    has(k) {
+        if (typeof k !== 'number' || (k >>> 0) !== k || k >= this._universe) return false;
+        const i = this._sparse[k];
+        return i < this._n && this._dense[i] === k;
+    }
+
+    /**
+     * k's current priority, or -1 if k is absent or a bad key. O(1). NEVER throws
+     * (mirrors the never-throw query contract). -1 is the unambiguous "not tracked"
+     * sentinel: every real priority is a non-negative integer in [0, ceiling].
+     * @returns {number}
+     */
+    priorityOf(k) {
+        if (typeof k !== 'number' || (k >>> 0) !== k || k >= this._universe) return -1;
+        const i = this._sparse[k];
+        return (i < this._n && this._dense[i] === k) ? this._prio[i] : -1;
+    }
+
+    /**
+     * Insert key k at integer priority p. O(1). Fails closed, ALL guards preceding
+     * every write (a byte-identical no-op on any reject): a bad key throws via _oob;
+     * a bad priority (not a uint32 in [0, ceiling]) throws via _badPrio; a priority
+     * BELOW the monotone cursor throws via _rewind; a NEW key when full throws via
+     * _full. An already-present key is an IDEMPOTENT no-op (the priority arg is still
+     * validated) -- use decreaseKey to lower a tracked key.
+     * @param {number} k  a key integer in [0, universe)
+     * @param {number} p  a priority integer in [0, ceiling], p >= cursor
+     * @returns {BucketQueue} this
+     */
+    insert(k, p) {
+        if (typeof k !== 'number' || (k >>> 0) !== k || k >= this._universe) return this._oob(k);
+        if (typeof p !== 'number' || (p >>> 0) !== p || p >= this._ceilP1) return this._badPrio(p);
+        if (p < this._cur) return this._rewind(p);
+        const si = this._sparse[k];
+        if (si < this._n && this._dense[si] === k) return this; // present -> idempotent no-op
+        if (this._n === this._cap) return this._full();
+        this._insertOne(k, p);
+        return this;
+    }
+
+    /**
+     * Lower key k's priority to newPrio. O(1). Fails closed (all guards precede every
+     * write): a bad key throws via _oob; a bad newPrio throws via _badPrio; a newPrio
+     * BELOW the cursor throws via _rewind. An ABSENT key is a documented no-op (there
+     * is no priority to relax -- mirrors the family's never-throw-on-a-benign-absent
+     * discipline), and a newPrio that is NOT a strict decrease (>= the key's current
+     * priority) is a documented no-op (the conventional relaxation semantics: a
+     * decrease-key only ever lowers, never raises).
+     * @param {number} k        a key integer in [0, universe)
+     * @param {number} newPrio  the new priority, <= current AND >= cursor
+     * @returns {BucketQueue} this
+     */
+    decreaseKey(k, newPrio) {
+        if (typeof k !== 'number' || (k >>> 0) !== k || k >= this._universe) return this._oob(k);
+        if (typeof newPrio !== 'number' || (newPrio >>> 0) !== newPrio || newPrio >= this._ceilP1) {
+            return this._badPrio(newPrio);
+        }
+        if (newPrio < this._cur) return this._rewind(newPrio);
+        const i = this._sparse[k];
+        if (i >= this._n || this._dense[i] !== k) return this; // absent -> vacuous no-op
+        const old = this._prio[i];
+        if (newPrio >= old) return this;                       // not a strict decrease -> no-op
+        // unlink i from bucket `old`.
+        const p = this._pk[i];
+        const nx = this._nk[i];
+        if (p === BQ_NIL) this._bHead[old] = nx; else this._nk[p] = nx;
+        if (nx === BQ_NIL) this._bTail[old] = p; else this._pk[nx] = p;
+        // relink i at the TAIL of bucket newPrio (FIFO newest). Emptiness of the target
+        // is decided by the cross-check BEFORE _prio[i] is rewritten (so h === i cannot
+        // confuse the test -- i was in bucket `old`, not newPrio).
+        const h = this._bHead[newPrio];
+        const empty = h >= this._n || this._prio[h] !== newPrio;
+        this._prio[i] = newPrio;
+        if (empty) {
+            this._bHead[newPrio] = i;
+            this._bTail[newPrio] = i;
+            this._pk[i] = BQ_NIL;
+            this._nk[i] = BQ_NIL;
+        } else {
+            const t = this._bTail[newPrio];
+            this._pk[i] = t;
+            this._nk[i] = BQ_NIL;
+            this._nk[t] = i;
+            this._bTail[newPrio] = i;
+        }
+        return this;
+    }
+
+    /**
+     * The minimum-priority key (FIFO tie-break -- earliest-inserted in that bucket)
+     * WITHOUT removing it. O(1) AMORTIZED (the cursor advance over emptied buckets is
+     * charged once across the whole drain). Advances the monotone cursor to the min
+     * non-empty bucket. `undefined` on an empty queue, NEVER throws.
+     * @returns {number|undefined}
+     */
+    peekMin() {
+        if (this._n === 0) return undefined;
+        let c = this._cur;
+        let h = this._bHead[c];
+        // Advance over empty buckets. A bucket is empty iff its head is not a live
+        // node at priority c (NIL / stale-beyond-live via `h >= _n`, or stale-wrong-
+        // priority via `_prio[h] !== c`). _n > 0 guarantees the loop terminates.
+        while (h >= this._n || this._prio[h] !== c) { c++; h = this._bHead[c]; }
+        this._cur = c;
+        return this._dense[h];
+    }
+
+    /**
+     * Remove AND return the minimum-priority key (same selection as peekMin). O(1)
+     * AMORTIZED. Advances the cursor FORWARD only (monotone, never rewinds).
+     * `undefined` on an empty queue, NEVER throws. The victim's dense slot is filled by
+     * the swap-last-into-hole delete uses (with the moved node's intrusive pointers +
+     * bucket head/tail fixed up), so the cross-check + the bucket lists stay exact.
+     * @returns {number|undefined}
+     */
+    extractMin() {
+        if (this._n === 0) return undefined;
+        let c = this._cur;
+        let h = this._bHead[c];
+        while (h >= this._n || this._prio[h] !== c) { c++; h = this._bHead[c]; }
+        this._cur = c;
+        const victim = h;                    // FIFO oldest node in the min bucket
+        const key = this._dense[victim];
+        // Unlink victim (the head) from bucket c.
+        const nx = this._nk[victim];
+        this._bHead[c] = nx;
+        if (nx === BQ_NIL) this._bTail[c] = BQ_NIL; else this._pk[nx] = BQ_NIL;
+        // Swap-remove the victim's dense slot (mirrors FreqO1.popMin / SparseSet.delete).
+        const last = --this._n;
+        if (victim !== last) {
+            const mk = this._dense[last];
+            const mp = this._prio[last];
+            this._dense[victim] = mk;
+            this._sparse[mk] = victim;
+            this._prio[victim] = mp;
+            const mpr = this._pk[last];
+            const mnx = this._nk[last];
+            this._pk[victim] = mpr;
+            this._nk[victim] = mnx;
+            if (mpr === BQ_NIL) this._bHead[mp] = victim; else this._nk[mpr] = victim;
+            if (mnx === BQ_NIL) this._bTail[mp] = victim; else this._pk[mnx] = victim;
+        }
+        return key;
+    }
+
+    /**
+     * Empty the queue in O(1): reset the live count and the monotone cursor -- two
+     * scalars, touching NO backing array. Stale dense/sparse entries fail the has()
+     * cross-check, and stale static bucket heads/tails fail the `head < _n &&
+     * _prio[head] === p` bucket cross-check, so no store is ever zeroed (mirrors
+     * SparseSet.clear() / FreqO1.clear()). After clear() the cursor restarts at 0.
+     */
+    clear() {
+        this._n = 0;
+        this._cur = 0;
+    }
+
+    /**
+     * Iterate live keys in DENSE STORAGE order (insertion order, permuted by an
+     * extractMin swap-remove) -- the same alloc-free discipline SparseSet / FreqO1
+     * use, NOT priority order. O(size). Re-reads `_n` each step, so a re-entrant
+     * extractMin from inside fn self-terminates rather than reading out of bounds.
+     * @param {(key:number, priority:number, queue:BucketQueue)=>void} fn
+     */
+    forEach(fn) {
+        const d = this._dense;
+        const p = this._prio;
+        for (let i = 0; i < this._n; i++) fn(d[i], p[i], this);
+    }
+
+    /**
+     * Iterate live keys in dense storage order (same order as forEach). O(size).
+     * The ONE per-protocol ALLOCATOR (a {value, done} per step) -- kept OUT of the
+     * zero-alloc claims; use forEach for the alloc-free scan.
+     */
+    *[Symbol.iterator]() {
+        const d = this._dense;
+        for (let i = 0; i < this._n; i++) yield d[i];
+    }
+
+    // ---- private helpers (hot: node/bucket surgery; cold: throw builders) ------
+
+    /**
+     * Insert a brand-new key k at priority p: append it to bucket p's FIFO tail
+     * (newest), creating the list if the bucket is empty. Assumes k is validated,
+     * absent, p >= cursor, and _n < capacity. Bucket emptiness is decided by the
+     * cross-check (`h >= j` catches NIL / never-reused / stale-beyond-live; `_prio[h]
+     * !== p` catches a stale head re-used at a different priority). O(1).
+     * @private
+     */
+    _insertOne(k, p) {
+        const j = this._n;
+        const h = this._bHead[p];
+        this._dense[j] = k;
+        this._sparse[k] = j;
+        this._prio[j] = p;
+        if (h >= j || this._prio[h] !== p) {
+            // empty bucket (NIL / stale): j is the sole node.
+            this._bHead[p] = j;
+            this._bTail[p] = j;
+            this._pk[j] = BQ_NIL;
+            this._nk[j] = BQ_NIL;
+        } else {
+            // non-empty: append j at the tail (FIFO newest at this priority).
+            const t = this._bTail[p];
+            this._pk[j] = t;
+            this._nk[j] = BQ_NIL;
+            this._nk[t] = j;
+            this._bTail[p] = j;
+        }
+        this._n = j + 1;
+    }
+
+    /** @private */
+    _oob(k) {
+        // String(k) -- NOT '+ k' / a template literal: those THROW on a Symbol,
+        // which would turn a fail-closed reject into a different crash.
+        throw new RangeError('[lite-o1] key out of universe [0, ' + this._universe + '): ' + String(k));
+    }
+
+    /** @private */
+    _badPrio(p) {
+        throw new RangeError('[lite-o1] priority out of range [0, ' + this._ceiling + ']: ' + String(p));
+    }
+
+    /** @private */
+    _full() {
+        throw new RangeError('[lite-o1] BucketQueue full (capacity ' + this._cap + ')');
+    }
+
+    /** @private */
+    _rewind(p) {
+        throw new RangeError('[lite-o1] BucketQueue priority ' + String(p) +
+            ' is below the monotone cursor ' + this._cur + ' (extract order must be non-decreasing)');
     }
 }

@@ -22,7 +22,7 @@
  */
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1 } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue } from '../../O1.js';
 
 const U = 1 << 16;      // universe 65536
 const CAP = 1 << 14;    // capacity 16384
@@ -722,6 +722,135 @@ const freqForEachDrain = {
     statsOf(s) { return { grows: freqGrows(s) }; },
 };
 
+// ===========================================================================
+// BucketQueue scenarios -- private Uint32Array key columns + static bucket arrays,
+// all AMORTIZED O(1) zero-alloc (insert / decreaseKey / extractMin / forEach). The
+// bucket-list surgery + monotone cursor are pure pointer arithmetic over recycled
+// typed slots -- no coercion, no heap double.
+// ===========================================================================
+
+const BQ_U = 1 << 16;    // universe 65536
+const BQ_CEIL = 1 << 16; // priority ceiling headroom the climbing cursor never exhausts here
+const BQ_CAP = 1 << 14;  // capacity 16384
+const BQ_W = 1 << 12;    // 4096 resident keys -> steady state, never full/empty
+const BQ_SPREAD = 1 << 8; // bounded active-bucket span (hot bucket array)
+
+/**
+ * The zero-alloc counter for BucketQueue scenarios: the byte lengths of EVERY backing
+ * Uint32Array (the key substrate + node columns + the static bucket head/tail arrays).
+ * Capacity + universe + ceiling are fixed at construction, so this NEVER grows -- the
+ * delta across the window must be 0 (the `bucketGrows` 0-delta canary; mirrors grows /
+ * ringGrows / ufGrows / monoGrows / minGrows / randGrows / freqGrows).
+ */
+function bucketGrows(s) {
+    const q = s.bq;
+    return q._dense.buffer.byteLength + q._sparse.buffer.byteLength +
+        q._prio.buffer.byteLength + q._nk.buffer.byteLength + q._pk.buffer.byteLength +
+        q._bHead.buffer.byteLength + q._bTail.buffer.byteLength;
+}
+
+/**
+ * insert-churn: fresh keys at capacity, all at priority 0 (the cursor never leaves 0
+ * because nothing is extracted). insert is fail-closed past capacity, so clear()
+ * (O(1), zero-alloc, resets the cursor to 0) the instant the queue is full and keep
+ * refilling -- the queue never exceeds BQ_CAP and every op is a real insert.
+ */
+const bqInsertChurn = {
+    name: 'BucketQueue insert-churn',
+    setup() { return { bq: new BucketQueue(BQ_U, BQ_CEIL, BQ_CAP), n: 0 }; },
+    hot(s, n) {
+        const q = s.bq;
+        let live = s.n | 0;
+        for (let i = 0; i < n; i++) {
+            if (live === BQ_CAP) { q.clear(); live = 0; }
+            q.insert(live, 0);
+            live = (live + 1) | 0;
+        }
+        s.n = live | 0;
+    },
+    statsOf(s) { return { grows: bucketGrows(s) }; },
+};
+
+/**
+ * extract-drain: refill a bounded resident window across a bounded active-bucket span
+ * the instant the queue empties, then extractMin one per op -- so the measured window
+ * is dominated by REAL removals (the bucket head-pop, the swap-remove pointer fix-up,
+ * the monotone cursor advancing as a bucket empties). The queue oscillates
+ * 0 -> BQ_W (< BQ_CAP), never full, and every op is zero-alloc. clear() resets the
+ * cursor to 0 each cycle so the refill's low priorities never trip the rewind guard.
+ */
+const bqExtractDrain = {
+    name: 'BucketQueue extract-drain (bulk fill then drain)',
+    setup() { return { bq: new BucketQueue(BQ_U, BQ_CEIL, BQ_CAP) }; },
+    hot(s, n) {
+        const q = s.bq;
+        for (let i = 0; i < n; i++) {
+            if (q.size === 0) {
+                q.clear();
+                for (let k = 0; k < BQ_W; k++) q.insert(k, ((k * 2654435761) >>> 0) & (BQ_SPREAD - 1));
+            }
+            q.extractMin();
+        }
+    },
+    statsOf(s) { return { grows: bucketGrows(s) }; },
+};
+
+/**
+ * decreaseKey-churn: prime BQ_W resident keys at a bounded HIGH priority, then each op
+ * relaxes one key DOWN by one bucket toward the cursor (a real cross-bucket surgery:
+ * unlink from bucket p, relink at bucket p-1). Nothing is extracted, so the cursor
+ * stays at 0 and every decrease is >= cursor. Every BQ_W ops the queue is cleared +
+ * re-primed at the high priority (O(BQ_W), amortized, zero-alloc) so the keys always
+ * have room to keep stepping down.
+ */
+const bqDecreaseKeyChurn = {
+    name: 'BucketQueue decreaseKey-churn',
+    setup() {
+        const bq = new BucketQueue(BQ_U, BQ_CEIL, BQ_CAP);
+        for (let k = 0; k < BQ_W; k++) bq.insert(k, BQ_SPREAD - 1);
+        return { bq, i: 0 };
+    },
+    hot(s, n) {
+        const q = s.bq;
+        let idx = s.i | 0;
+        for (let i = 0; i < n; i++) {
+            if ((idx & (BQ_W - 1)) === 0) {
+                q.clear();
+                for (let k = 0; k < BQ_W; k++) q.insert(k, BQ_SPREAD - 1);
+            }
+            const key = idx & (BQ_W - 1);
+            const cp = q.priorityOf(key);
+            if (cp > 0) q.decreaseKey(key, cp - 1); // step one bucket down (>= cursor 0)
+            idx = (idx + 1) | 0;
+        }
+        s.i = idx | 0;
+    },
+    statsOf(s) { return { grows: bucketGrows(s) }; },
+};
+
+/**
+ * BucketQueue forEach-drain: a primed queue drained each op through a HOISTED
+ * module-scope callback (never re-created per op). Mirrors SparseSet's forEachDrain --
+ * proves forEach itself (the alloc-free dense-order scan; the ONE per-protocol
+ * allocator is [Symbol.iterator], gated separately by bqMustFailAlloc) allocates
+ * nothing over its own dedicated window.
+ */
+let bqDrainAcc = 0;
+function bqDrainInto(k, p) { bqDrainAcc = (bqDrainAcc + k + p) | 0; }
+const bqForEachDrain = {
+    name: 'BucketQueue forEach-drain',
+    setup() {
+        const bq = new BucketQueue(BQ_U, BQ_CEIL, BQ_CAP);
+        for (let i = 0; i < 256; i++) bq.insert(i, i & (BQ_SPREAD - 1)); // bounded resident set to drain
+        return { bq };
+    },
+    hot(s, n) {
+        const q = s.bq;
+        for (let i = 0; i < n; i++) q.forEach(bqDrainInto);
+    },
+    statsOf(s) { return { grows: bucketGrows(s) }; },
+};
+
 const scenarios = [
     addChurn, hasHit, deleteChurn, clearRefill, forEachDrain,
     ringFifo, ringLifo, ringInterleave,
@@ -730,6 +859,7 @@ const scenarios = [
     minPushChurn, minPopDrain, minExtremeRead, minForEachDrain,
     randSampleRead, randRemoveDrain, randAddChurn, randForEachScan,
     freqIncrementChurn, freqPopMinDrain, freqForEachDrain,
+    bqInsertChurn, bqExtractDrain, bqDecreaseKeyChurn, bqForEachDrain,
 ];
 
 /**
@@ -888,6 +1018,33 @@ const freqMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/**
+ * The BucketQueue teeth: a per-op `[Symbol.iterator]` spread into a FRESH [] each op --
+ * the generator + its per-step {value, done} wrappers + the array MUST trip the gate
+ * (scavenges scale with n), proving the instrument has teeth on the BucketQueue surface
+ * too (its iterator is the ONE documented per-protocol allocator; forEach is the
+ * alloc-free scan). statsOf returns a constant so the failure is the allocation lanes,
+ * not a missing-counter artifact.
+ */
+const bqMustFailAlloc = {
+    name: 'BucketQueue [Symbol.iterator] spread into fresh array (MUST allocate)',
+    setup() {
+        const bq = new BucketQueue(256, 256, 256);
+        for (let i = 0; i < 64; i++) bq.insert(i, i & 63);
+        return { bq };
+    },
+    hot(s, n) {
+        const bq = s.bq;
+        let sink = 0;
+        for (let i = 0; i < n; i++) {
+            const arr = [...bq]; // fresh generator + array per op -> heap churn
+            sink += arr.length;
+        }
+        s.sink = sink;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -897,5 +1054,5 @@ zgcSuite({
     counters: { grows: 0 },
     maxRetainedKB: 64,
     scenarios,
-    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc],
+    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc],
 });

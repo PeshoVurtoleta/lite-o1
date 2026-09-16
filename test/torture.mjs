@@ -39,7 +39,7 @@ async function main() {
     const { GcProfiler, checkNoGc, measureAllocs } =
         await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1 } = await import('../O1.js');
+    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue } = await import('../O1.js');
 
     const U = 1 << 16;      // universe 65536
     const CAP = 1 << 14;    // capacity 16384
@@ -135,6 +135,18 @@ async function main() {
             fq.peekMin();
             fq.popMin();
             tracker.track(fq, noop, 'freqo1', { audit: true });
+            // BucketQueue owns only its private Uint32Array key columns + static
+            // bucket arrays; nothing external to release. Its arrays hold numbers, so
+            // a reclaimed instance is the desired outcome, proven by size()->0.
+            // Exercise insert/decreaseKey/priorityOf/peekMin/extractMin before tracking.
+            const bq = new BucketQueue(1024, 255, 256);
+            bq.insert(i & 1023, (i + 1) & 255);
+            bq.insert((i + 1) & 1023, (i + 2) & 255);
+            bq.decreaseKey(i & 1023, i & 255);
+            bq.priorityOf(i & 1023);
+            bq.peekMin();
+            bq.extractMin();
+            tracker.track(bq, noop, 'bucketqueue', { audit: true });
         }
         return tracker.size();
     }
@@ -283,6 +295,29 @@ async function main() {
     const freqBpc = freqAllocRes.bytesPerCall === null ? 0 : freqAllocRes.bytesPerCall;
     const freqAllocBytes = Math.max(0, Math.round(freqBpc));
     const freqAllocOk = freqAllocBytes === 0;
+
+    // BucketQueue hot path: a bounded resident monotone priority queue drained in a
+    // rolling window. Each step extractMin-removes the min-priority key (the bucket
+    // head-pop + swap-remove pointer fix-up, plus the monotone cursor advancing as a
+    // bucket empties) and re-inserts that key ONE bucket ahead of the cursor (always
+    // >= cursor, so the monotone contract never trips). Size stays steady at BUCK_W
+    // and the cursor climbs slowly, exercising the cross-bucket surgery + the cursor
+    // advance without ever touching full/empty. Every op is AMORTIZED O(1), zero-alloc
+    // (the key columns + static bucket arrays recycle typed slots only). The ceiling
+    // is sized far above the cursor's reach across the whole run (the O(ceiling) space
+    // co-headline -- two ~4 MiB static bucket columns), so no clear/reprime is needed.
+    const BUCK_W = 1 << 12;              // 4096 resident keys, < CAP so never full
+    const BUCK_CEIL = 1 << 20;           // 1048576 priorities: cursor never nears it in this run
+    const buck = new BucketQueue(U, BUCK_CEIL, CAP);
+    for (let k = 0; k < BUCK_W; k++) buck.insert(k, 0); // prime a bounded resident window at priority 0
+    const buckStep = () => {
+        const k = buck.extractMin();     // drain the min key (cursor advances when a bucket empties)
+        buck.insert(k, buck.cursor + 1); // re-insert one bucket ahead -> rolling window
+    };
+    const buckAllocRes = measureAllocs(buckStep, { iterations: 100000, batches: 8 });
+    const buckBpc = buckAllocRes.bytesPerCall === null ? 0 : buckAllocRes.bytesPerCall;
+    const buckAllocBytes = Math.max(0, Math.round(buckBpc));
+    const buckAllocOk = buckAllocBytes === 0;
     // "0 B/op" resolved at the sampling floor: heapUsed deltas are quantized and
     // noisy, so a truly non-allocating op reads a sub-byte figure (a lone blip
     // in one batch / iterations). Round to the nearest byte -- any per-op
@@ -303,6 +338,7 @@ async function main() {
         minStep();
         randStep();
         freqStep();
+        buckStep();
         if ((i & 8191) === 0) {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
         }
@@ -360,6 +396,19 @@ async function main() {
         while (freq.size > 0) SINK += freq.popMin() >= 0 ? 1 : 0;
         freq.clear();
     }
+    // BucketQueue fill (across a spread of priorities -> real bucket surgery) +
+    // decreaseKey relaxation + extractMin drain + forEach + O(1) clear cycles --
+    // exercises insert, cross-bucket decreaseKey, the swap-remove pointer fix-up, the
+    // alloc-free scan, and clear. clear() resets the cursor, so each cycle re-enters
+    // the low-priority band; the drain empties it each cycle.
+    buck.clear(); // the hot loop left the cursor high; clear() resets it to 0 to re-prime low
+    for (let f = 0; f < 1024; f++) {
+        for (let k = 0; k < 512; k++) buck.insert(k, (k * 2654435761) & 511);
+        for (let k = 0; k < 512; k++) buck.decreaseKey(k, 0); // relax all to priority 0 (>= cursor 0)
+        buck.forEach(cb);
+        while (buck.size > 0) SINK += buck.extractMin() >= 0 ? 1 : 0;
+        buck.clear();
+    }
     await new Promise((r) => setTimeout(r, 50));
     const s2 = gc.summary();
     const report = checkNoGc(s2, { maxMajor: 0, maxPauseMs: 2 });
@@ -391,6 +440,9 @@ async function main() {
         for (let k = 0; k < CAP; k++) freq.add(k);
         while (freq.size > 0) freq.popMin();
         freq.clear();
+        for (let k = 0; k < CAP; k++) buck.insert(k, 0);
+        while (buck.size > 0) buck.extractMin();
+        buck.clear();
     }
     globalThis.gc();
     const abAfter = process.memoryUsage().arrayBuffers;
@@ -400,7 +452,7 @@ async function main() {
     // ---- verdict + GATE line ----------------------------------------------
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
         findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && monoAllocOk &&
-        minAllocOk && randAllocOk && freqAllocOk && abOk;
+        minAllocOk && randAllocOk && freqAllocOk && buckAllocOk && abOk;
 
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
@@ -410,7 +462,7 @@ async function main() {
         ' | alloc=' + allocBytes + ' B/op (SparseSet) ' + ringAllocBytes + ' B/op (RingDeque) ' +
         ufAllocBytes + ' B/op (UnionFind) ' + monoAllocBytes + ' B/op (MonoDeque) ' +
         minAllocBytes + ' B/op (MinStack) ' + randAllocBytes + ' B/op (RandomSet) ' +
-        freqAllocBytes + ' B/op (FreqO1)' +
+        freqAllocBytes + ' B/op (FreqO1) ' + buckAllocBytes + ' B/op (BucketQueue)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
         ' (tracked=' + trackedMid + ' sink=' + SINK + ' abGrowth=' + abDelta + ')');
 
@@ -428,6 +480,7 @@ async function main() {
         if (!minAllocOk) console.error('  alloc ' + minAllocBytes + ' B/op MinStack (raw bytesPerCall ' + minBpc + ')');
         if (!randAllocOk) console.error('  alloc ' + randAllocBytes + ' B/op RandomSet (raw bytesPerCall ' + randBpc + ')');
         if (!freqAllocOk) console.error('  alloc ' + freqAllocBytes + ' B/op FreqO1 (raw bytesPerCall ' + freqBpc + ')');
+        if (!buckAllocOk) console.error('  alloc ' + buckAllocBytes + ' B/op BucketQueue (raw bytesPerCall ' + buckBpc + ')');
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;
     }

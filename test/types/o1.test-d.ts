@@ -5,7 +5,7 @@
  * fails `npm run test:types`. Not executed; only type-checked.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, VERSION } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, VERSION } from '../../O1.js';
 
 // VERSION is a string.
 const v: string = VERSION;
@@ -354,3 +354,60 @@ new FreqO1('1000');
 new FreqO1(1000, 256, 'max');
 // @ts-expect-error -- increment takes a number.
 fq.increment('3');
+
+// --- BucketQueue -----------------------------------------------------------
+
+// Constructor: universe + ceiling required; capacity optional (all numbers).
+const bq: BucketQueue = new BucketQueue(1000, 255);
+const bqCap: BucketQueue = new BucketQueue(1000, 255, 256);
+void bqCap;
+
+// Getters: size / capacity / universe / ceiling / cursor are readonly numbers.
+const bqsize: number = bq.size;
+const bqcap: number = bq.capacity;
+const bquniv: number = bq.universe;
+const bqceil: number = bq.ceiling;
+const bqcur: number = bq.cursor;
+void bqsize; void bqcap; void bquniv; void bqceil; void bqcur;
+
+// @ts-expect-error -- size is readonly.
+bq.size = 5;
+// @ts-expect-error -- ceiling is readonly.
+bq.ceiling = 5;
+// @ts-expect-error -- cursor is readonly.
+bq.cursor = 5;
+
+// insert / decreaseKey -> this (chainable); has -> boolean; priorityOf -> number.
+const chainedBq: BucketQueue = bq.insert(1, 3).decreaseKey(1, 2);
+const bqhas: boolean = bq.has(1);
+const bqprio: number = bq.priorityOf(1);
+const bqcleared: void = bq.clear();
+void chainedBq; void bqhas; void bqprio; void bqcleared;
+
+// peekMin / extractMin -> number | undefined.
+const bqpeek: number | undefined = bq.peekMin();
+const bqext: number | undefined = bq.extractMin();
+void bqpeek; void bqext;
+
+// forEach callback gets (key, priority, queue).
+bq.forEach((k, priority, queue) => {
+    const kk: number = k;
+    const pp: number = priority;
+    const self: BucketQueue = queue;
+    void kk; void pp; void self;
+});
+
+// Iterable of number.
+for (const k of bq) {
+    const kk: number = k;
+    void kk;
+}
+const bqspread: number[] = [...bq];
+void bqspread;
+
+// @ts-expect-error -- universe must be a number.
+new BucketQueue('1000', 255);
+// @ts-expect-error -- ceiling must be a number.
+new BucketQueue(1000, 'x');
+// @ts-expect-error -- insert takes numbers.
+bq.insert('3', 0);

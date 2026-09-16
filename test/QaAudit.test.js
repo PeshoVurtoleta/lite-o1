@@ -10,7 +10,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1 } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue } from '../O1.js';
 
 const litO1 = (e) => e instanceof Error && /^\[lite-o1]/.test(e.message);
 
@@ -938,4 +938,152 @@ test('ADVERSARIAL: popMin() called from inside a for-of ([Symbol.iterator]) walk
     assert.equal(threw, false, 'for-of + re-entrant popMin() must not throw');
     assert.ok(visited <= startSize, 'for-of walk ran past the original member count: ' + visited);
     assert.ok(freqCrossCheckOk(f), 'cross-check broken after re-entrant popMin() during for-of');
+});
+
+// ===========================================================================
+// BucketQueue boundary audits (dense/sparse substrate + static bucket forest +
+// the monotone-cursor contract)
+// ===========================================================================
+
+// A local cross-check helper (dense/sparse invariant + priority in [0, ceiling]).
+function bqCrossCheckOk(q) {
+    for (let i = 0; i < q._n; i++) {
+        const key = q._dense[i];
+        if (q._sparse[key] !== i) return false;
+        if (!q.has(key)) return false;
+        if (q._prio[i] > q._ceiling) return false;
+        if (q.priorityOf(key) !== q._prio[i]) return false;
+    }
+    return true;
+}
+
+// Snapshot every private column + scalar a mutator can touch (byte-identical proofs).
+function bqSnapshot(q) {
+    return {
+        n: q._n, cur: q._cur,
+        dense: q._dense.slice(), sparse: q._sparse.slice(), prio: q._prio.slice(),
+        nk: q._nk.slice(), pk: q._pk.slice(),
+        bHead: q._bHead.slice(), bTail: q._bTail.slice(),
+    };
+}
+
+test('ADVERSARIAL: BucketQueue has/priorityOf must not throw on a Symbol / BigInt key; insert/decreaseKey reject typeof-first', () => {
+    const q = new BucketQueue(100, 8);
+    q.insert(0, 0);
+    assert.doesNotThrow(() => q.has(Symbol('k')), 'has(Symbol) must not throw');
+    assert.equal(q.has(Symbol('k')), false);
+    assert.doesNotThrow(() => q.priorityOf(5n), 'priorityOf(BigInt) must not throw');
+    assert.equal(q.priorityOf(5n), -1);
+    // insert / decreaseKey must fail closed with [lite-o1], not a raw TypeError from coercion.
+    assert.throws(() => q.insert(Symbol('k'), 0), litO1, 'insert(Symbol) must be [lite-o1]');
+    assert.throws(() => q.insert(5n, 0), litO1, 'insert(BigInt) must be [lite-o1]');
+    assert.throws(() => q.decreaseKey(Symbol('k'), 0), litO1, 'decreaseKey(Symbol) must be [lite-o1]');
+    assert.throws(() => q.decreaseKey(5n, 0), litO1, 'decreaseKey(BigInt) must be [lite-o1]');
+    assert.equal(q.size, 1);
+    assert.ok(bqCrossCheckOk(q));
+});
+
+test('ADVERSARIAL: BucketQueue rejects a Symbol / BigInt / object-with-valueOf PRIORITY typeof-first, byte-identical', () => {
+    const q = new BucketQueue(100, 8);
+    q.insert(2, 3);
+    const before = bqSnapshot(q);
+    /* eslint-disable no-new-wrappers */
+    for (const bad of [Symbol('p'), 5n, { valueOf: () => 1 },
+        { valueOf: () => 1, toString: () => '1' }, new Number(1)]) {
+        assert.throws(() => q.insert(0, bad), litO1, 'insert prio=' + String(bad));
+        assert.throws(() => q.decreaseKey(2, bad), litO1, 'decreaseKey prio=' + String(bad));
+    }
+    /* eslint-enable no-new-wrappers */
+    assert.deepEqual(bqSnapshot(q), before, 'a bad-priority reject mutated state');
+    assert.equal(q.priorityOf(2), 3);
+    assert.ok(bqCrossCheckOk(q));
+});
+
+test('ADVERSARIAL: BucketQueue rejects NaN / null / -1 / 1.5 / -0-priority-ok / >= universe / > ceiling -- byte-identical no-op', () => {
+    const q = new BucketQueue(10, 5);
+    q.insert(2, 3);
+    const before = bqSnapshot(q);
+    // bad keys.
+    for (const bad of [NaN, null, undefined, -1, 1.5, 10, 11]) {
+        assert.throws(() => q.insert(bad, 0), litO1, 'insert key=' + String(bad));
+        assert.doesNotThrow(() => q.has(bad));
+        assert.equal(q.has(bad), false);
+        assert.doesNotThrow(() => q.priorityOf(bad));
+        assert.equal(q.priorityOf(bad), -1);
+    }
+    // bad priorities (NaN, null, -1, 1.5, 6 > ceiling 5).
+    for (const bad of [NaN, null, undefined, -1, 1.5, 6, Infinity]) {
+        assert.throws(() => q.insert(0, bad), litO1, 'insert prio=' + String(bad));
+    }
+    assert.deepEqual(bqSnapshot(q), before, 'a reject mutated state');
+    assert.equal(q.size, 1);
+    // -0 aliases key 0 AND priority 0 (uint32 coercion), not rejected.
+    q.clear();
+    assert.doesNotThrow(() => q.insert(-0, -0));
+    assert.equal(q.has(0), true);
+    assert.equal(q.priorityOf(0), 0);
+    assert.ok(bqCrossCheckOk(q));
+});
+
+test('ADVERSARIAL: BucketQueue rewind guard -- insert/decreaseKey below the cursor throw a byte-identical no-op', () => {
+    const q = new BucketQueue(64, 16);
+    q.insert(1, 4); q.insert(2, 9);
+    assert.equal(q.extractMin(), 1); // cursor -> 4
+    assert.equal(q.cursor, 4);
+    const before = bqSnapshot(q);
+    assert.throws(() => q.insert(3, 0), litO1, 'insert below cursor');
+    assert.throws(() => q.insert(3, 3), litO1, 'insert below cursor');
+    assert.throws(() => q.decreaseKey(2, 3), litO1, 'decreaseKey below cursor');
+    assert.deepEqual(bqSnapshot(q), before, 'a below-cursor reject mutated state');
+    assert.ok(bqCrossCheckOk(q));
+});
+
+test('BucketQueue: peekMin/extractMin on empty are undefined over 1000 calls, 0 throws; priorityOf(absent) = -1', () => {
+    const q = new BucketQueue(50, 10);
+    let throws = 0;
+    for (let i = 0; i < 1000; i++) {
+        try {
+            assert.ok(Object.is(q.peekMin(), undefined));
+            assert.ok(Object.is(q.extractMin(), undefined));
+        } catch { throws++; }
+    }
+    assert.equal(throws, 0);
+    assert.equal(q.priorityOf(0), -1);
+    q.insert(0, 3);
+    q.clear();
+    assert.ok(Object.is(q.peekMin(), undefined));
+    assert.equal(q.priorityOf(0), -1);
+});
+
+test('BucketQueue: re-entrant extractMin() from inside forEach shrinks safely, no throw / no OOB', () => {
+    const N = 200;
+    const q = new BucketQueue(N, N);
+    for (let k = 0; k < N; k++) q.insert(k, k);
+    let throws = 0;
+    let iterations = 0;
+    const startSize = q.size;
+    q.forEach(() => {
+        iterations++;
+        try { q.extractMin(); } catch { throws++; }
+    });
+    assert.equal(throws, 0, 'extractMin() from inside forEach must never throw');
+    assert.ok(iterations >= 1 && iterations <= startSize, 'iterations ' + iterations + ' out of bounds');
+    assert.ok(q.size < startSize, 'extractMin() from inside forEach must have shrunk the queue');
+    assert.ok(bqCrossCheckOk(q), 'cross-check broken after re-entrant extractMin() during forEach');
+});
+
+test('BucketQueue: clear() voids stale STATIC buckets -- a lower-priority second generation drains correctly', () => {
+    const q = new BucketQueue(64, 32);
+    // generation 1: fill high, drain some to push the cursor up, then clear.
+    for (let k = 0; k < 8; k++) q.insert(k, 20 + k);
+    q.extractMin(); q.extractMin();
+    assert.ok(q.cursor >= 20);
+    q.clear();
+    assert.equal(q.cursor, 0);
+    // generation 2: reuse LOW priorities the stale static buckets still point into.
+    q.insert(10, 0); q.insert(11, 0); q.insert(12, 1);
+    assert.equal(q.extractMin(), 10); // FIFO within priority 0
+    assert.equal(q.extractMin(), 11);
+    assert.equal(q.extractMin(), 12);
+    assert.ok(bqCrossCheckOk(q));
 });

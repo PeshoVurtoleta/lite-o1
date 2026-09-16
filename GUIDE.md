@@ -288,6 +288,53 @@ there is no amortized spike to expose -- the flat line IS the worst-case claim.
 
 ---
 
+### BucketQueue (v0.8.0)
+
+Monotone integer priority queue ("Dial" / bucket queue) over private `Uint32Array`
+key columns + a STATIC per-priority bucket array. `insert(k, p)` adds a key at an
+integer priority, `decreaseKey(k, p)` lowers it, `extractMin` drains keys in
+NON-DECREASING priority order (FIFO tie-break) -- all AMORTIZED O(1). The
+amortized-honesty member for priority queues; the standalone primitive behind Dial's
+algorithm.
+
+**Reach for it when:**
+
+- You need a priority queue whose priorities are SMALL BOUNDED INTEGERS (edge weights,
+  distances, discrete levels) and you process them MONOTONICALLY -- Dijkstra / Dial's
+  algorithm over integer weights, event simulation with integer timestamps, bucket /
+  radix scheduling, level-by-level BFS with weights. Where a binary heap is O(log n) per
+  op, a bucket queue is O(1) amortized.
+- You need `decreaseKey` at O(1) (the relaxation step in Dijkstra) with zero per-op
+  allocation -- a binary heap's decreaseKey needs a position map and a sift.
+- The extract order is naturally non-decreasing (you never need to pull a priority below
+  one you have already extracted) -- that monotone discipline is what buys the constant.
+
+**Avoid it when:**
+
+- Your priorities are LARGE or UNBOUNDED, floats, or sparse over a huge range -- the
+  bucket array is `ceiling + 1` slots (space O(ceiling)); use a binary heap (O(log n) but
+  O(1) space per element) for a wide/continuous priority domain.
+- Your access pattern is NOT monotone -- you need to insert a priority BELOW the current
+  frontier (the cursor), or re-lower a key past it. BucketQueue fails closed (throws) on
+  a below-cursor insert / decreaseKey; a general (non-monotone) priority queue wants a
+  heap.
+- You are on a strict per-op WORST-CASE budget: a single `extractMin` is O(gap) worst
+  case when the cursor must jump across a long run of empty buckets (amortized O(1)) --
+  read the MAX-single-op line the witness prints, not just the flat amortized curve.
+- Keys are strings, objects, or sparse integers over a huge / unbounded domain -- the
+  `sparse` array is universe-sized; the same SparseSet caveat applies.
+
+**Measure it:** `npm run witness` -- BucketQueue `extractMin` flatness `>= 0.70` across
+the size sweep `[1e4..1e5]` (the 1e3 point is a pure-L1 micro-case, shown but not gated)
+while an alloc-free binary MIN-HEAP on the same monotone trace runs `>= 1.5x` slower per
+op. The heap foil is O(log n), so it decays only GENTLY (unlike the O(n) foils that
+collapse to `<= 0.55`) -- the evidence is BucketQueue's flat line plus its sustained
+throughput lead, not a foil collapse. Read the MAX-single-op line beside the flat
+amortized curve: a tall bar there is the honest O(gap) cursor-jump worst case, not an
+O(1) violation.
+
+---
+
 ## Roadmap members (not yet shipped)
 
 Placeholders so the decision axes are visible early; each fills in on release.

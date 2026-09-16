@@ -10,8 +10,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **8-dimension benchmark suite (`benchmark/`, repo-only -- NOT part of the
   published surface, NO version bump).** The ecosystem MVP of RESEARCH.md section 3:
-  it profiles the six shipped members (SparseSet, RingDeque, UnionFind, MonoDeque,
-  MinStack, RandomSet) against the JS built-ins across eight axes -- D1 latency distribution
+  it profiles six of the eight shipped members (SparseSet, RingDeque, UnionFind,
+  MonoDeque, MinStack, RandomSet; FreqO1 and BucketQueue are not yet in the matrix)
+  against the JS built-ins across eight axes -- D1 latency distribution
   (p50/p90/p99/p99.9/max, with + without forced GC), D2 amortized drift over long
   mixed traces, D3 memory footprint + stability, D4 cache behaviour (a labelled
   PORTABLE PROXY: dense-iteration vs random-lookup + a working-set stride sweep; no
@@ -31,6 +32,122 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   impossible 0 fails) + FIXED-SEED DETERMINISM (two runs at seed `0x9e3779b1`
   produce byte-identical workload trace hashes, using the repo's own Numerical
   Recipes LCG -- no new PRNG introduced).
+
+## [0.8.0] - 2026-09-16
+
+The eighth member of the O(1) family: an AMORTIZED O(1) MONOTONE integer priority
+queue ("Dial" / bucket queue) -- the standalone primitive behind Dial's algorithm
+(Dijkstra over small integer priorities). Tree-shakeable alongside SparseSet,
+RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, and FreqO1 (the eight share no
+mutable module state).
+
+### Added
+
+- **`BucketQueue(universe, ceiling, capacity = universe)`** -- a zero-GC, AMORTIZED
+  O(1) monotone integer priority queue over PRIVATE `Uint32Array` key columns and a
+  STATIC per-priority bucket array (NO public SlotPool; ADR 0003's SlotPool deferral
+  STANDS -- BucketQueue owns its own columns and stays self-contained + tree-shakeable):
+  - Layout: KEYS ride SparseSet's dense + sparse cross-check (the dense index is the
+    stable node id), so `clear()` is O(1). Per KEY: its priority (== its bucket index)
+    and an intrusive DOUBLY-linked FIFO list within a bucket. Per BUCKET (a STATIC array
+    indexed by priority 0..ceiling, NO free-list): FIFO head/tail key nodes. A scalar
+    cursor is the monotone frontier; extractMin / peekMin advance it FORWARD over
+    emptied buckets to the min non-empty bucket. A stale static bucket head (left by a
+    prior generation after `clear()`) is voided by the SAME `i < _n` cross-check that
+    voids stale sparse entries (a bucket p is non-empty iff `_bHead[p] < _n &&
+    _prio[_bHead[p]] === p`), so `clear()` needs no per-bucket reset.
+  - `insert(k, p) -> this` -- insert k at priority p. IDEMPOTENT no-op if k is already
+    present (use decreaseKey to lower it).
+  - `decreaseKey(k, newPrio) -> this` -- lower k's priority. An ABSENT key, or a newPrio
+    that is not a strict decrease, is a documented no-op (the conventional relaxation
+    semantics -- decreaseKey only ever lowers).
+  - `extractMin() -> number|undefined` -- remove + return the min-priority key (FIFO
+    tie-break); advances the cursor FORWARD only. `undefined` on empty, NEVER throws.
+  - `peekMin() -> number|undefined` -- the min-priority key without removing it.
+  - `priorityOf(k) -> number` -- k's priority, or **-1 if absent / bad** key. NEVER
+    throws (-1 is the unambiguous "not tracked" sentinel; every real priority is a
+    non-negative integer in [0, ceiling]).
+  - `has(k) -> boolean` -- membership; a bad key is ABSENT, never throws.
+  - `size` / `capacity` / `universe` / `ceiling` / `cursor` getters. `clear()` is O(1):
+    resets the live count + the cursor to 0, touches NO store.
+  - `forEach(fn)` -- an O(size) alloc-free scan in DENSE STORAGE order (NOT priority
+    order; fn is (key, priority, queue)), re-reading `size` each step so a re-entrant
+    `extractMin` self-terminates. `[Symbol.iterator]` -- an O(size) scan in the same
+    order that ALLOCATES per protocol, kept out of the zero-alloc claims.
+  - MONOTONE contract (what buys the amortized O(1)): the extract order is
+    non-decreasing and the cursor NEVER rewinds -- an insert below the cursor, or a
+    decreaseKey to a priority below the cursor, throws `[lite-o1]` fail-closed (a
+    byte-identical no-op). The cursor's total travel across a full drain is <= ceiling+1,
+    so extractMin amortizes to O(1) even though a single extractMin is O(gap) worst-case.
+    Space is O(ceiling) -- a documented co-headline (the static bucket arrays are length
+    ceiling+1); ceiling in [0, 2^31-1] is a TYPE bound, not a practical size. Fail
+    closed: a bad key / priority throws `[lite-o1]` on the MUTATORS insert / decreaseKey
+    (typeof-guarded BEFORE the coercing `>>>`, so a Symbol / BigInt never triggers a raw
+    `TypeError`; `null` is not zero), but is ABSENT for the QUERIES has / priorityOf
+    (never throw). A NEW key past capacity throws a byte-identical no-op. Pool sizing: at
+    most `capacity` keys are live, one capacity-sized node slot per key, so the
+    `n === capacity` guard makes over-allocation impossible; the static buckets have no
+    free-list to exhaust.
+- **`BucketQueue` type surface** in `O1.d.ts` (constructor + five getters + the six
+  methods + forEach + iterator), exercised by `test/types/o1.test-d.ts`.
+- **`test/BucketQueue.test.js`** -- contract (every method, return types) + boundary
+  (universe=1, ceiling=0, capacity=1, empty, full, key at 0 and universe-1, priority at
+  0 and ceiling) + WHITE-BOX priming of the `>=` ceiling guard (prio===ceiling ok,
+  prio>ceiling throws) and the rewind guard (extract to advance the cursor, then insert
+  / decreaseKey below it throws) as byte-identical no-ops + FIFO tie-break + clear/reuse
+  (stale static buckets voided) + re-entrant forEach / for-of + a large monotone-drain
+  vs an independent oracle + a >= 3e5-op interleaved insert / decreaseKey / peekMin /
+  extractMin differential fuzz vs a brute-force ORACLE (a `Map` of key -> {prio, tick} +
+  a min-scan), 0 divergences.
+- **`test/QaAudit.test.js`** -- a BucketQueue adversarial block: Symbol / BigInt /
+  object-with-valueOf / boxed Number / NaN / null / -1 / 1.5 / >= universe / > ceiling
+  keys AND priorities rejected typeof-first on the mutators with a byte-identical no-op
+  state; has / priorityOf never throw (priorityOf returns -1); the rewind guard as a
+  byte-identical no-op; -0 aliasing key 0 and priority 0; re-entrant extractMin from
+  inside forEach; the O(1) clear() voiding stale static buckets across a lower-priority
+  second generation.
+
+### Proof
+
+- **Torture** (`node --expose-gc test/torture.mjs`): BucketQueue added to every phase --
+  0 B/op on the hot path (a rolling extractMin + insert churn), `maxMajor` 0,
+  `maxPauseMs <= 2`, arrayBuffers delta <= 0, `tracker.size()` back to 0 after the
+  retention churn. The run proves 0 B/op across ALL EIGHT members.
+- **Witness** (`node test/witness.mjs`): BucketQueue `extractMin` stays FLAT from size
+  1e3 to 1e5 (a steady-state monotone churn) vs an ALLOC-FREE binary MIN-HEAP driven by
+  the SAME trace (O(log n)/op). Flatness >= 0.70 (steady window size >= 1e4),
+  BucketQueue/heap ratio >= 1.5x. The O(log n) heap foil decays only gently (it cannot
+  reach the O(n) foils' 0.55 collapse over a steady window), so it is REPORTED and
+  asserted merely to be LESS flat than the bucket queue -- the evidence is the sustained
+  throughput lead, not a foil collapse. Prints the MAX single-op time (an O(gap) cursor
+  jump) beside a typical O(1) extractMin -- the amortized-honesty bar (reported, NOT
+  gated), like MonoDeque.
+- **Perf gate** (`npm run test:perf`): three new zero-alloc scenarios (insert-churn,
+  extract-drain, decreaseKey-churn) plus a forEach-drain, with a `bucketGrows` 0-delta
+  canary on ALL backing `Uint32Array` columns (the key substrate + node columns + the
+  static bucket head/tail arrays), plus an iterator-into-fresh-array `mustFail` teeth case.
+
+### Changed
+
+- `VERSION` -> `'0.8.0'`; `package.json` version + description + keywords
+  (`priority-queue`, `bucket-queue`, `dial`, `dijkstra`, `monotone-priority-queue`). The
+  three version sites (`package.json` / `VERSION` / `llms.txt`) move together. The
+  SparseSet / RingDeque / UnionFind / MonoDeque / MinStack / RandomSet / FreqO1 class
+  bodies are BYTE-IDENTICAL -- only the `O1.js` header comment, the `VERSION` const, and
+  their `VERSION` test assertions changed.
+
+### ADR
+
+- [`0013`](./decisions/0013-bucketqueue-dial.md) -- the monotone-cursor invariant (and
+  why it buys amortized O(1)), the conditional-on-C + amortized honesty, the O(ceiling)
+  space co-headline, the static-buckets-no-free-list decision (and why ADR 0003's
+  SlotPool deferral stands), the O(1)-clear-over-static-buckets cross-check, the FIFO
+  within-bucket tie-break, the lean surface, the priorityOf(absent) = -1 rationale, the
+  insert-present / decreaseKey-absent / non-strict-decrease no-op decisions, the
+  pool-sizing / exhaustion-impossible-under-contract proof, and the binary-heap-foil
+  witness (and why an O(log n) foil is gated differently from an O(n) foil).
+
+[0.8.0]: https://www.npmjs.com/package/@zakkster/lite-o1/v/0.8.0
 
 ## [0.7.0] - 2026-09-16
 

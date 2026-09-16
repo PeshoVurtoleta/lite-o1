@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-Version: 0.7.0
+Version: 0.8.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -13,9 +13,9 @@ op is O(1) worst-case (or O(1)-amortized where stated) and allocates zero bytes
 after construction, and a shipped witness harness demonstrates the flat
 throughput curve against a built-in foil.
 
-v0.7.0 ships seven members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
-RandomSet, and FreqO1. They share no mutable module state, so a bundler that
-imports one drops the others (tree-shakeable).
+v0.8.0 ships eight members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
+RandomSet, FreqO1, and BucketQueue. They share no mutable module state, so a
+bundler that imports one drops the others (tree-shakeable).
 
 ## Exports (from the single main file O1.js)
 
@@ -30,7 +30,10 @@ imports one drops the others (tree-shakeable).
   WORST-CASE O(1) uniform sample() + removeRandom().
 - `FreqO1` -- class. A zero-GC WORST-CASE O(1) LFU frequency structure with
   add() / increment() / peekMin() / popMin() over a private bucket forest.
-- `VERSION` -- string, '0.7.0'.
+- `BucketQueue` -- class. A zero-GC AMORTIZED O(1) monotone integer priority queue
+  ("Dial") with insert() / decreaseKey() / extractMin() / peekMin() over private key
+  columns + a static per-priority bucket array.
+- `VERSION` -- string, '0.8.0'.
 
 ## SparseSet
 
@@ -377,6 +380,82 @@ Worst-case honesty: like MinStack / RandomSet, every hot op is WORST-CASE O(1) (
 fixed number of pointer writes on the bucket forest, never a run) -- so the witness
 prints NO MAX-single-op line; the flat line IS the worst-case claim.
 
+## BucketQueue
+
+    new BucketQueue(universe, ceiling, capacity = universe)
+
+- An AMORTIZED O(1) MONOTONE integer priority queue -- the standalone primitive behind
+  Dial's algorithm (Dijkstra over small integer priorities). Integer keys [0, universe)
+  are inserted at an integer priority [0, ceiling]; extractMin drains keys in
+  NON-DECREASING priority order (FIFO tie-break within a priority).
+- universe: exclusive key ceiling; integer in [1, 2^32]. Keys are integers in [0, universe).
+- ceiling: INCLUSIVE max priority; integer in [0, 2^31-1]. Priorities are [0, ceiling].
+  Space is O(ceiling) -- a documented co-headline: the static per-priority bucket arrays
+  are length ceiling+1. The 2^31-1 bound is a TYPE bound (an ~8 GiB bucket column), not a
+  practical size; a bucket queue is FOR small bounded integer priorities.
+- capacity: max simultaneously-live keys; integer in [1, universe], default universe.
+- Constructor throws a [lite-o1] RangeError on a bad universe / ceiling / capacity
+  (typeof-guarded FIRST so a Symbol / BigInt never reaches coercion; String(x) message).
+- Substrate (all PRIVATE Uint32Array columns; NO public SlotPool -- ADR 0003's deferral
+  stands): KEYS ride SparseSet's dense + sparse cross-check (dense index = the stable
+  node id). Per KEY: priority (== its bucket index) + next/prev intrusive FIFO list
+  within a bucket. Per BUCKET (a STATIC array indexed by priority 0..ceiling, NO
+  free-list): FIFO head/tail key nodes. A scalar cursor `_cur` is the monotone frontier;
+  extractMin / peekMin advance it FORWARD over emptied buckets to the min non-empty
+  bucket. clear() is O(1): a stale static bucket head is voided by the SAME `i < _n`
+  cross-check that voids stale sparse entries (a bucket p is non-empty iff
+  _bHead[p] < _n && _prio[_bHead[p]] === p), so no per-bucket reset is needed.
+
+Hot surface (all AMORTIZED O(1), zero allocation):
+
+- insert(k, p) -> this      Insert k at priority p. IDEMPOTENT no-op if k is already
+                            present (use decreaseKey to lower it). Fail closed: a bad
+                            key / bad priority / a priority BELOW the cursor / a NEW key
+                            past capacity throw [lite-o1] as a byte-identical no-op.
+- decreaseKey(k, newPrio) -> this  Lower k's priority. An ABSENT key, or a newPrio that
+                            is NOT a strict decrease, is a documented no-op (the
+                            conventional relaxation semantics -- decreaseKey only ever
+                            lowers). Fail closed: a bad key / bad priority / a newPrio
+                            BELOW the cursor throw [lite-o1] as a byte-identical no-op.
+- extractMin() -> number|undefined  Remove + return the min-priority key (FIFO tie-break).
+                            Advances the cursor FORWARD (never rewinds). undefined on
+                            empty, NEVER throws.
+- peekMin() -> number|undefined  The min-priority key without removing it. undefined on
+                            empty, NEVER throws.
+- priorityOf(k) -> number   k's priority, or -1 if absent / bad key. NEVER throws (-1 is
+                            the unambiguous "not tracked" sentinel; every real priority
+                            is a non-negative integer in [0, ceiling]).
+- has(k) -> boolean         True iff k is tracked. A bad key is ABSENT, never throws.
+- size / capacity / universe / ceiling / cursor (getters).
+- clear() -> void           O(1): resets the live count + the cursor to 0; touches NO
+                            store (stale dense/sparse + static buckets fail the cross-check).
+- forEach(fn) -> void       O(size) alloc-free scan in DENSE STORAGE order (NOT priority
+                            order); fn is (key, priority, queue). Re-reads size each step,
+                            so a re-entrant extractMin self-terminates.
+- [Symbol.iterator]()       O(size) scan, same order; ALLOCATES per protocol -- use
+                            forEach for the alloc-free scan.
+
+MONOTONE contract (LOCKED -- this is what buys the amortized O(1)): the extract order is
+non-decreasing and the cursor NEVER rewinds. insert(k, p) with p < cursor, and
+decreaseKey(k, newPrio) with newPrio < cursor, both THROW [lite-o1] (fail-closed,
+byte-identical no-op before the throw). Because the cursor only moves forward, its total
+travel across a full drain is <= ceiling+1, so the per-extractMin bucket scan amortizes to
+O(1) even though a single extractMin is O(gap) worst-case (the amortized-not-worst-case
+honesty, like MonoDeque / UnionFind). Guards use `>=` (p >= ceiling+1) / `<` (p < cursor)
+/ `===` (n === capacity), all fail-closed.
+
+Key / priority model: keys integer [0, universe); priorities integer [0, ceiling]. Both
+guards are typeof-first (`typeof x !== 'number' || (x >>> 0) !== x || x >= bound`) so a
+Symbol / BigInt never reaches the coercing `>>>`; messages via String(x). null is not
+zero. Fail closed on the MUTATORS (insert / decreaseKey), ABSENT on the QUERIES (has /
+priorityOf never throw). -0 aliases key 0 AND priority 0 via the uint32 coercion.
+
+Pool sizing (why exhaustion is impossible under contract, yet still fails closed): at most
+capacity keys are live at once, one node slot per key (dense / prio / nk / pk are all
+capacity-sized), so the `n === capacity` guard rejects a NEW key past capacity as a
+byte-identical no-op and no node slot is ever over-allocated. The buckets are static
+(0..ceiling), so there is no bucket free-list to exhaust.
+
 ## Design bounds
 
 - SparseSet valid key: integer in [0, universe).
@@ -411,15 +490,25 @@ prints NO MAX-single-op line; the flat line IS the worst-case claim.
   transient peak), so exhaustion cannot occur; the guard is defense in depth. forEach /
   [Symbol.iterator] scan in dense storage order (iterator allocates). NO decrement, NO
   peekMax, NO delete(k).
+- BucketQueue valid key: integer in [0, universe); valid priority: integer in [0, ceiling];
+  fixed capacity, no growth. MONOTONE: extractMin drains in non-decreasing priority order,
+  the cursor never rewinds; insert / decreaseKey below the cursor throw (fail closed).
+  Space O(ceiling). Fail closed on the mutators insert / decreaseKey (throws [lite-o1];
+  null is never coerced to key 0), absent on the queries has / priorityOf (never throw;
+  priorityOf returns -1). insert / decreaseKey / extractMin / peekMin are AMORTIZED O(1)
+  (a single extractMin is O(gap) worst-case); extractMin / peekMin undefined on empty.
+  FIFO tie-break within a priority. Static buckets 0..ceiling, no free-list. forEach /
+  [Symbol.iterator] scan in dense storage order (iterator allocates). insert of a present
+  key, and decreaseKey of an absent key or a non-strict-decrease, are documented no-ops.
 
 ## Scripts
 
-- npm test           -- 290 node:test cases (contract + boundary + differential fuzz).
+- npm test           -- 339 node:test cases (contract + boundary + differential fuzz).
 - npm run test:types -- tsc --noEmit against O1.d.ts.
 - npm run torture    -- lite-leak + lite-gc-profiler: 0 B/op, 0 major GC, leak-free.
 - npm run witness    -- O(1) throughput-invariance harness + foils + flatness gate.
 - npm run test:perf  -- lite-perf-gate hard zero-alloc scavenge-scaling gate.
-- npm run verify     -- all six (publish gate).
+- npm run verify     -- all five gates (publish gate).
 
 ## Witness gate (locked)
 
@@ -469,6 +558,17 @@ prints NO MAX-single-op line; the flat line IS the worst-case claim.
   is pinned). FreqO1 flatness >= 0.70; naive foil flatness <= 0.55; FreqO1/naive ratio
   >= 1.5x. NO MAX-single-op line: add / increment / peekMin / popMin are worst-case
   O(1) (a fixed number of pointer writes, no run).
+- BucketQueue: size-sweep [1e3, 1e4, 1e5], AMORTIZED-O(1) extractMin (a steady-state
+  monotone churn: extractMin + re-insert one bounded window ahead of the cursor) vs an
+  ALLOC-FREE binary MIN-HEAP driven by the SAME trace (O(log n) sift per op). ops/ms is a
+  rate (both batch 5e5). Gated over the steady window size >= 1e4 (the 1e3 point is a
+  pure-L1 micro-case shown but not gated). BucketQueue flatness >= 0.70; BucketQueue/heap
+  ratio >= 1.5x; the heap foil flatness is REPORTED and asserted merely to be LESS flat
+  than the bucket queue -- an O(log n) foil decays only ~log(n_lo)/log(n_hi) per decade
+  (~0.8) and CANNOT reach the O(n) foils' 0.55 collapse over a steady window, so the
+  evidence is the sustained throughput lead, not a foil collapse (see ADR 0013). The
+  witness ALSO prints the MAX single-op time (an O(gap) cursor jump across empty buckets)
+  beside a typical O(1) extractMin -- the amortized-honesty bar (reported, NOT gated).
 
 ## Not yet shipped
 
@@ -479,6 +579,7 @@ column or @zakkster/lite-arena); RingDeque holds numbers only; UnionFind holds
 disjoint-set connectivity over [0, n), not payloads; MonoDeque holds numeric
 window extremes only, MinStack holds numeric stack values + their running
 extreme only, RandomSet holds integer membership + uniform sampling over
-[0, universe), and FreqO1 holds integer keys + their access FREQUENCY over
-[0, universe) -- an LFU primitive, not a full cache (queue integer handles for
-object payloads).
+[0, universe), FreqO1 holds integer keys + their access FREQUENCY over
+[0, universe) -- an LFU primitive, not a full cache -- and BucketQueue holds integer
+keys + their integer PRIORITY over [0, universe) x [0, ceiling] -- a monotone priority
+queue, not a general heap (queue integer handles for object payloads).
