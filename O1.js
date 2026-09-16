@@ -3,11 +3,11 @@
  * that doubles as a teachable textbook: each member solves a real problem AND
  * proves its constant is real (the O(1) Witness -- see test/witness.mjs).
  *
- * v1.2.0 ships twelve members -- SparseSet, RingDeque, UnionFind, MonoDeque,
+ * v1.3.0 ships thirteen members -- SparseSet, RingDeque, UnionFind, MonoDeque,
  * MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel,
- * RingLog, and CuckooMap -- plus its `VERSION` const. The twelve are independent (no
- * shared mutable module state), so a bundler that imports one drops the others
- * (`sideEffects: false`).
+ * RingLog, CuckooMap, and SparseTable -- plus its `VERSION` const. The thirteen are
+ * independent (no shared mutable module state), so a bundler that imports one drops
+ * the others (`sideEffects: false`).
  *
  * The complexity class IS the product: every hot op below is O(1) worst-case and
  * allocates ZERO bytes after construction. The witness harness (never imported
@@ -18,7 +18,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.2.0';
+export const VERSION = '1.3.0';
 
 /** Largest universe the Uint32 substrate + the (k >>> 0) key check can honor. */
 const MAX_UNIVERSE = 0x100000000; // 2^32
@@ -3473,5 +3473,198 @@ export class CuckooMap {
     _fail(k) {
         throw new RangeError(
             '[lite-o1] CuckooMap could not place key ' + String(k) + ' after an in-place re-seed (load too high)');
+    }
+}
+
+// ---- SparseTable internals (module-level, cold-shared, no mutable module state) ----
+
+/**
+ * Largest source length SparseTable admits. Keeps the flat sparse table
+ * n*(floor(log2 n)+1) cells under 2^31 Float64 slots even at the ceiling (2^26 * 27 <
+ * 2^31), so no single typed array overflows. A TYPE bound (a 2^26-element source is
+ * already ~537 MB of table), not a size any host materializes -- the fail-closed guard,
+ * not a promise (mirrors MinStack's 2^31 ceiling note).
+ */
+const SPARSETABLE_MAX_LEN = 0x4000000; // 2^26
+
+/**
+ * SparseTable -- a zero-GC, WORST-CASE O(1) STATIC range-minimum / range-maximum table
+ * (the classic idempotent-operation sparse table / "StaticRMQ"). The suite's FIRST static
+ * build-once/immutable member.
+ *
+ * THE HONESTY CONTRACT (the load-bearing decision -- see decisions/0018): the QUERY is the
+ * hot op and it is TRUE WORST-CASE O(1), zero-alloc -- one floor-log2 (via clz32) + exactly
+ * two table reads + one compare, INDEPENDENT of the range width. The O(n log n) BUILD and the
+ * O(n log n) table SPACE are a DISCLOSED CO-HEADLINE (the same shape as BucketQueue's
+ * O(ceiling) space, TimerWheel's O(slots), HierarchicalTimerWheel's O(capacity)): they are
+ * paid ONCE at construction and are EXCLUDED from the per-op claim. The witness gates the
+ * QUERY as the hot op; build is never in the measured window. Because the query is worst-case
+ * O(1) (not amortized), there is NO max-single-op line (unlike the amortized cohort
+ * MonoDeque / UnionFind / BucketQueue / HierarchicalTimerWheel / CuckooMap) -- the flat query
+ * line IS the worst-case claim.
+ *
+ * Layout (flat SoA, zero pointer chasing): ONE internal Float64Array COPY of the n source
+ * values (so a later mutation of the caller's array can NEVER invalidate a query -- the table
+ * is genuinely immutable + self-contained), plus ONE flat Float64Array `_table` of length
+ * n*(K+1) where K = floor(log2(n)) (levels 0..K), indexed MANUALLY as table[level*n + i] =
+ * the extreme over the span [i, i+2^level). Level 0 is the source itself; level j combines two
+ * level-(j-1) spans of 2^(j-1). The exact SPACE co-headline: n*(floor(log2 n)+1) table cells +
+ * n source cells = n*(floor(log2 n)+2) Float64 slots.
+ *
+ * `kind` ('min' | 'max') is FROZEN at construction (one extreme per instance; run two
+ * instances for both -- mirrors MinStack / MonoDeque). A ctor-cached boolean drives the hot
+ * compare, so query() does NO per-call kind-string test.
+ *
+ * Build-once, query-only: there are NO mutators (no set / update / push) and NO clear()
+ * (immutable -- a clear would be nonsensical; see the ADR). Fail closed at CONSTRUCTION (a
+ * non-array source, an empty source, a bad length, or a non-numeric / NaN element throw
+ * [lite-o1] -- nothing half-built escapes, a byte-identical no-op). NEVER-throw QUERY: query /
+ * at with a bad l / r / i return `undefined` and never throw (the family "queries never throw"
+ * law -- like get / has / peek). The only allocators are the constructor and the per-protocol
+ * [Symbol.iterator]; query / at / forEach allocate ZERO bytes.
+ *
+ * Value contract (LOCKED, IDENTICAL to RingDeque / MonoDeque / MinStack / RingLog): every
+ * source element must be typeof 'number' AND not NaN; +/-Infinity accepted; null / undefined /
+ * string / object (incl. numeric valueOf) / Symbol / BigInt / NaN reject. The typeof guard
+ * runs FIRST so a Symbol / BigInt never reaches coercion; messages via String(x).
+ */
+export class SparseTable {
+    /**
+     * @param {number[]|Float64Array|Int32Array|Uint32Array|Float32Array|Int8Array|Uint8Array|Int16Array|Uint16Array|Uint8ClampedArray}
+     *        source  the values to index; a real Array or a numeric TypedArray, length in
+     *                [1, 2^26]. COPIED into an internal Float64Array (the table is immutable).
+     * @param {'min'|'max'} kind  the frozen extreme this instance reports.
+     */
+    constructor(source, kind) {
+        // Shape guard FIRST: a real Array or an ArrayBuffer view (numeric TypedArray). A
+        // DataView / BigInt typed array is admitted here but fails the per-element number
+        // check below; null / a primitive is rejected outright. String(x) is Symbol-safe.
+        if (source === null || typeof source !== 'object' ||
+            !(Array.isArray(source) || ArrayBuffer.isView(source))) {
+            throw new TypeError(
+                '[lite-o1] SparseTable source must be an Array or a numeric TypedArray, got ' + String(source));
+        }
+        const len = source.length;
+        if (!Number.isInteger(len) || len < 1 || len > SPARSETABLE_MAX_LEN) {
+            throw new RangeError(
+                '[lite-o1] SparseTable source length must be an integer in [1, 2^26], got ' + String(len));
+        }
+        if (kind !== 'min' && kind !== 'max') {
+            throw new RangeError(
+                '[lite-o1] SparseTable kind must be "min" or "max", got ' + String(kind));
+        }
+        // Copy + validate every element: typeof FIRST so a Symbol / BigInt element never
+        // reaches coercion; NaN rejected (v !== v); +/-Infinity accepted. Nothing half-built
+        // escapes -- validation throws before _table is allocated or any this.* is assigned;
+        // the source-copy scratch buffer is a discarded local (byte-identical no-op).
+        const src = new Float64Array(len);
+        for (let i = 0; i < len; i++) {
+            const v = source[i];
+            if (typeof v !== 'number' || v !== v) this._badElem(v, i); // v !== v -> NaN
+            src[i] = v;
+        }
+        // K = floor(log2(len)) via clz32 (branchless, no Math.log). Levels 0..K.
+        const K = 31 - Math.clz32(len);
+        const table = new Float64Array(len * (K + 1));
+        const min = kind === 'min';
+        // Level 0 IS the source: table[0*len + i] = the extreme over [i, i+1) = src[i].
+        for (let i = 0; i < len; i++) table[i] = src[i];
+        // Level j covers [i, i+2^j): fold two adjacent level-(j-1) spans of 2^(j-1). Only i
+        // with a FULL 2^j window inside [0, len) are filled (i < len - 2^j + 1); the tail
+        // cells stay 0 and are NEVER read (a query of width w picks level floor(log2 w), whose
+        // two windows [l, l+2^k) and [r-2^k+1, r+1) are always fully in range).
+        for (let j = 1; j <= K; j++) {
+            const span = 1 << (j - 1);
+            const base = j * len;
+            const prev = (j - 1) * len;
+            const lim = len - (1 << j) + 1;
+            for (let i = 0; i < lim; i++) {
+                const a = table[prev + i];
+                const b = table[prev + i + span];
+                table[base + i] = min ? (a < b ? a : b) : (a > b ? a : b);
+            }
+        }
+        this._src = src;         // immutable Float64 copy of the source (query-independent)
+        this._table = table;     // flat sparse table, table[level*len + i]
+        this._len = len;         // number of source elements
+        this._k = K;             // max level = floor(log2(len))
+        this._min = min;         // hot-path branch (min vs max), ctor-frozen
+        this._kind = kind;       // frozen kind ('min' | 'max')
+    }
+
+    /** Number of source elements. O(1). */
+    get length() { return this._len; }
+
+    /** The frozen extreme this instance reports, 'min' or 'max'. O(1). */
+    get kind() { return this._kind; }
+
+    /**
+     * The extreme (min or max, per the frozen kind) over the INCLUSIVE range [l, r]. WORST-CASE
+     * O(1), zero-alloc: one floor-log2 (via clz32) + exactly TWO table reads + one compare,
+     * INDEPENDENT of the range width -- the idempotent-overlap trick (min/max are idempotent, so
+     * the two overlapping half-windows of width 2^k that cover [l, r] give the exact answer even
+     * where they overlap). Returns `undefined` for a bad l / r (non-number, non-safe index, out
+     * of [0, length), or l > r) and NEVER throws (the family "queries never throw" law). typeof
+     * FIRST so a Symbol / BigInt never reaches the arithmetic. `_min` is the ctor-frozen kind
+     * flag, so no kind-string compare runs per call.
+     * @param {number} l  inclusive left index in [0, length)
+     * @param {number} r  inclusive right index in [l, length)
+     * @returns {number|undefined}
+     */
+    query(l, r) {
+        const len = this._len;
+        if (typeof l !== 'number' || (l | 0) !== l || l < 0 || l >= len) return undefined;
+        if (typeof r !== 'number' || (r | 0) !== r || r < l || r >= len) return undefined;
+        const table = this._table;
+        const k = 31 - Math.clz32(r - l + 1);  // floor(log2(width)); width >= 1 so k >= 0
+        const base = k * len;
+        const a = table[base + l];
+        const b = table[base + (r - (1 << k) + 1)];
+        return this._min ? (a < b ? a : b) : (a > b ? a : b);
+    }
+
+    /**
+     * The single source element at index i. O(1). Returns `undefined` for a non-integer or
+     * out-of-range i and NEVER throws (symmetry with query's never-throw contract; typeof FIRST
+     * so a Symbol / BigInt never coerces).
+     * @param {number} i
+     * @returns {number|undefined}
+     */
+    at(i) {
+        if (typeof i !== 'number' || (i | 0) !== i || i < 0 || i >= this._len) return undefined;
+        return this._src[i];
+    }
+
+    /**
+     * Iterate the SOURCE values in index order, alloc-free. O(length) -- the documented scan
+     * exception, EXCLUDED from the zero-alloc-per-op claims. A HOISTED callback keeps it
+     * allocation-free.
+     * @param {(value:number, index:number, table:SparseTable)=>void} fn
+     */
+    forEach(fn) {
+        const src = this._src;
+        const len = this._len;
+        for (let i = 0; i < len; i++) fn(src[i], i, this);
+    }
+
+    /**
+     * Iterate the SOURCE values in index order. O(length). The ONE documented per-protocol
+     * ALLOCATOR (a {value, done} per step) -- kept OUT of the zero-alloc claims (use forEach
+     * for the alloc-free scan).
+     */
+    *[Symbol.iterator]() {
+        const src = this._src;
+        const len = this._len;
+        for (let i = 0; i < len; i++) yield src[i];
+    }
+
+    // ---- cold path only: throw builder (string concat lives here, off the hot body) ----
+
+    /** @private */
+    _badElem(v, i) {
+        // String(v) -- NOT '+ v' / a template literal: those THROW on a Symbol or BigInt,
+        // turning a fail-closed reject into a different crash.
+        throw new TypeError(
+            '[lite-o1] SparseTable source[' + i + '] must be a number and not NaN, got ' + String(v));
     }
 }

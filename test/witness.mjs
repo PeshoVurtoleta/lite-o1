@@ -48,7 +48,7 @@
  * metric are unchanged; only the measurement is made steadier.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable } from '../O1.js';
 
 const SIZES = [1e3, 1e4, 1e5, 1e6, 1e7];
 const BATCH = 1e6;
@@ -1516,5 +1516,108 @@ if (!cuAllOk) {
     if (!cuNaiveOk) console.error('  violation naive foil flatness ' + fmt(naiveMap.flatness) + ' > 0.55');
     if (!cuRatioOk) console.error('  violation min CuckooMap ratio ' + fmt(cuRatio) + 'x < 1.50x');
     if (!cuSpikeOk) console.error('  violation re-seed spike ' + fmt(cuSpike.ratio) + 'x < 2x (must wear the max-single-op line)');
+    process.exitCode = 1;
+}
+
+// ===========================================================================
+// SparseTable witness -- WORST-CASE-O(1) STATIC range-min QUERY vs an alloc-free
+// O(len) naive range-scan foil (recompute the extreme by scanning [l, r] each query).
+// ===========================================================================
+// len is the source length. The QUERY is the hot op (the O(n log n) BUILD is the disclosed
+// co-headline, done in build() OUTSIDE the timed loop, EXCLUDED from the per-op claim). Each
+// op queries a WIDE range [l, len-1] (width ~ len): the SparseTable answers in two table reads
+// + one compare, O(1) INDEPENDENT of the width, while the foil RESCANS all ~len elements, O(len)
+// per query -- so the foil diverges as len grows. Gating over WIDE ranges is deliberate: a
+// narrow range would make the O(len) foil cheap and hide the divergence (the whole point). This
+// is a TRUE O(len) foil (a full factor of len lost per decade), so it collapses to the <= 0.55
+// bar (like the RingLog / TimerWheel foils). ops/ms is a RATE, so the table (batch 5e5) and the
+// foil (batch 2e3) use DIFFERENT batches yet flatness + ratio compare directly. Gated over the
+// steady window len >= 1e4 (the 1e3 point is a pure-L1 micro-case, shown but not gated). NO
+// max-single-op line: query is WORST-CASE O(1), so there is no amortized spike to expose.
+const ST_SIZES = [1e3, 1e4, 1e5];
+const ST_BATCH = 5e5;        // large: stable timing for the O(1) query
+const ST_FOIL_BATCH = 2e3;   // small: an O(len) scan at len=1e5 must stay tractable
+const ST_GATE_MIN = 1e4;
+
+// SparseTable: build a table of `len` values ONCE (outside the timed op), then each op runs a
+// WIDE-range query [l, len-1] over a walking left edge -- worst-case O(1), independent of width.
+function buildSparseTable(len) {
+    const src = new Float64Array(len);
+    for (let k = 0; k < len; k++) src[k] = (k * 2654435761) & 0x7fffffff;
+    const t = new SparseTable(src, 'min'); // the O(n log n) BUILD -- excluded from the timed op
+    const half = len >> 1;
+    let l = 0;
+    const op = () => {
+        l++;
+        if (l >= half) l = 0;             // walk the left edge over the first half
+        if (t.query(l, len - 1) !== undefined) SINK++; // WIDE range: width ~ len -> foil diverges
+    };
+    return { op };
+}
+
+// Foil: an alloc-free naive range-scan. A Float64Array holds the same source; every op
+// RECOMPUTES the extreme by linearly scanning [l, len-1] -- O(len) per query, so ops/ms
+// collapses as len grows, the exact trap the sparse table's O(1) overlap query kills.
+function buildNaiveRangeScanFoil(len) {
+    const src = new Float64Array(len);
+    for (let k = 0; k < len; k++) src[k] = (k * 2654435761) & 0x7fffffff;
+    const half = len >> 1;
+    let l = 0;
+    const op = () => {
+        l++;
+        if (l >= half) l = 0;
+        let best = src[l];
+        for (let j = l + 1; j < len; j++) if (src[j] < best) best = src[j]; // O(len) rescan
+        SINK += best;
+    };
+    return { op };
+}
+
+const st = witness(buildSparseTable, ST_SIZES, ST_BATCH, REPS, ST_GATE_MIN);
+const naiveScan = witness(buildNaiveRangeScanFoil, ST_SIZES, ST_FOIL_BATCH, REPS, ST_GATE_MIN);
+
+console.log('');
+console.log('O(1) Witness -- SparseTable range-min query vs a naive O(len) range scan (rate ops/ms, median of ' +
+    REPS + ', gate len >= ' + nStr(ST_GATE_MIN) + ', WIDE ranges)');
+console.log('');
+console.log('  len       SparseTable ops/ms naive ops/ms   ratio');
+console.log('  --------  ----------------   ------------   -----');
+let stRatio = Infinity;
+for (let i = 0; i < ST_SIZES.length; i++) {
+    const a = st.rows[i].opsPerMs;
+    const b = naiveScan.rows[i].opsPerMs;
+    const ratio = b > 0 ? a / b : Infinity;
+    const gated = ST_SIZES[i] >= ST_GATE_MIN;
+    if (gated && ratio < stRatio) stRatio = ratio; // ratio gate: steady window only
+    const tag = ST_SIZES[i] < ST_GATE_MIN ? '   <- L1 micro-case (shown, not gated)' : '';
+    console.log('  ' + nStr(ST_SIZES[i]).padEnd(8) + '  ' +
+        fmt(a).padStart(16) + '   ' + fmt(b).padStart(12) + '   ' + fmt(ratio).padStart(5) + 'x' + tag);
+}
+
+console.log('');
+console.log('  SparseTable flatness (len >= ' + nStr(ST_GATE_MIN) + '): ' + fmt(st.flatness) + '   (gate >= 0.70)');
+console.log('  naive foil flatness (last/first): ' + fmt(naiveScan.flatness) + '   (gate <= 0.55 -- true O(len) collapse)');
+console.log('  min SparseTable/naive ratio:      ' + fmt(stRatio) + 'x  (gate >= 1.50x, WIDE ranges)');
+// NO MAX-single-op line here (unlike the amortized cohort): SparseTable's query is WORST-CASE
+// O(1) -- a floor-log2 + two table reads + one compare, INDEPENDENT of the range width, never a
+// run and never a cascade. The O(n log n) BUILD is the disclosed co-headline (paid once at
+// construction, outside the timed op), not a per-op spike. The flat query line IS the worst-case
+// claim (the O(len) scan foil is the honest 0.55-collapse rival).
+
+const stOk = st.flatness >= 0.70;
+const naiveScanOk = naiveScan.flatness <= 0.55;
+const stRatioOk = stRatio >= 1.5;
+const stAllOk = stOk && naiveScanOk && stRatioOk;
+
+console.log('');
+console.log('WITNESS SparseTable ' + (stAllOk ? 'ok' : 'FAIL') +
+    ' st.flatness=' + fmt(st.flatness) +
+    ' naive.flatness=' + fmt(naiveScan.flatness) +
+    ' minRatio=' + fmt(stRatio) + 'x');
+
+if (!stAllOk) {
+    if (!stOk) console.error('  violation SparseTable flatness ' + fmt(st.flatness) + ' < 0.70');
+    if (!naiveScanOk) console.error('  violation naive foil flatness ' + fmt(naiveScan.flatness) + ' > 0.55');
+    if (!stRatioOk) console.error('  violation min SparseTable ratio ' + fmt(stRatio) + 'x < 1.50x');
     process.exitCode = 1;
 }

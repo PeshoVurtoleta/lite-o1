@@ -39,7 +39,7 @@ async function main() {
     const { GcProfiler, checkNoGc, measureAllocs } =
         await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap } = await import('../O1.js');
+    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable } = await import('../O1.js');
 
     const U = 1 << 16;      // universe 65536
     const CAP = 1 << 14;    // capacity 16384
@@ -196,6 +196,17 @@ async function main() {
             cm.has(0);
             cm.delete(i & 255);
             tracker.track(cm, noop, 'cuckoomap', { audit: true });
+            // SparseTable owns only its two Float64Arrays (the source copy + the flat table);
+            // nothing external to release. Its arrays hold numbers, so a reclaimed instance is
+            // the desired outcome, proven by size()->0. STATIC/immutable: build once, then
+            // exercise the query + at + forEach query-only surface before tracking.
+            const stTmp = new Float64Array(128);
+            for (let k = 0; k < 128; k++) stTmp[k] = (k ^ i) & 127;
+            const stbl = new SparseTable(stTmp, (i & 1) ? 'min' : 'max');
+            stbl.query(i & 63, (i & 63) + 32);
+            stbl.query(0, 127);
+            stbl.at(i & 127);
+            tracker.track(stbl, noop, 'sparsetable', { audit: true });
         }
         return tracker.size();
     }
@@ -471,6 +482,31 @@ async function main() {
     const cuckAllocBytes = Math.max(0, Math.round(cuckBpc));
     const cuckAllocOk = cuckAllocBytes === 0;
 
+    // SparseTable hot path: a STATIC build-once table, BUILT ONCE OUTSIDE the measured window
+    // (the O(n log n) build is the disclosed co-headline, EXCLUDED from the per-op claim -- like
+    // every other member's construction). The measured hot loop is repeated query() calls over a
+    // walking WIDE window plus an at() read -- both worst-case O(1), zero-alloc (a floor-log2 +
+    // two table reads + one compare; the immutable Float64 columns are typed slots, never a JS
+    // allocation). The query return folds into an int32 sink so V8 cannot elide it and no heap
+    // double is promoted (source values are SMI ints).
+    const ST_LEN = 1 << 14;              // 16384 source elements
+    const ST_W = 1 << 12;                // 4096-wide query window (< ST_LEN)
+    const stSrc = new Float64Array(ST_LEN);
+    for (let k = 0; k < ST_LEN; k++) stSrc[k] = (k * 2654435761) & 0x7fffffff;
+    const sparseTable = new SparseTable(stSrc, 'min'); // built once, outside the measured loop
+    let stl = 0;
+    let stSink = 0;
+    const stStep = () => {
+        stl++;
+        if (stl > ST_LEN - ST_W) stl = 0;
+        stSink = (stSink + (sparseTable.query(stl, stl + ST_W - 1) | 0)) | 0; // O(1) wide-range query
+        stSink = (stSink + (sparseTable.at(stl) | 0)) | 0;                    // O(1) source read
+    };
+    const stAllocRes = measureAllocs(stStep, { iterations: 100000, batches: 8 });
+    const stBpc = stAllocRes.bytesPerCall === null ? 0 : stAllocRes.bytesPerCall;
+    const stAllocBytes = Math.max(0, Math.round(stBpc));
+    const stAllocOk = stAllocBytes === 0;
+
     // "0 B/op" resolved at the sampling floor: heapUsed deltas are quantized and
     // noisy, so a truly non-allocating op reads a sub-byte figure (a lone blip
     // in one batch / iterations). Round to the nearest byte -- any per-op
@@ -496,6 +532,7 @@ async function main() {
         htwStep();
         ringLogStep();
         cuckStep();
+        stStep();
         if ((i & 8191) === 0) {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
         }
@@ -608,6 +645,17 @@ async function main() {
         cuck.forEach(cuckCb);
         cuck.clear();
     }
+    // SparseTable forEach scan + query sweep cycles -- exercises the alloc-free source scan and
+    // the O(1) query hot body across a spread of ranges. STATIC/immutable: there is NO clear /
+    // refill (build-once), so the single reused table is re-queried, never rebuilt.
+    for (let f = 0; f < 1024; f++) {
+        sparseTable.forEach(cb);
+        for (let k = 0; k < 512; k++) {
+            const l = (k * 31) & (ST_LEN - 1);
+            const r = l + (k & 255);
+            SINK += (sparseTable.query(l, r < ST_LEN ? r : ST_LEN - 1) | 0);
+        }
+    }
     await new Promise((r) => setTimeout(r, 50));
     const s2 = gc.summary();
     const report = checkNoGc(s2, { maxMajor: 0, maxPauseMs: 2 });
@@ -664,7 +712,7 @@ async function main() {
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
         findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && monoAllocOk &&
         minAllocOk && randAllocOk && freqAllocOk && buckAllocOk && twAllocOk && htwAllocOk &&
-        ringLogAllocOk && cuckAllocOk && abOk;
+        ringLogAllocOk && cuckAllocOk && stAllocOk && abOk;
 
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
@@ -678,9 +726,10 @@ async function main() {
         twAllocBytes + ' B/op (TimerWheel) ' +
         htwAllocBytes + ' B/op (HierarchicalTimerWheel) ' +
         ringLogAllocBytes + ' B/op (RingLog) ' +
-        cuckAllocBytes + ' B/op (CuckooMap)' +
+        cuckAllocBytes + ' B/op (CuckooMap) ' +
+        stAllocBytes + ' B/op (SparseTable)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
-        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' abGrowth=' + abDelta + ')');
+        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' abGrowth=' + abDelta + ')');
 
     if (!ok) {
         if (!trackedOk) console.error('  vacuous: tracker held ' + trackedMid + ' instances (expected > 0)');
@@ -701,6 +750,7 @@ async function main() {
         if (!htwAllocOk) console.error('  alloc ' + htwAllocBytes + ' B/op HierarchicalTimerWheel (raw bytesPerCall ' + htwBpc + ')');
         if (!ringLogAllocOk) console.error('  alloc ' + ringLogAllocBytes + ' B/op RingLog (raw bytesPerCall ' + ringLogBpc + ')');
         if (!cuckAllocOk) console.error('  alloc ' + cuckAllocBytes + ' B/op CuckooMap (raw bytesPerCall ' + cuckBpc + ')');
+        if (!stAllocOk) console.error('  alloc ' + stAllocBytes + ' B/op SparseTable (raw bytesPerCall ' + stBpc + ')');
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;
     }

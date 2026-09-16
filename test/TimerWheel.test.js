@@ -66,8 +66,8 @@ function snapshot(w) {
 
 // --- version + surface -----------------------------------------------------
 
-test('VERSION is the frozen 1.2.0 string', () => {
-    assert.equal(VERSION, '1.2.0');
+test('VERSION is the frozen 1.3.0 string', () => {
+    assert.equal(VERSION, '1.3.0');
 });
 
 test('empty wheel: getters + has/cancel/drainDue/iterate are well-defined', () => {

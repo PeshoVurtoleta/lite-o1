@@ -26,8 +26,8 @@ const litO1 = (e) => e instanceof Error && /^\[lite-o1]/.test(e.message);
 
 // --- version + surface -----------------------------------------------------
 
-test('VERSION is the frozen 1.2.0 string', () => {
-    assert.equal(VERSION, '1.2.0');
+test('VERSION is the frozen 1.3.0 string', () => {
+    assert.equal(VERSION, '1.3.0');
 });
 
 test('empty deque: size 0, capacity as rounded, kind frozen, value/frontSeq -> undefined', () => {

@@ -22,7 +22,7 @@
  */
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable } from '../../O1.js';
 
 const U = 1 << 16;      // universe 65536
 const CAP = 1 << 14;    // capacity 16384
@@ -1374,6 +1374,98 @@ const cuckForEachDrain = {
     statsOf(s) { return { grows: cuckGrows(s) }; },
 };
 
+// ===========================================================================
+// SparseTable scenarios -- a STATIC build-once table over two immutable Float64Array columns
+// (a source copy + the flat sparse table). The QUERY is WORST-CASE O(1) zero-alloc (a floor-
+// log2 + two table reads + one compare); at() is a single O(1) source read. The O(n log n) BUILD
+// is done in setup() (OUTSIDE the measured window) -- the disclosed co-headline, EXCLUDED from
+// the per-op claim, like every other member's construction. There is NO clear / refill (static /
+// immutable): the single reused table is re-queried, never rebuilt.
+// ===========================================================================
+
+const ST_CAP = 1 << 14;   // 16384 source elements
+const ST_W = 1 << 12;     // 4096-wide query window (< ST_CAP)
+
+/**
+ * The zero-alloc counter for SparseTable scenarios: BOTH immutable backing Float64Arrays'
+ * ArrayBuffer byte lengths (the source copy + the flat sparse table). Both are fixed at
+ * construction, so this NEVER grows -- the delta across the window must be 0 (the `stGrows`
+ * 0-delta canary; mirrors grows / ringGrows / ... / cuckGrows).
+ */
+function stGrows(s) {
+    return s.st._src.buffer.byteLength + s.st._table.buffer.byteLength;
+}
+
+/** A SparseTable built ONCE over a bounded source (the O(n log n) build is out of the window). */
+function stFill() {
+    const src = new Float64Array(ST_CAP);
+    for (let i = 0; i < ST_CAP; i++) src[i] = (i * 2654435761) & 0x7fffffff;
+    return new SparseTable(src, 'min');
+}
+
+/**
+ * query-wide: a prebuilt table; every op a WIDE-window range query (the worst-case-O(1) hot
+ * body -- a floor-log2 + two table reads + one compare, independent of width), int32-wrapped acc
+ * so the read is never dead-code-eliminated / promoted to a heap double. The left edge walks a
+ * bounded window; the query stays fully in range.
+ */
+const stQuery = {
+    name: 'SparseTable query (wide window)',
+    setup() { return { st: stFill(), l: 0, acc: 0 }; },
+    hot(s, n) {
+        const st = s.st;
+        let l = s.l | 0;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) {
+            acc = (acc + (st.query(l, l + ST_W - 1) | 0)) | 0;
+            l++; if (l > ST_CAP - ST_W) l = 0;
+        }
+        s.l = l | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: stGrows(s) }; },
+};
+
+/** at-read: a prebuilt table; every op a single O(1) source-element read, int32-wrapped acc. */
+const stAtRead = {
+    name: 'SparseTable at-read',
+    setup() { return { st: stFill(), i: 0, acc: 0 }; },
+    hot(s, n) {
+        const st = s.st;
+        let idx = s.i | 0;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) {
+            acc = (acc + (st.at(idx & (ST_CAP - 1)) | 0)) | 0;
+            idx = (idx + 1) | 0;
+        }
+        s.i = idx | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: stGrows(s) }; },
+};
+
+/**
+ * SparseTable forEach-drain: a prebuilt table scanned each op through a HOISTED module-scope
+ * callback (never re-created per op). Proves forEach itself (the alloc-free source scan; the ONE
+ * per-protocol allocator is [Symbol.iterator], gated separately by stMustFailAlloc) allocates
+ * nothing over its own dedicated window.
+ */
+let stDrainAcc = 0;
+function stForEachInto(v, i) { stDrainAcc = (stDrainAcc + v + i) | 0; }
+const stForEachDrain = {
+    name: 'SparseTable forEach-drain',
+    setup() {
+        const src = new Float64Array(256);
+        for (let i = 0; i < 256; i++) src[i] = (i * 2654435761) & 0x7fffffff; // bounded source to scan
+        return { st: new SparseTable(src, 'max') };
+    },
+    hot(s, n) {
+        const st = s.st;
+        for (let i = 0; i < n; i++) st.forEach(stForEachInto);
+    },
+    statsOf(s) { return { grows: stGrows(s) }; },
+};
+
 const scenarios = [
     addChurn, hasHit, deleteChurn, clearRefill, forEachDrain,
     ringFifo, ringLifo, ringInterleave,
@@ -1387,6 +1479,7 @@ const scenarios = [
     htwScheduleChurn, htwDrainCascade, htwCancelChurn, htwAdvanceTick, htwForEachDrain,
     ringLogFillChurn, ringLogOverwriteChurn, ringLogGetScan, ringLogForEachDrain,
     cuckGetHit, cuckHasHit, cuckSetChurn, cuckUpdateChurn, cuckForEachDrain,
+    stQuery, stAtRead, stForEachDrain,
 ];
 
 /**
@@ -1680,6 +1773,32 @@ const cuckMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/**
+ * The SparseTable teeth: a per-op `[Symbol.iterator]` spread into a FRESH [] each op -- the
+ * generator + its per-step {value, done} wrappers + the array MUST trip the gate (scavenges
+ * scale with n), proving the instrument has teeth on the SparseTable surface too (its iterator
+ * is the ONE documented per-protocol allocator; forEach is the alloc-free scan). statsOf returns
+ * a constant so the failure is the allocation lanes, not a missing-counter artifact.
+ */
+const stMustFailAlloc = {
+    name: 'SparseTable [Symbol.iterator] spread into fresh array (MUST allocate)',
+    setup() {
+        const src = new Float64Array(64);
+        for (let i = 0; i < 64; i++) src[i] = (i * 2654435761) & 0x7fffffff;
+        return { st: new SparseTable(src, 'min') };
+    },
+    hot(s, n) {
+        const st = s.st;
+        let sink = 0;
+        for (let i = 0; i < n; i++) {
+            const arr = [...st]; // fresh generator + array per op -> heap churn
+            sink += arr.length;
+        }
+        s.sink = sink;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -1689,5 +1808,5 @@ zgcSuite({
     counters: { grows: 0 },
     maxRetainedKB: 64,
     scenarios,
-    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc, twMustFailAlloc, htwMustFailAlloc, ringLogMustFailAlloc, cuckMustFailAlloc],
+    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc, twMustFailAlloc, htwMustFailAlloc, ringLogMustFailAlloc, cuckMustFailAlloc, stMustFailAlloc],
 });

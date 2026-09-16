@@ -8,6 +8,85 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.3.0] - 2026-09-16
+
+### Added
+
+- **`SparseTable` -- the thirteenth member: a zero-GC, WORST-CASE O(1)-QUERY STATIC
+  range-minimum / range-maximum table (the idempotent-operation sparse table / "StaticRMQ").**
+  The suite's FIRST static build-once / immutable member. Build the table ONCE from a numeric
+  array, then answer "the min (or max) over any inclusive range `[l, r]`" in true worst-case O(1)
+  -- a floor-log2 (via `Math.clz32`) picks a level, and two overlapping `2^k`-wide precomputed
+  windows cover `[l, r]` exactly (the idempotent-overlap trick). THE HONESTY CONTRACT (the
+  load-bearing decision, [`decisions/0018`](./decisions/0018-sparsetable.md)): the QUERY is the hot
+  op and it is true worst-case O(1), zero-alloc (two table reads + one compare, independent of the
+  range width); the O(n log n) BUILD and O(n log n) table SPACE are a DISCLOSED co-headline (the
+  same shape as BucketQueue's O(ceiling) space or TimerWheel's O(slots)) paid once at construction
+  and EXCLUDED from the per-op claim. Because the query is worst-case O(1) (not amortized), there is
+  NO max-single-op line -- SparseTable joins the worst-case cohort. `kind` (`'min'` | `'max'`) is
+  frozen at construction (a ctor-cached boolean drives the hot compare; run two instances for both,
+  like MinStack / MonoDeque). The source (a real `Array` of numbers or any numeric `TypedArray`) is
+  COPIED element-by-element into an internal `Float64Array` at build, so a later mutation of the
+  caller's array can NEVER invalidate a query (genuinely immutable + self-contained). Flat SoA
+  layout: ONE source copy + ONE flat `Float64Array` of length `n*(K+1)` (`K = floor(log2 n)`),
+  indexed manually as `table[level*n + i]`. EXACT space co-headline: `n*(floor(log2 n)+1)` table
+  cells + `n` source cells = `n*(floor(log2 n)+2)` Float64 slots. Build-once, query-only: there are
+  deliberately NO mutators (no `set` / `update` / `push`) and NO `clear()` (immutable -- rebuild a
+  new instance to change the data). Fail closed at CONSTRUCTION (a non-array / empty / bad-length
+  source, a bad kind, or a non-numeric / NaN element throws `[lite-o1]` typeof-first, a
+  byte-identical no-op thrown BEFORE any table is allocated -- nothing half-built escapes);
+  NEVER-throw QUERY (`query` / `at` with a bad `l` / `r` / `i` return `undefined`). The only
+  allocators are the constructor and the per-protocol `[Symbol.iterator]`; `query` / `at` / `forEach`
+  allocate ZERO bytes. Surface: `query(l, r) -> number|undefined`, `at(i) -> number|undefined`,
+  `forEach(fn)` (alloc-free, `(value, index, table)`), `[Symbol.iterator]`, and getters `length` /
+  `kind`. See the settled calls in [`decisions/0018`](./decisions/0018-sparsetable.md).
+- **`test/SparseTable.test.js`** -- full behavioral suite: constructor acceptance (a real Array +
+  every numeric TypedArray, copied), the `length` / `kind` getters, exact correctness for BOTH kinds
+  across power-of-two AND non-power-of-two lengths (`K = floor(log2 n)`, every `[l, r]` cross-checked
+  against a brute-force scan), the query boundary matrix (singleton `l==r`, the full range, `l > r`
+  -> `undefined`, out-of-range -> `undefined`, `+/-Infinity` accepted), never-throw queries (a
+  Symbol / BigInt / NaN / object / non-int index -> `undefined`, 0 throws), the coercion footgun (a
+  Symbol / BigInt / object-with-`valueOf` / boxed Number / NaN element throws at CONSTRUCTION
+  typeof-first, a valueOf-spy proving no coercion, a byte-identical no-op), IMMUTABILITY (mutating
+  the caller's Array / TypedArray after build does NOT change any query), `at` / `forEach` /
+  `[Symbol.iterator]` order, and a **>= 1e5-op differential fuzz** over random arrays (`n` up to
+  4096) for BOTH kinds vs a brute-force range-scan oracle (0 divergences). QaAudit gains a matching
+  SparseTable boundary block.
+- SparseTable wired into the gates: a `sparseTable` lane in `test/torture.mjs` (build once outside
+  the measured window, a repeated wide-range `query` + `at` hot loop at 0 B/op + a retention cycle),
+  three scenarios (`stQuery` / `stAtRead` / `stForEachDrain`) + a `stGrows` 0-delta canary + a
+  `[Symbol.iterator]` must-fail in `test/perf/PerfGate.test.mjs`, and a `buildSparseTable` witness vs
+  an alloc-free O(len) naive range-scan foil (collapses) gated over WIDE ranges, with NO
+  max-single-op line (the query is worst-case O(1); the build is the disclosed co-headline).
+
+### Changed
+
+- Version bumped **1.2.0 -> 1.3.0** (additive, backward-compatible -- the prior twelve members are
+  byte-identical; the sole `O1.js` edits are the header member-count, the `VERSION` string, and the
+  appended `SparseTable` class + its one `SPARSETABLE_MAX_LEN` const). `VERSION` const /
+  `package.json` / `llms.txt` in lockstep, enforced by the version-trinity test. New keywords
+  (sparse-table, static-rmq, range-minimum-query, range-maximum-query, rmq, idempotent, immutable,
+  build-once, o1-query).
+
+### Docs
+
+- `GUIDE.md` gains a SparseTable flowchart leaf, a picker-table row, a `### SparseTable (v1.3.0)`
+  per-member section (reach-for / avoid / measure-it, incl. the static-vs-mutable + idempotent-vs-sum
+  boundaries), the budget-rule "eight `(wc)` members" update, and the intro count/version -> thirteen
+  / v1.3.0; SparseTable removed from the roadmap.
+- `README.md` integrates SparseTable across the spine (positioning + what-you-get, a runnable
+  quick-start, a Zero-GC design allocation table, an API reference + constants-table rows, a
+  reach-for / avoid section with the SparseTable-vs-segment-tree contrast, testing prose); the
+  repo-only benchmark matrix + its 80-cell numbers are unchanged (SparseTable stays out of the bench,
+  like RingLog / CuckooMap).
+- `llms.txt` -> Version 1.3.0, thirteen members, `VERSION -- '1.3.0'`, a `## SparseTable` surface
+  section + a design-bounds entry + the witness-gate note, and a roadmap that lists only SlotPool as
+  remaining post-1.0 work.
+- `decisions/0018-sparsetable.md` -- the static-member honesty contract (the boundary call + why the
+  query is a legit O(1) family member), the frozen-kind / source-copy-for-immutability / flat-SoA
+  calls, and the rejected alternatives (a jagged table; a reference-not-copy source; a general
+  combiner instead of a frozen kind).
+
 ## [1.2.0] - 2026-09-16
 
 ### Added

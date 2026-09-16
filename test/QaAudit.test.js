@@ -13,19 +13,19 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, VERSION } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, VERSION } from '../O1.js';
 import * as O1Module from '../O1.js';
 
 const litO1 = (e) => e instanceof Error && /^\[lite-o1]/.test(e.message);
 
-// The twelve shipped member class names (CuckooMap added at v1.2.0). This list is the
+// The thirteen shipped member class names (SparseTable added at v1.3.0). This list is the
 // regression guard itself: it does NOT read O1.js to discover members, so
 // adding/removing/renaming a member without touching this test -- or without
 // updating the docs below -- is exactly the drift this test exists to catch.
-const TWELVE_MEMBERS = [
+const THIRTEEN_MEMBERS = [
     'SparseSet', 'RingDeque', 'UnionFind', 'MonoDeque', 'MinStack',
     'RandomSet', 'FreqO1', 'BucketQueue', 'TimerWheel', 'HierarchicalTimerWheel',
-    'RingLog', 'CuckooMap',
+    'RingLog', 'CuckooMap', 'SparseTable',
 ];
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -1417,41 +1417,90 @@ test('HierarchicalTimerWheel: maxDelay (2^26-1) accepted, 2^26 throws; capacity=
 });
 
 // ===========================================================================
-// Cross-file "twelve members" regression guard. v1.2.0 grew the roster to
-// twelve (CuckooMap); this test fails if a future session adds/removes a member
-// from O1.js without also updating README.md / GUIDE.md / llms.txt, or vice
-// versa (docs claim twelve but the module does not export twelve).
+// SparseTable boundary audits (QA pass, member 13 -- the first STATIC build-once /
+// immutable member: an O(n log n)-build, worst-case-O(1)-query range-min/max table).
+// Complements the dedicated test/SparseTable.test.js with the QaAudit boundary-matrix
+// style: the coercion valueOf-spy on a bad ELEMENT (typeof short-circuits BEFORE any
+// coercion, at construction), the query index boundary matrix, and the immutability
+// contract (a post-build mutation of the caller's source cannot invalidate a query).
 // ===========================================================================
 
-test('O1.js exports exactly the twelve frozen members plus VERSION -- no more, no fewer', () => {
-    for (const name of TWELVE_MEMBERS) {
+test('ADVERSARIAL: SparseTable rejects a Symbol / BigInt / valueOf-spy element typeof-first, BEFORE coercion, byte-identical no-op (nothing half-built)', () => {
+    let valueOfCalls = 0;
+    const evil = { valueOf() { valueOfCalls++; return 3; } };
+    /* eslint-disable no-new-wrappers */
+    for (const bad of [Symbol('v'), 5n, evil, new Number(2), NaN, null, undefined, '2', {}]) {
+        assert.throws(() => new SparseTable([1, 2, bad], 'min'), litO1, 'element=' + String(bad));
+        assert.throws(() => new SparseTable([1, 2, bad], 'max'), litO1, 'element=' + String(bad));
+    }
+    /* eslint-enable no-new-wrappers */
+    assert.equal(valueOfCalls, 0, 'a bad element must be rejected BEFORE its valueOf runs');
+});
+
+test('SparseTable: query index boundary matrix 0 / n-1 / n / -1 / l>r on n=10; queries never throw', () => {
+    const n = 10;
+    const arr = new Array(n);
+    for (let i = 0; i < n; i++) arr[i] = (i * 7 + 3) % 13;
+    const t = new SparseTable(arr, 'min');
+    assert.equal(t.query(0, n - 1), Math.min(...arr));   // full range
+    assert.equal(t.query(0, 0), arr[0]);                 // singleton at 0
+    assert.equal(t.query(n - 1, n - 1), arr[n - 1]);     // singleton at n-1
+    for (const [l, r] of [[-1, 3], [0, n], [n, n], [5, 4], [1.5, 3], [0, 3.5]]) {
+        assert.doesNotThrow(() => t.query(l, r));
+        assert.equal(t.query(l, r), undefined, 'query(' + l + ',' + r + ')');
+    }
+    assert.equal(t.at(-1), undefined);
+    assert.equal(t.at(n), undefined);
+});
+
+test('SparseTable IMMUTABILITY: a post-build mutation of the caller source never changes a query', () => {
+    const arr = [8, 3, 6, 1, 9, 2, 7];
+    const t = new SparseTable(arr, 'max');
+    const full = t.query(0, arr.length - 1);
+    assert.equal(full, 9);
+    for (let i = 0; i < arr.length; i++) arr[i] = -1;
+    assert.equal(t.query(0, arr.length - 1), 9, 'the internal copy is independent of the caller array');
+    assert.equal(t.at(4), 9);
+});
+
+// ===========================================================================
+// Cross-file "thirteen members" regression guard. v1.3.0 grew the roster to
+// thirteen (SparseTable); this test fails if a future session adds/removes a member
+// from O1.js without also updating README.md / GUIDE.md / llms.txt, or vice
+// versa (docs claim thirteen but the module does not export thirteen).
+// ===========================================================================
+
+test('O1.js exports exactly the thirteen frozen members plus VERSION -- no more, no fewer', () => {
+    for (const name of THIRTEEN_MEMBERS) {
         assert.equal(typeof O1Module[name], 'function', name + ' must be an exported class/function');
     }
     const exportedNames = Object.keys(O1Module).sort();
-    const expected = [...TWELVE_MEMBERS, 'VERSION'].sort();
-    assert.deepEqual(exportedNames, expected, 'O1.js export surface drifted from the frozen twelve-member + VERSION list');
+    const expected = [...THIRTEEN_MEMBERS, 'VERSION'].sort();
+    assert.deepEqual(exportedNames, expected, 'O1.js export surface drifted from the frozen thirteen-member + VERSION list');
 });
 
-test('README.md, GUIDE.md, and llms.txt all describe the roster as "twelve members" (case-insensitive), never a stale count', () => {
+test('README.md, GUIDE.md, and llms.txt all describe the roster as "thirteen members" (case-insensitive), never a stale count', () => {
     const files = ['README.md', 'GUIDE.md', 'llms.txt'];
     for (const f of files) {
         const text = readFileSync(join(ROOT, f), 'utf8');
-        assert.match(text, /twelve members?/i, f + ' must describe the roster as "twelve member(s)" somewhere');
+        assert.match(text, /thirteen members?/i, f + ' must describe the roster as "thirteen member(s)" somewhere');
         // Stale roster-size prose from earlier releases must not survive verbatim.
         // NOTE: "ten members" is NOT rejected here -- the repo-only benchmark suite
-        // deliberately still profiles TEN members (RingLog + CuckooMap are out of the
-        // bench, like FreqO1/BucketQueue/the wheels), so "ten members x 8 dimensions
-        // = 80 cells" is a CORRECT, current phrase. The stale roster counts are nine
-        // (pre-HTW) and eleven (pre-CuckooMap), plus the stale 72-cell benchmark size.
+        // deliberately still profiles TEN members (RingLog + CuckooMap + SparseTable are
+        // out of the bench, like FreqO1/BucketQueue/the wheels), so "ten members x 8
+        // dimensions = 80 cells" is a CORRECT, current phrase. The stale roster counts are
+        // nine (pre-HTW), eleven (pre-CuckooMap), and twelve (pre-SparseTable), plus the
+        // stale 72-cell benchmark size.
         assert.doesNotMatch(text, /\bnine members\b/i, f + ' must not still say "nine members"');
         assert.doesNotMatch(text, /\beleven members\b/i, f + ' must not still say "eleven members"');
+        assert.doesNotMatch(text, /\btwelve members\b/i, f + ' must not still say "twelve members"');
         assert.doesNotMatch(text, /\b72 cells\b/, f + ' must not still say the stale 72-cell benchmark count');
     }
 });
 
-test('every TWELVE_MEMBERS name appears in the GUIDE.md picker table and decision flowchart', () => {
+test('every THIRTEEN_MEMBERS name appears in the GUIDE.md picker table and decision flowchart', () => {
     const guide = readFileSync(join(ROOT, 'GUIDE.md'), 'utf8');
-    for (const name of TWELVE_MEMBERS) {
+    for (const name of THIRTEEN_MEMBERS) {
         const count = (guide.match(new RegExp('\\b' + name + '\\b', 'g')) || []).length;
         assert.ok(count >= 2, name + ' must appear at least twice in GUIDE.md (flowchart leaf + picker table row), found ' + count);
     }

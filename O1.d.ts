@@ -678,3 +678,48 @@ export class CuckooMap {
     /** Iterate [key, value] tuples in dense slot order. Allocates per protocol. */
     [Symbol.iterator](): IterableIterator<[number, number]>;
 }
+
+/**
+ * SparseTable -- a zero-GC, WORST-CASE O(1) STATIC range-minimum / range-maximum table
+ * (the idempotent-operation sparse table / "StaticRMQ"); the suite's first static
+ * build-once/immutable member. The QUERY is true worst-case O(1), zero-alloc (a floor-log2
+ * via clz32 + two table reads + one compare, independent of the range width). The O(n log n)
+ * BUILD and the O(n log n) table SPACE (n*(floor(log2 n)+1) table cells + n source cells) are
+ * a DISCLOSED co-headline paid once at construction, EXCLUDED from the per-op claim. `kind`
+ * ('min' | 'max') is frozen at construction. The source is COPIED into an internal
+ * Float64Array, so a later mutation of the caller's array cannot invalidate a query. Build-
+ * once, query-only: NO mutators and NO clear(). Fail closed at construction (a non-array /
+ * empty / bad-length source or a non-numeric / NaN element throws [lite-o1]); queries never
+ * throw (query / at return `undefined` on a bad index). Because the query is worst-case O(1),
+ * there is NO max-single-op line.
+ */
+export class SparseTable {
+    /**
+     * @param source  the values to index; a real Array of numbers or a numeric TypedArray,
+     *                length in [1, 2^26]. COPIED into an internal Float64Array (immutable).
+     * @param kind    the frozen extreme this instance reports: 'min' or 'max'.
+     */
+    constructor(
+        source: number[] | Float64Array | Float32Array | Int8Array | Uint8Array |
+            Uint8ClampedArray | Int16Array | Uint16Array | Int32Array | Uint32Array,
+        kind: 'min' | 'max',
+    );
+
+    /** Number of source elements. */
+    readonly length: number;
+
+    /** The frozen extreme this instance reports: 'min' or 'max'. */
+    readonly kind: 'min' | 'max';
+
+    /** The extreme over the inclusive range [l, r]. Worst-case O(1). `undefined` on a bad l / r (out of range, l > r); never throws. */
+    query(l: number, r: number): number | undefined;
+
+    /** The single source element at index i, or `undefined` out of range / non-integer. O(1). Never throws. */
+    at(i: number): number | undefined;
+
+    /** Iterate the source values in index order, alloc-free. fn is (value, index, table). */
+    forEach(fn: (value: number, index: number, table: SparseTable) => void): void;
+
+    /** Iterate the source values in index order. Allocates a {value, done} per step by protocol. */
+    [Symbol.iterator](): IterableIterator<number>;
+}

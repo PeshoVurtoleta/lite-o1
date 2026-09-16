@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-Version: 1.2.0
+Version: 1.3.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -13,11 +13,11 @@ op is O(1) worst-case (or O(1)-amortized where stated) and allocates zero bytes
 after construction, and a shipped witness harness demonstrates the flat
 throughput curve against a built-in foil.
 
-v1.2.0 ships twelve members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
-RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, and CuckooMap.
-They share no mutable module state, so a bundler that imports one drops the others
-(tree-shakeable). 1.2.0 is additive + backward-compatible: it only adds CuckooMap (1.1.0
-added RingLog).
+v1.3.0 ships thirteen members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
+RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, and
+SparseTable. They share no mutable module state, so a bundler that imports one drops the others
+(tree-shakeable). 1.3.0 is additive + backward-compatible: it only adds SparseTable (1.2.0
+added CuckooMap, 1.1.0 added RingLog).
 
 ## Exports (from the single main file O1.js)
 
@@ -54,7 +54,14 @@ added RingLog).
   eviction chain + a rare in-place O(capacity) re-seed -- the max-single-op line). Fixed
   capacity, fail closed under a 0.90 load ceiling. 0 is a legal key (occupancy byte is the
   only emptiness signal). O(capacity) space over a sparse / large integer key domain.
-- `VERSION` -- string, '1.2.0'.
+- `SparseTable` -- class. A zero-GC WORST-CASE O(1)-QUERY STATIC range-minimum / range-maximum
+  table (the idempotent-operation sparse table / "StaticRMQ") -- the suite's FIRST static
+  build-once/immutable member. query(l, r) is true worst-case O(1) (a floor-log2 via clz32 + two
+  table reads + one compare, independent of the range width); the O(n log n) BUILD and O(n log n)
+  table SPACE are a DISCLOSED co-headline paid once at construction. kind ('min' | 'max') frozen;
+  the source is COPIED into an internal Float64Array (immutable). Build-once, query-only (NO
+  mutators, NO clear); fail closed at construction, queries never throw.
+- `VERSION` -- string, '1.3.0'.
 
 ## SparseSet
 
@@ -748,6 +755,73 @@ SET (membership only) over a bounded [0, universe); CuckooMap is an O(capacity)-
 and you need only membership; pick CuckooMap when keys are sparse / large and you need values.
 (For APPROXIMATE membership with false positives, reach for @zakkster/lite-filter instead.)
 
+## SparseTable
+
+    new SparseTable(source, kind)
+
+- A WORST-CASE O(1)-QUERY STATIC range-minimum / range-maximum table (the classic
+  idempotent-operation sparse table / "StaticRMQ") -- the suite's FIRST static build-once /
+  immutable member. Build the table ONCE, then answer "the min (or max) over [l, r]" in true
+  worst-case O(1) forever.
+- source: the values to index; a real Array of numbers OR any numeric TypedArray, length in
+  [1, 2^26]. COPIED element-by-element into an internal Float64Array at build, so a later
+  mutation of the caller's array can NEVER invalidate a query (genuinely immutable +
+  self-contained). Object / string / BigInt-typed sources fail the per-element number check.
+- kind: 'min' or 'max', FROZEN at construction (one extreme per instance; run TWO instances for
+  both -- mirrors MinStack / MonoDeque). A ctor-cached boolean drives the hot compare, so
+  query() does NO per-call kind-string test.
+- Constructor throws a [lite-o1] error on a non-array / empty / bad-length source, a bad kind,
+  or a non-numeric / NaN element (typeof-guarded FIRST so a Symbol / BigInt never coerces;
+  String(x) message). Nothing half-built escapes -- validation throws before the table is
+  allocated or any instance field is assigned; the source-copy scratch buffer is a discarded
+  local, so a throw leaves nothing queryable (a byte-identical no-op).
+
+THE HONESTY CONTRACT (the load-bearing decision -- see decisions/0018): the QUERY is the hot op
+and it is TRUE WORST-CASE O(1), zero-alloc. The O(n log n) BUILD and the O(n log n) table SPACE
+are a DISCLOSED CO-HEADLINE (the same shape as BucketQueue's O(ceiling) space, TimerWheel's
+O(slots), HierarchicalTimerWheel's O(capacity)): paid ONCE at construction, EXCLUDED from the
+per-op claim. The witness gates the QUERY; build is never in the measured window. Because the
+query is worst-case O(1) (not amortized), there is NO max-single-op line.
+
+Layout (flat SoA): ONE internal Float64Array copy of the n source values + ONE flat
+Float64Array `_table` of length n*(K+1) where K = floor(log2(n)) (levels 0..K), indexed manually
+as table[level*n + i] = the extreme over the span [i, i+2^level). Level 0 is the source; level j
+folds two level-(j-1) spans of 2^(j-1). EXACT SPACE co-headline: n*(floor(log2 n)+1) table cells
++ n source cells = n*(floor(log2 n)+2) Float64 slots.
+
+Hot surface (query / at are WORST-CASE O(1), zero allocation):
+
+- query(l, r) -> number|undefined  The extreme (min or max, per the frozen kind) over the
+                        INCLUSIVE range [l, r]. WORST-CASE O(1): one floor-log2 (via clz32) + two
+                        table reads + one compare (the idempotent-overlap trick -- two
+                        overlapping 2^k-wide windows cover [l, r] exactly even where they
+                        overlap). A bad l / r (non-number, non-int, out of [0, length), or l > r)
+                        returns undefined and NEVER throws (the family "queries never throw" law;
+                        typeof FIRST so a Symbol / BigInt never coerces).
+- at(i) -> number|undefined  The single source element at index i. O(1). undefined out of range /
+                        non-integer, NEVER throws (symmetry with query).
+- length (getter)       Number of source elements.
+- kind (getter)         The frozen 'min' | 'max' extreme.
+- forEach(fn) -> void   O(length) alloc-free scan of the SOURCE values in index order; fn is
+                        (value, index, table). A documented exception, EXCLUDED from the
+                        zero-alloc-per-op claims.
+- [Symbol.iterator]()   O(length) scan of the source values; the ONE per-protocol ALLOCATOR --
+                        use forEach for the alloc-free scan.
+
+Build-once, query-only (LOCKED): there are NO mutators (no set / update / push) and NO clear() --
+the table is immutable, so a clear would be nonsensical (see the ADR). Rebuild a new instance to
+change the data.
+
+Value contract (LOCKED, IDENTICAL to RingDeque / MonoDeque / MinStack / RingLog): every source
+element must be typeof 'number' AND not NaN. Rejected (throws [lite-o1] at construction): null,
+undefined, string, Symbol, BigInt, object (incl. one with a numeric valueOf), NaN. Accepted: any
+finite number, and +Infinity / -Infinity. The typeof guard runs FIRST so a Symbol / BigInt never
+reaches coercion.
+
+Worst-case honesty: like MinStack / RingLog, the query is WORST-CASE O(1) -- so the witness
+prints NO MAX-single-op line; the flat query line IS the worst-case claim. The build cost is the
+honest co-headline (measured OUTSIDE the timed query op, like every member's construction).
+
 ## Design bounds
 
 - SparseSet valid key: integer in [0, universe).
@@ -838,10 +912,23 @@ and you need only membership; pick CuckooMap when keys are sparse / large and yo
   tombstones (a lookup visits only the two home buckets). Space O(capacity) over a sparse /
   large integer key domain (vs SparseSet's O(universe) over a dense one). clear() is O(capacity)
   (a Uint8Array fill). forEach / [Symbol.iterator] scan in dense slot order (iterator allocates).
+- SparseTable valid source: a real Array of numbers or a numeric TypedArray, length in [1, 2^26];
+  every element typeof 'number' and not NaN (+/-Infinity accepted). STATIC build-once / immutable:
+  the source is COPIED into an internal Float64Array (a post-build mutation of the caller's array
+  cannot invalidate a query); NO mutators, NO clear. query(l, r) / at(i) are WORST-CASE O(1)
+  (query = a floor-log2 via clz32 + two table reads + one compare, the idempotent-overlap trick),
+  undefined on a bad l / r / i (never throw). The O(n log n) BUILD + O(n log n) table SPACE
+  (n*(floor(log2 n)+1) table cells + n source cells) are a DISCLOSED co-headline paid once at
+  construction, EXCLUDED from the per-op claim (like BucketQueue's O(ceiling) / TimerWheel's
+  O(slots)). Fail closed at construction (a non-array / empty / bad-length source, a bad kind, or
+  a non-numeric / NaN element throws [lite-o1] a byte-identical no-op -- nothing half-built
+  escapes), queries never throw. kind ('min' | 'max') frozen. forEach / [Symbol.iterator] scan the
+  source values in index order (iterator allocates). NO max-single-op line (query is worst-case
+  O(1); the build cost is the honest co-headline, not a per-op spike).
 
 ## Scripts
 
-- npm test           -- 525 node:test cases (contract + boundary + differential fuzz).
+- npm test           -- 542 node:test cases (contract + boundary + differential fuzz).
 - npm run test:types -- tsc --noEmit against O1.d.ts.
 - npm run torture    -- lite-leak + lite-gc-profiler: 0 B/op, 0 major GC, leak-free.
 - npm run witness    -- O(1) throughput-invariance harness + foils + flatness gate.
@@ -938,13 +1025,21 @@ and you need only membership; pick CuckooMap when keys are sparse / large and yo
   the witness prints the in-place O(capacity) RE-SEED spike (9 fully-colliding keys trip
   MaxLoop) beside a typical O(1) set, gated as a visible >= 2x spike -- the amortized-honesty
   bar for set.
+- SparseTable: len-sweep [1e3, 1e4, 1e5], WORST-CASE-O(1) STATIC range-min QUERY over a WIDE range
+  (width ~ len; the O(n log n) BUILD is done OUTSIDE the timed op, EXCLUDED from the per-op claim)
+  vs an alloc-free O(len) naive range-scan foil (recompute the extreme by scanning [l, len-1] each
+  query). Gating over WIDE ranges is deliberate: a narrow range makes the O(len) foil cheap and
+  hides the divergence. ops/ms is a rate (table batch 5e5, foil batch 2e3). Gated over the steady
+  window len >= 1e4 (the 1e3 point is a pure-L1 micro-case shown but not gated). SparseTable
+  flatness >= 0.70; naive foil flatness <= 0.55 (a TRUE O(len) foil, so it collapses);
+  SparseTable/naive ratio >= 1.5x. NO MAX-single-op line: query is worst-case O(1) (the build cost
+  is the honest co-headline, not a per-op spike).
 
 ## Not yet shipped
 
-The public API is STABLE; 1.2.0 adds CuckooMap (additive, backward-compatible -- the prior
-eleven are unchanged; 1.1.0 added RingLog). Not in this release, planned for later:
-SlotPool (a free-list slot allocator with generational ABA-safe handles) and SparseTable /
-StaticRMQ (an O(1)-query static range-minimum table, the remaining post-1.0 member -> 1.3.0).
+The public API is STABLE; 1.3.0 adds SparseTable (additive, backward-compatible -- the prior
+twelve are unchanged; 1.2.0 added CuckooMap, 1.1.0 added RingLog). Not in this release, planned
+for later: SlotPool (a free-list slot allocator with generational ABA-safe handles).
 SparseSet holds membership, not payloads (store values in a parallel SoA
 column or @zakkster/lite-arena); RingDeque holds numbers only; UnionFind holds
 disjoint-set connectivity over [0, n), not payloads; MonoDeque holds numeric
@@ -961,6 +1056,9 @@ wheel, not an UNbounded one (a fully unbounded / hashed wheel remains a deferred
 member; both wheels schedule integer handles for object payloads, not payloads directly);
 and RingLog holds numbers only, a LOSSY rolling window you READ (keep the last N,
 overwrite-oldest) -- NOT a consumable queue (reach for RingDeque to drain / fail closed) --
-and CuckooMap holds an exact integer-key -> number MAP over sparse / large safe-integer keys
+CuckooMap holds an exact integer-key -> number MAP over sparse / large safe-integer keys
 (|k| <= 2^53), O(capacity) space (NOT SparseSet's O(universe) dense set, NOT lite-filter's
-approximate membership; map object payloads to integer handles).
+approximate membership; map object payloads to integer handles); and SparseTable holds a STATIC
+build-once immutable COPY of a numeric source for O(1) range-min / range-max QUERIES only -- NOT a
+mutable structure (there are no mutators / no clear; rebuild a new instance to change the data),
+NOT a full segment tree (it answers only an idempotent extreme, not sums / updates).

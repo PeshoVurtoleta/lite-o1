@@ -1,7 +1,7 @@
 # lite-o1 -- which structure to pick (GUIDE)
 
 A repo-only decision guide for the O(1) family: which member, reach-for / avoid,
-and how to measure the constant yourself. At v1.2.0 the family is STABLE at twelve
+and how to measure the constant yourself. At v1.3.0 the family is STABLE at thirteen
 members and this guide is complete for them -- still open (a new section lands with
 each future member), but no longer a skeleton. It is NOT an API encyclopedia (that
 is the README + `O1.d.ts`); it answers "which member, and is my constant real?"
@@ -23,7 +23,7 @@ flatness floor for YOUR workload -- run `npm run witness` and read the shape.
 
 ## Which member? (decision flowchart)
 
-ASCII, routes on the discriminating questions. Every leaf is one of the twelve
+ASCII, routes on the discriminating questions. Every leaf is one of the thirteen
 members; `(wc)` = worst-case O(1), `(am)` = amortized O(1).
 
 ```
@@ -47,6 +47,9 @@ START -- what is the SHAPE of your workload?
 |
 +-- The MIN or MAX of a SLIDING WINDOW over a numeric stream? -> MonoDeque (am)
 |
++-- The MIN or MAX over an ARBITRARY range [l, r] of a FIXED numeric array you
+|   build ONCE and never mutate (static range-min/max query)? -> SparseTable (wc query)
+|
 +-- "Are these two in the SAME GROUP?" over a fixed integer set,
 |   merging groups incrementally (no un-merge)? -> UnionFind (am)
 |
@@ -62,12 +65,13 @@ START -- what is the SHAPE of your workload?
 ```
 
 Budget rule of thumb: if you cannot tolerate ANY per-op spike (hard-real-time on
-the WORST single op), stay on the seven `(wc)` members. The five `(am)` members
+the WORST single op), stay on the eight `(wc)` members. The five `(am)` members
 (UnionFind, MonoDeque, BucketQueue, HierarchicalTimerWheel, CuckooMap) buy their constant
 with an amortized average and wear an honest worst-single-op tail -- read the MAX-single-op
 line the witness prints, and the per-member "avoid it when" notes below. (CuckooMap's
 lookup -- get / has / delete -- is worst-case O(1), a hard <= 8-slot probe; only its `set`
-is amortized, wearing the in-place re-seed spike.)
+is amortized, wearing the in-place re-seed spike. SparseTable's QUERY is worst-case O(1); its
+one-time O(n log n) BUILD is a disclosed co-headline paid at construction, not a per-op spike.)
 
 ## Which member? (picker table)
 
@@ -87,6 +91,7 @@ One row per member; pick by the left column, confirm with the discriminator.
 | timers over a WIDE but bounded delay horizon (< 2^26)        | HierarchicalTimerWheel | amortized   | cascading tvec wheel; O(1) amortized, periodic cascade spike |
 | "keep the last N" numbers, never block, overwrite the oldest  | RingLog                | worst-case  | lossy overwrite-oldest ring; push returns the evicted; read-only, no drain |
 | an exact key -> number MAP over sparse / large INTEGER keys   | CuckooMap              | amortized*  | bucketized cuckoo, <= 8-slot probe; *lookup wc, set amortized (re-seed spike) |
+| the MIN or MAX over an ARBITRARY range of a FIXED numeric array | SparseTable            | worst-case  | STATIC build-once immutable range-min/max; O(1) query, O(n log n) build co-headline |
 
 ---
 
@@ -598,17 +603,61 @@ amortized-honesty bar for `set`, the thematic sibling of HierarchicalTimerWheel'
 
 ---
 
+### SparseTable (v1.3.0)
+
+Static range-minimum / range-maximum table (the idempotent-operation "sparse table" /
+StaticRMQ) over two immutable `Float64Array` columns (a source copy + a flat `n*(K+1)`
+table, `K = floor(log2 n)`). Build it ONCE from a numeric array; then `query(l, r)` returns
+the min OR max (the frozen `kind`) over any inclusive range in WORST-CASE O(1) -- a
+floor-log2 (via `clz32`) + two table reads + one compare, independent of the range width.
+The suite's FIRST static build-once / immutable member.
+
+**Reach for it when:**
+
+- You have a FIXED numeric array you build ONCE and then query many times for the min or
+  max over arbitrary ranges `[l, r]` -- static range-min/max (RMQ) over precomputed data:
+  offline analytics, a fixed heightmap / signal, a precomputed cost table, LCA-via-RMQ, or
+  any "extreme of a slice" you hit far more often than you rebuild.
+- You need a HARD per-QUERY budget: `query` is worst-case O(1), never an amortized probe
+  or a tree descent (a segment tree is O(log n) per query).
+- The data never changes after build (or changes rarely enough that a full rebuild is
+  cheaper than carrying update machinery) -- SparseTable is immutable, so there is no
+  per-update cost to amortize.
+- You need zero per-query allocation, and you want the table self-contained: the source is
+  COPIED at build, so a later mutation of your array cannot silently invalidate a query.
+
+**Avoid it when:**
+
+- Your data is MUTABLE (point updates between queries) -- SparseTable has no `set` / `update`
+  and no `clear`; a change means rebuilding the whole table (O(n log n)). Reach for a segment
+  tree / Fenwick tree (a future lite-logn member) for update + query.
+- You need a NON-idempotent range aggregate -- SUM, product, count, XOR-with-updates -- the
+  overlap trick only works for idempotent operations (min / max / gcd / and / or). A sum
+  needs a prefix array or a Fenwick tree, not a sparse table.
+- Memory is tight and `n` is large: the table is `n*(floor(log2 n)+1)` cells PLUS the `n`
+  source cells (all Float64), i.e. O(n log n) space -- the disclosed co-headline. A segment
+  tree is O(n) space (but O(log n) query); pick by which axis you must pay.
+- Your build is itself on a hot path -- the O(n log n) build is paid up front; SparseTable
+  wins only when queries dominate builds.
+
+**Measure it:** `npm run witness` -- SparseTable range-min `query` flatness `>= 0.70` across
+the length sweep `[1e4..1e5]` (the 1e3 point is a pure-L1 micro-case, shown but not gated)
+while an alloc-free naive O(len) range-scan foil (recompute the extreme by scanning `[l, r]`
+each query) collapses (`<= 0.55`), ratio `>= 1.5x`. The ratio is gated over WIDE ranges (width
+~ len), where the O(len) foil genuinely diverges. There is deliberately NO MAX-single-op line:
+the query is worst-case O(1); the one-time O(n log n) BUILD is the honest co-headline (measured
+OUTSIDE the timed query, like every member's construction), not a per-op spike.
+
+---
+
 ## Roadmap members (not yet shipped, planned)
 
-The public API is stable at v1.2.0's twelve members; these are planned, not shipped.
+The public API is stable at v1.3.0's thirteen members; these are planned, not shipped.
 Placeholders so the decision axes are visible early; each fills in on release.
 
 - **SlotPool** -- free-list slot allocator with generational (ABA-safe) handles.
   Reach for it as the SoA substrate; reconcile against `@zakkster/lite-arena`
   before picking one.
-- **SparseTable / StaticRMQ** -- an O(1)-query static range-minimum table (build
-  once, query O(1)); carries the "admit static, build-once members?" boundary call.
-  The remaining post-1.0 member -> 1.3.0.
 
 ---
 
