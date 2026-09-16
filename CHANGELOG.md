@@ -6,14 +6,58 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.10.0] - 2026-09-16
+
+### Added
+
+- **`HierarchicalTimerWheel` -- the tenth (capstone) member: a zero-GC, AMORTIZED O(1)
+  CASCADING multi-level timing wheel.** The cascading sibling of `TimerWheel`: four nested
+  levels in the Linux `tvec` shape (1x256 + 3x64, total delay range 2^26) let it schedule a
+  far larger BOUNDED delay horizon (`delay` in `[0, 2^26)`) with the SAME zero-alloc
+  substrate as the simple wheel -- one node per timer, moved between intrusive lists BY
+  INDEX ONLY. As the clock advances, coarse timers CASCADE down to finer levels: a level-0
+  wrap (every 256 ticks) re-files the next level's due bucket down (nested for levels 2/3),
+  all by pointer surgery, ZERO allocation even on a cascade tick. `schedule` / `cancel` /
+  `advance(1)` / `has` are amortized O(1); `drainDue` is O(due); a level-wrap tick runs the
+  O(bucket) cascade -- the teaching MAX-single-op SPIKE (the witness gates it at >= 8x the
+  typical tick), amortized O(1) over a timer's life. It shares no mutable module state with
+  the other nine, so a bundler that imports one drops the rest (tree-shakeable). Getters:
+  `size` / `capacity` / `universe` / `now` / `maxDelay` (2^26 - 1).
+- Fail closed, mirroring `TimerWheel`: a bad id, a `delay >= 2^26`, or a NEW id past
+  capacity throw a `[lite-o1]` `RangeError` as a BYTE-IDENTICAL no-op (every guard precedes
+  the first write). DRAIN-BEFORE-CASCADE: `advance()` throws if a level-0 slot left behind
+  is undrained. RE-ENTRANCY: `schedule` / `cancel` / `clear` from inside a fired `drainDue`
+  callback are LEGAL; a re-entrant `advance()` (nested, or from inside a callback -- guarded
+  by a `_busy` flag) THROWS `[lite-o1]`. `has` / `cancel` never throw (a bad / absent id is
+  absent / false). The `now` ceiling is 2^53 (a `>=` guard keeps `now` + the stored Float64
+  `expiry` integer-exact).
+- **Benchmark suite (repo-only): `HierarchicalTimerWheel` added as the tenth subject.** Its
+  primary foil is a FAIR one -- an alloc-free 4-ary min-heap (O(log n) per fired timer)
+  driven by the same tick trace -- so `STRONG_BASELINE` is NA and `RATIONALE` records a
+  FAIR-ALREADY verdict. Wired into every `Matrix.mjs` / `Dimensions.mjs` dispatch helper
+  (each still throws `[bench] unhandled member` for an unknown member); `theoreticalMinPerLive`
+  = 24 B/live (4 Uint32 columns + a Float64 expiry). The witness adds a
+  `HierarchicalTimerWheel` section (amortized-flat vs the 4-ary heap + the gated cascade
+  spike); `torture.mjs` and the `test:perf` gate add cascade-crossing zero-alloc scenarios.
+
+### Docs
+
+- `README.md`, `llms.txt`, `O1.d.ts`, and this changelog document the tenth member. New ADR
+  [`0015`](./decisions/0015-hierarchical-timerwheel.md) records the settled design calls
+  (the hybrid 1x256 + 3x64 geometry + why, the fail-closed `delay >= 2^26` `RangeError`,
+  the re-entrancy contract where `advance()` throws, and the fair 4-ary-heap foil).
+
 ### Internal
 
+- Version trinity bumped 0.9.0 -> 0.10.0 (`package.json` / `O1.js` `VERSION` / `llms.txt`),
+  byte-identical. `O1.js` / `O1.d.ts` remain ASCII-only; `files[]` unchanged (the new member
+  ships inside the existing single main file).
 - **8-dimension benchmark suite (`benchmark/`, repo-only -- NOT part of the
-  published surface, NO version bump).** The ecosystem MVP of RESEARCH.md section 3:
-  it profiles all nine shipped members (SparseSet, RingDeque, UnionFind, MonoDeque,
-  MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel)
-  against the JS built-ins across eight axes -- D1 latency distribution
-  (p50/p90/p99/p99.9/max, with + without forced GC), D2 amortized drift over long
+  published surface).** The ecosystem MVP of RESEARCH.md section 3:
+  it profiles the shipped members against the JS built-ins across eight axes -- D1 latency
+  distribution (p50/p90/p99/p99.9/max, with + without forced GC), D2 amortized drift over long
   mixed traces, D3 memory footprint + stability, D4 cache behaviour (a labelled
   PORTABLE PROXY: dense-iteration vs random-lookup + a working-set stride sweep; no
   native perf counters), D5 bundle size + tree-shaking (esbuild min + gzip), D6 GC
@@ -25,25 +69,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   applicability matrix emits the string `n/a` -- never 0 -- for cells that do not
   apply (fail closed; null is not zero). `esbuild` added as a DEV dependency only
   (the D5 bundler); zero RUNTIME deps preserved. `O1.js` / `O1.d.ts` / `files[]`
-  BYTE-IDENTICAL, `npm pack` unchanged at seven files. See ADR
-  [`0009`](./decisions/0009-benchmark-suite.md).
+  unchanged by the suite. See ADR [`0009`](./decisions/0009-benchmark-suite.md).
 - **`test/Bench.test.mjs`** -- the suite gate (in `npm test`): ANTI-VACUITY (every
   dimension returns positive, non-degenerate numbers; an empty array or an
   impossible 0 fails) + FIXED-SEED DETERMINISM (two runs at seed `0x9e3779b1`
   produce byte-identical workload trace hashes, using the repo's own Numerical
   Recipes LCG -- no new PRNG introduced).
-- **Benchmark accuracy additions (repo-only, no version bump).** The suite now
-  profiles all NINE shipped members (FreqO1 / BucketQueue / TimerWheel added to the
-  matrix, mirroring their `test/witness.mjs` foils: a naive LFU min-scan, an
-  alloc-free binary min-heap, and a naive O(n)-scan scheduler). D1 gains a true
+- **Benchmark rigor additions (repo-only).** D1 gains a true
   per-op tail (`p99` / `max` via `process.hrtime.bigint()`, calibrated empty-call
-  overhead subtracted and clamped >= 0) for the AMORTIZED members (MonoDeque,
-  UnionFind, BucketQueue) -- `n/a` (never 0) for the worst-case-O(1) members. New
-  `Harness.stats()` (median / mean / cv / stable, fail-closed on empty / zero-mean)
-  and a post-run drift sentinel (re-times SparseSet/D1 and DISCLOSES thermal / turbo
-  drift > 10% -- a warning, not a hard failure). CPU model + count recorded in the
-  report meta. Every dispatch site is now an explicit per-member branch ending in a
-  loud `throw` (an unknown member fails closed, never silently defaults to RandomSet).
+  overhead subtracted and clamped >= 0) for the AMORTIZED members --
+  `n/a` (never 0) for the worst-case-O(1) members. New
+  `Harness.stats()` (median / mean / cv / stable, fail-closed on empty / zero-mean),
+  bootstrap confidence intervals + a Mann-Whitney significance flag (seeded by the repo
+  LCG, so determinism holds), uniform overhead-subtraction, a p99.99 tail, and a D3
+  bytes/live load-factor curve; STRONG second baselines for the strawman foils with a
+  per-member FAIR/STRAWMAN `RATIONALE` verdict; a package-agnostic `benchmark/Template.mjs`
+  + `benchmark/METHODOLOGY.md` blueprint. A post-run drift sentinel (re-times SparseSet/D1
+  and DISCLOSES thermal / turbo drift > 10% -- a warning, not a hard failure). CPU model +
+  count recorded in the report meta. Every dispatch site is an explicit per-member branch
+  ending in a loud `throw` (an unknown member fails closed, never silently defaulting). See
+  ADR [`0009`](./decisions/0009-benchmark-suite.md).
 
 ## [0.9.0] - 2026-09-16
 

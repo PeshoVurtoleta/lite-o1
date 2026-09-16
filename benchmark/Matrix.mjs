@@ -17,13 +17,14 @@
  *   - FreqO1 vs a naive frequency table that linearly scans for the LFU key
  *   - BucketQueue vs an alloc-free binary min-heap on the same monotone trace
  *   - TimerWheel vs a naive O(n)-scan scheduler that rescans all pending deadlines
+ *   - HierarchicalTimerWheel vs an alloc-free 4-ary min-heap on the same tick trace
  */
 
 /** Sentinel for a cell that does not apply. NEVER 0. */
 export const NA = 'n/a';
 
-/** The nine shipped members, in build order. */
-export const SUBJECTS = ['SparseSet', 'RingDeque', 'UnionFind', 'MonoDeque', 'MinStack', 'RandomSet', 'FreqO1', 'BucketQueue', 'TimerWheel'];
+/** The ten shipped members, in build order. */
+export const SUBJECTS = ['SparseSet', 'RingDeque', 'UnionFind', 'MonoDeque', 'MinStack', 'RandomSet', 'FreqO1', 'BucketQueue', 'TimerWheel', 'HierarchicalTimerWheel'];
 
 /** The eight measurement dimensions (RESEARCH.md section 3). */
 export const DIMENSIONS = ['D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7', 'D8'];
@@ -51,6 +52,7 @@ export const BASELINE = {
     FreqO1: 'naive-freq',
     BucketQueue: 'binary-heap',
     TimerWheel: 'naive-scan',
+    HierarchicalTimerWheel: '4-ary-heap',
 };
 
 /**
@@ -82,6 +84,7 @@ export const STRONG_BASELINE = {
     FreqO1: NA,
     BucketQueue: NA,
     TimerWheel: NA,
+    HierarchicalTimerWheel: NA,
 };
 
 /**
@@ -154,6 +157,13 @@ export const RATIONALE = {
         verdict: 'FAIR-ALREADY', strong: NA,
         why: 'a flat array of deadlines scanned each tick (O(n)) is the naive scheduler the ' +
             'timing wheel exists to replace -- the honest rival, not a strawman.',
+    },
+    HierarchicalTimerWheel: {
+        verdict: 'FAIR-ALREADY', strong: NA,
+        why: 'the primary foil is already a STRONG one -- an alloc-free 4-ary min-heap ' +
+            '(O(log n) per tick), the real data structure a careful dev reaches for when ' +
+            'delays outrun a simple wheel, not a strawman; the cascading wheel wins by an ' +
+            'O(1)-amortized constant while wearing the max-single-op cascade spike (see the witness).',
     },
 };
 

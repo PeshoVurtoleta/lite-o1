@@ -196,6 +196,18 @@ test('fall-through now THROWS: memberBytes / theoreticalMinPerLive reject an unk
     }
 });
 
+test('fall-through now THROWS: D2 (which dispatches through the internal makeMixed) rejects an unknown member', () => {
+    // makeMixed is not exported; D2 calls it as its very first step (before any
+    // member-specific work), so D2('Bogus') exercises makeMixed's own fail-closed
+    // throw -- a future 11th member cannot silently inherit an existing mixed trace.
+    assert.throws(() => D2('Bogus', OPTS.D2), /unhandled member: Bogus/);
+    for (const m of SUBJECTS) {
+        const r = D2(m, OPTS.D2);
+        assert.equal(r.dim, 'D2');
+        assert.equal(r.member, m);
+    }
+});
+
 test('drift sentinel: pure drift helper computes the fraction + fires the warn predicate', () => {
     // Injected readings 100 -> 130 yield exactly 0.30 drift and trip the > 0.10 limit.
     assert.ok(Math.abs(driftFraction(100, 130) - 0.30) < 1e-12, 'drift ' + driftFraction(100, 130));
@@ -443,10 +455,12 @@ test('Template: validateManifest fails closed; createBenchKit runs one dimension
     assert.throws(() => kit.rationale('Nope'), /unhandled member/);
 });
 
-test('D1 perOpTail: exactly the 3 amortized members carry a tail object; the other 6 are the NA string, never 0', () => {
+test('D1 perOpTail: exactly the 4 amortized members carry a tail object; the other 6 are the NA string, never 0', () => {
     // The amortized headline set (RESEARCH.md: MonoDeque pop-storm, UnionFind
-    // pre-flatten find, BucketQueue cursor jump) is exactly 3 of the 9 SUBJECTS.
-    const AMORTIZED = new Set(['MonoDeque', 'UnionFind', 'BucketQueue']);
+    // pre-flatten find, BucketQueue cursor jump, HierarchicalTimerWheel level-wrap
+    // cascade) is exactly 4 of the 10 SUBJECTS. (TimerWheel is NOT amortized -- its
+    // drain-before-advance keeps every op worst-case O(1) -- so it stays NA.)
+    const AMORTIZED = new Set(['MonoDeque', 'UnionFind', 'BucketQueue', 'HierarchicalTimerWheel']);
     for (const m of SUBJECTS) {
         const r = D1(m, OPTS.D1);
         if (AMORTIZED.has(m)) {

@@ -16,7 +16,7 @@
 
 import {
     SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet,
-    FreqO1, BucketQueue, TimerWheel,
+    FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel,
 } from '../O1.js';
 import {
     prng, median, warm, gcNow, hasGc, percentile, collect, timeNsPerOp, foldHash,
@@ -38,6 +38,12 @@ const BQ_WINDOW = 64;        // bounded active-bucket span (keeps the monotone c
 const BQ_CEIL = 1 << 20;     // fixed priority-ceiling headroom the climbing cursor never exhausts
 /** Next power of two >= n (TimerWheel slots; one timer per slot -> ~1 due per tick). */
 function twSlots(n) { let s = 1; while (s < n) s *= 2; return s; }
+
+// HierarchicalTimerWheel sizing -- mirror test/witness.mjs exactly. Delays are spread
+// across level 0 + level 1 so drained timers re-arm one level up and CASCADE back down
+// as `now` wraps every 256 ticks (exercising the cascade spike, not just level 0).
+const HTW_SPREAD = 4096;     // prime delay spread (spans level 0 [0,256) + level 1 [256,4096))
+const HTW_REARM = 4095;      // re-arm delay -> level 1 (drained timers cascade back down)
 
 // ===========================================================================
 // Steady-state hot-op builders -- mirror test/witness.mjs exactly.
@@ -113,6 +119,17 @@ export function makeSubject(member, n, rng) {
         const w = new TimerWheel(n, S, n);
         for (let k = 0; k < n; k++) w.schedule(k, k % S);
         const rearm = (id, wheel) => { wheel.schedule(id, S - 1); SINK += id; };
+        return { obj: w, op: () => { w.drainDue(rearm); w.advance(1); } };
+    }
+    if (member === 'HierarchicalTimerWheel') {
+        // A bounded cascading wheel of n live timers spread across level 0 + level 1; each
+        // op drains the due slot (re-arming every fired timer one level up so the resident
+        // set stays n and drained timers CASCADE back down as `now` wraps every 256 ticks)
+        // and advances one tick -- amortized O(1) (a level-wrap tick runs the cascade spike).
+        const w = new HierarchicalTimerWheel(n, n);
+        const spread = Math.min(HTW_SPREAD, w.maxDelay);
+        for (let k = 0; k < n; k++) w.schedule(k, k % spread);
+        const rearm = (id, wheel) => { wheel.schedule(id, HTW_REARM); SINK += id; };
         return { obj: w, op: () => { w.drainDue(rearm); w.advance(1); } };
     }
     if (member === 'MonoDeque') {
@@ -264,6 +281,52 @@ export function makeBaseline(member, n) {
             },
         };
     }
+    if (member === 'HierarchicalTimerWheel') {
+        // alloc-free 4-ary MIN-HEAP keyed by absolute expiry, driven by the SAME tick
+        // trace: each tick pops every timer whose expiry === now and re-inserts it
+        // HTW_REARM ticks ahead (sift-down + sift-up are O(log_4 n)), then advances now --
+        // O(log n) per fired timer, the log-n cost the cascading wheel removes. A 4-ary
+        // (not binary) heap is the tougher, fairer foil (shallower, cache-friendlier).
+        const cap = n + 1;
+        const he = new Float64Array(cap); // 1-based: expiries
+        const hk = new Uint32Array(cap);  // parallel ids
+        let size = 0;
+        const up = (i) => {
+            while (i > 1) {
+                const p = (i + 2) >> 2; // 4-ary parent = floor((i+2)/4)
+                if (he[p] <= he[i]) break;
+                const te = he[p]; he[p] = he[i]; he[i] = te;
+                const tk = hk[p]; hk[p] = hk[i]; hk[i] = tk;
+                i = p;
+            }
+        };
+        const down = (i) => {
+            for (;;) {
+                let best = i;
+                const c0 = 4 * i - 2;                  // first of the 4 children
+                for (let c = c0; c < c0 + 4 && c <= size; c++) if (he[c] < he[best]) best = c;
+                if (best === i) break;
+                const te = he[best]; he[best] = he[i]; he[i] = te;
+                const tk = hk[best]; hk[best] = hk[i]; hk[i] = tk;
+                i = best;
+            }
+        };
+        const spread = Math.min(HTW_SPREAD, (1 << 26) - 1);
+        for (let k = 0; k < n; k++) { const i = ++size; he[i] = k % spread; hk[i] = k; up(i); }
+        let now = 0;
+        return {
+            op: () => {
+                while (size > 0 && he[1] === now) {   // fire every timer due at this tick
+                    const id = hk[1];
+                    he[1] = he[size]; hk[1] = hk[size]; size--;
+                    down(1);
+                    const i = ++size; he[i] = now + HTW_REARM; hk[i] = id; up(i); // re-arm one level up
+                    SINK += id;
+                }
+                now++;
+            },
+        };
+    }
     if (member === 'MonoDeque') {
         // naive window rescan (O(W) per element).
         const W = n;
@@ -368,6 +431,7 @@ const LINEAR_BASELINE = {
     FreqO1: true,        // naive-freq foil is an O(n) LFU scan
     BucketQueue: true,   // binary-heap foil is O(log n) per op
     TimerWheel: true,    // naive-scan foil is an O(n) deadline scan
+    HierarchicalTimerWheel: true, // 4-ary-heap foil is O(log n) per fired timer
 };
 
 /** Exact backing-store byte footprint of a member instance (typed-array buffers). */
@@ -402,6 +466,13 @@ export function memberBytes(member, obj) {
             obj._slotOf.buffer.byteLength + obj._next.buffer.byteLength + obj._prev.buffer.byteLength +
             obj._sHead.buffer.byteLength + obj._sTail.buffer.byteLength;
     }
+    if (member === 'HierarchicalTimerWheel') {
+        // id substrate (dense+sparse+listOf+next+prev) + expiry (Float64) + static lists
+        // (head+tail, one per flat list -> O(1) fixed 449 heads, NOT per-live).
+        return obj._dense.buffer.byteLength + obj._sparse.buffer.byteLength +
+            obj._listOf.buffer.byteLength + obj._next.buffer.byteLength + obj._prev.buffer.byteLength +
+            obj._expiry.buffer.byteLength + obj._head.buffer.byteLength + obj._tail.buffer.byteLength;
+    }
     throw new Error('[bench] unhandled member: ' + member);
 }
 
@@ -421,6 +492,11 @@ export function theoreticalMinPerLive(member) {
     if (member === 'FreqO1') return 20;
     if (member === 'BucketQueue') return 16; // dense + prio + nk + pk = 4 Uint32 per live key
     if (member === 'TimerWheel') return 16;  // dense + slotOf + next + prev = 4 Uint32 per live timer
+    // HierarchicalTimerWheel: dense + listOf + next + prev = 4 Uint32 (16 B) + expiry
+    // (Float64, 8 B) per live timer. The Float64 expiry column is the price of the
+    // cascade (it re-files each timer by its absolute expiry), so the dense floor is 24,
+    // NOT widened to absorb the universe-sized sparse array or the fixed 449-list heads.
+    if (member === 'HierarchicalTimerWheel') return 24;
     throw new Error('[bench] unhandled member: ' + member);
 }
 
@@ -437,12 +513,14 @@ function liveCount(member, obj) {
 /**
  * The AMORTIZED members: their headline is a per-op cost that is O(1) on average
  * but hides a rarer worst single op (MonoDeque's pop-storm, UnionFind's pre-flatten
- * find, BucketQueue's cursor jump). These are the members that wear the witness'
- * MAX-single-op line, so D1 measures a true per-op tail for them; every other
- * member is worst-case O(1) (no hidden spike), so its perOpTail reads NA -- the
- * batch-mean distribution already tells the whole story.
+ * find, BucketQueue's cursor jump, HierarchicalTimerWheel's level-wrap CASCADE).
+ * These are the members that wear the witness' MAX-single-op line, so D1 measures a
+ * true per-op tail for them; every other member is worst-case O(1) (no hidden spike),
+ * so its perOpTail reads NA -- the batch-mean distribution already tells the whole
+ * story. (TimerWheel is NOT here: its drain-before-advance keeps every op worst-case
+ * O(1); HierarchicalTimerWheel IS, because its cascade is the whole teaching point.)
  */
-const AMORTIZED = { MonoDeque: true, UnionFind: true, BucketQueue: true };
+const AMORTIZED = { MonoDeque: true, UnionFind: true, BucketQueue: true, HierarchicalTimerWheel: true };
 
 function distOf(op, batch, samples, forceGc) {
     warm(op, batch, 2);
@@ -644,16 +722,30 @@ function makeMixed(member, cap, rng) {
         const rearm = (id, wheel) => { wheel.schedule(id, S - 1); SINK += id; };
         return () => { w.drainDue(rearm); w.advance(1); };
     }
-    // MonoDeque
-    const W = cap >> 1;
-    const d = new MonoDeque(cap, 'min');
-    let v = 0;
-    const nextVal = () => { v = (v * 1103515245 + 12345) & 0x7fffffff; return v % 1000000; };
-    return () => {
-        const seq = d.push(nextVal());
-        d.evictOlderThan(seq - W);
-        if (d.value() !== undefined) SINK++;
-    };
+    if (member === 'HierarchicalTimerWheel') {
+        // A bounded cascading wheel of cap>>1 timers spread across level 0 + level 1: each
+        // op drains the due slot (re-arming fired timers one level up so the resident set
+        // stays steady and drained timers cascade back down) and advances one tick.
+        const w = new HierarchicalTimerWheel(cap, cap);
+        const spread = Math.min(HTW_SPREAD, w.maxDelay);
+        for (let k = 0; k < (cap >> 1); k++) w.schedule(k, k % spread);
+        const rearm = (id, wheel) => { wheel.schedule(id, HTW_REARM); SINK += id; };
+        return () => { w.drainDue(rearm); w.advance(1); };
+    }
+    if (member === 'MonoDeque') {
+        const W = cap >> 1;
+        const d = new MonoDeque(cap, 'min');
+        let v = 0;
+        const nextVal = () => { v = (v * 1103515245 + 12345) & 0x7fffffff; return v % 1000000; };
+        return () => {
+            const seq = d.push(nextVal());
+            d.evictOlderThan(seq - W);
+            if (d.value() !== undefined) SINK++;
+        };
+    }
+    // Fail closed (mirrors every other dispatch helper): a member NOT handled above must
+    // throw, so a future 11th member cannot silently inherit MonoDeque's mixed trace.
+    throw new Error('[bench] unhandled member: ' + member);
 }
 
 export function D2(member, opts = {}) {
@@ -698,6 +790,12 @@ function fillMember(member, obj, count) {
     if (member === 'FreqO1') { obj.clear(); for (let k = 0; k < count; k++) obj.add(k); return; }
     if (member === 'BucketQueue') { obj.clear(); for (let k = 0; k < count; k++) obj.insert(k, k % BQ_WINDOW); return; }
     if (member === 'TimerWheel') { obj.clear(); for (let k = 0; k < count; k++) obj.schedule(k, k % obj.slots); return; }
+    if (member === 'HierarchicalTimerWheel') {
+        obj.clear();
+        const spread = Math.min(HTW_SPREAD, obj.maxDelay);
+        for (let k = 0; k < count; k++) obj.schedule(k, k % spread);
+        return;
+    }
     if (member === 'MonoDeque') {
         obj.clear();
         let v = 0;
@@ -730,6 +828,7 @@ export function D3(member, opts = {}) {
     else if (member === 'FreqO1') obj = new FreqO1(n, n);
     else if (member === 'BucketQueue') obj = new BucketQueue(n, BQ_CEIL, n); // bounded priority ceiling
     else if (member === 'TimerWheel') obj = new TimerWheel(n, twSlots(n), n); // slots >= n (one per slot)
+    else if (member === 'HierarchicalTimerWheel') obj = new HierarchicalTimerWheel(n, n);
     else throw new Error('[bench] unhandled member: ' + member);
 
     gcNow();
@@ -1078,6 +1177,14 @@ export function churnNs(member, n, seed) {
         const op = () => { w.drainDue(rearm); w.advance(1); };
         return median(collect(op, 4000, 60));
     }
+    if (member === 'HierarchicalTimerWheel') {
+        const w = new HierarchicalTimerWheel(n, n);
+        const spread = Math.min(HTW_SPREAD, w.maxDelay);
+        for (let k = 0; k < n; k++) w.schedule(k, k % spread);
+        const rearm = (id, wheel) => { wheel.schedule(id, HTW_REARM); SINK += id; };
+        const op = () => { w.drainDue(rearm); w.advance(1); };
+        return median(collect(op, 4000, 60));
+    }
     if (member === 'MonoDeque') {
         const d = new MonoDeque(n, 'min');
         const W = n >> 1;
@@ -1152,7 +1259,8 @@ export function traceHash(member, seed = DEFAULT_SEED, length = 100000) {
     // keys over TRACE_UNIVERSE; 1 = signed +/- 1000 values; 2 = MonoDeque's 0..1e6.
     let mode;
     if (member === 'SparseSet' || member === 'UnionFind' || member === 'RandomSet' ||
-        member === 'FreqO1' || member === 'BucketQueue' || member === 'TimerWheel') mode = 0;
+        member === 'FreqO1' || member === 'BucketQueue' || member === 'TimerWheel' ||
+        member === 'HierarchicalTimerWheel') mode = 0;
     else if (member === 'RingDeque' || member === 'MinStack') mode = 1;
     else if (member === 'MonoDeque') mode = 2;
     else throw new Error('[bench] unhandled member: ' + member);

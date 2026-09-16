@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-> Zero-GC, O(1) data structures that PROVE their constant. v0.9.0 ships SparseSet (an integer set with O(1) add / has / delete / iterate and an O(1) clear() that zeroes nothing), RingDeque (a fixed-capacity numeric double-ended queue with O(1) push/pop at both ends), UnionFind (a disjoint-set forest with near-O(1) amortized find / union), MonoDeque (a monotonic deque for O(1)-amortized sliding-window min / max), MinStack (a fixed-capacity numeric stack with a worst-case-O(1) running min / max), RandomSet (an integer set with worst-case-O(1) uniform sample / removeRandom), FreqO1 (a worst-case-O(1) LFU frequency structure with O(1) add / increment / peekMin / popMin), BucketQueue (an amortized-O(1) monotone integer priority queue / Dial with O(1) insert / decreaseKey / extractMin), and TimerWheel (a worst-case-O(1) bounded simple timing wheel with O(1) schedule / cancel / advance and drain-before-advance) -- plus a throughput-invariance witness that shows the flat cost curve while a native Set, Array.prototype.shift, a naive disjoint-set, a full-window rescan, a full-stack rescan, a Set-iterate-to-the-kth, a frequency-table min-scan, a binary heap, or a naive-scan scheduler decays.
+> Zero-GC, O(1) data structures that PROVE their constant. v0.10.0 ships SparseSet (an integer set with O(1) add / has / delete / iterate and an O(1) clear() that zeroes nothing), RingDeque (a fixed-capacity numeric double-ended queue with O(1) push/pop at both ends), UnionFind (a disjoint-set forest with near-O(1) amortized find / union), MonoDeque (a monotonic deque for O(1)-amortized sliding-window min / max), MinStack (a fixed-capacity numeric stack with a worst-case-O(1) running min / max), RandomSet (an integer set with worst-case-O(1) uniform sample / removeRandom), FreqO1 (a worst-case-O(1) LFU frequency structure with O(1) add / increment / peekMin / popMin), BucketQueue (an amortized-O(1) monotone integer priority queue / Dial with O(1) insert / decreaseKey / extractMin), TimerWheel (a worst-case-O(1) bounded simple timing wheel with O(1) schedule / cancel / advance and drain-before-advance), and HierarchicalTimerWheel (an amortized-O(1) cascading multi-level timing wheel with a 2^26 delay range) -- plus a throughput-invariance witness that shows the flat cost curve while a native Set, Array.prototype.shift, a naive disjoint-set, a full-window rescan, a full-stack rescan, a Set-iterate-to-the-kth, a frequency-table min-scan, a binary heap, a naive-scan scheduler, or a 4-ary heap decays.
 
 [![npm version](https://img.shields.io/npm/v/@zakkster/lite-o1.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-o1)
 [![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
@@ -17,7 +17,7 @@
 
 Almost no JavaScript data-structure library ships the evidence that its Big-O claim survives contact with a real engine -- megamorphic call sites, GC pauses, cache misses, deopts. `lite-o1` is a curated, tree-shakeable family of the O(1) structures that actually matter, each zero-GC, each written to teach the trick that buys the constant, and each shipped with a harness that DEMONSTRATES the flat cost curve rather than asserting it. The complexity class IS the product.
 
-v0.9.0 ships nine members. **SparseSet**, the textbook O(1) integer set (a dense + sparse array pair) whose `clear()` runs in O(1) by resetting a count and zeroing nothing at all. **RingDeque**, a fixed-capacity double-ended queue of numbers over one circular `Float64Array` -- O(1) push/pop at both ends, the zero-GC answer to the `Array.prototype.shift` O(n) trap. **UnionFind**, a disjoint-set forest over two `Uint32Array` columns -- near-O(1) amortized `find` / `union` via path halving + union by size, the family's first amortized-honesty member. **MonoDeque**, a monotonic deque over two parallel `Float64Array` columns -- O(1)-amortized sliding-window min / max, the zero-GC answer to the full-window-rescan O(W) trap. **MinStack**, a fixed-capacity numeric stack over two parallel `Float64Array` columns (value + a running-extreme prefix) -- WORST-CASE O(1) push/pop plus a running min / max, no amortization asterisk. **RandomSet**, SparseSet's substrate plus WORST-CASE O(1) uniform `sample()` / `removeRandom()` -- the zero-GC answer to the `Array.from(set)[k]` O(n)-plus-allocation trap. **FreqO1**, a WORST-CASE O(1) frequency structure over a private bucket forest -- `add` / `increment` / `peekMin` / `popMin`, the standalone primitive behind O(1) LFU eviction, the zero-GC answer to the scan-all-counts-for-the-minimum O(n) trap. **BucketQueue**, an AMORTIZED O(1) monotone integer priority queue ("Dial") over private key columns + a static per-priority bucket array -- `insert` / `decreaseKey` / `extractMin`, the standalone primitive behind Dial's algorithm, the zero-GC answer to a binary heap's O(log n) per op when priorities are small bounded integers. And **TimerWheel**, a WORST-CASE O(1) bounded "simple" timing wheel (Varghese-Lauck) over private id columns + a static per-slot FIFO ring -- `schedule` / `cancel` / `drainDue` / `advance`, the standalone primitive behind O(1) timer scheduling, the zero-GC answer to a binary-heap timer queue's O(log n) per op (and a linear scan's O(n) per tick) when the delay horizon is bounded. They share no mutable module state, so a bundler that imports one drops the others.
+v0.10.0 ships ten members. **SparseSet**, the textbook O(1) integer set (a dense + sparse array pair) whose `clear()` runs in O(1) by resetting a count and zeroing nothing at all. **RingDeque**, a fixed-capacity double-ended queue of numbers over one circular `Float64Array` -- O(1) push/pop at both ends, the zero-GC answer to the `Array.prototype.shift` O(n) trap. **UnionFind**, a disjoint-set forest over two `Uint32Array` columns -- near-O(1) amortized `find` / `union` via path halving + union by size, the family's first amortized-honesty member. **MonoDeque**, a monotonic deque over two parallel `Float64Array` columns -- O(1)-amortized sliding-window min / max, the zero-GC answer to the full-window-rescan O(W) trap. **MinStack**, a fixed-capacity numeric stack over two parallel `Float64Array` columns (value + a running-extreme prefix) -- WORST-CASE O(1) push/pop plus a running min / max, no amortization asterisk. **RandomSet**, SparseSet's substrate plus WORST-CASE O(1) uniform `sample()` / `removeRandom()` -- the zero-GC answer to the `Array.from(set)[k]` O(n)-plus-allocation trap. **FreqO1**, a WORST-CASE O(1) frequency structure over a private bucket forest -- `add` / `increment` / `peekMin` / `popMin`, the standalone primitive behind O(1) LFU eviction, the zero-GC answer to the scan-all-counts-for-the-minimum O(n) trap. **BucketQueue**, an AMORTIZED O(1) monotone integer priority queue ("Dial") over private key columns + a static per-priority bucket array -- `insert` / `decreaseKey` / `extractMin`, the standalone primitive behind Dial's algorithm, the zero-GC answer to a binary heap's O(log n) per op when priorities are small bounded integers. And **TimerWheel**, a WORST-CASE O(1) bounded "simple" timing wheel (Varghese-Lauck) over private id columns + a static per-slot FIFO ring -- `schedule` / `cancel` / `drainDue` / `advance`, the standalone primitive behind O(1) timer scheduling, the zero-GC answer to a binary-heap timer queue's O(log n) per op (and a linear scan's O(n) per tick) when the delay horizon is bounded. And **HierarchicalTimerWheel**, an AMORTIZED O(1) CASCADING multi-level timing wheel (the Linux tvec shape: 1x256 + 3x64, delay range 2^26) over the same substrate plus a Float64 expiry column -- `schedule` / `cancel` / `drainDue` / `advance`, TimerWheel's sibling for a delay horizon too wide for one rotation, cascading coarse timers down to finer levels by index (zero allocation) and wearing an honest max-single-op cascade spike. They share no mutable module state, so a bundler that imports one drops the others.
 
 ```bash
 npm install @zakkster/lite-o1
@@ -83,6 +83,9 @@ Every op above is O(1) worst-case and allocates zero bytes after construction. T
 - [TimerWheel](#timerwheel)
   - [How TimerWheel works](#how-timerwheel-works)
   - [TimerWheel API reference](#timerwheel-api-reference)
+- [HierarchicalTimerWheel](#hierarchicaltimerwheel)
+  - [How HierarchicalTimerWheel works](#how-hierarchicaltimerwheel-works)
+  - [HierarchicalTimerWheel API reference](#hierarchicaltimerwheel-api-reference)
 - [Composability with the ecosystem](#composability-with-the-ecosystem)
 - [Zero-GC design notes](#zero-gc-design-notes)
 - [Design decisions worth knowing](#design-decisions-worth-knowing)
@@ -174,8 +177,9 @@ Existing options: a native `Set` (arbitrary keys, but a hash table that decays a
   - **`clear()`** -- empty in O(1): resets the count + the tick clock, zeroes no store.
   - **`forEach(fn)` / `[Symbol.iterator]`** -- iterate live timers in dense storage order (`forEach` alloc-free, fn is `(id, slot, wheel)`; the iterator allocates per protocol).
   - **`size` / `capacity` / `universe` / `slots` / `now`** -- getters.
+- **`HierarchicalTimerWheel(universe, capacity?)`** -- a zero-GC AMORTIZED O(1) CASCADING multi-level timing wheel (the Linux tvec shape: 1x256 + 3x64, delay range `2^26`) over the same substrate as TimerWheel plus a Float64 `expiry` column: TimerWheel's sibling for a wider bounded delay horizon. The surface mirrors TimerWheel -- `schedule(id, delay)` (delay in `[0, 2^26)`), `cancel(id)`, `drainDue(fn)`, `advance(ticks = 1)`, `has(id)`, `clear()`, `forEach(fn)` (fn is `(id, expiry, wheel)`), `[Symbol.iterator]`, and getters `size` / `capacity` / `universe` / `now` / `maxDelay` (`2^26 - 1`). As the clock advances, coarse timers CASCADE down to finer levels by index (zero allocation); a level-wrap `advance(1)` is O(bucket) -- the amortized-O(1) cascade SPIKE. Re-entrant `schedule` / `cancel` / `clear` from a callback are supported; re-entrant `advance()` throws. Fails closed: a bad id / a delay `>= 2^26` / a NEW id past capacity throw `[lite-o1]` as a byte-identical no-op; drain-before-advance is enforced.
 - **`VERSION`** -- the package version string.
-- **The O(1) Witness** (`npm run witness`) -- an offline harness that times a fixed batch of each member's hot op across an n-sweep, reports ops/ms + a flatness ratio (SparseSet vs a native `Set`, RingDeque vs `Array.prototype.shift`, UnionFind vs a naive disjoint-set, MonoDeque vs a full-window rescan, MinStack vs a full-stack rescan, RandomSet vs a `Set` iterate-to-the-kth, FreqO1 vs a frequency-table min-scan, BucketQueue vs a binary min-heap, TimerWheel vs a naive-scan scheduler), and fails if the constant regressed.
+- **The O(1) Witness** (`npm run witness`) -- an offline harness that times a fixed batch of each member's hot op across an n-sweep, reports ops/ms + a flatness ratio (SparseSet vs a native `Set`, RingDeque vs `Array.prototype.shift`, UnionFind vs a naive disjoint-set, MonoDeque vs a full-window rescan, MinStack vs a full-stack rescan, RandomSet vs a `Set` iterate-to-the-kth, FreqO1 vs a frequency-table min-scan, BucketQueue vs a binary min-heap, TimerWheel vs a naive-scan scheduler, HierarchicalTimerWheel vs a 4-ary min-heap), and fails if the constant regressed.
 
 Full types ship in [`O1.d.ts`](./O1.d.ts). Tree-shakeable named exports (`sideEffects: false`) -- import only what you use.
 
@@ -242,7 +246,7 @@ get capacity: number        // max live members as constructed
 
 | Constant   | Value     | Meaning                                            |
 | ---------- | --------- | -------------------------------------------------- |
-| `VERSION`  | `'0.9.0'` | Package version string.                            |
+| `VERSION`  | `'0.10.0'` | Package version string.                           |
 
 Contract bounds (validated, not exported):
 
@@ -281,6 +285,11 @@ Contract bounds (validated, not exported):
 | TimerWheel valid id    | integer in `[0, universe)`                    |
 | TimerWheel valid delay | integer in `[0, slots-1]`                     |
 | TimerWheel `now` ceiling | `TW_MAX_TICK = 2^53` (advance past it throws) |
+| HierarchicalTimerWheel `universe` | integer in `[1, 2^32]`             |
+| HierarchicalTimerWheel `capacity` | integer in `[1, universe]`, default `universe` |
+| HierarchicalTimerWheel valid id   | integer in `[0, universe)`         |
+| HierarchicalTimerWheel valid delay | integer in `[0, 2^26)` (`maxDelay = 2^26 - 1`; delay range O(1) via 4 levels) |
+| HierarchicalTimerWheel `now` ceiling | `2^53` (advance past it throws)  |
 
 ---
 
@@ -1088,6 +1097,81 @@ get now: number                              // the monotone tick counter
 
 ---
 
+## HierarchicalTimerWheel
+
+TimerWheel's CASCADING sibling: a bounded, multi-level timing wheel for a delay horizon too wide for one rotation of a simple wheel.
+
+```js
+import { HierarchicalTimerWheel } from '@zakkster/lite-o1';
+
+// universe = id ceiling; capacity = max live timers. Delay range is fixed at 2^26.
+const wheel = new HierarchicalTimerWheel(1000, 1000);
+
+wheel.schedule(7, 5);        // fires 5 ticks from now (level 0)
+wheel.schedule(8, 300);      // 300 ticks out (level 1 -- cascades down as `now` nears it)
+wheel.schedule(9, 5_000_000);// ~5M ticks out (level 3 -- cascades L3 -> L2 -> L1 -> L0)
+
+for (let t = 0; t < 6; t++) {
+  wheel.drainDue((id) => console.log('fire', id, 'at tick', wheel.now)); // -> fire 7 at tick 5
+  wheel.advance(1);          // steps the clock; a level-0 wrap cascades the next level down
+}
+```
+
+The four nested levels use the Linux `tvec` shape (`1x256 + 3x64`, total range `2^26` ticks): a wide 256-slot root scanned every tick, plus three 64-slot coarse levels. As the clock advances, coarse timers CASCADE down to finer levels **by index only** (pointer surgery between intrusive lists -- zero allocation, even on a cascade tick). `schedule` / `cancel` / `advance(1)` / `has` are amortized O(1); `drainDue` is O(due); a level-wrap tick runs the O(bucket) cascade -- the teaching max-single-op **spike** that the witness gates.
+
+```
+O(1) Witness -- HierarchicalTimerWheel tick (drainDue + advance, cascading) vs a 4-ary min-heap
+
+  size      HierWheel ops/ms   heap ops/ms    ratio
+  --------  ----------------   ------------   -----
+  1e4               35260.83       17612.25    2.00x
+  1e5               31754.77       15570.10    2.04x
+
+  HierWheel flatness (size >= 1e4): ~0.90   (gate >= 0.70)
+  4-ary heap foil flatness:         ~0.88   (O(log n): decays gently, gate < HierWheel flatness)
+  min HierWheel/heap ratio:         ~2.00x  (gate >= 1.50x)
+  MAX single tick (O(load) cascade, load=8e3): ~0.016 ms  vs typical O(1) tick: ~0.000004 ms  spike ~4000x  (gate >= 8x)
+```
+
+The cascading wheel's tick streams flat while a FAIR alloc-free 4-ary min-heap (O(log n) per fired timer) trails by a sustained constant factor. UNLIKE TimerWheel, it WEARS a MAX-single-op line: the witness gates the cascade spike at `>= 8x` the typical tick -- the amortized-honesty bar, this member's headline. Like BucketQueue's heap, the O(log n) foil decays gently (not the O(n) foils' 0.55 collapse), so the evidence is the throughput lead, not a foil collapse. (Absolute ops/ms is machine-specific; reproduce on your own hardware.)
+
+<details>
+<summary><strong>How HierarchicalTimerWheel works</strong> -- the geometry, the by-index cascade, and drain-before-cascade</summary>
+
+**The geometry (1x256 + 3x64).** Level 0 is 256 slots (mask `0xFF`, shift 0), scanned every `drainDue` tick -- the hot path; a wide root keeps each per-tick drain list short. Levels 1..3 are 64 slots each (mask `0x3F`, shifts 8/14/20), covering delay `[2^8, 2^14)`, `[2^14, 2^20)`, `[2^20, 2^26)`. A timer expiring at absolute tick `expiry` with `delta = expiry - now` files at: `delta < 2^8` -> L0 slot `expiry & 0xFF`; `< 2^14` -> L1 `(expiry >>> 8) & 0x3F`; `< 2^20` -> L2 `(expiry >>> 14) & 0x3F`; else L3 `(expiry >>> 20) & 0x3F`. All 448 (`= 256 + 3*64`) list heads live in ONE flat `_head` / `_tail` array plus a reserved DRAINING identity -- a FIXED 449-head cost independent of the horizon (the hierarchy is what buys a `2^26` reach for O(1) space in the levels).
+
+**The by-index cascade (the zero-GC crux).** When the level-0 cursor WRAPS (every 256 ticks) the next level's now-due bucket is cascaded DOWN: the bucket is walked and each timer is re-filed at its now-correct finer level/slot (from its stored `_expiry`), moving nodes between intrusive lists **by index** -- zero allocation. Nested: a level-1 wrap cascades level 2, a level-2 wrap cascades level 3. A cascaded timer always moves to a FINER (different) list, so the emptied source is detached and the walk always terminates.
+
+**Drain-before-cascade + the substrate.** It reuses TimerWheel's exact substrate -- IDs on SparseSet's dense + sparse cross-check, a per-node intrusive FIFO, static list heads voided by the same cross-check so `clear()` is O(1) -- and diverges only where the multi-level heads require it: `_listOf` names a flat list index, and a Float64 `_expiry` column stores the absolute expiry needed to re-file on cascade (24 B/live vs TimerWheel's 16 B/live -- the price of cascading). Because a rotation is fully drained (`advance()` throws if a level-0 slot left behind is undrained) before the wrap that cascades the next level down, a cascade never buries an un-fired due timer -- TimerWheel's drain-before-advance extended to DRAIN-BEFORE-CASCADE.
+
+**Amortized, not worst-case.** A level-wrap `advance(1)` is O(bucket) -- the cascade spike -- while a normal tick is O(1). Each timer cascades at most `levels - 1` times over its life, so `advance` amortizes to O(1) per tick. Re-entrancy: `schedule` / `cancel` / `clear` from inside a fired `drainDue` callback are legal; a re-entrant `advance()` (nested, or from inside a callback) throws `[lite-o1]` (guarded by a `_busy` flag). The `now` counter is a plain double capped at `2^53` via a `>=` ceiling guard, keeping `now` and the stored `expiry` integer-exact.
+
+</details>
+
+### HierarchicalTimerWheel API reference
+
+```ts
+new HierarchicalTimerWheel(universe: number, capacity?: number)
+
+schedule(id: number, delay: number): this   // file at the level/slot for delay; idempotent if present; amortized O(1)
+cancel(id: number): boolean                  // unlink + swap-remove; true iff scheduled; amortized O(1); never throws
+drainDue(fn: (id: number, wheel: HierarchicalTimerWheel) => void): void  // fire + remove the level-0 due list in FIFO order; O(due)
+advance(ticks?: number): this               // step the clock, cascading on a wrap; amortized O(1) per tick (O(bucket) on a wrap)
+has(id: number): boolean                     // membership; O(1); never throws
+clear(): void                                // O(1): resets the count + tick clock; zeroes no store
+forEach(fn: (id: number, expiry: number, wheel: HierarchicalTimerWheel) => void): void  // dense storage order, alloc-free
+[Symbol.iterator](): IterableIterator<number>  // dense storage order; allocates per protocol
+// getters: size, capacity, universe, now, maxDelay (2^26 - 1)
+```
+
+- **`schedule(id, delay)`** throws `[lite-o1] id out of universe ...` for a bad id (including `-1`, `1.5`, `NaN`, `null`, a Symbol / BigInt, `id === universe`), `[lite-o1] delay out of range [0, 67108863] ...` for a delay that is not a uint32 in `[0, 2^26)`, and `[lite-o1] HierarchicalTimerWheel full ...` when a NEW id would exceed capacity. Every throw is a byte-identical no-op. An already-present id is an idempotent no-op (reschedule = `cancel` then `schedule`). `-0` aliases id `0` and delay `0` (uint32 coercion).
+- **`advance(ticks)`** throws `[lite-o1] HierarchicalTimerWheel advance would skip an undrained due slot ...` if a level-0 slot being left behind is non-empty (drain-before-advance), `[lite-o1] HierarchicalTimerWheel advance() during an in-flight drain/advance ...` if called re-entrantly (nested, or from inside a drainDue callback -- it would strand the un-fired due timers), and `[lite-o1] HierarchicalTimerWheel tick ceiling 2^53 reached ...` when `now + ticks` would reach `2^53` -- each a byte-identical no-op for `advance(1)`. `ticks` must be a uint32 (typeof-guarded first).
+- **`has(id)` / `cancel(id)`** never throw: a bad id is absent (`has` -> `false`, `cancel` -> `false`). `null` is rejected as `null`, never coerced to id `0`.
+
+**Reach for HierarchicalTimerWheel when** your delay horizon is WIDE but bounded (up to `2^26` ticks) -- too far for a simple TimerWheel, but you do not want a heap's O(log n) per op -- and you can tolerate a periodic cascade spike in exchange for an amortized-O(1) average. **Avoid it when** your horizon fits one rotation of a simple wheel (reach for TimerWheel -- worst-case O(1), no spike, 16 B/live), your delays are unbounded (a `delay >= 2^26` throws), or you cannot tolerate ANY per-op spike (a hard-real-time deadline on the worst single tick). See [`GUIDE.md`](./GUIDE.md) for the full reach-for / avoid / measure-it.
+
+---
+
 ## Composability with the ecosystem
 
 SparseSet is the dense-integer membership primitive under an ECS-style loop. A common pattern: a `SparseSet` per component tracks which entity ids currently have that component; a `@zakkster/lite-arena` `Arena` owns the component payloads by generational handle. Membership and iteration are O(1) and alloc-free; the per-frame `clear()` of a scratch set (visited masks, this-frame-touched ids) is free.
@@ -1249,15 +1333,16 @@ The key guard is the same branchless typeof-first check as SparseSet (`typeof k 
 - **FreqO1 is a worst-case-O(1) LFU frequency primitive over a private bucket forest, sized so its free-list can't run dry.** The classic O(1)-LFU bucket structure made pointer-free over private `Uint32Array` columns (NO public SlotPool -- ADR 0003's deferral stands): keys ride SparseSet's cross-check (dense index = node id, so `clear()` is O(1)), the min is the head of a frequency-sorted bucket list, and the tie-break is FIFO (earliest-inserted-into-that-bucket evicted first). The surface is deliberately lean -- no `decrement`, no `peekMax`, no `delete(k)` -- and it holds counts, not payloads (compose it with a value store for a full LFU cache). `MAX_FREQ = 2^32-2` (a bump past it throws, no wrap). The bucket pool is a bump + free stack holding capacity + 1 usable buckets (the transient increment peak), so exhaustion cannot occur under the contract and the `_poolExhausted` throw is defense in depth. See [`decisions/0012`](./decisions/0012-freqo1.md).
 - **BucketQueue is an amortized-O(1) MONOTONE integer priority queue over static per-priority buckets, and honest about the amortized asterisk.** The classic Dial bucket queue made pointer-free over private `Uint32Array` key columns (keys ride SparseSet's cross-check, so `clear()` is O(1) even though the static bucket heads are stale -- voided by the `_bHead[p] < _n && _prio[_bHead[p]] === p` cross-check) plus a static per-priority bucket array (NO free-list -- one bucket per priority, nothing to allocate or exhaust). The monotone cursor never rewinds; an insert / decreaseKey below it throws `[lite-o1]` fail-closed, and that discipline bounds the cursor's total travel to `ceiling + 1`, so `extractMin` amortizes to O(1) (a single one is O(gap) worst-case -- the witness prints the MAX-single-op bar). Space is O(ceiling) (a documented co-headline); `priorityOf` returns `-1` for an absent key (priority 0 is a real priority, so 0 cannot mean "not tracked"); insert of a present key, and decreaseKey of an absent key or a non-strict decrease, are documented no-ops (the conventional relaxation semantics). NO public SlotPool -- ADR 0003's deferral stands. See [`decisions/0013`](./decisions/0013-bucketqueue-dial.md).
 - **TimerWheel is a worst-case-O(1) BOUNDED "simple" timing wheel, and honest that the delay range is the price.** The Varghese-Lauck single-wheel variant (NOT the hashed / hierarchical one) made pointer-free over private `Uint32Array` id columns (ids ride SparseSet's cross-check, so `clear()` is O(1) even though the static slot heads are stale -- voided by the `_sHead[s] < _size && _slotOf[_sHead[s]] === s` cross-check) plus a static per-slot FIFO ring (NO free-list -- one slot per ring position, nothing to allocate or exhaust). The DRAIN-BEFORE-ADVANCE contract is the gem: `slot[now & MASK]` is the due set, and `advance` refuses to lap over an undrained slot (it throws `[lite-o1]` fail-closed), so a slot always holds exactly one rotation's timers -- no cursor, no absolute-deadline column, and no O(gap) worst case (unlike BucketQueue). Delay is bounded to `[0, slots-1]` and space is O(slots) (the documented co-headline); the `now` counter is capped at 2^53 via a `>=` guard (primed by a white-box test, the MonoDeque saturating-counter lesson); schedule of a present id is an idempotent no-op (reschedule = cancel then schedule). NO public SlotPool -- ADR 0003's deferral stands; a hashed wheel for unbounded delays is a deferred future member. See [`decisions/0014`](./decisions/0014-timerwheel.md).
+- **HierarchicalTimerWheel is TimerWheel's CASCADING sibling, and the cascade is zero-GC by index.** The Linux `tvec` shape (1x256 + 3x64, delay range `2^26`) reuses TimerWheel's exact substrate -- ids on SparseSet's cross-check, a per-node intrusive FIFO, static list heads voided by the same cross-check so `clear()` is O(1) -- and diverges only where the multi-level heads require it: `_listOf` names a flat list index (0..447 or a reserved DRAINING identity), and a Float64 `_expiry` column stores the absolute expiry needed to re-file a timer on cascade (24 B/live vs TimerWheel's 16 B/live -- the price of cascading). The gem is DRAIN-BEFORE-CASCADE: a level-0 wrap re-files the next level's due bucket DOWN to finer levels by pointer surgery (zero allocation, even on a cascade tick), and because a rotation is fully drained before the wrap, a cascade never buries an un-fired due timer. A level-wrap `advance(1)` is O(bucket) -- the amortized-O(1) cascade SPIKE, the member's honest headline (the witness gates it at `>= 8x` the typical tick). Re-entrant `advance()` throws (a `_busy` flag); `schedule` / `cancel` / `clear` from a callback stay legal. The foil is a FAIR alloc-free 4-ary min-heap, not a strawman. See [`decisions/0015`](./decisions/0015-hierarchical-timerwheel.md).
 
 ---
 
 ## Testing
 
-**389 deterministic `node:test` cases**, plus a torture gate, a hard perf gate, and the O(1) witness gate.
+**475 deterministic `node:test` cases**, plus a torture gate, a hard perf gate, and the O(1) witness gate.
 
 ```bash
-npm test           # 389 node:test cases (contract + boundary + differential fuzz)
+npm test           # 475 node:test cases (contract + boundary + differential fuzz)
 npm run test:types # tsc --noEmit against O1.d.ts
 npm run torture    # @zakkster/lite-leak + lite-gc-profiler: 0 B/op + leak-free
 npm run witness    # the O(1) throughput-invariance harness + foils + flatness gate

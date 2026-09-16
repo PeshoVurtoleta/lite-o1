@@ -3,10 +3,10 @@
  * that doubles as a teachable textbook: each member solves a real problem AND
  * proves its constant is real (the O(1) Witness -- see test/witness.mjs).
  *
- * v0.9.0 ships nine members -- SparseSet, RingDeque, UnionFind, MonoDeque,
- * MinStack, RandomSet, FreqO1, BucketQueue, and TimerWheel -- plus its `VERSION`
- * const. The nine are independent (no shared mutable module state), so a bundler
- * that imports one drops the others (`sideEffects: false`).
+ * v0.10.0 ships ten members -- SparseSet, RingDeque, UnionFind, MonoDeque,
+ * MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, and HierarchicalTimerWheel
+ * -- plus its `VERSION` const. The ten are independent (no shared mutable module
+ * state), so a bundler that imports one drops the others (`sideEffects: false`).
  *
  * The complexity class IS the product: every hot op below is O(1) worst-case and
  * allocates ZERO bytes after construction. The witness harness (never imported
@@ -17,7 +17,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '0.9.0';
+export const VERSION = '0.10.0';
 
 /** Largest universe the Uint32 substrate + the (k >>> 0) key check can honor. */
 const MAX_UNIVERSE = 0x100000000; // 2^32
@@ -2389,6 +2389,488 @@ export class TimerWheel {
     /** @private */
     _draining() {
         throw new RangeError('[lite-o1] TimerWheel advance() during an in-flight drainDue; ' +
+            'advance only between drains (would strand the un-fired due timers)');
+    }
+}
+
+/**
+ * NIL for HierarchicalTimerWheel's intrusive per-list pointers (`_next` / `_prev` /
+ * `_head` / `_tail`), which store DENSE indices in [0, capacity). Identical role to
+ * TimerWheel's TW_NIL: 0 is a valid dense index, so the sentinel is the top uint32
+ * value -- never a legal index -- and it is always `>= _size`, so the same
+ * `head >= _size` test that voids stale post-clear heads treats a NIL head as empty.
+ */
+const HTW_NIL = 0xFFFFFFFF; // 2^32 - 1
+
+/**
+ * Largest tick a HierarchicalTimerWheel's monotone `now` may reach (identical to
+ * TW_MAX_TICK). `now` is a plain double; 2^53 is the last integer with no larger
+ * integer sharing its double, so once `now + ticks` would reach 2^53 the wheel
+ * THROWS rather than let two ticks alias one value (the low-bit slot math would
+ * then misfile) or lose the integer precision a stored `_expiry` relies on.
+ */
+const HTW_MAX_TICK = 2 ** 53; // 2^53 (Number.MAX_SAFE_INTEGER + 1)
+
+// ---- hybrid geometry: 1x256 + 3x64 (the Linux tvec shape), total range 2^26 ----
+// Level 0 is 256 slots (8 bits) scanned every tick -- the hot path; levels 1..3 are
+// 64 slots each (6 bits), covering [2^8, 2^14), [2^14, 2^20), [2^20, 2^26). The four
+// list-head bases pack every level into ONE flat head/tail array (see the class doc).
+const HTW_L0_SLOTS = 256;          // level-0 slot count (mask 0xFF, shift 0)
+const HTW_L1_BASE = 256;           // flat base of level 1 (64 slots, mask 0x3F, shift 8)
+const HTW_L2_BASE = 320;           // flat base of level 2 (64 slots, mask 0x3F, shift 14)
+const HTW_L3_BASE = 384;           // flat base of level 3 (64 slots, mask 0x3F, shift 20)
+const HTW_HEADS = 448;             // total slot heads = 256 + 3*64
+const HTW_DRAINING = 448;          // reserved DRAINING list identity (index HTW_HEADS)
+const HTW_L0_MAX = 256;            // delta < this -> level 0 (2^8)
+const HTW_L1_MAX = 16384;          // delta < this -> level 1 (2^14)
+const HTW_L2_MAX = 1048576;        // delta < this -> level 2 (2^20)
+const HTW_MAX_DELTA = 67108864;    // exclusive delay ceiling: 2^26 (delta in [0, 2^26))
+
+/**
+ * HierarchicalTimerWheel -- a zero-GC, AMORTIZED O(1) CASCADING timing wheel: the
+ * multi-level sibling of TimerWheel, over PRIVATE `Uint32Array` columns and a STATIC
+ * per-list ring. Where a simple TimerWheel holds exactly ONE rotation's timers (delay
+ * bounded to slots-1), this wheel nests four levels in the Linux `tvec` shape and
+ * CASCADES coarse timers down to finer levels as time advances, so it schedules a
+ * bounded but far larger delay horizon (delay in [0, 2^26)) with the SAME zero-alloc
+ * substrate -- one node per timer, moved between intrusive lists by index only.
+ *
+ * GEOMETRY (hybrid 1x256 + 3x64, total range 2^26 ticks):
+ *   - Level 0: 256 slots, mask 0xFF, shift 0. Scanned EVERY drainDue tick -- the hot
+ *     path. A wide root keeps each per-tick drain list short.
+ *   - Level 1: 64 slots, mask 0x3F, shift 8.  Covers delay in [2^8,  2^14).
+ *   - Level 2: 64 slots, mask 0x3F, shift 14. Covers delay in [2^14, 2^20).
+ *   - Level 3: 64 slots, mask 0x3F, shift 20. Covers delay in [2^20, 2^26).
+ * All 448 (= 256 + 3*64) list heads live in ONE flat `_head` / `_tail` array plus a
+ * reserved DRAINING identity at index 448 (drainDue's snapshot list, exactly as
+ * TimerWheel). Level/slot selection for a timer expiring at absolute tick `expiry`
+ * with `delta = expiry - now` in [0, 2^26):
+ *     delta < 2^8  -> L0, slot =  expiry        & 0xFF
+ *     delta < 2^14 -> L1, slot = (expiry >>> 8)  & 0x3F
+ *     delta < 2^20 -> L2, slot = (expiry >>> 14) & 0x3F
+ *     else         -> L3, slot = (expiry >>> 20) & 0x3F
+ * (`expiry` is a Float64 up to 2^53; a bitwise op takes ToUint32(expiry) = expiry mod
+ * 2^32, whose low <= 26 bits are exactly the bits the masks read -- so the slot math is
+ * correct even past 2^31. `delta` is compared as a plain number, no coercion.)
+ *
+ * CASCADE (the zero-GC crux): when the level-0 cursor WRAPS (every 256 ticks) the
+ * level-1 bucket now coming due is cascaded DOWN; if level 1 also wrapped, level 2 is
+ * cascaded; if level 2 wrapped, level 3. On cascade, the due outer bucket is walked and
+ * every timer is RE-FILED at its now-correct finer level/slot BY INDEX ONLY -- node
+ * pointer surgery between intrusive lists, ZERO allocation. A timer in L1's due bucket
+ * always has delta < 256 by then, so it re-files into L0; an L2 timer into L1 or L0; an
+ * L3 timer into L2/L1/L0 -- cascade always moves to a FINER (different) list, so the
+ * emptied source list can be cleared and the walk always terminates.
+ *
+ * DRAIN-BEFORE-CASCADE (TimerWheel's drain-before-advance, extended): `drainDue(fn)`
+ * fires + removes EXACTLY the timers in the level-0 due list `slot[now & 0xFF]` at
+ * ENTRY (SNAPSHOT semantics, O(due), fn HOISTED so the loop allocates nothing).
+ * `advance(ticks)` steps the clock; each level-0 slot LEFT BEHIND must be EMPTY
+ * (drained) or it THROWS `[lite-o1]` fail-closed. Because a rotation is fully drained
+ * before the wrap that cascades the next level down, cascade never buries an un-fired
+ * due timer. HONESTY: advance is AMORTIZED O(1) per tick -- a cascade tick is O(levels)
+ * <= 4 list moves plus the moved bucket's timers (each timer cascades at most
+ * levels-1 times over its whole life). That per-wrap SPIKE is the teaching feature, not
+ * a defect (the witness prints it beside a typical tick); it is not smoothed away.
+ *
+ * RE-ENTRANCY: inside a fired callback, schedule / cancel (incl. self) / clear are
+ * LEGAL and safe (the due list is moved into the reserved DRAINING identity at entry,
+ * then head-drained -- a (re)scheduled timer lands in the now-empty real slot and
+ * DEFERS to a later drain; a canceled not-yet-fired timer does not fire). A re-entrant
+ * `advance()` (nested time-advance, whether from inside a drainDue callback or a nested
+ * advance) THROWS `[lite-o1]`: a `_busy` flag guards the whole drain + cascade + advance
+ * region and is restored in `finally`.
+ *
+ * Layout (all PRIVATE, mirrors TimerWheel's substrate; diverges only where the
+ * multi-level heads require it -- `_listOf` names a FLAT list index, and `_expiry`
+ * stores the absolute tick needed to re-file on cascade):
+ *   - IDS ride SparseSet's dense + sparse cross-check (`_dense[i]` is the id at dense
+ *     index i; `_sparse[id]` maps back; the dense index i IS the node identity the
+ *     intrusive lists use, so `clear()` is O(1)).
+ *   - Per NODE (dense index i): `_listOf[i]` (the flat list it sits in: 0..447, or the
+ *     DRAINING identity 448), `_next[i]` / `_prev[i]` (an intrusive doubly-linked FIFO
+ *     of dense indices within a list; NIL = HTW_NIL), and `_expiry[i]` (absolute
+ *     expiry tick, a Float64 so it stays integer-exact to 2^53).
+ *   - Per LIST (`_head` / `_tail`, a STATIC array of length HTW_HEADS + 1): a list L is
+ *     non-empty iff `_head[L] < _size && _listOf[_head[L]] === L` (the SparseSet
+ *     cross-check extended to the list heads -- identical to TimerWheel's slot heads),
+ *     so `clear()` resets two scalars and zeroes NO store.
+ *
+ * ID / DELAY / TICKS model: ids are integers [0, universe); delay is an integer
+ * [0, 2^26); ticks is an integer [0, 2^32-1]. Every guard is typeof-first
+ * (`typeof x !== 'number' || (x >>> 0) !== x || x >= bound`) so a Symbol / BigInt never
+ * reaches the coercing `>>>`; the cold builders name the offender with `String(x)`.
+ * `null` is not zero. `-0` aliases id 0 / delay 0 via the uint32 coercion. Fail closed
+ * on the MUTATORS (schedule / advance throw a BYTE-IDENTICAL no-op -- every guard
+ * precedes the first write), ABSENT / never-throw on the QUERIES (has / cancel).
+ */
+export class HierarchicalTimerWheel {
+    /**
+     * @param {number} universe            exclusive id ceiling; integer in [1, 2^32]. Ids are [0, universe).
+     * @param {number} [capacity=universe] max simultaneously-live timers; integer in [1, universe].
+     */
+    constructor(universe, capacity = universe) {
+        // typeof guard BEFORE any coercion (Number.isInteger never coerces; false on a
+        // Symbol / BigInt), and String(x) in the cold message is Symbol/BigInt-safe.
+        if (typeof universe !== 'number' || !Number.isInteger(universe) ||
+            universe < 1 || universe > MAX_UNIVERSE) {
+            throw new RangeError(
+                '[lite-o1] universe must be an integer in [1, 2^32], got ' + String(universe));
+        }
+        if (typeof capacity !== 'number' || !Number.isInteger(capacity) ||
+            capacity < 1 || capacity > universe) {
+            throw new RangeError(
+                '[lite-o1] capacity must be an integer in [1, ' + universe + '], got ' + String(capacity));
+        }
+        this._universe = universe;
+        this._cap = capacity;
+        // ---- id substrate (dense + sparse cross-check; dense index = node id) ----
+        this._dense = new Uint32Array(capacity);   // dense[i] = the i-th live timer id
+        this._sparse = new Uint32Array(universe);  // sparse[id] = dense index (valid iff cross-check)
+        this._listOf = new Uint32Array(capacity);  // listOf[i] = flat list dense[i] sits in (0..447 or DRAINING)
+        this._next = new Uint32Array(capacity);    // next[i]/prev[i] = next/prev dense index in the
+        this._prev = new Uint32Array(capacity);    //   list's FIFO order (NIL = HTW_NIL)
+        this._expiry = new Float64Array(capacity); // expiry[i] = absolute expiry tick (integer-exact to 2^53)
+        this._size = 0;                            // live timer count
+        // ---- static lists (0..447 = the 4 levels; index 448 = DRAINING) ----
+        this._head = new Uint32Array(HTW_HEADS + 1).fill(HTW_NIL); // FIFO oldest node per list
+        this._tail = new Uint32Array(HTW_HEADS + 1).fill(HTW_NIL); // FIFO newest node per list
+        this._now = 0;                             // monotone tick counter
+        this._busy = false;                        // guards the drain + cascade + advance region
+    }
+
+    /** Number of live timers. O(1). */
+    get size() { return this._size; }
+
+    /** Max simultaneously-live timers this wheel was sized for. O(1). */
+    get capacity() { return this._cap; }
+
+    /** Exclusive id ceiling; ids are [0, universe). O(1). */
+    get universe() { return this._universe; }
+
+    /** The monotone tick counter. O(1). */
+    get now() { return this._now; }
+
+    /** Largest schedulable delay (2^26 - 1); delay is [0, maxDelay]. O(1). */
+    get maxDelay() { return HTW_MAX_DELTA - 1; }
+
+    /**
+     * True iff id is scheduled. O(1): the SparseSet cross-check. A bad id (negative,
+     * fractional, NaN, null, Symbol, BigInt, >= universe) is ABSENT, never a throw. The
+     * `typeof` short-circuits BEFORE `>>>` runs (which coerces + THROWS on a Symbol /
+     * BigInt); `(id >>> 0) !== id` then rejects every non-uint32 number.
+     */
+    has(id) {
+        if (typeof id !== 'number' || (id >>> 0) !== id || id >= this._universe) return false;
+        const i = this._sparse[id];
+        return i < this._size && this._dense[i] === id;
+    }
+
+    /**
+     * Schedule id to fire `delay` ticks from now: file it at level/slot chosen from
+     * `delay` (== delta at schedule time) and `expiry = now + delay`. O(1) worst-case,
+     * zero-alloc. Fails closed, ALL guards preceding every write (a byte-identical
+     * no-op on any reject): a bad id throws via _oob; a bad delay (not a uint32 in
+     * [0, 2^26)) throws via _badDelay; a NEW id when full throws via _full; an expiry
+     * that would reach 2^53 throws via _tickCeil (keeping `_expiry` integer-exact). An
+     * already-present id is an IDEMPOTENT no-op (the delay arg is still validated) --
+     * reschedule = cancel then schedule (mirrors TimerWheel). Guard typeof FIRST on
+     * BOTH args so a Symbol / BigInt never reaches the coercing `>>>`.
+     * @param {number} id     a timer id integer in [0, universe)
+     * @param {number} delay  ticks from now, an integer in [0, 2^26)
+     * @returns {HierarchicalTimerWheel} this
+     */
+    schedule(id, delay) {
+        if (typeof id !== 'number' || (id >>> 0) !== id || id >= this._universe) return this._oob(id);
+        if (typeof delay !== 'number' || (delay >>> 0) !== delay || delay >= HTW_MAX_DELTA) return this._badDelay(delay);
+        const si = this._sparse[id];
+        if (si < this._size && this._dense[si] === id) return this; // present -> idempotent no-op
+        if (this._size === this._cap) return this._full();
+        // Keep `now + delay` strictly below 2^53 so the stored expiry stays integer-exact
+        // and the low-bit slot math never aliases (the MonoDeque saturating-counter lesson).
+        if (this._now + delay >= HTW_MAX_TICK) return this._tickCeil();
+        const j = this._size;
+        const expiry = this._now + delay;
+        this._dense[j] = id;
+        this._sparse[id] = j;
+        this._expiry[j] = expiry;
+        this._fileByDelta(j, delay, expiry); // delta === delay for a fresh schedule
+        this._size = j + 1;
+        return this;
+    }
+
+    /**
+     * Cancel id. O(1) worst-case, zero-alloc. Unlink it from its list (fixing that
+     * list's head/tail via _listOf) then swap the last dense node into its hole (fixing
+     * that node's intrusive pointers + its list head/tail), so the cross-check + the
+     * lists stay exact. Returns true iff id was scheduled; a bad / absent id returns
+     * false and NEVER throws (mirrors the query contract). Guard typeof FIRST.
+     * @param {number} id
+     * @returns {boolean} true iff id was scheduled and removed.
+     */
+    cancel(id) {
+        if (typeof id !== 'number' || (id >>> 0) !== id || id >= this._universe) return false;
+        const i = this._sparse[id];
+        if (i >= this._size || this._dense[i] !== id) return false;
+        this._removeNode(i);
+        return true;
+    }
+
+    /**
+     * Fire + remove EXACTLY the set of timers present in the level-0 due list
+     * (`slot[now & 0xFF]`) at the moment drainDue is ENTERED, calling fn(id, wheel) per
+     * timer in FIFO order. O(due), zero-alloc. SNAPSHOT semantics identical to
+     * TimerWheel: at entry the due list is MOVED into the reserved DRAINING identity and
+     * every node relabeled `_listOf = DRAINING`, so the REAL slot goes empty (a
+     * re-entrant (re)schedule during fn lands there and DEFERS), then the DRAINING list
+     * is HEAD-DRAINED (re-reading the head each step is robust to a re-entrant cancel of
+     * any pending node, and the list only shrinks so it terminates). `_busy` is set
+     * across the drain so a re-entrant advance() throws; a re-entrant clear()
+     * self-terminates via the `i >= _size || _listOf[i] !== DRAINING` guard. fn is user
+     * code -- the one documented alloc exception.
+     * @param {(id:number, wheel:HierarchicalTimerWheel)=>void} fn
+     */
+    drainDue(fn) {
+        const slot = this._now & 0xFF;             // level-0 due list
+        const draining = HTW_DRAINING;
+        let h = this._head[slot];
+        if (h >= this._size || this._listOf[h] !== slot) return; // empty / stale -> no-op
+        for (let n = h; n !== HTW_NIL; n = this._next[n]) this._listOf[n] = draining;
+        this._head[draining] = h;
+        this._tail[draining] = this._tail[slot];
+        this._head[slot] = HTW_NIL;
+        this._tail[slot] = HTW_NIL;
+        const wasBusy = this._busy;
+        this._busy = true; // block a re-entrant advance() across the fired callbacks
+        try {
+            for (;;) {
+                const i = this._head[draining];
+                if (i === HTW_NIL || i >= this._size || this._listOf[i] !== draining) break;
+                const id = this._dense[i];
+                this._removeNode(i);   // unlink from the DRAINING list + swap-remove dense
+                fn(id, this);          // fired AFTER removal -> a re-entrant cancel(id) is inert
+            }
+        } finally {
+            this._busy = wasBusy;
+        }
+    }
+
+    /**
+     * Advance the tick clock by `ticks` (default 1). Per tick: the level-0 slot being
+     * LEFT BEHIND (`now & 0xFF`) must be EMPTY (drained) or it THROWS `[lite-o1]`
+     * (drain-before-advance / drain-before-cascade); then `now` increments, and if that
+     * increment WRAPS level 0 (`(now & 0xFF) === 0`) the next level's now-due bucket is
+     * cascaded down (nested: level 2 if level 1 also wrapped, level 3 if level 2 also
+     * wrapped). advance(1) is worst-case O(1) on a normal tick and O(levels + bucket) on
+     * a cascade tick -- the teaching SPIKE (roughly 1 tick in 256), amortized O(1) over a
+     * timer's life. `advance(1)` is a BYTE-IDENTICAL no-op on the undrained throw (the
+     * emptiness check precedes every mutation); `advance(k)` commits the drained prefix
+     * (the wheel stays a valid representation at each intermediate `now`). Fails closed:
+     * a non-uint32 `ticks` throws via _badTicks; `now + ticks` reaching 2^53 throws via
+     * _tickCeil; a re-entrant advance (nested, or from inside a drainDue callback, seen
+     * via `_busy`) throws via _advancing.
+     * @param {number} [ticks=1]
+     * @returns {HierarchicalTimerWheel} this
+     */
+    advance(ticks = 1) {
+        if (typeof ticks !== 'number' || (ticks >>> 0) !== ticks) return this._badTicks(ticks);
+        if (this._busy) return this._advancing(); // nested / in-flight-drain advance is fail-closed
+        if (this._now + ticks >= HTW_MAX_TICK) return this._tickCeil();
+        this._busy = true;
+        try {
+            for (let t = 0; t < ticks; t++) {
+                const slot = this._now & 0xFF;
+                const h = this._head[slot];
+                if (h < this._size && this._listOf[h] === slot) return this._undrained();
+                const now = this._now + 1;
+                this._now = now;
+                if ((now & 0xFF) === 0) {
+                    // level 0 wrapped -> cascade level 1's now-due bucket down (and deeper
+                    // on a nested wrap). A cascaded timer always re-files into a FINER level.
+                    const i1 = (now >>> 8) & 0x3F;
+                    this._cascade(HTW_L1_BASE + i1);
+                    if (i1 === 0) {
+                        const i2 = (now >>> 14) & 0x3F;
+                        this._cascade(HTW_L2_BASE + i2);
+                        if (i2 === 0) {
+                            this._cascade(HTW_L3_BASE + ((now >>> 20) & 0x3F));
+                        }
+                    }
+                }
+            }
+        } finally {
+            this._busy = false;
+        }
+        return this;
+    }
+
+    /**
+     * Empty the wheel in O(1): reset the live count and the tick clock -- two scalars,
+     * touching NO backing array. Stale dense/sparse entries fail the has() cross-check,
+     * and stale static list heads/tails fail the `head < _size && _listOf[head] === L`
+     * cross-check, so no store is ever zeroed (mirrors TimerWheel). After clear() the
+     * tick clock restarts at 0. Legal from inside a drainDue callback.
+     */
+    clear() {
+        this._size = 0;
+        this._now = 0;
+    }
+
+    /**
+     * Iterate live timers in DENSE STORAGE order (insertion order, permuted by a
+     * cancel / drain / cascade swap-remove) -- NOT time order. O(size). Re-reads `_size`
+     * each step, so a re-entrant cancel from inside fn self-terminates. A HOISTED
+     * callback keeps it allocation-free (the documented O(k) exception). fn is
+     * (id, expiry, wheel).
+     * @param {(id:number, expiry:number, wheel:HierarchicalTimerWheel)=>void} fn
+     */
+    forEach(fn) {
+        const d = this._dense;
+        const e = this._expiry;
+        for (let i = 0; i < this._size; i++) fn(d[i], e[i], this);
+    }
+
+    /**
+     * Iterate live timer ids in dense storage order (same order as forEach). O(size).
+     * The ONE per-protocol ALLOCATOR (a {value, done} per step) -- kept OUT of the
+     * zero-alloc claims; use forEach for the alloc-free scan.
+     */
+    *[Symbol.iterator]() {
+        const d = this._dense;
+        for (let i = 0; i < this._size; i++) yield d[i];
+    }
+
+    // ---- private helpers (hot: node/list surgery + cascade; cold: throw builders) ----
+
+    /**
+     * File node j into the level/slot chosen from `delta` (the level) and `expiry` (the
+     * slot within that level). Used by schedule (delta === delay) and by cascade
+     * (delta === expiry - now). O(1). See the class doc for the selection table.
+     * @private
+     */
+    _fileByDelta(j, delta, expiry) {
+        let list;
+        if (delta < HTW_L0_MAX) list = expiry & 0xFF;
+        else if (delta < HTW_L1_MAX) list = HTW_L1_BASE + ((expiry >>> 8) & 0x3F);
+        else if (delta < HTW_L2_MAX) list = HTW_L2_BASE + ((expiry >>> 14) & 0x3F);
+        else list = HTW_L3_BASE + ((expiry >>> 20) & 0x3F);
+        this._linkTail(j, list);
+    }
+
+    /**
+     * Append node j to the FIFO tail of flat list `list`, creating the list if empty.
+     * The list is empty iff its stored tail is NIL / stale-beyond-live (`t >= _size`) or
+     * points at a node re-used in a different list (`_listOf[t] !== list`) -- the same
+     * cross-check that voids stale heads after clear(). O(1).
+     * @private
+     */
+    _linkTail(j, list) {
+        const t = this._tail[list];
+        this._listOf[j] = list;
+        if (t >= this._size || this._listOf[t] !== list) {
+            // empty list (NIL / stale): j is the sole node.
+            this._head[list] = j;
+            this._tail[list] = j;
+            this._prev[j] = HTW_NIL;
+            this._next[j] = HTW_NIL;
+        } else {
+            // non-empty: append j at the tail (FIFO newest in this list).
+            this._prev[j] = t;
+            this._next[j] = HTW_NIL;
+            this._next[t] = j;
+            this._tail[list] = j;
+        }
+    }
+
+    /**
+     * Cascade flat list `srcList` DOWN: re-file every timer in it at its now-correct
+     * finer level/slot BY INDEX ONLY, then empty the source. O(bucket), zero-alloc. The
+     * source head is captured, then the source list is DETACHED (head/tail -> NIL)
+     * BEFORE re-filing, so re-filing (always into a FINER, different list) cannot corrupt
+     * the walk; `nx` is captured before each node's pointers are overwritten. An empty /
+     * stale source is a no-op via the cross-check.
+     * @private
+     */
+    _cascade(srcList) {
+        let n = this._head[srcList];
+        if (n >= this._size || this._listOf[n] !== srcList) return; // empty / stale -> no-op
+        this._head[srcList] = HTW_NIL; // detach the whole list first (re-file targets are finer)
+        this._tail[srcList] = HTW_NIL;
+        const now = this._now;
+        while (n !== HTW_NIL) {
+            const nx = this._next[n];                     // capture before _linkTail overwrites it
+            const e = this._expiry[n];
+            this._fileByDelta(n, e - now, e);
+            n = nx;
+        }
+    }
+
+    /**
+     * Remove the node at dense index i: unlink it from its list (`_listOf[i]`, a real
+     * level list OR the DRAINING identity), fixing that list's head/tail, then swap the
+     * last live node into index i (fixing the moved node's intrusive pointers + its list
+     * head/tail + its expiry). O(1). Because the moved node's list is read from
+     * `_listOf[last]`, it repairs the DRAINING list too, so a swap during a head-drain
+     * leaves the DRAINING head/tail correct (mirrors TimerWheel._removeNode).
+     * @private
+     */
+    _removeNode(i) {
+        const list = this._listOf[i];
+        const p = this._prev[i];
+        const nx = this._next[i];
+        if (p === HTW_NIL) this._head[list] = nx; else this._next[p] = nx;
+        if (nx === HTW_NIL) this._tail[list] = p; else this._prev[nx] = p;
+        const last = --this._size;
+        if (i === last) return;
+        const mk = this._dense[last];
+        const ml = this._listOf[last];
+        this._dense[i] = mk;
+        this._sparse[mk] = i;
+        this._listOf[i] = ml;
+        this._expiry[i] = this._expiry[last];
+        const mp = this._prev[last];
+        const mn = this._next[last];
+        this._prev[i] = mp;
+        this._next[i] = mn;
+        if (mp === HTW_NIL) this._head[ml] = i; else this._next[mp] = i;
+        if (mn === HTW_NIL) this._tail[ml] = i; else this._prev[mn] = i;
+    }
+
+    /** @private */
+    _oob(id) {
+        // String(id) -- NOT '+ id' / a template literal: those THROW on a Symbol.
+        throw new RangeError('[lite-o1] id out of universe [0, ' + this._universe + '): ' + String(id));
+    }
+
+    /** @private */
+    _badDelay(delay) {
+        throw new RangeError('[lite-o1] delay out of range [0, ' + (HTW_MAX_DELTA - 1) + ']: ' + String(delay));
+    }
+
+    /** @private */
+    _full() {
+        throw new RangeError('[lite-o1] HierarchicalTimerWheel full (capacity ' + this._cap + ')');
+    }
+
+    /** @private */
+    _badTicks(ticks) {
+        throw new RangeError('[lite-o1] ticks must be an integer in [0, 2^32-1], got ' + String(ticks));
+    }
+
+    /** @private */
+    _tickCeil() {
+        throw new RangeError('[lite-o1] HierarchicalTimerWheel tick ceiling 2^53 reached; call clear() to reuse');
+    }
+
+    /** @private */
+    _undrained() {
+        throw new RangeError('[lite-o1] HierarchicalTimerWheel advance would skip an undrained due slot; ' +
+            'drainDue() before advance() (drain-before-advance)');
+    }
+
+    /** @private */
+    _advancing() {
+        throw new RangeError('[lite-o1] HierarchicalTimerWheel advance() during an in-flight drain/advance; ' +
             'advance only between drains (would strand the un-fired due timers)');
     }
 }

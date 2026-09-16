@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-Version: 0.9.0
+Version: 0.10.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -13,9 +13,9 @@ op is O(1) worst-case (or O(1)-amortized where stated) and allocates zero bytes
 after construction, and a shipped witness harness demonstrates the flat
 throughput curve against a built-in foil.
 
-v0.9.0 ships nine members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
-RandomSet, FreqO1, BucketQueue, and TimerWheel. They share no mutable module state,
-so a bundler that imports one drops the others (tree-shakeable).
+v0.10.0 ships ten members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
+RandomSet, FreqO1, BucketQueue, TimerWheel, and HierarchicalTimerWheel. They share
+no mutable module state, so a bundler that imports one drops the others (tree-shakeable).
 
 ## Exports (from the single main file O1.js)
 
@@ -36,7 +36,12 @@ so a bundler that imports one drops the others (tree-shakeable).
 - `TimerWheel` -- class. A zero-GC WORST-CASE O(1) bounded "simple" timing wheel
   (Varghese-Lauck) with schedule() / cancel() / drainDue() / advance() over private id
   columns + a static per-slot FIFO ring.
-- `VERSION` -- string, '0.9.0'.
+- `HierarchicalTimerWheel` -- class. A zero-GC AMORTIZED O(1) CASCADING multi-level
+  timing wheel (four levels in the Linux tvec shape 1x256 + 3x64, delay range 2^26)
+  with schedule() / cancel() / drainDue() / advance() over private id columns + a
+  Float64 expiry column + static per-list FIFO rings; coarse timers cascade down to
+  finer levels by INDEX as the clock advances.
+- `VERSION` -- string, '0.10.0'.
 
 ## SparseSet
 
@@ -542,6 +547,79 @@ capacity-sized), so the `size === capacity` guard rejects a NEW id past capacity
 byte-identical no-op and no node slot is ever over-allocated. The slots are static
 (0..slots-1), so there is no slot free-list to exhaust.
 
+## HierarchicalTimerWheel
+
+    new HierarchicalTimerWheel(universe, capacity = universe)
+
+- An AMORTIZED O(1) CASCADING timing wheel -- the multi-level sibling of TimerWheel. Where
+  a simple wheel holds one rotation's timers (delay <= slots-1), this nests FOUR levels in
+  the Linux tvec shape and cascades coarse timers down to finer levels as the clock
+  advances, so it schedules a far larger BOUNDED delay horizon (delay in [0, 2^26)) with the
+  SAME zero-alloc substrate -- one node per timer, moved between intrusive lists BY INDEX.
+- universe: exclusive id ceiling; integer in [1, 2^32]. Ids are integers in [0, universe).
+- capacity: max simultaneously-live timers; integer in [1, universe], default universe.
+- Constructor throws a [lite-o1] RangeError on a bad universe / capacity (typeof-guarded
+  FIRST so a Symbol / BigInt never reaches coercion; String(x) message).
+- GEOMETRY (hybrid 1x256 + 3x64, total range 2^26): level 0 = 256 slots (mask 0xFF, shift
+  0), scanned every drainDue tick -- the hot path; levels 1..3 = 64 slots each (mask 0x3F,
+  shifts 8/14/20), covering delay in [2^8, 2^14), [2^14, 2^20), [2^20, 2^26). Level/slot for
+  a timer expiring at `expiry` with delta = expiry - now: delta < 2^8 -> L0 slot
+  expiry & 0xFF; < 2^14 -> L1 (expiry >>> 8) & 0x3F; < 2^20 -> L2 (expiry >>> 14) & 0x3F;
+  else L3 (expiry >>> 20) & 0x3F.
+- Substrate (all PRIVATE; mirrors TimerWheel's, diverging only where the multi-level heads
+  require it): IDS ride SparseSet's dense + sparse cross-check (dense index = node id). Per
+  NODE: listOf (the flat list it sits in, 0..447 or the DRAINING identity 448), next/prev
+  intrusive FIFO, and expiry (a Float64, integer-exact to 2^53, needed to re-file on
+  cascade). Per LIST (a STATIC array of length 449, NO free-list): FIFO head/tail. clear()
+  is O(1): stale heads are voided by the SAME cross-check that voids stale sparse entries.
+
+Hot surface (schedule / cancel / advance(1) / has AMORTIZED O(1); drainDue O(due); all zero
+allocation):
+
+- schedule(id, delay) -> this  File id at the level/slot for `delay` (expiry = now + delay).
+                            IDEMPOTENT no-op if present. Fail closed: a bad id / a delay >=
+                            2^26 / a NEW id past capacity / an expiry reaching 2^53 throw
+                            [lite-o1] as a byte-identical no-op.
+- cancel(id) -> boolean     Unlink id + swap-remove. True iff scheduled; a bad / absent id
+                            returns false, NEVER throws.
+- drainDue(fn) -> void      Fire + remove every timer in the level-0 due list
+                            (slot[now & 0xFF]) at ENTRY, fn(id, wheel) in FIFO order. O(due).
+                            SNAPSHOT semantics identical to TimerWheel (re-entrant
+                            schedule/cancel/clear supported; the due list is moved into the
+                            reserved DRAINING identity then head-drained; a re-entrant
+                            advance throws). fn is user code -- the one alloc exception.
+- advance(ticks = 1) -> this  DRAIN-BEFORE-CASCADE: each level-0 slot left behind must be
+                            EMPTY or it throws [lite-o1]. On a level-0 wrap (every 256 ticks)
+                            the next level's due bucket is CASCADED down (nested for levels
+                            2/3). advance(1) is O(1) on a normal tick and O(levels + bucket)
+                            on a wrap -- the max-single-op cascade SPIKE (the teaching
+                            feature; the witness prints it), amortized O(1) over a timer's
+                            life. Also throws [lite-o1] on `now` reaching 2^53, or a
+                            re-entrant advance (nested / in-flight drain, via a _busy guard).
+- has(id) -> boolean        True iff scheduled. A bad id is ABSENT, never throws.
+- size / capacity / universe / now / maxDelay (getters). maxDelay is 2^26 - 1.
+- clear() -> void           O(1): resets the live count + tick clock to 0; touches NO store.
+- forEach(fn) -> void       O(size) alloc-free scan in DENSE STORAGE order (NOT time order);
+                            fn is (id, expiry, wheel). Re-reads size each step, so a
+                            re-entrant cancel self-terminates.
+- [Symbol.iterator]()       O(size) scan, same order; ALLOCATES per protocol -- use forEach
+                            for the alloc-free scan.
+
+CASCADE contract (LOCKED -- the zero-GC crux + the amortized O(1)): a level-1 due bucket
+always has delta < 256 by the wrap that cascades it, so it re-files into level 0; a level-2
+bucket into level 1/0; a level-3 bucket into level 2/1/0 -- always a FINER (different) list,
+so the emptied source is cleared and the walk terminates, all by INDEX (ZERO allocation).
+Each timer cascades at most levels-1 times over its life, so advance amortizes to O(1) per
+tick even though a wrap tick is O(bucket). The foil is a FAIR one -- an alloc-free 4-ary
+min-heap (O(log n) per tick) -- not a strawman; the wheel wins by an O(1) constant while
+wearing the cascade spike (see the witness + ADR 0015).
+
+Id / delay / ticks model: ids integer [0, universe); delay integer [0, 2^26); ticks integer
+[0, 2^32-1]. Every guard is typeof-first so a Symbol / BigInt never reaches the coercing
+`>>>`; messages via String(x). null is not zero. Fail closed on the MUTATORS (schedule /
+advance throw), ABSENT on the QUERIES (has / cancel never throw). Re-entrant advance is the
+one drainDue-callback exception -- it throws [lite-o1] (schedule / cancel / clear stay legal).
+
 ## Design bounds
 
 - SparseSet valid key: integer in [0, universe).
@@ -598,10 +676,23 @@ byte-identical no-op and no node slot is ever over-allocated. The slots are stat
   slots 0..slots-1, no free-list. forEach / [Symbol.iterator] scan in dense storage order
   (iterator allocates). schedule of a present id is an idempotent no-op (reschedule =
   cancel then schedule). NO pollDue, NO cursor, NO absolute-deadline column.
+- HierarchicalTimerWheel valid id: integer in [0, universe); valid delay: integer in
+  [0, 2^26); fixed capacity, no growth. CASCADING multi-level wheel (Linux tvec shape
+  1x256 + 3x64): schedule files at the level/slot for `delay`; DRAIN-BEFORE-CASCADE --
+  advance() refuses to lap over an undrained level-0 slot (throws fail-closed) and cascades
+  coarse levels down by INDEX on a wrap. Space O(capacity + 449). Fail closed on the
+  mutators schedule / advance (throws [lite-o1]; a delay >= 2^26 throws a byte-identical
+  no-op; null is never coerced to id 0), absent on the queries has / cancel (never throw;
+  cancel returns false). schedule / cancel / advance(1) / has are AMORTIZED O(1) (a level-
+  wrap advance is O(bucket) -- the cascade spike); drainDue is O(due). `now` ceiling 2^53.
+  Re-entrant advance throws [lite-o1] (schedule / cancel / clear stay legal in a callback).
+  FIFO within-list order. Static 449 lists, no free-list. forEach (id, expiry, wheel) /
+  [Symbol.iterator] scan in dense storage order (iterator allocates). schedule of a present
+  id is an idempotent no-op. The foil is a FAIR 4-ary min-heap (O(log n)), not a strawman.
 
 ## Scripts
 
-- npm test           -- 389 node:test cases (contract + boundary + differential fuzz).
+- npm test           -- 475 node:test cases (contract + boundary + differential fuzz).
 - npm run test:types -- tsc --noEmit against O1.d.ts.
 - npm run torture    -- lite-leak + lite-gc-profiler: 0 B/op, 0 major GC, leak-free.
 - npm run witness    -- O(1) throughput-invariance harness + foils + flatness gate.
@@ -676,6 +767,18 @@ byte-identical no-op and no node slot is ever over-allocated. The slots are stat
   collapses -- unlike BucketQueue's O(log n) heap); TimerWheel/naive ratio >= 1.5x. NO
   MAX-single-op line: schedule / cancel / advance(1) are worst-case O(1) (drain-before-
   advance keeps a slot to one rotation's timers), so there is no amortized spike.
+- HierarchicalTimerWheel: size-sweep [1e3, 1e4, 1e5], AMORTIZED-O(1) cascading TICK (a
+  steady-state drainDue + advance, with the delay horizon scaled to n so ~1 timer is due
+  per tick and drained timers re-arm one level up + cascade back down) vs an ALLOC-FREE
+  4-ary MIN-HEAP driven by the SAME tick trace (O(log n) per fired timer). ops/ms is a rate
+  (both batch 5e5). Gated over the steady window size >= 1e4 (the 1e3 point is a pure-L1
+  micro-case shown but not gated). HierarchicalTimerWheel flatness >= 0.70; HierWheel/heap
+  ratio >= 1.5x; the 4-ary heap foil flatness is REPORTED and asserted merely to be LESS
+  flat than the wheel -- an O(log n) foil decays gently and CANNOT reach the O(n) foils'
+  0.55 collapse, so the evidence is the sustained throughput lead (see ADR 0015 + 0013).
+  UNLIKE TimerWheel, it WEARS a MAX-single-op line: the witness gates a visible cascade
+  SPIKE (a level-0 wrap re-filing a heavily-loaded level-1 bucket down) at >= 8x the
+  typical tick -- the amortized-honesty bar for the cascade, the member's headline.
 
 ## Not yet shipped
 
@@ -689,7 +792,9 @@ extreme only, RandomSet holds integer membership + uniform sampling over
 [0, universe), FreqO1 holds integer keys + their access FREQUENCY over
 [0, universe) -- an LFU primitive, not a full cache -- and BucketQueue holds integer
 keys + their integer PRIORITY over [0, universe) x [0, ceiling] -- a monotone priority
-queue, not a general heap (queue integer handles for object payloads) -- and TimerWheel
+queue, not a general heap (queue integer handles for object payloads) -- TimerWheel
 holds integer timer IDS over [0, universe) filed against a delay in [0, slots-1] -- a
-BOUNDED simple wheel, not a hashed / hierarchical one (a hashed wheel for unbounded
-delays is a deferred future member; schedule integer handles for object payloads).
+BOUNDED simple wheel, one rotation deep -- and HierarchicalTimerWheel holds integer timer
+IDS over [0, universe) filed against a delay in [0, 2^26) -- a BOUNDED CASCADING four-level
+wheel, not an UNbounded one (a fully unbounded / hashed wheel remains a deferred future
+member; both wheels schedule integer handles for object payloads, not payloads directly).

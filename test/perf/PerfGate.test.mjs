@@ -22,7 +22,7 @@
  */
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel } from '../../O1.js';
 
 const U = 1 << 16;      // universe 65536
 const CAP = 1 << 14;    // capacity 16384
@@ -989,6 +989,150 @@ const twForEachDrain = {
     statsOf(s) { return { grows: twGrows(s) }; },
 };
 
+// ===========================================================================
+// HierarchicalTimerWheel scenarios -- private Uint32Array id columns + a Float64Array
+// expiry column + static per-list FIFO arrays, all AMORTIZED O(1) zero-alloc (schedule /
+// cancel / advance(1)) plus the O(due) drainDue and the O(bucket) CASCADE. The list
+// surgery + the by-INDEX cascade re-file are pure pointer arithmetic over recycled typed
+// slots -- no coercion, no heap double, no allocation even on a cascade tick.
+// ===========================================================================
+
+const HTW_U = 1 << 16;    // universe 65536
+const HTW_CAP = 1 << 14;  // capacity 16384
+const HTW_W = 1 << 12;    // 4096 resident timers -> steady state, never full/empty
+const HTW_SPREAD = 4096;  // delay spread (level 0 [0,256) + level 1 [256,4096))
+const HTW_REARM = 4095;   // re-arm delay -> level 1 (drained timers cascade back down)
+
+/**
+ * The zero-alloc counter for HierarchicalTimerWheel scenarios: the byte lengths of EVERY
+ * backing buffer (the id substrate + node columns + the Float64 expiry column + the static
+ * per-list head/tail arrays). Capacity + universe are fixed at construction, so this NEVER
+ * grows -- the delta across the window must be 0 (the `htwGrows` 0-delta canary; mirrors
+ * grows / ringGrows / ... / twGrows).
+ */
+function htwGrows(s) {
+    const w = s.htw;
+    return w._dense.buffer.byteLength + w._sparse.buffer.byteLength +
+        w._listOf.buffer.byteLength + w._next.buffer.byteLength + w._prev.buffer.byteLength +
+        w._expiry.buffer.byteLength + w._head.buffer.byteLength + w._tail.buffer.byteLength;
+}
+
+function htwNoop() {}
+
+/**
+ * schedule-churn: fresh timers at capacity, all at delay 0 (the level-0 due slot).
+ * schedule is fail-closed past capacity, so clear() (O(1), zero-alloc, resets now to 0)
+ * the instant the wheel is full and keep refilling -- the wheel never exceeds HTW_CAP and
+ * every op is a real schedule (the id substrate write + the level/slot file at the tail).
+ */
+const htwScheduleChurn = {
+    name: 'HierarchicalTimerWheel schedule-churn',
+    setup() { return { htw: new HierarchicalTimerWheel(HTW_U, HTW_CAP), n: 0 }; },
+    hot(s, n) {
+        const w = s.htw;
+        let live = s.n | 0;
+        for (let i = 0; i < n; i++) {
+            if (live === HTW_CAP) { w.clear(); live = 0; }
+            w.schedule(live, 0);
+            live = (live + 1) | 0;
+        }
+        s.n = live | 0;
+    },
+    statsOf(s) { return { grows: htwGrows(s) }; },
+};
+
+/**
+ * drainDue-cascade: prime a bounded resident window spread across level 0 + level 1, then
+ * each op drains the current due slot (re-arming every fired timer ONE LEVEL UP so it
+ * CASCADES back down as `now` wraps) + advance(1) -- so the measured window is dominated by
+ * REAL drains (FIFO head-walk, per-timer swap-remove), by-INDEX cascade re-files on the
+ * ~1-in-256 wrap tick, and the O(1) advance. clear() resets now to 0 the instant the wheel
+ * empties, so the wheel oscillates 0 -> HTW_W (< HTW_CAP), never full, every op zero-alloc
+ * INCLUDING the cascade ticks (the whole point of this scenario).
+ */
+const htwDrainCascade = {
+    name: 'HierarchicalTimerWheel drainDue-cascade (spread fill then drain + advance)',
+    setup() {
+        const htw = new HierarchicalTimerWheel(HTW_U, HTW_CAP);
+        for (let k = 0; k < HTW_W; k++) htw.schedule(k, k & (HTW_SPREAD - 1)); // spread across level 0 + level 1
+        return { htw, rearm: (id, wheel) => { wheel.schedule(id, HTW_REARM); } };
+    },
+    hot(s, n) {
+        const w = s.htw;
+        const rearm = s.rearm;
+        for (let i = 0; i < n; i++) {
+            if (w.size === 0) { w.clear(); for (let k = 0; k < HTW_W; k++) w.schedule(k, k & (HTW_SPREAD - 1)); }
+            w.drainDue(rearm);  // fire the due slot, re-arm each drained timer into level 1
+            w.advance(1);       // step the clock (cascade on a level-0/1/2 wrap -> by-index re-file)
+        }
+    },
+    statsOf(s) { return { grows: htwGrows(s) }; },
+};
+
+/**
+ * cancel-churn: prime HTW_W resident timers spread across levels, then each op cancels one
+ * (a real unlink from its list + swap-remove) and re-schedules it at the same delay -- so
+ * size returns to HTW_W every op and no op touches full/empty. No advance, so now stays 0.
+ * Every op is zero-alloc.
+ */
+const htwCancelChurn = {
+    name: 'HierarchicalTimerWheel cancel-churn',
+    setup() {
+        const htw = new HierarchicalTimerWheel(HTW_U, HTW_CAP);
+        for (let k = 0; k < HTW_W; k++) htw.schedule(k, k & (HTW_SPREAD - 1));
+        return { htw, i: 0 };
+    },
+    hot(s, n) {
+        const w = s.htw;
+        let idx = s.i | 0;
+        for (let i = 0; i < n; i++) {
+            const key = idx & (HTW_W - 1);
+            w.cancel(key);                              // real unlink + swap-remove
+            w.schedule(key, key & (HTW_SPREAD - 1));    // re-add -> size returns to HTW_W
+            idx = (idx + 1) | 0;
+        }
+        s.i = idx | 0;
+    },
+    statsOf(s) { return { grows: htwGrows(s) }; },
+};
+
+/**
+ * advance-tick: an EMPTY wheel advanced one tick per op -- exercises the advance hot body
+ * (the emptiness check + counter add) AND its empty-bucket cascade branch on every wrap.
+ * All slots read empty, so every advance is legal and O(1); now climbs but never nears 2^53.
+ */
+const htwAdvanceTick = {
+    name: 'HierarchicalTimerWheel advance-tick (empty wheel, cascades empty buckets)',
+    setup() { return { htw: new HierarchicalTimerWheel(HTW_U, HTW_CAP) }; },
+    hot(s, n) {
+        const w = s.htw;
+        for (let i = 0; i < n; i++) w.advance(1);
+    },
+    statsOf(s) { return { grows: htwGrows(s) }; },
+};
+
+/**
+ * HierarchicalTimerWheel forEach-drain: a primed wheel scanned each op through a HOISTED
+ * module-scope callback (never re-created per op). Proves forEach itself (the alloc-free
+ * dense-order scan; the ONE per-protocol allocator is [Symbol.iterator], gated separately
+ * by htwMustFailAlloc) allocates nothing over its own dedicated window.
+ */
+let htwDrainAcc = 0;
+function htwForEachInto(id, expiry) { htwDrainAcc = (htwDrainAcc + id + (expiry | 0)) | 0; }
+const htwForEachDrain = {
+    name: 'HierarchicalTimerWheel forEach-drain',
+    setup() {
+        const htw = new HierarchicalTimerWheel(HTW_U, HTW_CAP);
+        for (let i = 0; i < 256; i++) htw.schedule(i, i & (HTW_SPREAD - 1)); // bounded resident set to scan
+        return { htw };
+    },
+    hot(s, n) {
+        const w = s.htw;
+        for (let i = 0; i < n; i++) w.forEach(htwForEachInto);
+    },
+    statsOf(s) { return { grows: htwGrows(s) }; },
+};
+
 const scenarios = [
     addChurn, hasHit, deleteChurn, clearRefill, forEachDrain,
     ringFifo, ringLifo, ringInterleave,
@@ -999,6 +1143,7 @@ const scenarios = [
     freqIncrementChurn, freqPopMinDrain, freqForEachDrain,
     bqInsertChurn, bqExtractDrain, bqDecreaseKeyChurn, bqForEachDrain,
     twScheduleChurn, twDrainDrain, twCancelChurn, twAdvanceTick, twForEachDrain,
+    htwScheduleChurn, htwDrainCascade, htwCancelChurn, htwAdvanceTick, htwForEachDrain,
 ];
 
 /**
@@ -1211,6 +1356,33 @@ const twMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/**
+ * The HierarchicalTimerWheel teeth: a per-op `[Symbol.iterator]` spread into a FRESH []
+ * each op -- the generator + its per-step {value, done} wrappers + the array MUST trip the
+ * gate (scavenges scale with n), proving the instrument has teeth on the
+ * HierarchicalTimerWheel surface too (its iterator is the ONE documented per-protocol
+ * allocator; forEach is the alloc-free scan). statsOf returns a constant so the failure is
+ * the allocation lanes, not a missing-counter artifact.
+ */
+const htwMustFailAlloc = {
+    name: 'HierarchicalTimerWheel [Symbol.iterator] spread into fresh array (MUST allocate)',
+    setup() {
+        const htw = new HierarchicalTimerWheel(256, 256);
+        for (let i = 0; i < 64; i++) htw.schedule(i, i & 255);
+        return { htw };
+    },
+    hot(s, n) {
+        const htw = s.htw;
+        let sink = 0;
+        for (let i = 0; i < n; i++) {
+            const arr = [...htw]; // fresh generator + array per op -> heap churn
+            sink += arr.length;
+        }
+        s.sink = sink;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -1220,5 +1392,5 @@ zgcSuite({
     counters: { grows: 0 },
     maxRetainedKB: 64,
     scenarios,
-    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc, twMustFailAlloc],
+    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc, twMustFailAlloc, htwMustFailAlloc],
 });

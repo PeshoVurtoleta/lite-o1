@@ -10,9 +10,26 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel } from '../O1.js';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, VERSION } from '../O1.js';
 
 const litO1 = (e) => e instanceof Error && /^\[lite-o1]/.test(e.message);
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const ROOT = join(__dirname, '..');
+
+// --- VERSION trinity: O1.js const === package.json === llms.txt ------------
+
+test('VERSION trinity: O1.js const, package.json, and llms.txt agree byte-for-byte', () => {
+    const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
+    assert.equal(VERSION, pkg.version, 'O1.js VERSION const !== package.json version');
+    const llms = readFileSync(join(ROOT, 'llms.txt'), 'utf8');
+    const m = llms.match(/^Version:\s*(\S+)/m);
+    assert.ok(m, 'llms.txt must carry a "Version: <x>" header line');
+    assert.equal(m[1], VERSION, 'llms.txt Version header !== O1.js VERSION const');
+});
 
 // --- universe-size boundary: N=1 (the smallest legal universe) -------------
 
@@ -1300,4 +1317,90 @@ test('ADVERSARIAL: advance() from inside drainDue IS legal for the LAST draining
     assert.deepEqual(results, ['threw:1', 'threw:2', 'advanced:3']);
     assert.equal(w2.now, 1);
     assert.ok(twCrossCheckOk(w2));
+});
+
+// ===========================================================================
+// HierarchicalTimerWheel boundary audits (QA pass, member 10 -- private id
+// columns + a Float64 expiry column + static per-flat-list FIFO rings + the
+// by-index CASCADE / drain-before-cascade contract). Complements the dedicated
+// test/HierarchicalTimerWheel.test.js with the QaAudit boundary-matrix style:
+// the coercion valueOf-spy on BOTH mutator args, the id boundary matrix
+// (0/1/N-1/N/N+1), and the maxDelay boundary. The KEY CONTRAST vs member 9:
+// HTW's _busy guard makes a re-entrant advance() fail-closed for EVERY in-drain
+// case (including the sole/last node), where TimerWheel permits the last node.
+// ===========================================================================
+
+function htwCrossCheckOk(w) {
+    for (let i = 0; i < w._size; i++) {
+        const id = w._dense[i];
+        if (w._sparse[id] !== i) return false;
+        if (!w.has(id)) return false;
+        if (w._listOf[i] > 448) return false; // 448 lists (256 + 3*64) + the DRAINING id
+    }
+    return true;
+}
+
+function htwSnapshot(w) {
+    return {
+        size: w._size, now: w._now,
+        dense: w._dense.slice(), sparse: w._sparse.slice(), listOf: w._listOf.slice(),
+        next: w._next.slice(), prev: w._prev.slice(), expiry: w._expiry.slice(),
+        head: w._head.slice(), tail: w._tail.slice(),
+    };
+}
+
+test('ADVERSARIAL: HierarchicalTimerWheel schedule() coercion footgun on BOTH args -- typeof short-circuits BEFORE valueOf runs', () => {
+    const w = new HierarchicalTimerWheel(16, 8);
+    w.schedule(1, 0);
+    const before = htwSnapshot(w);
+    let idTouched = 0, delayTouched = 0;
+    const evilId = { valueOf() { idTouched++; return 3; } };
+    const evilDelay = { valueOf() { delayTouched++; return 3; } };
+    /* eslint-disable no-new-wrappers */
+    for (const bad of [Symbol('x'), 5n, evilId, new Number(2), NaN, null, undefined, -1, 1.5]) {
+        assert.throws(() => w.schedule(bad, 0), litO1, 'id=' + String(bad));
+        assert.doesNotThrow(() => w.has(bad));
+        assert.equal(w.has(bad), false);
+        assert.doesNotThrow(() => w.cancel(bad));
+        assert.equal(w.cancel(bad), false);
+    }
+    for (const bad of [Symbol('d'), 5n, evilDelay, NaN, null, undefined, -1, 1.5, 2 ** 26]) {
+        assert.throws(() => w.schedule(2, bad), litO1, 'delay=' + String(bad));
+    }
+    /* eslint-enable no-new-wrappers */
+    assert.throws(() => w.schedule(16, 0), litO1, 'id === universe');
+    assert.throws(() => w.schedule(2, -1), litO1, 'delay < 0');
+    assert.equal(idTouched, 0, 'schedule(evilId, ...) must not call valueOf before rejecting');
+    assert.equal(delayTouched, 0, 'schedule(2, evilDelay) must not call valueOf before rejecting');
+    assert.deepEqual(htwSnapshot(w), before, 'a rejected schedule mutated state');
+    assert.ok(htwCrossCheckOk(w));
+});
+
+test('HierarchicalTimerWheel: id boundary matrix 0 / 1 / N-1 / N / N+1 on universe=10; null never coerced', () => {
+    const U = 10, w = new HierarchicalTimerWheel(U, U);
+    w.schedule(0, 0); w.schedule(1, 300); w.schedule(U - 1, 20000);
+    assert.ok(w.has(0) && w.has(1) && w.has(U - 1));
+    assert.equal(w.has(U), false);
+    assert.equal(w.cancel(U), false);
+    assert.throws(() => w.schedule(U, 0), litO1);
+    assert.equal(w.has(U + 1), false);
+    assert.throws(() => w.schedule(U + 1, 0), litO1);
+    // null is never coerced to id 0 / delay 0.
+    assert.throws(() => w.schedule(null, 0), litO1);
+    assert.throws(() => w.schedule(0, null), litO1); // note: id 0 already present -> idempotent, but delay validated
+    assert.equal(w.size, 3);
+    assert.ok(htwCrossCheckOk(w));
+});
+
+test('HierarchicalTimerWheel: maxDelay (2^26-1) accepted, 2^26 throws; capacity=1 exhaustion byte-identical', () => {
+    const w = new HierarchicalTimerWheel(16, 1);
+    w.schedule(0, 0);
+    const before = htwSnapshot(w);
+    assert.throws(() => w.schedule(1, 0), litO1); // full at capacity 1
+    assert.deepEqual(htwSnapshot(w), before, 'a full schedule mutated state');
+    assert.equal(w.has(1), false);
+    // the present id 0 stays idempotent-schedulable even while full; a bad delay still throws.
+    assert.doesNotThrow(() => w.schedule(0, 2 ** 26 - 1)); // present -> no-op, delay validated OK
+    assert.throws(() => w.schedule(0, 2 ** 26), litO1);    // present id, but a >= 2^26 delay throws
+    assert.ok(htwCrossCheckOk(w));
 });

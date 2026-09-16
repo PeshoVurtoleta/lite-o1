@@ -39,7 +39,7 @@ async function main() {
     const { GcProfiler, checkNoGc, measureAllocs } =
         await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel } = await import('../O1.js');
+    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel } = await import('../O1.js');
 
     const U = 1 << 16;      // universe 65536
     const CAP = 1 << 14;    // capacity 16384
@@ -159,6 +159,20 @@ async function main() {
             tw.drainDue(noop);
             tw.advance(1);
             tracker.track(tw, noop, 'timerwheel', { audit: true });
+            // HierarchicalTimerWheel owns only its private Uint32Array id columns +
+            // Float64Array expiry column + static per-list arrays; nothing external to
+            // release. Its arrays hold numbers, so a reclaimed instance is the desired
+            // outcome, proven by size()->0. Exercise schedule (across all four levels) /
+            // has / cancel / drainDue / advance before tracking.
+            const htw = new HierarchicalTimerWheel(1024, 256);
+            htw.schedule(i & 1023, i & 63);              // level 0
+            htw.schedule((i + 1) & 1023, 300 + (i & 63)); // level 1
+            htw.schedule((i + 2) & 1023, 20000);          // level 2
+            htw.has(i & 1023);
+            htw.cancel(i & 1023);
+            htw.drainDue(noop);
+            htw.advance(1);
+            tracker.track(htw, noop, 'hierarchicaltimerwheel', { audit: true });
         }
         return tracker.size();
     }
@@ -355,6 +369,34 @@ async function main() {
     const twAllocBytes = Math.max(0, Math.round(twBpc));
     const twAllocOk = twAllocBytes === 0;
     const twNoop = () => {};
+
+    // HierarchicalTimerWheel hot path: a bounded resident cascading wheel churned in a
+    // rolling drain that CROSSES LEVEL WRAPS (so the measured window includes cascade
+    // ticks). HTW_W timers are primed spread across level 0 + level 1; each step drains
+    // the current due slot (fire + swap-remove per timer) re-arming every drained timer
+    // at a level-1 delay through a HOISTED callback -- so drained timers land in level 1
+    // and CASCADE back down as `now` wraps every 256 ticks -- then advance(1) over the
+    // now-drained slot (drain-before-advance holds, so no throw; the wrap tick runs the
+    // O(levels + bucket) cascade). Size stays steady at HTW_W and `now` climbs across
+    // ~3000 wraps over the measured iterations, exercising schedule + the FIFO head-walk
+    // + swap-remove + the by-INDEX cascade re-file + the O(1) advance with no full/empty
+    // edge. Every op is zero-alloc (id columns + expiry column + static list arrays
+    // recycle typed slots only; the cascade moves nodes between lists by pointer surgery,
+    // never a JS allocation). drainDue's fn is user code (the documented exception).
+    const HTW_W = 1 << 12;               // 4096 resident timers, < CAP so never full
+    const HTW_REARM = 4095;              // re-arm delay -> level 1 (drained timers cascade back down)
+    const htw = new HierarchicalTimerWheel(U, CAP);
+    for (let k = 0; k < HTW_W; k++) htw.schedule(k, k & 4095); // spread across level 0 + level 1
+    const htwRearm = (id, wheel) => { wheel.schedule(id, HTW_REARM); }; // re-arm one level up
+    const htwStep = () => {
+        htw.drainDue(htwRearm); // fire+remove the due slot, re-arm each drained timer into level 1
+        htw.advance(1);         // the current slot is drained -> legal O(1) advance (cascade on a wrap)
+    };
+    const htwAllocRes = measureAllocs(htwStep, { iterations: 100000, batches: 8 });
+    const htwBpc = htwAllocRes.bytesPerCall === null ? 0 : htwAllocRes.bytesPerCall;
+    const htwAllocBytes = Math.max(0, Math.round(htwBpc));
+    const htwAllocOk = htwAllocBytes === 0;
+    const htwNoop = () => {};
     // "0 B/op" resolved at the sampling floor: heapUsed deltas are quantized and
     // noisy, so a truly non-allocating op reads a sub-byte figure (a lone blip
     // in one batch / iterations). Round to the nearest byte -- any per-op
@@ -377,6 +419,7 @@ async function main() {
         freqStep();
         buckStep();
         twStep();
+        htwStep();
         if ((i & 8191) === 0) {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
         }
@@ -457,6 +500,19 @@ async function main() {
         tw.forEach(cb);
         tw.drainDue(twNoop);                             // drain slot 0 -> size 0
     }
+    // HierarchicalTimerWheel fill (spread across all four levels) + forEach (dense scan)
+    // + a drain-and-advance sweep that CASCADES level 1/2/3 down + O(1) clear cycles --
+    // exercises schedule at every level, the by-INDEX cascade re-file, the FIFO head-walk
+    // + swap-remove drain, the alloc-free scan, and clear. clear() first resets `now` (the
+    // hot loop left it high) so each cycle re-enters at tick 0; the drain-advance sweep
+    // fires everything scheduled within the swept window and cascades the rest down.
+    for (let f = 0; f < 256; f++) {
+        htw.clear();
+        for (let k = 0; k < 512; k++) htw.schedule(k, k & 1023); // spread across level 0 + level 1
+        htw.forEach(cb);
+        // drain 1024 ticks: crosses 4 level-0 wraps (cascades) and fires every timer
+        for (let t = 0; t < 1024; t++) { htw.drainDue(htwNoop); htw.advance(1); }
+    }
     await new Promise((r) => setTimeout(r, 50));
     const s2 = gc.summary();
     const report = checkNoGc(s2, { maxMajor: 0, maxPauseMs: 2 });
@@ -495,6 +551,10 @@ async function main() {
         for (let k = 0; k < CAP; k++) tw.schedule(k, 0); // all due at tick 0 (slot 0)
         tw.drainDue(twNoop);                             // drain slot 0 -> size 0
         tw.clear();
+        htw.clear();
+        for (let k = 0; k < CAP; k++) htw.schedule(k, 0); // all due at tick 0 (level-0 slot 0)
+        htw.drainDue(htwNoop);                            // drain slot 0 -> size 0
+        htw.clear();
     }
     globalThis.gc();
     const abAfter = process.memoryUsage().arrayBuffers;
@@ -504,7 +564,7 @@ async function main() {
     // ---- verdict + GATE line ----------------------------------------------
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
         findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && monoAllocOk &&
-        minAllocOk && randAllocOk && freqAllocOk && buckAllocOk && twAllocOk && abOk;
+        minAllocOk && randAllocOk && freqAllocOk && buckAllocOk && twAllocOk && htwAllocOk && abOk;
 
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
@@ -515,7 +575,8 @@ async function main() {
         ufAllocBytes + ' B/op (UnionFind) ' + monoAllocBytes + ' B/op (MonoDeque) ' +
         minAllocBytes + ' B/op (MinStack) ' + randAllocBytes + ' B/op (RandomSet) ' +
         freqAllocBytes + ' B/op (FreqO1) ' + buckAllocBytes + ' B/op (BucketQueue) ' +
-        twAllocBytes + ' B/op (TimerWheel)' +
+        twAllocBytes + ' B/op (TimerWheel) ' +
+        htwAllocBytes + ' B/op (HierarchicalTimerWheel)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
         ' (tracked=' + trackedMid + ' sink=' + SINK + ' abGrowth=' + abDelta + ')');
 
@@ -535,6 +596,7 @@ async function main() {
         if (!freqAllocOk) console.error('  alloc ' + freqAllocBytes + ' B/op FreqO1 (raw bytesPerCall ' + freqBpc + ')');
         if (!buckAllocOk) console.error('  alloc ' + buckAllocBytes + ' B/op BucketQueue (raw bytesPerCall ' + buckBpc + ')');
         if (!twAllocOk) console.error('  alloc ' + twAllocBytes + ' B/op TimerWheel (raw bytesPerCall ' + twBpc + ')');
+        if (!htwAllocOk) console.error('  alloc ' + htwAllocBytes + ' B/op HierarchicalTimerWheel (raw bytesPerCall ' + htwBpc + ')');
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;
     }

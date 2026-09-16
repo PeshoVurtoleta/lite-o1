@@ -379,6 +379,51 @@ flat line is the whole claim.
 
 ---
 
+### HierarchicalTimerWheel (v0.10.0)
+
+Bounded CASCADING multi-level timing wheel (the Linux `tvec` shape: 1x256 + 3x64, delay
+range 2^26) over the SAME substrate as TimerWheel plus a Float64 `expiry` column. Four
+nested coarse-to-fine rings; as the clock advances, coarse timers CASCADE down to finer
+rings BY INDEX (zero allocation). `schedule` / `cancel` / `advance(1)` / `has` are
+amortized O(1); `drainDue` is O(due); a level-wrap tick runs the O(bucket) cascade -- the
+teaching max-single-op spike. TimerWheel's cascading sibling: pick it when the delay
+horizon outruns a single rotation but is still bounded.
+
+**Reach for it when:**
+
+- You schedule timers over a WIDE but BOUNDED horizon (up to 2^26 ticks) -- too far for a
+  simple TimerWheel (whose flat ring you would have to size to the whole horizon), but you
+  do NOT want a binary-heap timer queue's O(log n) per op. The hierarchy gives O(1)
+  amortized firing at O(capacity + 449) space regardless of horizon width.
+- You can tolerate a periodic per-tick SPIKE (a level-wrap cascade re-files a coarse bucket
+  down, ~1 tick in 256) in exchange for an amortized-O(1) average -- the teaching feature,
+  gated visible in the witness at `>= 8x` the typical tick.
+- You need `schedule` AND `cancel` at amortized O(1) with zero per-op allocation, including
+  on cascade ticks, and you follow the drain-before-cascade discipline (drain the due slot
+  before advancing past it).
+
+**Avoid it when:**
+
+- Your horizon fits ONE rotation of a simple wheel -- reach for TimerWheel, which is
+  WORST-CASE O(1) with NO cascade spike and a smaller 16 B/live footprint (vs 24 B/live
+  here -- the Float64 `expiry` is the price of cascading).
+- Your delays are UNBOUNDED / of unknown horizon -- a delay `>= 2^26` throws; reach for a
+  fully-hashed/unbounded wheel (a deferred future member) or a heap.
+- You cannot tolerate ANY per-op spike (a hard-real-time deadline on the WORST single tick)
+  -- the cascade tick is O(bucket); use TimerWheel (worst-case O(1)) if the horizon fits.
+- You need sub-tick / float deadlines, or ids are strings / objects / sparse over a huge
+  domain -- the same integer-tick + universe-sized-`sparse` caveats as TimerWheel apply.
+
+**Measure it:** `npm run witness` -- HierarchicalTimerWheel single-tick (`drainDue` +
+`advance`) flatness `>= 0.70` across `[1e4..1e5]` (the 1e3 point is a pure-L1 micro-case,
+shown but not gated) while a FAIR alloc-free 4-ary min-heap foil (O(log n) per fired timer)
+runs `>= 1.5x` slower and is measurably LESS flat -- like BucketQueue's heap, an O(log n)
+foil decays gently rather than collapsing to 0.55, so the evidence is the sustained
+throughput lead, not a foil collapse. UNLIKE TimerWheel, it WEARS a MAX-single-op line: the
+witness gates the cascade spike at `>= 8x` the typical tick (the amortized-honesty bar).
+
+---
+
 ## Roadmap members (not yet shipped)
 
 Placeholders so the decision axes are visible early; each fills in on release.

@@ -48,7 +48,7 @@
  * metric are unchanged; only the measurement is made steadier.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel } from '../O1.js';
 
 const SIZES = [1e3, 1e4, 1e5, 1e6, 1e7];
 const BATCH = 1e6;
@@ -576,6 +576,106 @@ function buildNaiveSchedulerFoil(n) {
     return { op };
 }
 
+// HierarchicalTimerWheel: a bounded CASCADING wheel of n LIVE timers spread over a delay
+// horizon of WIDTH n (delays 0..n-1), so ~1 timer is due per tick regardless of n and
+// each drained timer re-arms ~n ticks ahead -- landing in a coarse level and CASCADING
+// back down as `now` wraps. The key to O(1)-INDEPENDENT-of-n: with the horizon scaled to
+// n, a level's cascade bucket always holds ~(its span) timers and is cascaded once per
+// (its span) ticks, so the cascade cost amortizes to ~1 timer/tick no matter how large n
+// is. Each op drains the due slot (re-arming every fired timer) and advances one tick --
+// AMORTIZED O(1) (a level-wrap tick runs the O(bucket) cascade spike). It streams FLAT.
+function buildHierWheel(n) {
+    const w = new HierarchicalTimerWheel(n, n);
+    const spread = Math.min(n, w.maxDelay);            // horizon width n -> ~1 due per tick
+    for (let k = 0; k < n; k++) w.schedule(k, k % spread);
+    const rearm = (id, wheel) => { wheel.schedule(id, spread - 1); SINK += id; }; // re-arm ~n ahead
+    const op = () => {
+        w.drainDue(rearm); // fire the ~1 timer due at the current tick (O(1))
+        w.advance(1);      // step the clock (cascade on a level-0/1/2 wrap)
+    };
+    return { op };
+}
+
+// Foil: an ALLOC-FREE 4-ary MIN-HEAP keyed by absolute expiry, driven by the IDENTICAL
+// tick trace -- each tick pops every timer whose expiry === now (sift DOWN O(log_4 n)),
+// re-arms it one level up (sift UP O(log_4 n)), then advances now. Per fired timer is
+// O(log n), so ops/ms decays as n grows -- the log-n cost the cascading wheel removes. A
+// 4-ary heap is the tougher, fairer foil (shallower + more cache-friendly than binary),
+// so (like BucketQueue's binary heap) it is an O(log n) rival that decays GENTLY, not an
+// O(n) foil that collapses to 0.55 -- gated on the sustained throughput lead, per ADR 0015.
+function buildFourAryHeapFoil(n) {
+    const cap = n + 1;
+    const he = new Float64Array(cap); // 1-based: expiries
+    const hk = new Uint32Array(cap);  // parallel ids
+    let size = 0;
+    const up = (i) => {
+        while (i > 1) {
+            const p = (i + 2) >> 2; // 4-ary parent = floor((i+2)/4)
+            if (he[p] <= he[i]) break;
+            const te = he[p]; he[p] = he[i]; he[i] = te;
+            const tk = hk[p]; hk[p] = hk[i]; hk[i] = tk;
+            i = p;
+        }
+    };
+    const down = (i) => {
+        for (;;) {
+            let best = i;
+            const c0 = 4 * i - 2;                       // first of the 4 children
+            for (let c = c0; c < c0 + 4 && c <= size; c++) if (he[c] < he[best]) best = c;
+            if (best === i) break;
+            const te = he[best]; he[best] = he[i]; he[i] = te;
+            const tk = hk[best]; hk[best] = hk[i]; hk[i] = tk;
+            i = best;
+        }
+    };
+    const spread = Math.min(n, (1 << 26) - 1);         // IDENTICAL horizon to the wheel trace
+    for (let k = 0; k < n; k++) { const i = ++size; he[i] = k % spread; hk[i] = k; up(i); }
+    let now = 0;
+    const op = () => {
+        while (size > 0 && he[1] === now) {            // fire every timer due at this tick
+            const id = hk[1];
+            he[1] = he[size]; hk[1] = hk[size]; size--;
+            down(1);
+            const i = ++size; he[i] = now + (spread - 1); hk[i] = id; up(i); // re-arm ~n ahead
+            SINK += id;
+        }
+        now++;
+    };
+    return { op };
+}
+
+// HierarchicalTimerWheel cascade honesty: advance(1) is AMORTIZED O(1). Most ticks are a
+// single emptiness check + counter add (typical), but the ~1-in-256 level-0 WRAP tick
+// runs the cascade -- re-filing a whole level-1 bucket DOWN by index. Loading that bucket
+// heavily makes the spike large + reliable: the worst single tick (cascading `load`
+// timers) is a tall bar beside the typical O(1) tick, even though the amortized ops/ms
+// line stays flat. Returns { worst, typical, ratio } in ms. (Measured separately so it
+// never perturbs the batch timing -- the same discipline as monoMaxSingleOpMs.)
+function hierMaxSingleOpMs(load) {
+    // Pack `load` timers into ONE level-1 bucket: schedule them all at delay 256 so their
+    // expiry lands in level 1 slot 1. Advancing to now=256 wraps level 0 and cascades that
+    // whole bucket down in a SINGLE advance(1) -> the O(load) spike.
+    const w = new HierarchicalTimerWheel(load + 8, load + 8);
+    for (let k = 0; k < load; k++) w.schedule(k, 256); // all land in level 1 slot 1
+    for (let t = 0; t < 255; t++) w.advance(1);        // walk to now=255 (level 0 not yet wrapped)
+    const t0 = performance.now();
+    w.advance(1);                                      // now=256: level-0 wrap -> cascade `load` timers
+    const worst = performance.now() - t0;
+
+    // Typical: the per-tick cost of an EMPTY wheel, timed over a large batch (a single
+    // typical tick is sub-nanosecond -- below performance.now()'s resolution -- so it must
+    // be amortized over a batch to read a stable number). The empty wheel's wrap ticks are
+    // still O(1) (empty buckets cascade nothing), so the batch mean IS the typical tick.
+    const w2 = new HierarchicalTimerWheel(8, 8);
+    const BATCH = 500000;
+    for (let r = 0; r < BATCH; r++) w2.advance(1);    // warm to steady state
+    const t1 = performance.now();
+    for (let r = 0; r < BATCH; r++) w2.advance(1);
+    const typical = (performance.now() - t1) / BATCH;
+    const ratio = typical > 0 ? worst / typical : Infinity;
+    return { worst, typical, ratio };
+}
+
 // BucketQueue amortized honesty: a single extractMin is O(1) AMORTIZED, not
 // worst-case. When the cursor must jump across a long run of empty buckets to reach
 // the next key, that single extractMin is O(gap) worst-case, while a typical
@@ -1077,5 +1177,82 @@ if (!twAllOk) {
     if (!twOk) console.error('  violation TimerWheel flatness ' + fmt(twy.flatness) + ' < 0.70');
     if (!naiveSchedOk) console.error('  violation naive foil flatness ' + fmt(naiveSched.flatness) + ' > 0.55');
     if (!twRatioOk) console.error('  violation min tw ratio ' + fmt(twRatio) + 'x < 1.50x');
+    process.exitCode = 1;
+}
+
+// ===========================================================================
+// HierarchicalTimerWheel witness -- amortized-O(1) cascading tick vs an O(log n)
+// 4-ary min-heap foil, PLUS the max-single-op cascade spike (the teaching feature).
+// ===========================================================================
+const HTW_SIZES = [1e3, 1e4, 1e5];
+const HTW_BATCH = 5e5;      // large: stable timing for the amortized-O(1) tick
+const HTW_HEAP_BATCH = 5e5; // the O(log n) 4-ary heap stays tractable at n=1e5
+// The HTW tick (a drainDue + advance) is a handful of pointer writes on a typical tick,
+// so the size=1e3 point is a pure-L1 micro-case that turbo-spikes as the flatness
+// DENOMINATOR (the same effect ADR-0004's amendment pinned). Gated over the steady
+// window size >= 1e4; the 1e3 point is DISPLAYED, tagged.
+const HTW_GATE_MIN = 1e4;
+const hw = witness(buildHierWheel, HTW_SIZES, HTW_BATCH, REPS, HTW_GATE_MIN);
+const heap4 = witness(buildFourAryHeapFoil, HTW_SIZES, HTW_HEAP_BATCH, REPS, HTW_GATE_MIN);
+
+console.log('');
+console.log('O(1) Witness -- HierarchicalTimerWheel tick (drainDue + advance, cascading) vs a 4-ary min-heap (rate ops/ms, median of ' +
+    REPS + ', gate size >= ' + nStr(HTW_GATE_MIN) + ')');
+console.log('');
+console.log('  size      HierWheel ops/ms   heap ops/ms    ratio');
+console.log('  --------  ----------------   ------------   -----');
+let hwRatio = Infinity;
+for (let i = 0; i < HTW_SIZES.length; i++) {
+    const a = hw.rows[i].opsPerMs;
+    const b = heap4.rows[i].opsPerMs;
+    const ratio = b > 0 ? a / b : Infinity;
+    const gated = HTW_SIZES[i] >= HTW_GATE_MIN;
+    if (gated && ratio < hwRatio) hwRatio = ratio; // ratio gate: steady window only
+    const tag = HTW_SIZES[i] < HTW_GATE_MIN ? '   <- L1 micro-case (shown, not gated)' : '';
+    console.log('  ' + nStr(HTW_SIZES[i]).padEnd(8) + '  ' +
+        fmt(a).padStart(16) + '   ' + fmt(b).padStart(12) + '   ' + fmt(ratio).padStart(5) + 'x' + tag);
+}
+
+// Cascade honesty: the MAX single-op time (a level-0 wrap that cascades a heavily-loaded
+// level-1 bucket DOWN by index) beside a typical O(1) tick. The cascade spike is the
+// member's HEADLINE -- it WEARS the max-single-op line (unlike TimerWheel) -- so it is
+// GATED to be a visible >= 8x median spike, proving the amortized-O(1) claim is honest
+// about its worst single op rather than hiding it behind the flat average.
+const HTW_SPIKE_LOAD = 1 << 13; // 8192 timers cascaded in a single wrap tick
+const hwSpike = hierMaxSingleOpMs(HTW_SPIKE_LOAD);
+
+console.log('');
+console.log('  HierWheel flatness (size >= ' + nStr(HTW_GATE_MIN) + '): ' + fmt(hw.flatness) + '   (gate >= 0.70)');
+console.log('  4-ary heap foil flatness (last/first): ' + fmt(heap4.flatness) +
+    '   (O(log n): decays gently, gate < HierWheel flatness -- see note)');
+console.log('  min HierWheel/heap ratio:          ' + fmt(hwRatio) + 'x  (gate >= 1.50x)');
+console.log('  MAX single tick (O(load) cascade, load=' + nStr(HTW_SPIKE_LOAD) +
+    '): ' + hwSpike.worst.toFixed(4) + ' ms   vs typical O(1) tick: ' +
+    hwSpike.typical.toFixed(6) + ' ms   spike ' + fmt(hwSpike.ratio) + 'x   (gate >= 8x -- the teaching feature)');
+
+// Gate: HierarchicalTimerWheel is genuinely O(1)-amortized (flatness >= 0.70), it beats
+// the 4-ary heap by a sustained constant factor (ratio >= 1.5x), the O(log n) heap is
+// measurably LESS flat than the O(1) wheel (the honest log-n foil bar -- NOT the O(n)
+// foils' 0.55 collapse, which a log-n foil cannot reach over a steady window; see ADR
+// 0015 + ADR 0013), and the cascade SPIKE is a visible >= 8x max-single-op line.
+const hwOk = hw.flatness >= 0.70;
+const heap4Ok = heap4.flatness < hw.flatness;
+const hwRatioOk = hwRatio >= 1.5;
+const hwSpikeOk = hwSpike.ratio >= 8;
+const hwAllOk = hwOk && heap4Ok && hwRatioOk && hwSpikeOk;
+
+console.log('');
+console.log('WITNESS HierarchicalTimerWheel ' + (hwAllOk ? 'ok' : 'FAIL') +
+    ' hw.flatness=' + fmt(hw.flatness) +
+    ' heap.flatness=' + fmt(heap4.flatness) +
+    ' minRatio=' + fmt(hwRatio) + 'x' +
+    ' spike=' + fmt(hwSpike.ratio) + 'x');
+
+if (!hwAllOk) {
+    if (!hwOk) console.error('  violation HierarchicalTimerWheel flatness ' + fmt(hw.flatness) + ' < 0.70');
+    if (!heap4Ok) console.error('  violation 4-ary heap foil flatness ' + fmt(heap4.flatness) +
+        ' not < HierWheel flatness ' + fmt(hw.flatness));
+    if (!hwRatioOk) console.error('  violation min hw ratio ' + fmt(hwRatio) + 'x < 1.50x');
+    if (!hwSpikeOk) console.error('  violation cascade spike ' + fmt(hwSpike.ratio) + 'x < 8x (must wear the max-single-op line)');
     process.exitCode = 1;
 }

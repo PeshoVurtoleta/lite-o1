@@ -270,7 +270,50 @@ excellent structures, but their headline op is not O(1), so they do not belong i
 - **B-tree / LSM** -- O(log n), and disk-oriented.
 
 If a sibling "sub-linear but not constant" family is ever wanted, it is a DIFFERENT package. lite-o1
-holds the line at the constant.
+holds the line at the constant. (The van Emde Boas / y-fast line above is exactly that sibling: it is
+owned by the drafted lite-loglogn package -- O(log log U) -- not lite-o1.)
+
+### Post-1.0 roster -- three dedicated future sessions
+
+lite-o1 reaches its 1.0.0 milestone at ten members (SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
+RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel) plus the two-round benchmark suite and
+the 1.0 docs/GUIDE capstone. 1.0.0 is "complete for now," NOT "closed" -- the roster stays a textbook one
+keeps adding to. Three vetted candidates are queued as their own dedicated post-1.0 sessions, one concept
+per session, drafted-then-greenlit like every member before them (each gets its design settled with the
+user before any code). Sourced from the user's 2026-09-16 candidate list; the vEB/y-fast and Soft-Heap
+entries from that list were routed elsewhere (see below).
+
+| Session | Structure | Headline op(s) | Bound | Why it earns a slot | Version |
+|---------|-----------|----------------|-------|---------------------|---------|
+| Post-1.0 #1 | **RingLog** (lossy overwrite ring) | push (overwrite-oldest) / iterate / drain | O(1) worst-case | The real-time/telemetry/audio idiom: a fixed-capacity ring that OVERWRITES the oldest entry on full, rather than failing closed like RingDeque. Distinct SEMANTIC, not a RingDeque preset (supersedes the Tier-3 "may be a preset" hedge). Cleanest win: low complexity, pure O(1), naturally zero-GC. Teaching pair with RingDeque (lossy-overwrite vs fail-closed-at-capacity). | 1.1.0 |
+| Post-1.0 #2 | **CuckooMap / HopscotchMap** (name TBD) | get / set / delete | O(1) worst-case lookup; O(1) amortized insert | The first GENERAL-KEY exact dictionary with worst-case-O(1) lookup in the suite (SparseSet/RandomSet are integer-keyed; lite-lru is caches; lite-filter is APPROXIMATE membership -- none is an exact worst-case-O(1) map). Its rehash spike WEARS THE MAX-SINGLE-OP LINE, the same honesty headline as HierarchicalTimerWheel's cascade -- a thematic sibling. The meatiest of the three (eviction-loop bound + zero-GC rehash to design). | 1.2.0 |
+| Post-1.0 #3 | **SparseTable / StaticRMQ** | build / query (range min/max) | O(1) query (after O(n log n) build) | Legit O(1) range-min/max query over flat typed arrays, zero-GC. The O(1)-query answer to lite-logn's O(log n) Fenwick/SegmentTree -- a perfect cross-package teaching contrast. Carries ONE boundary decision to settle first (see open question below). | 1.3.0 |
+
+Suggested order (adjustable): RingLog first (easy win, warms the post-1.0 cadence) -> CuckooMap (fills the
+real exact-dictionary gap) -> SparseTable (settle the static-member boundary, then ship). Each is a full
+pipeline session (planner -> discuss/settle -> coder -> reviewer -> qa), user commits/publishes, /release
+gate + card sync after, same as members 1-10.
+
+Design calls to settle at each session's start (surfaced now so they are not a surprise):
+- **RingLog:** does overwrite return/expose the evicted entry (a drain hook) or silently drop it? clear()
+  semantics vs RingDeque; is it a distinct class or a RingDeque mode flag (lean: distinct class, distinct
+  contract). Witness/foil = vs `Array.prototype.shift`-on-full (the O(n) trap it kills).
+- **CuckooMap:** cuckoo vs hopscotch (worst-case guarantee vs cache-locality); table count + bucket width;
+  the eviction/relocation-loop bound before declaring a rehash; rehash = fail-closed-at-capacity (preferred,
+  keeps true worst-case O(1)) vs opt-in labeled growth; key domain (general via a hash fn vs int-fast-path).
+  Bench foil = a plain JS object/Map (FAIR).
+- **SparseTable:** THE boundary call -- does lite-o1 admit STATIC, build-once/immutable members (O(1) query
+  but not a mutable O(1)-op structure)? If yes, SparseTable is the template for that sub-family; if no, it is
+  routed out. Also: min/max only vs an idempotent-monoid generalization (gcd, bitwise-or) -- lean: ship RMQ
+  min/max, note the monoid generalization. Bench foil = lite-logn SegmentTree (O(log n) query) if available,
+  else a naive O(n) scan.
+
+Routed elsewhere (from the same candidate list, for the record, so they are not re-proposed as lite-o1):
+- **van Emde Boas / y-fast trie** -> lite-loglogn (O(log log U); already drafted RESEARCH.md/ROADMAP.md there).
+- **Fibonacci-heap alternative** (O(1) amortized decrease-key, O(log n) delete-min) -> lite-logn (its
+  IndexedHeap/decrease-key slot). **Soft Heap** is APPROXIMATE (deliberate key corruption for speed) and
+  exotic -- research-shelf only, philosophically closer to lite-filter's approximate world than to lite-o1's
+  exactness; not queued.
 
 ---
 
@@ -506,6 +549,12 @@ demo shows steady-state ops + the throughput witness.
   CI noise (the witness must fail a real regression without failing on a busy runner)?
 - **What does the user's existing research add or reorder?** (The candidate roster here is a first pass
   from the O(1) literature; fold the user's notes in as the authoritative input at planning time.)
+- **Does lite-o1 admit STATIC members?** (Raised by the post-1.0 SparseTable/StaticRMQ candidate.) Every
+  member to date is a mutable structure whose HOT OP is O(1). A build-once/immutable structure with an
+  O(1) QUERY but an O(n log n) build is a different flavor of the same "the constant is the product"
+  promise. Decide before SparseTable: admit a labeled "static/immutable, O(1)-query" sub-family (with
+  SparseTable as its template), or hold the line at mutable-O(1)-op only and route it out. Load-bearing --
+  it decides a whole potential sub-family, not just one member.
 
 ---
 

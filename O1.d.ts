@@ -497,3 +497,66 @@ export class TimerWheel {
     /** Iterate live timer ids in dense storage order. */
     [Symbol.iterator](): IterableIterator<number>;
 }
+
+/**
+ * HierarchicalTimerWheel -- a zero-GC, amortized-O(1) CASCADING timing wheel: the
+ * multi-level sibling of TimerWheel. Four nested levels in the Linux `tvec` shape
+ * (1x256 + 3x64, total range 2^26 ticks) let it schedule a far larger bounded delay
+ * horizon (delay in [0, 2^26)) with the same zero-alloc substrate -- one node per timer,
+ * moved between intrusive lists BY INDEX ONLY. As `now` advances, coarse timers CASCADE
+ * down to finer levels (a level-0 wrap every 256 ticks cascades level 1 down, nested for
+ * levels 2/3). schedule / cancel / advance(1) / has are amortized O(1); drainDue is
+ * O(due); a level-wrap tick runs the O(bucket) cascade -- the teaching max-single-op
+ * spike (see the witness), amortized O(1) over a timer's life. Fail closed: a bad id, a
+ * delay >= 2^26, or a NEW id past capacity throw a [lite-o1] RangeError as a
+ * byte-identical no-op; drain-before-advance -- advance() throws if a level-0 slot left
+ * behind is undrained, and a re-entrant advance() (nested, or from inside a drainDue
+ * callback) throws. Re-entrant schedule / cancel / clear from inside a fired callback are
+ * legal. has / cancel never throw (a bad / absent id is absent / false).
+ */
+export class HierarchicalTimerWheel {
+    /**
+     * @param universe  exclusive id ceiling; an integer in [1, 2^32]. Ids are [0, universe).
+     * @param capacity  max simultaneously-live timers; an integer in [1, universe]. Defaults to universe.
+     */
+    constructor(universe: number, capacity?: number);
+
+    /** Number of live timers. */
+    readonly size: number;
+
+    /** Max simultaneously-live timers this wheel was sized for. */
+    readonly capacity: number;
+
+    /** Exclusive id ceiling; ids are [0, universe). */
+    readonly universe: number;
+
+    /** The monotone tick counter. */
+    readonly now: number;
+
+    /** Largest schedulable delay (2^26 - 1); delay is [0, maxDelay]. */
+    readonly maxDelay: number;
+
+    /** True iff id is scheduled. Never throws; a bad id is absent. */
+    has(id: number): boolean;
+
+    /** Schedule id to fire `delay` ticks from now. Idempotent no-op if present. Throws [lite-o1] on a bad id / a delay >= 2^26 / when full. */
+    schedule(id: number, delay: number): this;
+
+    /** Cancel id. Returns true iff it was scheduled; a bad / absent id returns false. Never throws. */
+    cancel(id: number): boolean;
+
+    /** Fire + remove every timer in the level-0 due list (slot[now & 0xFF]), calling fn(id, wheel) per timer. */
+    drainDue(fn: (id: number, wheel: HierarchicalTimerWheel) => void): void;
+
+    /** Advance the tick clock by `ticks` (default 1), cascading coarse levels down on a wrap. Throws [lite-o1] if a level-0 slot left behind is undrained (drain-before-advance), the 2^53 tick ceiling is reached, or it is called re-entrantly (nested / in-flight drain). */
+    advance(ticks?: number): this;
+
+    /** Empty the wheel in O(1) (resets the count + tick clock; zeroes no store). */
+    clear(): void;
+
+    /** Iterate live timers in dense storage order, alloc-free. fn is (id, expiry, wheel). */
+    forEach(fn: (id: number, expiry: number, wheel: HierarchicalTimerWheel) => void): void;
+
+    /** Iterate live timer ids in dense storage order. */
+    [Symbol.iterator](): IterableIterator<number>;
+}
