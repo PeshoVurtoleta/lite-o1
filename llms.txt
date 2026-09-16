@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-Version: 0.10.0
+Version: 1.0.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -13,7 +13,7 @@ op is O(1) worst-case (or O(1)-amortized where stated) and allocates zero bytes
 after construction, and a shipped witness harness demonstrates the flat
 throughput curve against a built-in foil.
 
-v0.10.0 ships ten members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
+v1.0.0 ships ten members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
 RandomSet, FreqO1, BucketQueue, TimerWheel, and HierarchicalTimerWheel. They share
 no mutable module state, so a bundler that imports one drops the others (tree-shakeable).
 
@@ -41,7 +41,7 @@ no mutable module state, so a bundler that imports one drops the others (tree-sh
   with schedule() / cancel() / drainDue() / advance() over private id columns + a
   Float64 expiry column + static per-list FIFO rings; coarse timers cascade down to
   finer levels by INDEX as the clock advances.
-- `VERSION` -- string, '0.10.0'.
+- `VERSION` -- string, '1.0.0'.
 
 ## SparseSet
 
@@ -692,7 +692,7 @@ one drainDue-callback exception -- it throws [lite-o1] (schedule / cancel / clea
 
 ## Scripts
 
-- npm test           -- 475 node:test cases (contract + boundary + differential fuzz).
+- npm test           -- 478 node:test cases (contract + boundary + differential fuzz).
 - npm run test:types -- tsc --noEmit against O1.d.ts.
 - npm run torture    -- lite-leak + lite-gc-profiler: 0 B/op, 0 major GC, leak-free.
 - npm run witness    -- O(1) throughput-invariance harness + foils + flatness gate.
@@ -782,9 +782,12 @@ one drainDue-callback exception -- it throws [lite-o1] (schedule / cancel / clea
 
 ## Not yet shipped
 
-SlotPool and the eight-dimension benchmark suite are on the roadmap, not this
-release. A RingLog / overwrite-oldest RingDeque preset is a deferred future
-variant. SparseSet holds membership, not payloads (store values in a parallel SoA
+The public API is STABLE at 1.0.0. Not in this release, planned for later:
+SlotPool (a free-list slot allocator with generational ABA-safe handles), and the
+post-1.0 roster -- RingLog (a lossy overwrite-oldest ring), CuckooMap / Hopscotch
+(a general-key worst-case-O(1) map), and SparseTable / StaticRMQ (an O(1)-query
+static range-minimum table). A RingLog / overwrite-oldest RingDeque preset is the
+same deferred variant. SparseSet holds membership, not payloads (store values in a parallel SoA
 column or @zakkster/lite-arena); RingDeque holds numbers only; UnionFind holds
 disjoint-set connectivity over [0, n), not payloads; MonoDeque holds numeric
 window extremes only, MinStack holds numeric stack values + their running

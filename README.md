@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-> Zero-GC, O(1) data structures that PROVE their constant. v0.10.0 ships SparseSet (an integer set with O(1) add / has / delete / iterate and an O(1) clear() that zeroes nothing), RingDeque (a fixed-capacity numeric double-ended queue with O(1) push/pop at both ends), UnionFind (a disjoint-set forest with near-O(1) amortized find / union), MonoDeque (a monotonic deque for O(1)-amortized sliding-window min / max), MinStack (a fixed-capacity numeric stack with a worst-case-O(1) running min / max), RandomSet (an integer set with worst-case-O(1) uniform sample / removeRandom), FreqO1 (a worst-case-O(1) LFU frequency structure with O(1) add / increment / peekMin / popMin), BucketQueue (an amortized-O(1) monotone integer priority queue / Dial with O(1) insert / decreaseKey / extractMin), TimerWheel (a worst-case-O(1) bounded simple timing wheel with O(1) schedule / cancel / advance and drain-before-advance), and HierarchicalTimerWheel (an amortized-O(1) cascading multi-level timing wheel with a 2^26 delay range) -- plus a throughput-invariance witness that shows the flat cost curve while a native Set, Array.prototype.shift, a naive disjoint-set, a full-window rescan, a full-stack rescan, a Set-iterate-to-the-kth, a frequency-table min-scan, a binary heap, a naive-scan scheduler, or a 4-ary heap decays.
+> Zero-GC, O(1) data structures that PROVE their constant. v1.0.0 ships SparseSet (an integer set with O(1) add / has / delete / iterate and an O(1) clear() that zeroes nothing), RingDeque (a fixed-capacity numeric double-ended queue with O(1) push/pop at both ends), UnionFind (a disjoint-set forest with near-O(1) amortized find / union), MonoDeque (a monotonic deque for O(1)-amortized sliding-window min / max), MinStack (a fixed-capacity numeric stack with a worst-case-O(1) running min / max), RandomSet (an integer set with worst-case-O(1) uniform sample / removeRandom), FreqO1 (a worst-case-O(1) LFU frequency structure with O(1) add / increment / peekMin / popMin), BucketQueue (an amortized-O(1) monotone integer priority queue / Dial with O(1) insert / decreaseKey / extractMin), TimerWheel (a worst-case-O(1) bounded simple timing wheel with O(1) schedule / cancel / advance and drain-before-advance), and HierarchicalTimerWheel (an amortized-O(1) cascading multi-level timing wheel with a 2^26 delay range) -- plus a throughput-invariance witness that shows the flat cost curve while a native Set, Array.prototype.shift, a naive disjoint-set, a full-window rescan, a full-stack rescan, a Set-iterate-to-the-kth, a frequency-table min-scan, a binary heap, a naive-scan scheduler, or a 4-ary heap decays.
 
 [![npm version](https://img.shields.io/npm/v/@zakkster/lite-o1.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-o1)
 [![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
@@ -17,7 +17,7 @@
 
 Almost no JavaScript data-structure library ships the evidence that its Big-O claim survives contact with a real engine -- megamorphic call sites, GC pauses, cache misses, deopts. `lite-o1` is a curated, tree-shakeable family of the O(1) structures that actually matter, each zero-GC, each written to teach the trick that buys the constant, and each shipped with a harness that DEMONSTRATES the flat cost curve rather than asserting it. The complexity class IS the product.
 
-v0.10.0 ships ten members. **SparseSet**, the textbook O(1) integer set (a dense + sparse array pair) whose `clear()` runs in O(1) by resetting a count and zeroing nothing at all. **RingDeque**, a fixed-capacity double-ended queue of numbers over one circular `Float64Array` -- O(1) push/pop at both ends, the zero-GC answer to the `Array.prototype.shift` O(n) trap. **UnionFind**, a disjoint-set forest over two `Uint32Array` columns -- near-O(1) amortized `find` / `union` via path halving + union by size, the family's first amortized-honesty member. **MonoDeque**, a monotonic deque over two parallel `Float64Array` columns -- O(1)-amortized sliding-window min / max, the zero-GC answer to the full-window-rescan O(W) trap. **MinStack**, a fixed-capacity numeric stack over two parallel `Float64Array` columns (value + a running-extreme prefix) -- WORST-CASE O(1) push/pop plus a running min / max, no amortization asterisk. **RandomSet**, SparseSet's substrate plus WORST-CASE O(1) uniform `sample()` / `removeRandom()` -- the zero-GC answer to the `Array.from(set)[k]` O(n)-plus-allocation trap. **FreqO1**, a WORST-CASE O(1) frequency structure over a private bucket forest -- `add` / `increment` / `peekMin` / `popMin`, the standalone primitive behind O(1) LFU eviction, the zero-GC answer to the scan-all-counts-for-the-minimum O(n) trap. **BucketQueue**, an AMORTIZED O(1) monotone integer priority queue ("Dial") over private key columns + a static per-priority bucket array -- `insert` / `decreaseKey` / `extractMin`, the standalone primitive behind Dial's algorithm, the zero-GC answer to a binary heap's O(log n) per op when priorities are small bounded integers. And **TimerWheel**, a WORST-CASE O(1) bounded "simple" timing wheel (Varghese-Lauck) over private id columns + a static per-slot FIFO ring -- `schedule` / `cancel` / `drainDue` / `advance`, the standalone primitive behind O(1) timer scheduling, the zero-GC answer to a binary-heap timer queue's O(log n) per op (and a linear scan's O(n) per tick) when the delay horizon is bounded. And **HierarchicalTimerWheel**, an AMORTIZED O(1) CASCADING multi-level timing wheel (the Linux tvec shape: 1x256 + 3x64, delay range 2^26) over the same substrate plus a Float64 expiry column -- `schedule` / `cancel` / `drainDue` / `advance`, TimerWheel's sibling for a delay horizon too wide for one rotation, cascading coarse timers down to finer levels by index (zero allocation) and wearing an honest max-single-op cascade spike. They share no mutable module state, so a bundler that imports one drops the others.
+v1.0.0 ships ten members. **SparseSet**, the textbook O(1) integer set (a dense + sparse array pair) whose `clear()` runs in O(1) by resetting a count and zeroing nothing at all. **RingDeque**, a fixed-capacity double-ended queue of numbers over one circular `Float64Array` -- O(1) push/pop at both ends, the zero-GC answer to the `Array.prototype.shift` O(n) trap. **UnionFind**, a disjoint-set forest over two `Uint32Array` columns -- near-O(1) amortized `find` / `union` via path halving + union by size, the family's first amortized-honesty member. **MonoDeque**, a monotonic deque over two parallel `Float64Array` columns -- O(1)-amortized sliding-window min / max, the zero-GC answer to the full-window-rescan O(W) trap. **MinStack**, a fixed-capacity numeric stack over two parallel `Float64Array` columns (value + a running-extreme prefix) -- WORST-CASE O(1) push/pop plus a running min / max, no amortization asterisk. **RandomSet**, SparseSet's substrate plus WORST-CASE O(1) uniform `sample()` / `removeRandom()` -- the zero-GC answer to the `Array.from(set)[k]` O(n)-plus-allocation trap. **FreqO1**, a WORST-CASE O(1) frequency structure over a private bucket forest -- `add` / `increment` / `peekMin` / `popMin`, the standalone primitive behind O(1) LFU eviction, the zero-GC answer to the scan-all-counts-for-the-minimum O(n) trap. **BucketQueue**, an AMORTIZED O(1) monotone integer priority queue ("Dial") over private key columns + a static per-priority bucket array -- `insert` / `decreaseKey` / `extractMin`, the standalone primitive behind Dial's algorithm, the zero-GC answer to a binary heap's O(log n) per op when priorities are small bounded integers. And **TimerWheel**, a WORST-CASE O(1) bounded "simple" timing wheel (Varghese-Lauck) over private id columns + a static per-slot FIFO ring -- `schedule` / `cancel` / `drainDue` / `advance`, the standalone primitive behind O(1) timer scheduling, the zero-GC answer to a binary-heap timer queue's O(log n) per op (and a linear scan's O(n) per tick) when the delay horizon is bounded. And **HierarchicalTimerWheel**, an AMORTIZED O(1) CASCADING multi-level timing wheel (the Linux tvec shape: 1x256 + 3x64, delay range 2^26) over the same substrate plus a Float64 expiry column -- `schedule` / `cancel` / `drainDue` / `advance`, TimerWheel's sibling for a delay horizon too wide for one rotation, cascading coarse timers down to finer levels by index (zero allocation) and wearing an honest max-single-op cascade spike. They share no mutable module state, so a bundler that imports one drops the others.
 
 ```bash
 npm install @zakkster/lite-o1
@@ -246,7 +246,7 @@ get capacity: number        // max live members as constructed
 
 | Constant   | Value     | Meaning                                            |
 | ---------- | --------- | -------------------------------------------------- |
-| `VERSION`  | `'0.10.0'` | Package version string.                           |
+| `VERSION`  | `'1.0.0'` | Package version string.                            |
 
 Contract bounds (validated, not exported):
 
@@ -1314,6 +1314,50 @@ The key guard is the same branchless typeof-first check as SparseSet (`typeof k 
 
 The key guard is the same branchless typeof-first check as SparseSet (`typeof k !== 'number' || (k >>> 0) !== k || k >= universe`), with the `_oob` / `_full` / `_freqCeil` / `_poolExhausted` throw builders (using `String(k)`) on the cold path. The bucket pool is a bump pointer plus a free stack -- allocation recycles a returned bucket id or bumps a fresh one, freeing pushes it back, and `clear()` resets both in O(1) -- so the bucket-forest surgery (unlink + find-or-create target + relink + free-if-empty) is pure typed-slot arithmetic, never a JS allocation. The pool holds capacity + 1 usable buckets (the transient increment peak), so the `_poolExhausted` guard is provably unreachable under the contract. The torture and perf gates prove FreqO1 at **0 B/op** across increment-churn / popMin-drain / forEach-drain scenarios, with a 0-delta on ALL backing `Uint32Array` columns (fixed capacity -- no resize) and the leak tracker back at `size() = 0`. `forEach` is the alloc-free O(size) scan; `[Symbol.iterator]` is the one op that allocates, by generator protocol.
 
+**BucketQueue** allocates its key substrate (dense + sparse + the per-key priority / next / prev columns) and its static per-priority bucket head/tail arrays (length ceiling + 1) once, at construction:
+
+| Operation                        | Steady-state allocations |
+| -------------------------------- | ------------------------ |
+| `insert(k, p)` / `decreaseKey(k, p)` | **0** (bucket-list pointer surgery) |
+| `extractMin()` / `peekMin()`     | **0** (cursor advance + swap-last fix-up) |
+| `priorityOf(k)` / `has(k)`       | **0** (the cross-check + one array read) |
+| `clear()`                        | **0** (count + cursor to 0) |
+| `forEach(fn)`                    | **0** (O(size) dense scan) |
+| `[Symbol.iterator]()`            | a `{value,done}` per step (protocol) |
+| `new BucketQueue(...)`           | once, at construction (all columns + buckets) |
+
+The key / priority guards are the same branchless typeof-first checks, with the `_oob` / `_badPrio` / `_full` / `_belowCursor` throw builders (using `String(x)`) on the cold path. The static buckets have NO free-list (one head/tail per priority, nothing to allocate or exhaust); a stale bucket head is voided by the `_bHead[p] < _n && _prio[_bHead[p]] === p` cross-check, so `clear()` is O(1). The torture and perf gates prove BucketQueue at **0 B/op** across insert-churn / decreaseKey / monotone extractMin-drain scenarios, with a 0-delta on all backing columns (fixed capacity -- no resize) and the leak tracker back at `size() = 0`. `forEach` is the alloc-free O(size) scan; `[Symbol.iterator]` is the one op that allocates, by generator protocol.
+
+**TimerWheel** allocates its id substrate (dense + sparse + the per-node slotOf / next / prev columns) and its static per-slot FIFO head/tail rings (length slots, rounded up to a power of two) once, at construction:
+
+| Operation                        | Steady-state allocations |
+| -------------------------------- | ------------------------ |
+| `schedule(id, delay)` / `cancel(id)` | **0** (slot-FIFO pointer surgery) |
+| `advance(1)`                     | **0** (an emptiness check + a counter add) |
+| `drainDue(fn)`                   | **0** (head-drain of the due slot; `fn` is user code) |
+| `has(id)`                        | **0** (the cross-check + one array read) |
+| `clear()`                        | **0** (count + tick clock to 0) |
+| `forEach(fn)`                    | **0** (O(size) dense scan) |
+| `[Symbol.iterator]()`            | a `{value,done}` per step (protocol) |
+| `new TimerWheel(...)`            | once, at construction (all columns + slots) |
+
+The id / delay / ticks guards are the same branchless typeof-first checks, with the `_oob` / `_badDelay` / `_full` / `_undrained` / `_tickCeil` throw builders (using `String(x)`) on the cold path. The static slots have NO free-list; a stale slot head is voided by the `_sHead[s] < _size && _slotOf[_sHead[s]] === s` cross-check, so `clear()` is O(1). DRAIN-BEFORE-ADVANCE keeps a slot to one rotation's timers, so there is no cursor and no O(gap) worst case. The torture and perf gates prove TimerWheel at **0 B/op** across schedule-churn / cancel / drainDue+advance tick scenarios, with a 0-delta on all backing columns (fixed capacity -- no resize) and the leak tracker back at `size() = 0`. `forEach` is the alloc-free O(size) scan; `[Symbol.iterator]` is the one op that allocates, by generator protocol.
+
+**HierarchicalTimerWheel** allocates TimerWheel's substrate plus a Float64 `_expiry` column and static per-list FIFO head/tail arrays (449 flat lists: 1x256 + 3x64) once, at construction:
+
+| Operation                        | Steady-state allocations |
+| -------------------------------- | ------------------------ |
+| `schedule(id, delay)` / `cancel(id)` | **0** (list-FIFO pointer surgery) |
+| `advance(1)` (normal tick)       | **0** (an emptiness check + a counter add) |
+| `advance(1)` (level-wrap cascade)| **0** (re-file by INDEX -- the O(bucket) spike, still alloc-free) |
+| `drainDue(fn)`                   | **0** (head-drain of the level-0 due list; `fn` is user code) |
+| `has(id)`                        | **0** (the cross-check + one array read) |
+| `clear()`                        | **0** (count + tick clock to 0) |
+| `[Symbol.iterator]()`            | a `{value,done}` per step (protocol) |
+| `new HierarchicalTimerWheel(...)`| once, at construction (all columns + lists) |
+
+The id / delay / ticks guards are the same branchless typeof-first checks, with the `_oob` / `_badDelay` / `_full` / `_undrained` / `_tickCeil` throw builders (using `String(x)`) on the cold path. The cascade is the crux: a level-wrap re-files a coarse bucket DOWN to finer lists by pointer surgery (zero allocation even on a cascade tick), so the amortized-O(1) firing stays 0 B/op while the level-wrap `advance(1)` wears an O(bucket) spike (the witness gates it at `>= 8x` the typical tick). The torture and perf gates prove HierarchicalTimerWheel at **0 B/op** across schedule-churn / cancel / drainDue+advance ticks INCLUDING cascade wraps, with a 0-delta on all backing columns (fixed capacity -- no resize) and the leak tracker back at `size() = 0`. `forEach` is the alloc-free O(size) scan; `[Symbol.iterator]` is the one op that allocates, by generator protocol.
+
 </details>
 
 ---
@@ -1339,10 +1383,10 @@ The key guard is the same branchless typeof-first check as SparseSet (`typeof k 
 
 ## Testing
 
-**475 deterministic `node:test` cases**, plus a torture gate, a hard perf gate, and the O(1) witness gate.
+**478 deterministic `node:test` cases**, plus a torture gate, a hard perf gate, and the O(1) witness gate.
 
 ```bash
-npm test           # 475 node:test cases (contract + boundary + differential fuzz)
+npm test           # 478 node:test cases (contract + boundary + differential fuzz)
 npm run test:types # tsc --noEmit against O1.d.ts
 npm run torture    # @zakkster/lite-leak + lite-gc-profiler: 0 B/op + leak-free
 npm run witness    # the O(1) throughput-invariance harness + foils + flatness gate
@@ -1350,7 +1394,7 @@ npm run test:perf  # @zakkster/lite-perf-gate: hard zero-alloc scavenge-scaling 
 npm run verify     # all five gates, the publish gate
 ```
 
-For SparseSet the suite covers: constructor validation (every bad `universe` / `capacity`), the add/has/delete/clear/iterate surface, the delete-swap back-pointer, idempotent add, insertion-order iteration, the full fail-closed key surface (`add` throws `/^\[lite-o1\]/`, `has` never throws), `null is not zero`, a **byte-identical** proof that `clear()` leaves the dense + sparse `ArrayBuffer`s untouched, and a **1,000,000-op differential fuzz** of mixed add/delete/has against a native `Set` oracle. For RingDeque: power-of-two capacity rounding, push/pop/peek at both ends, wrap-around across the `& MASK` seam, the fail-closed surface (full push throws as a byte-identical no-op; a non-number or NaN throws; a Symbol / BigInt fails closed, not raw; `+/-Infinity` accepted; empty pop/peek returns `undefined`), a byte-identical `clear()` proof, and a **1,000,000-op both-ends differential fuzz** against a plain-`Array` reference deque (0 divergences, with the full-throw and empty-undefined edges both exercised). For UnionFind: constructor validation (every bad `n`), the find/union/connected/componentSize/count/reset/forEachRoots/roots surface, `count` decrementing exactly once per true merge, a **path-halving depth-shrink proof** (a test-only peek at `_parent`), the full fail-closed element surface (a bad element -- including a Symbol / BigInt -- throws `/^\[lite-o1\]/`, never raw; `null is not zero`), and a **>= 100,000-op mixed union/find/connected differential fuzz** against a trivial no-compression / no-union-by-size oracle (0 divergences on connectivity, component size, and live count). For MonoDeque: power-of-two capacity rounding, seq assignment + dominated-pop for both `'min'` and `'max'`, `evictOlderThan` window slides, the fail-closed surface (ctor rejects a bad capacity + a bad kind; push throws on a non-number / NaN / Symbol / BigInt / object-with-valueOf, `+/-Infinity` accepted; a full push throws as a byte-identical no-op; `value` / `frontSeq` on empty return `undefined`), a byte-identical `clear()` proof, and a **>= 1,000,000-op push/evictOlderThan/value differential fuzz (both kinds)** against a brute-force sliding-window-extreme oracle (0 divergences), which also proves the monotone invariant and the amortized bound (total pops `<=` total pushes). For MinStack: exact capacity (NOT rounded), the push/pop/peek/extreme/clear surface for both `'min'` and `'max'`, the running-extreme carry + the exact restore of the prior extreme after each pop, the fail-closed surface (ctor rejects a bad capacity + a bad kind; push throws on a non-number / NaN / Symbol / BigInt / object-with-valueOf, `+/-Infinity` accepted; a full push throws as a byte-identical no-op; `pop` / `peek` / `extreme` on empty return `undefined`), a byte-identical `clear()` proof (same buffer identity), and a **>= 1,000,000-op interleaved push/pop differential fuzz (both kinds)** against a brute-force `Math.min` / `Math.max` oracle over the live array (0 divergences). For RandomSet: the full SparseSet contract (add/has/delete/clear/iterate, fail-closed bad-key + capacity, `null is not zero`, Symbol / BigInt rejected typeof-first, `-0` aliases 0), a bad-seed reject at the ctor door (typeof-first, no raw TypeError), a **>= 1,000,000-op interleaved add/delete/sample/removeRandom differential fuzz** against a native `Set` oracle (0 divergences: `sample` never mutates, `removeRandom` only ever returns a live member), a **10,000-member `removeRandom()` drain** returning every key exactly once with the sparse/dense cross-check intact throughout, empty-edge stability (1,000 empty `sample()` / `removeRandom()` calls -> `undefined`, 0 throws), a **UNIFORMITY** gate (100 members x 1,000,000 `sample()` draws at seed `0x9e3779b1`: every bucket in `[9400, 10600]` AND chi-square `< 148.23` for 99 df, reproduced deterministically across runs), and **DETERMINISM** (two same-seed instances give identical 100,000-draw sequences; distinct seeds diverge within 10 draws). For FreqO1: the add (idempotent, never bumps) / increment (insert-at-1-else-+1) / frequencyOf / has / peekMin / popMin / clear / iterate surface, the FIFO tie-break (equal frequency evicts earliest-inserted; increment re-stamps a key as newest at its new frequency), boundary cases (universe=1, capacity=1, empty, full, key at 0 and universe-1, all-same-frequency, deep-frequency chains, a fanned-out distinct-frequency spectrum), the fail-closed surface (ctor rejects a bad universe / capacity / maxFreq typeof-first; add / increment throw on a Symbol / BigInt / object-with-valueOf / boxed Number / NaN / null / -1 / 1.5 / >= universe as a byte-identical no-op; frequencyOf / has / peekMin / popMin never throw; the maxFreq ceiling throw primed at the boundary, no wrap; `-0` aliases 0), a byte-identical `clear()` + reuse proof, re-entrant increment / popMin from inside forEach and a for-of walk staying memory-safe, and a **>= 1,000,000-op interleaved add/increment/frequencyOf/peekMin/popMin differential fuzz** against a brute-force oracle (a `Map` of `key -> {freq, tick}` + a min-scan), 0 divergences, asserting popMin returns lowest-freq / earliest-arrival on ties throughout. For BucketQueue: the insert (idempotent on a present key) / decreaseKey (no-op on absent or a non-strict decrease) / extractMin (non-decreasing order, FIFO tie-break) / peekMin / priorityOf (-1 on absent) / has / clear / iterate surface, boundary cases (universe=1, ceiling=0, capacity=1, empty, full, key at 0 and universe-1, priority at 0 and ceiling), WHITE-BOX priming of the `>=` ceiling guard (prio===ceiling ok, prio>ceiling throws) and the rewind guard (extract to advance the cursor, then insert / decreaseKey below it throws) each as a **byte-identical** no-op, the fail-closed surface (ctor rejects a bad universe / ceiling / capacity typeof-first; insert / decreaseKey reject a Symbol / BigInt / object-with-valueOf / boxed Number / NaN / null / -1 / 1.5 / >= universe / > ceiling as a byte-identical no-op; has / priorityOf never throw; -0 aliases key 0 and priority 0), a byte-identical `clear()` + reuse proof that voids stale static buckets across a lower-priority second generation, re-entrant extractMin from inside forEach and a for-of walk staying memory-safe, a large monotone-drain vs an independent oracle, and a **>= 300,000-op interleaved insert/decreaseKey/peekMin/extractMin differential fuzz** against a brute-force oracle (a `Map` of `key -> {prio, tick}` + a min-scan), 0 divergences. For TimerWheel: the schedule (idempotent on a present id, delay still validated) / cancel (false on absent / bad) / has / drainDue (FIFO order) / advance / clear / forEach / iterate surface, boundary cases (universe=1, slots=1, capacity=1, empty, full, id at 0 and universe-1, delay 0 and delay slots-1, slots power-of-two rounding), WHITE-BOX priming of the `>=` delay guard (delay===slots-1 ok, delay===slots throws) and the `>=` MAX_TICK ceiling guard (`_now` forced to 2^53-1, advance throws -- proving the guard is not dead code) each as a **byte-identical** no-op, the drain-before-advance FAIL-CLOSED throw (advance over an undrained slot throws byte-identical), the fail-closed surface (ctor rejects a bad universe / slots / capacity typeof-first; schedule / advance reject a Symbol / BigInt / object-with-valueOf / NaN / null / -1 / 1.5 / out-of-range on BOTH the id and the delay/ticks arg as a byte-identical no-op; has / cancel never throw; `-0` aliases id 0 and delay 0), a byte-identical `clear()` + reuse proof that voids stale static slot heads, re-entrant cancel / schedule from inside drainDue and forEach staying memory-safe, a multi-tick wrap proof (the clock laps the wheel), and a **>= 3e5-op interleaved schedule/cancel/advance+drain differential fuzz** against a brute-force per-slot FIFO oracle over a wrapping clock, 0 divergences. No gate output is a FAIL.
+For SparseSet the suite covers: constructor validation (every bad `universe` / `capacity`), the add/has/delete/clear/iterate surface, the delete-swap back-pointer, idempotent add, insertion-order iteration, the full fail-closed key surface (`add` throws `/^\[lite-o1\]/`, `has` never throws), `null is not zero`, a **byte-identical** proof that `clear()` leaves the dense + sparse `ArrayBuffer`s untouched, and a **1,000,000-op differential fuzz** of mixed add/delete/has against a native `Set` oracle. For RingDeque: power-of-two capacity rounding, push/pop/peek at both ends, wrap-around across the `& MASK` seam, the fail-closed surface (full push throws as a byte-identical no-op; a non-number or NaN throws; a Symbol / BigInt fails closed, not raw; `+/-Infinity` accepted; empty pop/peek returns `undefined`), a byte-identical `clear()` proof, and a **1,000,000-op both-ends differential fuzz** against a plain-`Array` reference deque (0 divergences, with the full-throw and empty-undefined edges both exercised). For UnionFind: constructor validation (every bad `n`), the find/union/connected/componentSize/count/reset/forEachRoots/roots surface, `count` decrementing exactly once per true merge, a **path-halving depth-shrink proof** (a test-only peek at `_parent`), the full fail-closed element surface (a bad element -- including a Symbol / BigInt -- throws `/^\[lite-o1\]/`, never raw; `null is not zero`), and a **>= 100,000-op mixed union/find/connected differential fuzz** against a trivial no-compression / no-union-by-size oracle (0 divergences on connectivity, component size, and live count). For MonoDeque: power-of-two capacity rounding, seq assignment + dominated-pop for both `'min'` and `'max'`, `evictOlderThan` window slides, the fail-closed surface (ctor rejects a bad capacity + a bad kind; push throws on a non-number / NaN / Symbol / BigInt / object-with-valueOf, `+/-Infinity` accepted; a full push throws as a byte-identical no-op; `value` / `frontSeq` on empty return `undefined`), a byte-identical `clear()` proof, and a **>= 1,000,000-op push/evictOlderThan/value differential fuzz (both kinds)** against a brute-force sliding-window-extreme oracle (0 divergences), which also proves the monotone invariant and the amortized bound (total pops `<=` total pushes). For MinStack: exact capacity (NOT rounded), the push/pop/peek/extreme/clear surface for both `'min'` and `'max'`, the running-extreme carry + the exact restore of the prior extreme after each pop, the fail-closed surface (ctor rejects a bad capacity + a bad kind; push throws on a non-number / NaN / Symbol / BigInt / object-with-valueOf, `+/-Infinity` accepted; a full push throws as a byte-identical no-op; `pop` / `peek` / `extreme` on empty return `undefined`), a byte-identical `clear()` proof (same buffer identity), and a **>= 1,000,000-op interleaved push/pop differential fuzz (both kinds)** against a brute-force `Math.min` / `Math.max` oracle over the live array (0 divergences). For RandomSet: the full SparseSet contract (add/has/delete/clear/iterate, fail-closed bad-key + capacity, `null is not zero`, Symbol / BigInt rejected typeof-first, `-0` aliases 0), a bad-seed reject at the ctor door (typeof-first, no raw TypeError), a **>= 1,000,000-op interleaved add/delete/sample/removeRandom differential fuzz** against a native `Set` oracle (0 divergences: `sample` never mutates, `removeRandom` only ever returns a live member), a **10,000-member `removeRandom()` drain** returning every key exactly once with the sparse/dense cross-check intact throughout, empty-edge stability (1,000 empty `sample()` / `removeRandom()` calls -> `undefined`, 0 throws), a **UNIFORMITY** gate (100 members x 1,000,000 `sample()` draws at seed `0x9e3779b1`: every bucket in `[9400, 10600]` AND chi-square `< 148.23` for 99 df, reproduced deterministically across runs), and **DETERMINISM** (two same-seed instances give identical 100,000-draw sequences; distinct seeds diverge within 10 draws). For FreqO1: the add (idempotent, never bumps) / increment (insert-at-1-else-+1) / frequencyOf / has / peekMin / popMin / clear / iterate surface, the FIFO tie-break (equal frequency evicts earliest-inserted; increment re-stamps a key as newest at its new frequency), boundary cases (universe=1, capacity=1, empty, full, key at 0 and universe-1, all-same-frequency, deep-frequency chains, a fanned-out distinct-frequency spectrum), the fail-closed surface (ctor rejects a bad universe / capacity / maxFreq typeof-first; add / increment throw on a Symbol / BigInt / object-with-valueOf / boxed Number / NaN / null / -1 / 1.5 / >= universe as a byte-identical no-op; frequencyOf / has / peekMin / popMin never throw; the maxFreq ceiling throw primed at the boundary, no wrap; `-0` aliases 0), a byte-identical `clear()` + reuse proof, re-entrant increment / popMin from inside forEach and a for-of walk staying memory-safe, and a **>= 1,000,000-op interleaved add/increment/frequencyOf/peekMin/popMin differential fuzz** against a brute-force oracle (a `Map` of `key -> {freq, tick}` + a min-scan), 0 divergences, asserting popMin returns lowest-freq / earliest-arrival on ties throughout. For BucketQueue: the insert (idempotent on a present key) / decreaseKey (no-op on absent or a non-strict decrease) / extractMin (non-decreasing order, FIFO tie-break) / peekMin / priorityOf (-1 on absent) / has / clear / iterate surface, boundary cases (universe=1, ceiling=0, capacity=1, empty, full, key at 0 and universe-1, priority at 0 and ceiling), WHITE-BOX priming of the `>=` ceiling guard (prio===ceiling ok, prio>ceiling throws) and the rewind guard (extract to advance the cursor, then insert / decreaseKey below it throws) each as a **byte-identical** no-op, the fail-closed surface (ctor rejects a bad universe / ceiling / capacity typeof-first; insert / decreaseKey reject a Symbol / BigInt / object-with-valueOf / boxed Number / NaN / null / -1 / 1.5 / >= universe / > ceiling as a byte-identical no-op; has / priorityOf never throw; -0 aliases key 0 and priority 0), a byte-identical `clear()` + reuse proof that voids stale static buckets across a lower-priority second generation, re-entrant extractMin from inside forEach and a for-of walk staying memory-safe, a large monotone-drain vs an independent oracle, and a **>= 300,000-op interleaved insert/decreaseKey/peekMin/extractMin differential fuzz** against a brute-force oracle (a `Map` of `key -> {prio, tick}` + a min-scan), 0 divergences. For TimerWheel: the schedule (idempotent on a present id, delay still validated) / cancel (false on absent / bad) / has / drainDue (FIFO order) / advance / clear / forEach / iterate surface, boundary cases (universe=1, slots=1, capacity=1, empty, full, id at 0 and universe-1, delay 0 and delay slots-1, slots power-of-two rounding), WHITE-BOX priming of the `>=` delay guard (delay===slots-1 ok, delay===slots throws) and the `>=` MAX_TICK ceiling guard (`_now` forced to 2^53-1, advance throws -- proving the guard is not dead code) each as a **byte-identical** no-op, the drain-before-advance FAIL-CLOSED throw (advance over an undrained slot throws byte-identical), the fail-closed surface (ctor rejects a bad universe / slots / capacity typeof-first; schedule / advance reject a Symbol / BigInt / object-with-valueOf / NaN / null / -1 / 1.5 / out-of-range on BOTH the id and the delay/ticks arg as a byte-identical no-op; has / cancel never throw; `-0` aliases id 0 and delay 0), a byte-identical `clear()` + reuse proof that voids stale static slot heads, re-entrant cancel / schedule from inside drainDue and forEach staying memory-safe, a multi-tick wrap proof (the clock laps the wheel), and a **>= 3e5-op interleaved schedule/cancel/advance+drain differential fuzz** against a brute-force per-slot FIFO oracle over a wrapping clock, 0 divergences. For HierarchicalTimerWheel: the schedule (idempotent on a present id, delay still validated) / cancel (false on absent / bad) / has / drainDue (FIFO order) / advance / clear / forEach / iterate surface, the four-level `tvec` geometry (1x256 + 3x64) with delays landing on and cascading between every level, boundary cases (universe=1, capacity=1, empty, full, id at 0 and universe-1, delay 0 and delay 2^26-1, cross-level boundaries at 2^8 / 2^14 / 2^20), WHITE-BOX priming of the `>=` delay guard (delay===2^26-1 ok, delay===2^26 throws) and the `>=` 2^53 expiry / `now` ceiling guards each as a **byte-identical** no-op, the drain-before-cascade FAIL-CLOSED throw (advance over an undrained level-0 slot throws byte-identical) and the re-entrant-advance `_busy` throw (schedule / cancel / clear from a callback stay legal), the fail-closed surface (ctor rejects a bad universe / capacity typeof-first; schedule / advance reject a Symbol / BigInt / object-with-valueOf / NaN / null / -1 / 1.5 / out-of-range on BOTH the id and the delay/ticks arg as a byte-identical no-op; has / cancel never throw; `-0` aliases id 0 and delay 0), a byte-identical `clear()` + reuse proof that voids stale static list heads, a multi-rotation cascade proof (a far-future timer cascades level 3 -> ... -> level 0 and fires on the right tick), and a **>= 3e5-op interleaved schedule/cancel/advance+drain differential fuzz** against a brute-force absolute-expiry oracle over a wrapping clock, 0 divergences. No gate output is a FAIL.
 
 ---
 
@@ -1358,57 +1402,75 @@ For SparseSet the suite covers: constructor validation (every bad `universe` / `
 
 The **eight-dimension benchmark suite** -- the ecosystem MVP of the research notes --
 lives in `benchmark/` as repo-only dev infra (it is NOT in the published tarball and
-NOT a data-structure member). It profiles all nine members against the JS built-in
+NOT a data-structure member). It profiles all ten members against the JS built-in
 each one replaces, across eight axes that a single ops/ms number hides: D1 latency
 distribution (p50..max, with + without forced GC), D2 amortized drift, D3 memory,
 D4 cache behaviour (a labelled PORTABLE PROXY -- no native perf counters), D5 bundle
 size + tree-shaking, D6 GC pressure + allocation curve, D7 key-type + load-factor
-scaling, and D8 workload micro-benches.
+scaling, and D8 workload micro-benches -- **ten members x 8 dimensions = 80 cells**.
+
+The suite is a full-rigor "Bench v2": strong (alloc-free) baselines, a 95% bootstrap
+confidence interval on each subject median, a Mann-Whitney U significance test vs the
+foils, per-op overhead subtraction, a D7 load-factor curve, and a shared
+`benchmark/Template.mjs` the members copy so every cell is measured the same way. See
+ADR [`0009`](./decisions/0009-benchmark-suite.md) and
+[`benchmark/METHODOLOGY.md`](./benchmark/METHODOLOGY.md) for the design and the settled calls.
 
 ```bash
-npm run bench          # run all 72 (member x dimension) cells, one child process each
+npm run bench          # run all 80 (member x dimension) cells, one child process each
 npm run bench:report   # the above, then render a zero-dep HTML report (hand-rolled SVG)
                        #   -> benchmark/report.html (open it for the full charts + tables)
 ```
 
 Key deterministic results (machine-independent; latency / throughput numbers vary by
-host and live in the report):
+host and live in the report; the figures below are from the run recorded in
+`benchmark/results.json`):
 
 **D5 -- bundle size + tree-shaking** (esbuild minify + gzip). A single-member import
-drops the other eight; the all-member import is ~4.3 KB gzipped:
+drops the other nine; the all-member import is ~5.0 KB gzipped (5085 B):
 
-| import        | gzip (single) | gzip (all) | single / all |
-|---------------|---------------|------------|--------------|
-| SparseSet     | ~579 B        | ~4352 B    | ~0.13        |
-| RingDeque     | ~649 B        | ~4352 B    | ~0.15        |
-| UnionFind     | ~602 B        | ~4352 B    | ~0.14        |
-| MonoDeque     | ~823 B        | ~4352 B    | ~0.19        |
-| MinStack      | ~609 B        | ~4352 B    | ~0.14        |
-| RandomSet     | ~722 B        | ~4352 B    | ~0.17        |
-| FreqO1        | ~1356 B       | ~4352 B    | ~0.31        |
-| BucketQueue   | ~1174 B       | ~4352 B    | ~0.27        |
-| TimerWheel    | ~1403 B       | ~4352 B    | ~0.32        |
+| import                 | gzip (single) | gzip (all) | single / all |
+|------------------------|---------------|------------|--------------|
+| SparseSet              | ~581 B        | ~5085 B    | ~0.11        |
+| RingDeque              | ~651 B        | ~5085 B    | ~0.13        |
+| UnionFind              | ~604 B        | ~5085 B    | ~0.12        |
+| MonoDeque              | ~827 B        | ~5085 B    | ~0.16        |
+| MinStack               | ~611 B        | ~5085 B    | ~0.12        |
+| RandomSet              | ~725 B        | ~5085 B    | ~0.14        |
+| FreqO1                 | ~1359 B       | ~5085 B    | ~0.27        |
+| BucketQueue            | ~1176 B       | ~5085 B    | ~0.23        |
+| TimerWheel             | ~1410 B       | ~5085 B    | ~0.28        |
+| HierarchicalTimerWheel | ~1593 B       | ~5085 B    | ~0.31        |
 
 Tree-shaking works for every member (each lone import is smaller than the whole).
-The "< 40% of all" claim holds for every member; with nine members the all-member
-bundle grew, so each lone import is now a smaller fraction and the newer, heavier
-members (TimerWheel ~0.32 / FreqO1 ~0.31 / BucketQueue ~0.27) are the closest to the
-line. The six-member era's MonoDeque exception (~0.48) no longer applies (it is now
-~0.19). (Numbers shift as members are added; reproduce with `npm run bench`.)
+The "< 40% of all" claim holds for all ten; with ten members the all-member bundle
+grew, so each lone import is a small fraction and the two timing wheels
+(HierarchicalTimerWheel ~0.31 / TimerWheel ~0.28) are the closest to the line, while
+SparseSet is the lightest at ~0.11. (Numbers shift as members are added; reproduce
+with `npm run bench`.)
 
 **D6 -- GC pressure curve** (n = 1e3 .. 1e6, the 0 B/op gate as a measured line):
 
-| member    | zero-alloc | max major GC | max pause (ms / 1e6 ops) |
-|-----------|------------|--------------|--------------------------|
-| SparseSet   | yes        | 0            | <= 1                     |
-| RingDeque   | yes        | 0            | <= 1                     |
-| UnionFind   | yes        | 0            | <= 1                     |
-| MonoDeque   | yes        | 0            | <= 1                     |
-| MinStack    | yes        | 0            | <= 1                     |
-| RandomSet   | yes        | 0            | <= 1                     |
-| FreqO1      | yes        | 0            | <= 1                     |
-| BucketQueue | yes        | 0            | <= 1                     |
-| TimerWheel  | yes        | 0            | <= 1                     |
+| member                 | max major GC | max pause (ms / 1e6 ops) |
+|------------------------|--------------|--------------------------|
+| SparseSet              | 0            | 0                        |
+| RingDeque              | 0            | ~0.29                    |
+| UnionFind              | 0            | 0                        |
+| MonoDeque              | 0            | 0                        |
+| MinStack               | 0            | 0                        |
+| RandomSet              | 0            | 0                        |
+| FreqO1                 | 0            | 0                        |
+| BucketQueue            | 0            | ~0.45                    |
+| TimerWheel             | 0            | ~0.21                    |
+| HierarchicalTimerWheel | 0            | ~50.8 (all minor GC)     |
+
+**0 major GC across all ten.** The torture + perf gates are the authoritative
+zero-alloc proof and hold **0 B/op** per steady-state op for all ten members (incl.
+HierarchicalTimerWheel). D6's coarse heap-delta sampler reads a 0-2 B/op rounding
+wobble on RingDeque / TimerWheel / HierarchicalTimerWheel (driver granularity, not a
+per-op allocation in the structure); HierarchicalTimerWheel's ~50.8 ms figure is
+minor-GC pause from the D6 workload driver at n=1e6, again not a structure-side
+per-op alloc (the torture gate pins it at 0 B/op).
 
 **D3 -- memory footprint** (bytes per live element vs the theoretical minimum):
 
@@ -1417,14 +1479,15 @@ line. The six-member era's MonoDeque exception (~0.48) no longer applies (it is 
 | SparseSet | 8            | 4 (dense slot)  | 2.0x (the sparse index doubles it) |
 | RingDeque | 8            | 8 (one f64)     | 1.0x     |
 | UnionFind | 8            | 8 (parent+size) | 1.0x     |
-| MonoDeque | sized for worst case | 16 (value+seq) | fixed-capacity: sized for a fully-monotone window, so few survivors after dominated pops |
-| MinStack  | 16           | 16 (value+ext)  | 1.0x per live element; the running-extreme column doubles a plain numeric stack |
+| MonoDeque | sized for worst case | 16 (value+seq) | fixed-capacity: sized for a fully-monotone window, so few survivors after dominated pops read far above theoMin |
+| MinStack  | 16           | 16 (value+ext)  | 1.0x per live element; the running-extreme column is counted in theoMin |
 | RandomSet | 8            | 4 (dense slot)  | 2.0x (the sparse index doubles it, same as SparseSet) |
-| FreqO1    | LOAD-DEPENDENT (~48 at full load) | 20 (dense+freq+bkt+nk+pk) | the universe-sized sparse array + bucket free-list + O(distinct-frequencies) bucket pool are NOT per-live; theoMin is the dense floor, not widened to hide this |
-| BucketQueue | O(ceiling)-dominated (~148 at ceiling 2^20, live 65536) | 16 (dense+prio+nk+pk) | the static per-priority bucket array is O(ceiling), NOT per-live -- bytes/live tracks the ceiling:live ratio, an honest space characteristic |
+| FreqO1    | LOAD-DEPENDENT (~48 in this run) | 20 (dense+freq+bkt+nk+pk) | 2.40x; the universe-sized sparse array + bucket free-list + O(distinct-frequencies) bucket pool are NOT per-live; theoMin is the dense floor, not widened to hide this |
+| BucketQueue | O(ceiling)-dominated (~148 in this run) | 16 (dense+prio+nk+pk) | 9.25x; the static per-priority bucket array is O(ceiling), NOT per-live -- bytes/live tracks the ceiling:live ratio, an honest space characteristic |
 | TimerWheel | ~28 (slots >= live) | 16 (dense+slotOf+next+prev) | the static per-slot FIFO ring is O(slots); with slots rounded up to a power of two >= live, ~1.75x |
+| HierarchicalTimerWheel | ~28 (this run) | 24 (dense+slotOf+next+prev+expiry) | ~1.17x; the Float64 `_expiry` column is the price of cascading (24 B/live theoMin vs TimerWheel's 16) |
 
-All nine are fixed-capacity by design: they reuse one backing store, so `clear()`
+All ten are fixed-capacity by design: they reuse one backing store, so `clear()`
 retains the buffer (stated, not implicit). The suite's applicability matrix emits the
 string `n/a` -- never `0` -- for cells that do not apply (fail closed). D4 is labelled
 a PROXY (dense-iteration vs random-lookup + a working-set stride sweep) because a true
@@ -1443,9 +1506,9 @@ ADR [`0009`](./decisions/0009-benchmark-suite.md) for the design and the settled
 - **Not a cryptographic or weighted sampler.** RandomSet's `sample()` / `removeRandom()` are UNIFORM and STATISTICAL: the pick uses the LCG's high bits with no rejection, so a disclosed multiply-bias `<= n/2^32` remains -- draw from `crypto` for adversarial use, and reach elsewhere for weighted (non-uniform) sampling. Its keys are integers in `[0, universe)` (the SparseSet caveat applies), and two default-seeded instances share a sequence (pass distinct seeds to decorrelate).
 - **Not a general-purpose priority queue.** BucketQueue is MONOTONE and its priorities are small bounded integers `[0, ceiling]` (space O(ceiling)): the extract order must be non-decreasing (an insert / decreaseKey below the frontier cursor throws), so it cannot serve an arbitrary-order or wide/continuous-priority workload -- reach for a binary heap (O(log n) time, O(1) space per element) there. A single `extractMin` is amortized O(1), O(gap) worst-case.
 - **Not an unbounded timer queue.** TimerWheel is a BOUNDED "simple" wheel: the delay range is `[0, slots-1]` (space O(slots)), and a delay `>= slots` throws. For delays far in the future or of unknown horizon, reach for a hierarchical / hashed wheel (a deferred future member) or a binary-heap timer queue. It is integer-tick (no sub-tick / floating-point deadlines), and its clock must be drained before it advances (an undrained slot throws).
-- **Not a growable collection.** All nine members are fixed-capacity: a SparseSet / RandomSet / FreqO1 / BucketQueue / TimerWheel key or id past capacity, or a RingDeque / MonoDeque / MinStack push on a full store, throws; UnionFind's element universe `n` is fixed at construction. This is deliberate (worst-case / amortized bounds, fail closed -- no hidden resize), not a missing feature. An overwrite-oldest RingDeque preset (RingLog) is a deferred future variant, not the current default.
-- **Not a payload store.** SparseSet holds membership, RingDeque holds numbers, UnionFind holds connectivity, MonoDeque holds numeric window extremes, MinStack holds numeric stack values + their running extreme, RandomSet holds integer membership + uniform sampling, FreqO1 holds integer keys + their access frequency, BucketQueue holds integer keys + their integer priority, TimerWheel holds integer timer ids filed by delay -- none holds object payloads. Store component data in a parallel SoA column or `@zakkster/lite-arena` keyed by the same ids / handles.
-- **Not the full family yet.** v0.9.0 is SparseSet + RingDeque + UnionFind + MonoDeque + MinStack + RandomSet + FreqO1 + BucketQueue + TimerWheel. SlotPool (and a hierarchical / hashed timer wheel) are on the roadmap, not in this release.
+- **Not a growable collection.** All ten members are fixed-capacity: a SparseSet / RandomSet / FreqO1 / BucketQueue / TimerWheel / HierarchicalTimerWheel key or id past capacity, or a RingDeque / MonoDeque / MinStack push on a full store, throws; UnionFind's element universe `n` is fixed at construction. This is deliberate (worst-case / amortized bounds, fail closed -- no hidden resize), not a missing feature. An overwrite-oldest RingDeque preset (RingLog) is a deferred future variant, not the current default.
+- **Not a payload store.** SparseSet holds membership, RingDeque holds numbers, UnionFind holds connectivity, MonoDeque holds numeric window extremes, MinStack holds numeric stack values + their running extreme, RandomSet holds integer membership + uniform sampling, FreqO1 holds integer keys + their access frequency, BucketQueue holds integer keys + their integer priority, TimerWheel holds integer timer ids filed by delay, HierarchicalTimerWheel holds integer timer ids filed by a wide bounded delay -- none holds object payloads. Store component data in a parallel SoA column or `@zakkster/lite-arena` keyed by the same ids / handles.
+- **Not the full roster forever.** v1.0.0 is the ten-member stable API: SparseSet + RingDeque + UnionFind + MonoDeque + MinStack + RandomSet + FreqO1 + BucketQueue + TimerWheel + HierarchicalTimerWheel. SlotPool and the post-1.0 roster (RingLog, CuckooMap / Hopscotch, SparseTable / StaticRMQ) are planned, not in this release; a fully unbounded / hashed timer wheel remains a deferred future member.
 - **Not itself a benchmark suite.** The witness proves throughput invariance (one axis); the full eight-dimension latency/memory/cache/GC suite lives in `benchmark/` as repo-only dev infra (`npm run bench:report`), NOT shipped in the published package.
 
 ---

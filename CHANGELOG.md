@@ -8,6 +8,49 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.0.0] - 2026-09-16
+
+### Added
+
+- **`GUIDE.md` decision layer above the per-member sections.** An ASCII decision
+  flowchart routes on the discriminating questions (set vs queue/stack vs
+  sliding-window vs grouping vs priority vs timer; integer-bounded key; worst-case vs
+  amortized budget; sampling / frequency / min-max need; narrow vs wide bounded delay
+  horizon), every leaf resolving to one of the ten members. A one-glance PICKER TABLE
+  gives exactly one row per member ("if you need X -> Member, worst-case | amortized
+  O(1)", with a one-line discriminator).
+
+### Docs
+
+- `README.md` polished and made uniform across all ten members: the Zero-GC design
+  notes deep-dive now carries an allocation table + a gated-numbers paragraph for
+  `BucketQueue`, `TimerWheel`, and `HierarchicalTimerWheel` (previously it stopped at
+  `FreqO1`); the Testing section adds the `HierarchicalTimerWheel` coverage sentence.
+- Benchmark section refreshed to the re-measured Bench v2 run: **ten members x 8
+  dimensions = 80 cells** (was 72). D5 all-member bundle ~5.0 KB gzip (5085 B), with
+  each lone import < 40% of all ten (`HierarchicalTimerWheel` closest at ~0.31). D6:
+  0 major GC across all ten (torture + perf gates hold 0 B/op steady-state; the D6
+  heap-delta sampler reads a 0-2 B/op wobble for `RingDeque` / `TimerWheel` /
+  `HierarchicalTimerWheel`, and HTW carries the largest minor-GC pause). D3 memory +
+  D1 latency tables extended to `HierarchicalTimerWheel` (the fourth amortized member
+  with a real per-op tail). Bench v2 rigor documented: strong baselines, bootstrap
+  confidence intervals, Mann-Whitney U significance, overhead subtraction, D7
+  load-factor curve, `benchmark/METHODOLOGY.md` + `benchmark/Template.mjs`.
+- `llms.txt` version + roadmap refreshed: SlotPool and the post-1.0 roster (RingLog,
+  CuckooMap / Hopscotch, SparseTable / StaticRMQ) named as planned-not-shipped; test
+  count 478.
+- `GUIDE.md` benchmark section re-measured (80 cells; D1/D3/D5/D6 corrected for ten
+  members) and its framing moved from "living skeleton" to a v1.0.0 stable-but-open
+  guide; roadmap members list SlotPool + the post-1.0 roster honestly.
+
+### Changed
+
+- Version bumped **0.10.0 -> 1.0.0**; the public API is declared STABLE at its ten
+  members (`VERSION` const / `package.json` / `llms.txt` in lockstep, enforced by the
+  version-trinity test). No hot-path logic changed -- the sole `O1.js` edits are the
+  `VERSION` string and the header version stamp; torture / witness / perf gates stay
+  green.
+
 ## [0.10.0] - 2026-09-16
 
 ### Added

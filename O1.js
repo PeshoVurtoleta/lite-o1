@@ -3,7 +3,7 @@
  * that doubles as a teachable textbook: each member solves a real problem AND
  * proves its constant is real (the O(1) Witness -- see test/witness.mjs).
  *
- * v0.10.0 ships ten members -- SparseSet, RingDeque, UnionFind, MonoDeque,
+ * v1.0.0 ships ten members -- SparseSet, RingDeque, UnionFind, MonoDeque,
  * MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, and HierarchicalTimerWheel
  * -- plus its `VERSION` const. The ten are independent (no shared mutable module
  * state), so a bundler that imports one drops the others (`sideEffects: false`).
@@ -17,7 +17,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '0.10.0';
+export const VERSION = '1.0.0';
 
 /** Largest universe the Uint32 substrate + the (k >>> 0) key check can honor. */
 const MAX_UNIVERSE = 0x100000000; // 2^32

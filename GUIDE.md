@@ -1,12 +1,13 @@
 # lite-o1 -- which structure to pick (GUIDE)
 
-A repo-only decision guide for the O(1) family: reach-for / avoid, and how to
-measure the constant yourself. This is a living skeleton -- it grows one section
-per member as the family ships. It is NOT an API encyclopedia (that is the
-README + `O1.d.ts`); it answers "which member, and is my constant real?"
+A repo-only decision guide for the O(1) family: which member, reach-for / avoid,
+and how to measure the constant yourself. At v1.0.0 the family is STABLE at ten
+members and this guide is complete for them -- still open (a new section lands with
+each future member), but no longer a skeleton. It is NOT an API encyclopedia (that
+is the README + `O1.d.ts`); it answers "which member, and is my constant real?"
 
-Scope discipline (mirrors lite-lru's GUIDE): a flowchart / table + reach-for /
-avoid + measure-it, per member. No re-documenting signatures.
+Scope discipline (mirrors lite-lru's GUIDE): a decision flowchart + a picker table
+up top, then reach-for / avoid + measure-it per member. No re-documenting signatures.
 
 ---
 
@@ -17,6 +18,66 @@ avoid + measure-it, per member. No re-documenting signatures.
 lite-o1's answer is the O(1) Witness: ops/ms that stays flat as `n` grows is the
 proof. Every "reach for it" below is conditional on the witness staying above its
 flatness floor for YOUR workload -- run `npm run witness` and read the shape.
+
+---
+
+## Which member? (decision flowchart)
+
+ASCII, routes on the discriminating questions. Every leaf is one of the ten
+members; `(wc)` = worst-case O(1), `(am)` = amortized O(1).
+
+```
+START -- what is the SHAPE of your workload?
+|
++-- Membership of INTEGER keys in a bounded [0, universe)?
+|     |
+|     +-- also need a UNIFORM-RANDOM live member (sample / removeRandom)? -> RandomSet (wc)
+|     +-- also need the LEAST-FREQUENTLY-USED key (access counts, LFU victim)? -> FreqO1 (wc)
+|     +-- just add / has / delete / O(1) clear / dense iterate? -> SparseSet (wc)
+|
++-- A LINEAR sequence of NUMBERS you push/pop (stack or queue)?
+|     |
+|     +-- need the running MIN or MAX of the WHOLE live stack? -> MinStack (wc)
+|     +-- FIFO / LIFO push+pop at either end, no extreme query? -> RingDeque (wc)
+|
++-- The MIN or MAX of a SLIDING WINDOW over a numeric stream? -> MonoDeque (am)
+|
++-- "Are these two in the SAME GROUP?" over a fixed integer set,
+|   merging groups incrementally (no un-merge)? -> UnionFind (am)
+|
++-- Consume by an INTEGER PRIORITY, MONOTONICALLY (never below the frontier),
+|   priorities small + bounded [0, ceiling]? -> BucketQueue (am)
+|
++-- Fire events at a future TICK over a BOUNDED delay horizon?
+      |
+      +-- horizon fits ONE rotation (delay <= slots-1), want a hard
+      |   per-tick budget (no spike)? -> TimerWheel (wc)
+      +-- horizon WIDE but bounded (delay < 2^26), can tolerate a
+          periodic cascade spike? -> HierarchicalTimerWheel (am)
+```
+
+Budget rule of thumb: if you cannot tolerate ANY per-op spike (hard-real-time on
+the WORST single op), stay on the six `(wc)` members. The four `(am)` members
+(UnionFind, MonoDeque, BucketQueue, HierarchicalTimerWheel) buy their constant with
+an amortized average and wear an honest worst-single-op tail -- read the MAX-single-op
+line the witness prints, and the per-member "avoid it when" notes below.
+
+## Which member? (picker table)
+
+One row per member; pick by the left column, confirm with the discriminator.
+
+| If you need                                                  | Reach for              | Budget      | Discriminator (what sets it apart)                          |
+|--------------------------------------------------------------|------------------------|-------------|------------------------------------------------------------|
+| an integer set: add / has / delete / O(1) clear / iterate    | SparseSet              | worst-case  | membership only, bounded integer keys, clear() zeroes nothing |
+| a FIFO/LIFO of numbers, O(1) push/pop at both ends           | RingDeque              | worst-case  | numeric deque over one ring; kills the `shift` O(n) trap     |
+| "same component?" + incremental merges over a fixed set      | UnionFind              | amortized   | merge-only disjoint-set; near-O(1) alpha(n), no un-merge     |
+| the MIN or MAX of a SLIDING WINDOW over a numeric stream     | MonoDeque              | amortized   | one extreme (kind frozen); kills the O(W)-rescan trap        |
+| a numeric STACK plus its running MIN or MAX, hard budget     | MinStack              | worst-case  | extreme of the WHOLE live stack; no amortized pop-storm      |
+| a UNIFORM-RANDOM live member of an integer set               | RandomSet              | worst-case  | SparseSet superset; O(1) sample/removeRandom, seeded         |
+| the LEAST-FREQUENTLY-USED integer key (LFU victim)           | FreqO1                 | worst-case  | counts + O(1) peekMin/popMin; the LFU primitive, not a cache |
+| a priority queue over SMALL BOUNDED INTEGER priorities       | BucketQueue            | amortized   | monotone Dial; O(1) decreaseKey; below-cursor insert throws  |
+| timers over a delay horizon that fits ONE rotation           | TimerWheel             | worst-case  | simple Varghese-Lauck wheel; drain-before-advance, no spike  |
+| timers over a WIDE but bounded delay horizon (< 2^26)        | HierarchicalTimerWheel | amortized   | cascading tvec wheel; O(1) amortized, periodic cascade spike |
 
 ---
 
@@ -424,13 +485,20 @@ witness gates the cascade spike at `>= 8x` the typical tick (the amortized-hones
 
 ---
 
-## Roadmap members (not yet shipped)
+## Roadmap members (not yet shipped, planned)
 
+The public API is stable at v1.0.0's ten members; these are planned, not shipped.
 Placeholders so the decision axes are visible early; each fills in on release.
 
 - **SlotPool** -- free-list slot allocator with generational (ABA-safe) handles.
   Reach for it as the SoA substrate; reconcile against `@zakkster/lite-arena`
   before picking one.
+- **RingLog** -- a lossy overwrite-oldest ring (keep the last N, drop the oldest);
+  the "overwrite-oldest RingDeque preset" the RingDeque notes defer to.
+- **CuckooMap / Hopscotch** -- a general-key (not integer-bounded) worst-case-O(1)
+  map, for when the key space is not a small bounded integer range.
+- **SparseTable / StaticRMQ** -- an O(1)-query static range-minimum table (build
+  once, query O(1)); carries the "admit static, build-once members?" boundary call.
 
 ---
 
@@ -449,23 +517,33 @@ The witness is one axis (throughput invariance). The repo-only **eight-dimension
 benchmark suite** (`benchmark/`, not in the published tarball) profiles every member
 against its JS built-in on the axes a single ops/ms number hides -- latency tails,
 amortized drift, memory, cache proxy, bundle size, GC pressure, key-type / load-factor
-scaling, and workload micro-benches:
+scaling, and workload micro-benches. At v1.0.0 that is **ten members x 8 dimensions
+= 80 cells**:
 
 ```bash
-npm run bench          # all 72 (member x dimension) cells, one child process each
+npm run bench          # all 80 (member x dimension) cells, one child process each
 npm run bench:report   # renders a zero-dep HTML report -> benchmark/report.html
 ```
 
-Decision-relevant highlights (full charts + tables in `benchmark/report.html`):
+The suite is a full-rigor "Bench v2" (ADR [`0009`](./decisions/0009-benchmark-suite.md)
++ [`benchmark/METHODOLOGY.md`](./benchmark/METHODOLOGY.md)): strong (alloc-free)
+baselines, a 95% bootstrap confidence interval on each subject median, a Mann-Whitney
+U significance test vs the foils, per-op overhead subtraction, a D7 load-factor curve,
+and a shared `benchmark/Template.mjs` the members copy so every cell is measured the
+same way.
+
+Decision-relevant highlights (numbers from the run recorded in
+`benchmark/results.json`; full charts + tables in `benchmark/report.html`):
 
 | axis | what to read | what the members show |
 |------|--------------|-----------------------|
-| D5 bundle | single-member gzip vs all-member (~4.3 KB) | each lone import drops the other eight; every member < 40% of all, TimerWheel closest at ~0.32 (the newer members carry the heaviest machinery) |
-| D6 GC | zero-alloc + max major GC over n=1e3..1e6 | 0 B/op, 0 major GC, sub-ms pause for all nine -- the 0 B/op gate as a curve |
-| D3 memory | bytes/live vs theoretical min | SparseSet + RandomSet 2.0x (sparse index), RingDeque + UnionFind 1.0x, MinStack 2.0x (running-extreme column); FreqO1's bytes/live is load-dependent (bucket free-list + O(distinct-freq) pool); all fixed-capacity (clear() keeps the buffer) |
-| D1 latency | p99 / max ns/op (with + without GC) | flat tails; amortized members (UnionFind, MonoDeque, BucketQueue) show a true per-op tail (p99/max via hrtime) for their worst single op vs the typical one, while the worst-case-O(1) members read n/a there |
+| D5 bundle | single-member gzip vs all-member (~5.0 KB / 5085 B) | each lone import drops the other nine; every member < 40% of all-ten, HierarchicalTimerWheel closest at ~0.31 (~1593 B) then TimerWheel ~0.28, SparseSet lightest at ~0.11 (~581 B) |
+| D6 GC | zero-alloc + max major GC over n=1e3..1e6 | 0 major GC for all ten; the torture + perf gates hold 0 B/op steady-state for all ten (incl. HierarchicalTimerWheel); D6's coarse heap-delta sampler reads a 0-2 B/op rounding wobble for RingDeque / TimerWheel / HierarchicalTimerWheel, and HTW carries the largest pause (~50.8 ms per 1e6 ops at n=1e6, all minor GC -- the cascade's driver-side allocation, not a per-op leak) |
+| D3 memory | bytes/live vs theoretical min | RingDeque + UnionFind + MinStack 1.0x, SparseSet + RandomSet 2.0x (sparse index), HierarchicalTimerWheel 1.17x + TimerWheel 1.75x, FreqO1 2.40x, BucketQueue 9.25x (static per-priority buckets); MonoDeque's B/live is load-dependent (few live entries over a fixed ring reads far above theoMin); all fixed-capacity (clear() keeps the buffer) |
+| D1 latency | p99 / max ns/op (with + without GC) | flat tails; the four amortized members (UnionFind, MonoDeque, BucketQueue, HierarchicalTimerWheel) show a true per-op tail (p99/max via hrtime) for their worst single op vs the typical one -- HierarchicalTimerWheel p99 ~82 ns / max ~195 ns is the cascade spike -- while the six worst-case-O(1) members read n/a there |
 
 D4 is a labelled PORTABLE PROXY (dense-iteration vs random-lookup + a working-set
 stride sweep) -- no native perf counters. The applicability matrix prints `n/a`
 (never `0`) for cells that do not apply. See ADR
-[`0009`](./decisions/0009-benchmark-suite.md) for the design.
+[`0009`](./decisions/0009-benchmark-suite.md) and
+[`benchmark/METHODOLOGY.md`](./benchmark/METHODOLOGY.md) for the design.
