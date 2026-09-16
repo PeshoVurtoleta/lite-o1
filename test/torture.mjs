@@ -39,7 +39,7 @@ async function main() {
     const { GcProfiler, checkNoGc, measureAllocs } =
         await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack } = await import('../O1.js');
+    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet } = await import('../O1.js');
 
     const U = 1 << 16;      // universe 65536
     const CAP = 1 << 14;    // capacity 16384
@@ -112,6 +112,18 @@ async function main() {
             ms.extreme();
             ms.pop();
             tracker.track(ms, noop, 'minstack', { audit: true });
+            // RandomSet owns only its two Uint32Arrays; nothing external to
+            // release. Its arrays hold numbers, so a reclaimed instance is the
+            // desired outcome, proven by size()->0. Exercise add/has/sample/
+            // removeRandom/delete before tracking.
+            const rs = new RandomSet(1024, 256, i | 1);
+            rs.add(i & 1023);
+            rs.add((i + 1) & 1023);
+            rs.has(i & 1023);
+            rs.sample();
+            rs.removeRandom();
+            rs.delete(i & 1023);
+            tracker.track(rs, noop, 'randomset', { audit: true });
         }
         return tracker.size();
     }
@@ -222,6 +234,23 @@ async function main() {
     const minBpc = minAllocRes.bytesPerCall === null ? 0 : minAllocRes.bytesPerCall;
     const minAllocBytes = Math.max(0, Math.round(minBpc));
     const minAllocOk = minAllocBytes === 0;
+
+    // RandomSet hot path: a bounded resident set. Each step peeks a uniform member
+    // (sample), removes a uniform member (removeRandom) then re-adds the SAME key --
+    // so size returns to RAND_W every step and no op touches full/empty. Every op is
+    // WORST-CASE O(1), zero-alloc (the swap-remove + re-append touch typed slots only).
+    const RAND_W = 1 << 12;              // 4096 resident members, < CAP so never full
+    const rand = new RandomSet(U, CAP, 0x9e3779b1);
+    for (let k = 0; k < RAND_W; k++) rand.add(k); // prime a bounded resident window
+    const randStep = () => {
+        rand.sample();
+        const v = rand.removeRandom(); // removes a uniform member (size RAND_W-1)
+        rand.add(v);                   // re-append the just-removed key (size RAND_W)
+    };
+    const randAllocRes = measureAllocs(randStep, { iterations: 100000, batches: 8 });
+    const randBpc = randAllocRes.bytesPerCall === null ? 0 : randAllocRes.bytesPerCall;
+    const randAllocBytes = Math.max(0, Math.round(randBpc));
+    const randAllocOk = randAllocBytes === 0;
     // "0 B/op" resolved at the sampling floor: heapUsed deltas are quantized and
     // noisy, so a truly non-allocating op reads a sub-byte figure (a lone blip
     // in one batch / iterations). Round to the nearest byte -- any per-op
@@ -240,6 +269,7 @@ async function main() {
         ufStep();
         monoStep();
         minStep();
+        randStep();
         if ((i & 8191) === 0) {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
         }
@@ -278,6 +308,16 @@ async function main() {
         minStack.forEach(cb);
         minStack.clear();
     }
+    // RandomSet fill + sample/removeRandom drain + forEach + O(1) clear cycles --
+    // exercises add, the two random ops (swap-remove back-pointer fix), the
+    // alloc-free scan, and clear. The drain empties the set each cycle.
+    for (let f = 0; f < 1024; f++) {
+        for (let k = 0; k < 512; k++) rand.add(k);
+        rand.sample();
+        while (rand.size > 0) SINK += rand.removeRandom() >= 0 ? 1 : 0;
+        rand.forEach(cb);
+        rand.clear();
+    }
     await new Promise((r) => setTimeout(r, 50));
     const s2 = gc.summary();
     const report = checkNoGc(s2, { maxMajor: 0, maxPauseMs: 2 });
@@ -303,6 +343,9 @@ async function main() {
         mono.clear();
         for (let k = 0; k < CAP; k++) minStack.push((k * 2654435761) & 0x7fffffff);
         minStack.clear();
+        for (let k = 0; k < CAP; k++) rand.add(k);
+        while (rand.size > 0) rand.removeRandom();
+        rand.clear();
     }
     globalThis.gc();
     const abAfter = process.memoryUsage().arrayBuffers;
@@ -312,7 +355,7 @@ async function main() {
     // ---- verdict + GATE line ----------------------------------------------
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
         findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && monoAllocOk &&
-        minAllocOk && abOk;
+        minAllocOk && randAllocOk && abOk;
 
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
@@ -321,7 +364,7 @@ async function main() {
         ' maxMs=' + s2.gc.maxMs.toFixed(2) +
         ' | alloc=' + allocBytes + ' B/op (SparseSet) ' + ringAllocBytes + ' B/op (RingDeque) ' +
         ufAllocBytes + ' B/op (UnionFind) ' + monoAllocBytes + ' B/op (MonoDeque) ' +
-        minAllocBytes + ' B/op (MinStack)' +
+        minAllocBytes + ' B/op (MinStack) ' + randAllocBytes + ' B/op (RandomSet)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
         ' (tracked=' + trackedMid + ' sink=' + SINK + ' abGrowth=' + abDelta + ')');
 
@@ -337,6 +380,7 @@ async function main() {
         if (!ufAllocOk) console.error('  alloc ' + ufAllocBytes + ' B/op UnionFind (raw bytesPerCall ' + ufBpc + ')');
         if (!monoAllocOk) console.error('  alloc ' + monoAllocBytes + ' B/op MonoDeque (raw bytesPerCall ' + monoBpc + ')');
         if (!minAllocOk) console.error('  alloc ' + minAllocBytes + ' B/op MinStack (raw bytesPerCall ' + minBpc + ')');
+        if (!randAllocOk) console.error('  alloc ' + randAllocBytes + ' B/op RandomSet (raw bytesPerCall ' + randBpc + ')');
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;
     }

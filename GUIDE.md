@@ -205,6 +205,47 @@ line: push is worst-case O(1), so there is no amortized pop-storm to expose.
 
 ---
 
+### RandomSet (v0.6.0)
+
+Integer set over a known, bounded `[0, universe)` -- SparseSet's exact dense +
+sparse substrate -- that ALSO samples a uniform-random live member in WORST-CASE
+O(1). `sample()` peeks one, `removeRandom()` removes one. A per-instance seeded
+Numerical Recipes LCG drives the pick (positional 3rd ctor arg).
+
+**Reach for it when:**
+
+- You need a uniform-random element of a live integer set on a hot path -- random
+  eviction, reservoir-style sampling, randomized load-balancing, particle / agent
+  pools, fuzz-input selection -- and you were about to do `Array.from(set)[k]`
+  (O(n) walk PLUS a per-pick allocation) or iterate a `Set` to the k-th element.
+- You also need the full SparseSet contract (O(1) add / has / delete / clear /
+  dense iteration) on the SAME structure -- RandomSet is a strict superset.
+- You need REPRODUCIBLE randomness: a per-instance seed makes the sequence a pure
+  function of (seed, op order), so a failing run replays.
+- You need zero per-op allocation and a HARD per-op budget (sample / removeRandom
+  are worst-case O(1) -- no rejection loop, no run).
+
+**Avoid it when:**
+
+- You need cryptographic uniformity: the pick uses the LCG's HIGH bits (not
+  `s % n`) with NO rejection sampling, so a residual multiply-bias `<= n / 2^32`
+  remains (negligible but disclosed). Draw from `crypto` and index the dense array
+  directly for adversarial use.
+- Keys are strings, objects, or sparse integers over a huge / unbounded domain --
+  the `sparse` array is universe-sized; the same SparseSet caveat applies.
+- You want two independent instances to differ by default -- two DEFAULT-seeded
+  RandomSets produce IDENTICAL sequences; pass distinct seeds to decorrelate.
+- You need weighted (non-uniform) sampling -- RandomSet is uniform-only.
+
+**Measure it:** `npm run witness` -- RandomSet `sample()` flatness `>= 0.70` across
+the size sweep `[1e4..1e5]` (the 1e3 point is a pure-L1 micro-case, shown but not
+gated) while a native `Set` that iterates-to-the-k-th collapses (`<= 0.55`), ratio
+`>= 1.5x`. The foil is walked alloc-free with `Set.forEach`, so the gap is a pure
+SPEED comparison. For uniformity itself, `npm test` runs the chi-square gate (100
+members x 1e6 draws, deterministic).
+
+---
+
 ## Roadmap members (not yet shipped)
 
 Placeholders so the decision axes are visible early; each fills in on release.
@@ -233,7 +274,7 @@ amortized drift, memory, cache proxy, bundle size, GC pressure, key-type / load-
 scaling, and workload micro-benches:
 
 ```bash
-npm run bench          # all 40 (member x dimension) cells, one child process each
+npm run bench          # all 48 (member x dimension) cells, one child process each
 npm run bench:report   # renders a zero-dep HTML report -> benchmark/report.html
 ```
 
@@ -241,9 +282,9 @@ Decision-relevant highlights (full charts + tables in `benchmark/report.html`):
 
 | axis | what to read | what the members show |
 |------|--------------|-----------------------|
-| D5 bundle | single-member gzip vs all-member (~1.9 KB) | each lone import drops the other four; SparseSet / RingDeque / UnionFind / MinStack < 40% of all, MonoDeque ~43% (it is the heaviest member) |
-| D6 GC | zero-alloc + max major GC over n=1e3..1e6 | 0 B/op, 0 major GC, sub-ms pause for all five -- the 0 B/op gate as a curve |
-| D3 memory | bytes/live vs theoretical min | SparseSet 2.0x (sparse index), RingDeque + UnionFind 1.0x, MinStack 2.0x (running-extreme column); all fixed-capacity (clear() keeps the buffer) |
+| D5 bundle | single-member gzip vs all-member (~2.1 KB) | each lone import drops the other five; every member < 40% of all, MonoDeque closest at ~0.39 (it is the heaviest member) |
+| D6 GC | zero-alloc + max major GC over n=1e3..1e6 | 0 B/op, 0 major GC, sub-ms pause for all six -- the 0 B/op gate as a curve |
+| D3 memory | bytes/live vs theoretical min | SparseSet + RandomSet 2.0x (sparse index), RingDeque + UnionFind 1.0x, MinStack 2.0x (running-extreme column); all fixed-capacity (clear() keeps the buffer) |
 | D1 latency | p99 / max ns/op (with + without GC) | flat tails; amortized members (UnionFind, MonoDeque) show their worst single op vs the typical one, while MinStack is worst-case O(1) |
 
 D4 is a labelled PORTABLE PROXY (dense-iteration vs random-lookup + a working-set

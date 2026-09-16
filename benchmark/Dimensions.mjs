@@ -14,7 +14,7 @@
  * This file is NEVER imported by O1.js; it imports O1.js the way a consumer does.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet } from '../O1.js';
 import {
     prng, median, warm, gcNow, hasGc, percentile, collect, timeNsPerOp, foldHash,
     DEFAULT_SEED,
@@ -65,6 +65,12 @@ function makeSubject(member, n, rng) {
             obj: s,
             op: () => { v = (v + 1) | 0; s.push(-v); if (s.extreme() !== undefined) SINK++; s.pop(); },
         };
+    }
+    if (member === 'RandomSet') {
+        // A set of size n; sample() is the O(1) hot op (a pure peek, size unchanged).
+        const s = new RandomSet(n, n, 0x9e3779b1);
+        for (let k = 0; k < n; k++) s.add(k);
+        return { obj: s, op: () => { if (s.sample() >= 0) SINK++; } };
     }
     // MonoDeque: a sliding window of width W = n.
     const W = n;
@@ -118,6 +124,25 @@ function makeBaseline(member, n) {
             },
         };
     }
+    if (member === 'RandomSet') {
+        // naive native Set: to pick a uniform member it must ITERATE to the k-th
+        // element (Set has no random index) -- O(n)/pick. The walk uses Set.forEach
+        // (allocates nothing per step), so it is an honest SPEED foil.
+        const set = new Set();
+        for (let k = 0; k < n; k++) set.add(k);
+        let seed = 0x9e3779b1 >>> 0;
+        let idx = 0, target = 0, picked = 0;
+        const walk = (val) => { if (idx === target) picked = val; idx++; };
+        return {
+            op: () => {
+                seed = (seed * 1664525 + 1013904223) >>> 0;
+                target = Math.floor(seed / 4294967296 * n);
+                idx = 0;
+                set.forEach(walk); // O(n): no random access, must walk
+                SINK += picked;
+            },
+        };
+    }
     // naive window rescan (O(W) per element).
     const W = n;
     const win = new Float64Array(W);
@@ -137,7 +162,7 @@ function makeBaseline(member, n) {
 }
 
 /** True iff a member's baseline op is O(n) per call (so it must be timed gently). */
-const LINEAR_BASELINE = { SparseSet: false, RingDeque: true, UnionFind: true, MonoDeque: true, MinStack: true };
+const LINEAR_BASELINE = { SparseSet: false, RingDeque: true, UnionFind: true, MonoDeque: true, MinStack: true, RandomSet: true };
 
 /** Exact backing-store byte footprint of a member instance (typed-array buffers). */
 function memberBytes(member, obj) {
@@ -145,7 +170,8 @@ function memberBytes(member, obj) {
     if (member === 'RingDeque') return obj._store.buffer.byteLength;
     if (member === 'UnionFind') return obj._parent.buffer.byteLength + obj._size.buffer.byteLength;
     if (member === 'MonoDeque') return obj._val.buffer.byteLength + obj._seq.buffer.byteLength;
-    return obj._val.buffer.byteLength + obj._ext.buffer.byteLength; // MinStack (value + ext)
+    if (member === 'MinStack') return obj._val.buffer.byteLength + obj._ext.buffer.byteLength;
+    return obj._dense.buffer.byteLength + obj._sparse.buffer.byteLength; // RandomSet (dense + sparse)
 }
 
 /** Theoretical minimum bytes per LIVE element for a member (the dense payload). */
@@ -154,7 +180,8 @@ function theoreticalMinPerLive(member) {
     if (member === 'RingDeque') return 8;  // one Float64 slot per live value
     if (member === 'UnionFind') return 8;  // parent + size Uint32 per element
     if (member === 'MonoDeque') return 16; // value + seq Float64 per entry
-    return 16;                             // MinStack: value + ext Float64 per element
+    if (member === 'MinStack') return 16;  // value + ext Float64 per element
+    return 4;                              // RandomSet: one Uint32 dense slot per live key
 }
 
 /** The member's live-element count (its `size`/`count`/`capacity` semantics). */
@@ -267,6 +294,17 @@ function makeMixed(member, cap, rng) {
             s.pop();
         };
     }
+    if (member === 'RandomSet') {
+        // A bounded resident set: removeRandom() then re-add the returned key keeps
+        // size steady at cap>>1 while exercising sample() + the swap-remove.
+        const s = new RandomSet(cap, cap, 0x9e3779b1);
+        for (let k = 0; k < (cap >> 1); k++) s.add(k);
+        return () => {
+            if (s.sample() >= 0) SINK++;
+            const v = s.removeRandom();
+            s.add(v);
+        };
+    }
     // MonoDeque
     const W = cap >> 1;
     const d = new MonoDeque(cap, 'min');
@@ -315,6 +353,7 @@ export function D2(member, opts = {}) {
 
 function fillMember(member, obj, count) {
     if (member === 'SparseSet') { obj.clear(); for (let k = 0; k < count; k++) obj.add(k); return; }
+    if (member === 'RandomSet') { obj.clear(); for (let k = 0; k < count; k++) obj.add(k); return; }
     if (member === 'RingDeque') { obj.clear(); for (let k = 0; k < count; k++) obj.pushBack(k); return; }
     if (member === 'UnionFind') { obj.reset(); for (let k = 1; k < count; k++) obj.union(0, k); return; }
     obj.clear();
@@ -335,7 +374,8 @@ export function D3(member, opts = {}) {
     else if (member === 'RingDeque') obj = new RingDeque(n);
     else if (member === 'UnionFind') obj = new UnionFind(n);
     else if (member === 'MonoDeque') obj = new MonoDeque(n, 'min');
-    else obj = new MinStack(n, 'min');
+    else if (member === 'MinStack') obj = new MinStack(n, 'min');
+    else obj = new RandomSet(n, n, 0x9e3779b1);
 
     gcNow();
     const heapBase = process.memoryUsage().heapUsed;
@@ -634,6 +674,12 @@ function churnNs(member, n, seed) {
         const op = () => { v = (v + 1) | 0; s.push(-v); s.extreme(); s.pop(); };
         return median(collect(op, 4000, 60));
     }
+    if (member === 'RandomSet') {
+        const s = new RandomSet(n, n, 0x9e3779b1);
+        for (let k = 0; k < n; k++) s.add(k);
+        const op = () => { s.sample(); const v = s.removeRandom(); s.add(v); };
+        return median(collect(op, 4000, 60));
+    }
     const d = new MonoDeque(n, 'min');
     const W = n >> 1;
     let v = 0;
@@ -704,7 +750,7 @@ export function traceHash(member, seed = DEFAULT_SEED, length = 100000) {
     for (let i = 0; i < length; i++) {
         const r = rng();
         let x;
-        if (member === 'SparseSet' || member === 'UnionFind') x = r % TRACE_UNIVERSE;
+        if (member === 'SparseSet' || member === 'UnionFind' || member === 'RandomSet') x = r % TRACE_UNIVERSE;
         else if (member === 'RingDeque' || member === 'MinStack') x = (r % 2000) - 1000;
         else x = r % 1000000; // MonoDeque
         h = foldHash(h, x);

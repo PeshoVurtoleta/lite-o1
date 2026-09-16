@@ -48,7 +48,7 @@
  * metric are unchanged; only the measurement is made steadier.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet } from '../O1.js';
 
 const SIZES = [1e3, 1e4, 1e5, 1e6, 1e7];
 const BATCH = 1e6;
@@ -104,6 +104,24 @@ const NAIVE_STACK_BATCH = 300;  // small: an O(depth) rescan at depth=1e5 must s
 // NOT a widened gate: the 0.70 floor is unchanged; only the DOMAIN is pinned. The
 // 1e3 point is still DISPLAYED, tagged as the micro-case.
 const MIN_GATE_MIN = 1e4;
+
+// RandomSet sweep. n is the set SIZE (live members). The foil is a native Set that,
+// to pick a uniform member, must ITERATE to the k-th element (O(n)/pick) -- Set has
+// no random index -- so it degrades while RandomSet's sample() (a single high-bits
+// index into the dense array) stays flat. The foil walks with Set.forEach (which
+// allocates NOTHING per step, unlike the Set iterator protocol), so this is an
+// honest SPEED comparison, not an allocation strawman. ops/ms is a RATE, so the two
+// use DIFFERENT batches yet flatness + ratio compare directly.
+const RAND_SIZES = [1e3, 1e4, 1e5];
+const RAND_BATCH = 5e5;         // large: stable timing for the worst-case-O(1) sample
+const NAIVE_PICK_BATCH = 300;   // small: an O(n) Set walk at n=1e5 must stay tractable
+// sample() is the tiniest hot op in the family (an RNG advance + one dense read), so
+// the size=1e3 point is a pure-L1 micro-case that turbo-spikes as the flatness
+// DENOMINATOR (the same effect ADR-0004's amendment pinned for SparseSet). The gate
+// is computed over the steady window size >= 1e4, where the two columns leave L1 and
+// ops/ms isolates the constant. This is NOT a widened gate: the 0.70 floor is
+// unchanged; only the DOMAIN is pinned. The 1e3 point is still DISPLAYED, tagged.
+const RAND_GATE_MIN = 1e4;
 
 // Global sink: every op feeds it so V8 cannot dead-code-eliminate the batch.
 let SINK = 0;
@@ -324,6 +342,40 @@ function buildNaiveRescanFoil(n) {
         for (let j = 1; j < top; j++) if (arr[j] < best) best = arr[j]; // O(depth) rescan
         SINK += best;
         top--;                                                  // pop
+    };
+    return { op };
+}
+
+// RandomSet: a set of SIZE n. Each op samples a uniform-random live member in
+// worst-case O(1) -- an RNG advance + a single high-bits index into the dense array,
+// independent of n -- so the whole op streams flat as n grows.
+function buildRandomSet(n) {
+    const s = new RandomSet(n, n, 0x9e3779b1);
+    for (let k = 0; k < n; k++) s.add(k);
+    const op = () => {
+        if (s.sample() >= 0) SINK++;
+    };
+    return { op };
+}
+
+// Foil: a native Set picked by iterate-to-the-k-th. Set has no random index, so a
+// uniform pick must WALK to the k-th element -- O(n) per pick. The walk uses
+// Set.forEach (which allocates NOTHING per step, unlike the iterator protocol), so
+// ops/ms collapses as n grows on a purely-speed basis -- the exact trap the dense
+// array's O(1) index exists to kill.
+function buildNaiveSetPick(n) {
+    const set = new Set();
+    for (let k = 0; k < n; k++) set.add(k);
+    let seed = 0x9e3779b1 >>> 0;
+    let picked = 0;
+    const walk = (v) => { if (idx === target) picked = v; idx++; };
+    let idx = 0, target = 0;
+    const op = () => {
+        seed = (seed * 1664525 + 1013904223) >>> 0;
+        target = Math.floor(seed / 4294967296 * n); // uniform index in [0, n)
+        idx = 0;
+        set.forEach(walk); // O(n): no random access, must walk every element
+        SINK += picked;
     };
     return { op };
 }
@@ -587,5 +639,56 @@ if (!stackAllOk) {
     if (!mstkOk) console.error('  violation MinStack flatness ' + fmt(mstk.flatness) + ' < 0.70');
     if (!naiveStackOk) console.error('  violation naive foil flatness ' + fmt(naiveStack.flatness) + ' > 0.55');
     if (!stackRatioOk) console.error('  violation min stack ratio ' + fmt(minStackRatio) + 'x < 1.50x');
+    process.exitCode = 1;
+}
+
+// ===========================================================================
+// RandomSet witness -- worst-case-O(1) sample() vs a naive O(n) Set-walk foil
+// ===========================================================================
+const rset = witness(buildRandomSet, RAND_SIZES, RAND_BATCH, REPS, RAND_GATE_MIN);
+const naivePick = witness(buildNaiveSetPick, RAND_SIZES, NAIVE_PICK_BATCH, REPS, RAND_GATE_MIN);
+
+console.log('');
+console.log('O(1) Witness -- RandomSet sample() vs a naive Set iterate-to-kth (rate ops/ms, median of ' +
+    REPS + ', gate size >= ' + nStr(RAND_GATE_MIN) + ')');
+console.log('');
+console.log('  size      RandomSet ops/ms   naive ops/ms   ratio');
+console.log('  --------  ----------------   ------------   -----');
+let randRatio = Infinity;
+for (let i = 0; i < RAND_SIZES.length; i++) {
+    const a = rset.rows[i].opsPerMs;
+    const b = naivePick.rows[i].opsPerMs;
+    const ratio = b > 0 ? a / b : Infinity;
+    const gated = RAND_SIZES[i] >= RAND_GATE_MIN;
+    if (gated && ratio < randRatio) randRatio = ratio; // ratio gate: steady window only
+    const tag = RAND_SIZES[i] < RAND_GATE_MIN ? '   <- L1 micro-case (shown, not gated)' : '';
+    console.log('  ' + nStr(RAND_SIZES[i]).padEnd(8) + '  ' +
+        fmt(a).padStart(16) + '   ' + fmt(b).padStart(12) + '   ' + fmt(ratio).padStart(5) + 'x' + tag);
+}
+
+console.log('');
+console.log('  RandomSet flatness (size >= ' + nStr(RAND_GATE_MIN) + '): ' + fmt(rset.flatness) + '   (gate >= 0.70)');
+console.log('  naive foil flatness (last/first): ' + fmt(naivePick.flatness) + '   (gate <= 0.55)');
+console.log('  min RandomSet/naive ratio:        ' + fmt(randRatio) + 'x  (gate >= 1.50x)');
+// NO MAX-single-op line here (unlike MonoDeque): RandomSet's sample() and
+// removeRandom() are WORST-CASE O(1) -- an RNG advance + a single high-bits dense
+// index (+ a swap-remove for removeRandom), never a run. There is no amortized
+// spike to expose; the flat line IS the worst-case claim.
+
+const rsetOk = rset.flatness >= 0.70;
+const naivePickOk = naivePick.flatness <= 0.55;
+const randRatioOk = randRatio >= 1.5;
+const randAllOk = rsetOk && naivePickOk && randRatioOk;
+
+console.log('');
+console.log('WITNESS RandomSet ' + (randAllOk ? 'ok' : 'FAIL') +
+    ' rset.flatness=' + fmt(rset.flatness) +
+    ' naive.flatness=' + fmt(naivePick.flatness) +
+    ' minRatio=' + fmt(randRatio) + 'x');
+
+if (!randAllOk) {
+    if (!rsetOk) console.error('  violation RandomSet flatness ' + fmt(rset.flatness) + ' < 0.70');
+    if (!naivePickOk) console.error('  violation naive foil flatness ' + fmt(naivePick.flatness) + ' > 0.55');
+    if (!randRatioOk) console.error('  violation min rand ratio ' + fmt(randRatio) + 'x < 1.50x');
     process.exitCode = 1;
 }

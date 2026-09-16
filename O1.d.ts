@@ -254,3 +254,55 @@ export class MinStack {
     /** Iterate live elements top -> bottom (pop order). Allocates a {value, done} per step by protocol. */
     [Symbol.iterator](): IterableIterator<number>;
 }
+
+/**
+ * A zero-GC O(1) integer set over the universe [0, universe) that ALSO samples a
+ * uniform-random live member in WORST-CASE O(1). It duplicates SparseSet's dense +
+ * sparse cross-check substrate (add / has / delete / clear / iterate, same
+ * fail-closed + never-throw-query contract), and adds `sample()` (a uniform-random
+ * peek) and `removeRandom()` (a uniform-random swap-remove). The RNG is a
+ * per-instance Numerical Recipes LCG (`s = (s*1664525 + 1013904223) >>> 0`) mapped
+ * to an index by the HIGH bits (`floor(s/2^32 * n)`, never `s % n`); the seed is a
+ * positional 3rd ctor arg, so two default-seeded instances produce identical
+ * sequences. No rejection sampling (worst-case O(1)); the residual multiply-bias is
+ * disclosed, not coded around. `sample()` / `removeRandom()` return `undefined` on
+ * an empty set and never throw.
+ */
+export class RandomSet {
+    /**
+     * @param universe  exclusive key ceiling; an integer in [1, 2^32].
+     * @param capacity  max live entries; an integer in [1, universe]. Defaults to universe.
+     * @param seed      RNG seed; any integer, coerced to uint32. Defaults to 0x9e3779b1.
+     */
+    constructor(universe: number, capacity?: number, seed?: number);
+
+    /** Number of live members. */
+    readonly size: number;
+
+    /** Max live members this set was sized for. */
+    readonly capacity: number;
+
+    /** True iff k is a present member. Never throws; a bad key is absent. */
+    has(k: number): boolean;
+
+    /** Add k (idempotent). Throws a [lite-o1] error on a bad key or when full. */
+    add(k: number): this;
+
+    /** Remove k. Returns true iff it was present. Never throws. */
+    delete(k: number): boolean;
+
+    /** Empty the set in O(1) (resets the count; zeroes no store; does not reseed). */
+    clear(): void;
+
+    /** Iterate present keys in insertion order, alloc-free. */
+    forEach(fn: (key: number, set: RandomSet) => void): void;
+
+    /** Iterate present keys in insertion order. */
+    [Symbol.iterator](): IterableIterator<number>;
+
+    /** A uniform-random live member (peek; advances the RNG), or `undefined` when empty. Never throws. */
+    sample(): number | undefined;
+
+    /** Remove and return a uniform-random live member, or `undefined` when empty. Never throws. */
+    removeRandom(): number | undefined;
+}

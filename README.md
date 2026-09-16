@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-> Zero-GC, O(1) data structures that PROVE their constant. v0.5.0 ships SparseSet (an integer set with O(1) add / has / delete / iterate and an O(1) clear() that zeroes nothing), RingDeque (a fixed-capacity numeric double-ended queue with O(1) push/pop at both ends), UnionFind (a disjoint-set forest with near-O(1) amortized find / union), MonoDeque (a monotonic deque for O(1)-amortized sliding-window min / max), and MinStack (a fixed-capacity numeric stack with a worst-case-O(1) running min / max) -- plus a throughput-invariance witness that shows the flat cost curve while a native Set, Array.prototype.shift, a naive disjoint-set, a full-window rescan, or a full-stack rescan decays.
+> Zero-GC, O(1) data structures that PROVE their constant. v0.6.0 ships SparseSet (an integer set with O(1) add / has / delete / iterate and an O(1) clear() that zeroes nothing), RingDeque (a fixed-capacity numeric double-ended queue with O(1) push/pop at both ends), UnionFind (a disjoint-set forest with near-O(1) amortized find / union), MonoDeque (a monotonic deque for O(1)-amortized sliding-window min / max), MinStack (a fixed-capacity numeric stack with a worst-case-O(1) running min / max), and RandomSet (an integer set with worst-case-O(1) uniform sample / removeRandom) -- plus a throughput-invariance witness that shows the flat cost curve while a native Set, Array.prototype.shift, a naive disjoint-set, a full-window rescan, a full-stack rescan, or a Set-iterate-to-the-kth decays.
 
 [![npm version](https://img.shields.io/npm/v/@zakkster/lite-o1.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-o1)
 [![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
@@ -17,7 +17,7 @@
 
 Almost no JavaScript data-structure library ships the evidence that its Big-O claim survives contact with a real engine -- megamorphic call sites, GC pauses, cache misses, deopts. `lite-o1` is a curated, tree-shakeable family of the O(1) structures that actually matter, each zero-GC, each written to teach the trick that buys the constant, and each shipped with a harness that DEMONSTRATES the flat cost curve rather than asserting it. The complexity class IS the product.
 
-v0.5.0 ships five members. **SparseSet**, the textbook O(1) integer set (a dense + sparse array pair) whose `clear()` runs in O(1) by resetting a count and zeroing nothing at all. **RingDeque**, a fixed-capacity double-ended queue of numbers over one circular `Float64Array` -- O(1) push/pop at both ends, the zero-GC answer to the `Array.prototype.shift` O(n) trap. **UnionFind**, a disjoint-set forest over two `Uint32Array` columns -- near-O(1) amortized `find` / `union` via path halving + union by size, the family's first amortized-honesty member. **MonoDeque**, a monotonic deque over two parallel `Float64Array` columns -- O(1)-amortized sliding-window min / max, the zero-GC answer to the full-window-rescan O(W) trap. And **MinStack**, a fixed-capacity numeric stack over two parallel `Float64Array` columns (value + a running-extreme prefix) -- WORST-CASE O(1) push/pop plus a running min / max, no amortization asterisk. They share no mutable module state, so a bundler that imports one drops the others.
+v0.6.0 ships six members. **SparseSet**, the textbook O(1) integer set (a dense + sparse array pair) whose `clear()` runs in O(1) by resetting a count and zeroing nothing at all. **RingDeque**, a fixed-capacity double-ended queue of numbers over one circular `Float64Array` -- O(1) push/pop at both ends, the zero-GC answer to the `Array.prototype.shift` O(n) trap. **UnionFind**, a disjoint-set forest over two `Uint32Array` columns -- near-O(1) amortized `find` / `union` via path halving + union by size, the family's first amortized-honesty member. **MonoDeque**, a monotonic deque over two parallel `Float64Array` columns -- O(1)-amortized sliding-window min / max, the zero-GC answer to the full-window-rescan O(W) trap. **MinStack**, a fixed-capacity numeric stack over two parallel `Float64Array` columns (value + a running-extreme prefix) -- WORST-CASE O(1) push/pop plus a running min / max, no amortization asterisk. And **RandomSet**, SparseSet's substrate plus WORST-CASE O(1) uniform `sample()` / `removeRandom()` -- the zero-GC answer to the `Array.from(set)[k]` O(n)-plus-allocation trap. They share no mutable module state, so a bundler that imports one drops the others.
 
 ```bash
 npm install @zakkster/lite-o1
@@ -71,6 +71,9 @@ Every op above is O(1) worst-case and allocates zero bytes after construction. T
 - [MinStack](#minstack)
   - [How MinStack works](#how-minstack-works)
   - [MinStack API reference](#minstack-api-reference)
+- [RandomSet](#randomset)
+  - [How RandomSet works](#how-randomset-works)
+  - [RandomSet API reference](#randomset-api-reference)
 - [Composability with the ecosystem](#composability-with-the-ecosystem)
 - [Zero-GC design notes](#zero-gc-design-notes)
 - [Design decisions worth knowing](#design-decisions-worth-knowing)
@@ -130,8 +133,12 @@ Existing options: a native `Set` (arbitrary keys, but a hash table that decays a
   - **`kind` / `size` / `capacity`** -- getters (`kind` is the frozen `'min'`/`'max'`; `capacity` is the exact constructed integer).
   - **`clear()`** -- empty in O(1): resets the top pointer, zeroes no store.
   - **`forEach(fn)` / `[Symbol.iterator]`** -- iterate live elements top -> bottom (pop order, O(k)); `forEach` is alloc-free, `[Symbol.iterator]` allocates a `{value, done}` per step by protocol.
+- **`RandomSet(universe, capacity?, seed?)`** -- a zero-GC O(1) integer set (SparseSet's dense + sparse substrate, duplicated verbatim) that ALSO samples a uniform-random live member in WORST-CASE O(1). `seed` (default `0x9e3779b1`) is a per-instance RNG word. The hot surface is the SparseSet surface plus two random ops:
+  - **`add(k)` / `has(k)` / `delete(k)` / `clear()` / `forEach(fn)` / `[Symbol.iterator]` / `size` / `capacity`** -- identical to SparseSet (same fail-closed + never-throw-query contract).
+  - **`sample()`** -- a uniform-random live member WITHOUT removing it (a pure peek; it advances the RNG). O(1) worst-case. `undefined` on empty -- never a throw.
+  - **`removeRandom()`** -- remove + return a uniform-random live member (the same swap-last delete uses). O(1) worst-case. `undefined` on empty -- never a throw.
 - **`VERSION`** -- the package version string.
-- **The O(1) Witness** (`npm run witness`) -- an offline harness that times a fixed batch of each member's hot op across an n-sweep, reports ops/ms + a flatness ratio (SparseSet vs a native `Set`, RingDeque vs `Array.prototype.shift`, UnionFind vs a naive disjoint-set, MonoDeque vs a full-window rescan, MinStack vs a full-stack rescan), and fails if the constant regressed.
+- **The O(1) Witness** (`npm run witness`) -- an offline harness that times a fixed batch of each member's hot op across an n-sweep, reports ops/ms + a flatness ratio (SparseSet vs a native `Set`, RingDeque vs `Array.prototype.shift`, UnionFind vs a naive disjoint-set, MonoDeque vs a full-window rescan, MinStack vs a full-stack rescan, RandomSet vs a `Set` iterate-to-the-kth), and fails if the constant regressed.
 
 Full types ship in [`O1.d.ts`](./O1.d.ts). Tree-shakeable named exports (`sideEffects: false`) -- import only what you use.
 
@@ -198,7 +205,7 @@ get capacity: number        // max live members as constructed
 
 | Constant   | Value     | Meaning                                            |
 | ---------- | --------- | -------------------------------------------------- |
-| `VERSION`  | `'0.5.0'` | Package version string.                            |
+| `VERSION`  | `'0.6.0'` | Package version string.                            |
 
 Contract bounds (validated, not exported):
 
@@ -218,6 +225,10 @@ Contract bounds (validated, not exported):
 | MinStack `capacity` | integer in `[1, 2^31]`, EXACT (NOT rounded)      |
 | MinStack `kind`     | `'min'` or `'max'` (frozen at construction)      |
 | MinStack value      | `typeof 'number'` and not `NaN` (`+/-Infinity` OK) |
+| RandomSet `universe`| integer in `[1, 2^32]`                           |
+| RandomSet `capacity`| integer in `[1, universe]`, default `universe`   |
+| RandomSet `seed`    | any integer (coerced to uint32), default `0x9e3779b1` |
+| RandomSet valid key | integer in `[0, universe)`                       |
 
 ---
 
@@ -629,6 +640,103 @@ get capacity: number                 // max elements (exact, not rounded)
 
 ---
 
+## RandomSet
+
+The sixth member: SparseSet's **integer set** with one power added -- a uniform-random live member in **WORST-CASE O(1)**. It duplicates SparseSet's dense + sparse cross-check substrate verbatim (so `add` / `has` / `delete` / `clear` / iterate carry the exact same contract), then adds `sample()` (a uniform peek) and `removeRandom()` (a uniform swap-remove). The dense array's contiguous packing is what makes it O(1): a uniform index into `[0, size)` IS a uniform member, no scan, no rejection loop, no reservoir. A native `Set` cannot do this better than O(n) -- it has no random index, so `Array.from(set)[k]` is an O(n) walk PLUS a per-pick allocation.
+
+```js
+import { RandomSet } from '@zakkster/lite-o1';
+
+// Universe [0, 100000); seed makes the stream reproducible (default 0x9e3779b1).
+const pool = new RandomSet(100000, 10000, 0x9e3779b1);
+
+pool.add(42);  pool.add(7);  pool.add(1009);   // the SparseSet surface, unchanged
+
+pool.sample();          // -> a uniform member (peek); size UNCHANGED, never throws
+pool.sample();          // -> another uniform draw (advances the per-instance RNG)
+
+pool.removeRandom();    // -> a uniform member, REMOVED (swap-last, cross-check intact)
+pool.size;              // -> 2
+
+pool.has(42);           // -> true / false depending on the draw (still O(1))
+
+// Two DEFAULT-seeded instances produce IDENTICAL sequences -- pass distinct seeds
+// (Date.now(), a counter, crypto) to decorrelate independent pools.
+```
+
+Both `sample()` and `removeRandom()` are WORST-CASE O(1) and zero-allocation after construction; both return `undefined` on an empty set (never throw). The `witness` harness proves `sample()` holds its ops/ms while a native `Set` that iterates-to-the-kth to pick uniformly collapses as the set grows:
+
+```
+  size      RandomSet ops/ms   naive ops/ms   ratio
+  --------  ----------------   ------------   -----
+  1e3            ~126152.43        ~267.53  ~471.55x   <- L1 micro-case (shown, not gated)
+  1e4            ~123407.27         ~26.71 ~4620.93x
+  1e5            ~119660.17          ~2.50 ~47770x
+
+  RandomSet flatness (size >= 1e4): ~0.97   (gate >= 0.70)
+  naive foil flatness (last/first): ~0.09   (gate <= 0.55)
+  min RandomSet/naive ratio:        ~4620x  (gate >= 1.50x)
+```
+
+RandomSet's `sample()` streams flat across the size sweep while the naive Set-walk collapses ~10x per order of magnitude. The foil is walked with `Set.forEach` (which allocates nothing per step -- NOT `Array.from(set)[k]`), so the gap is a pure SPEED comparison, not an allocation strawman. There is deliberately NO MAX-single-op line: `sample()` / `removeRandom()` are worst-case O(1) (an RNG advance + one high-bits dense index, no rejection loop, no run) -- the flat line IS the worst-case claim. The size=1e3 point is a pure-L1 micro-case that turbo-spikes as the flatness denominator, so it is displayed but excluded from the gate (the same steady-window discipline SparseSet uses; the `0.70` floor is unchanged, only the domain is pinned). (Absolute ops/ms is machine-specific; reproduce on your own hardware.)
+
+### How RandomSet works
+
+<details>
+<summary>Why the dense array makes sampling O(1), the high-bits index map, and the disclosed multiply-bias.</summary>
+
+A RandomSet holds the SparseSet substrate -- a `dense` array packing the live members contiguously in `[0, n)`, and a `sparse` array mapping each key to its dense index, cross-checked by `sparse[k] < n && dense[sparse[k]] === k`. Because the live members are packed with no gaps, **a uniform index `i` in `[0, n)` picks `dense[i]`, a uniform member, in one read.**
+
+The index comes from a per-instance Numerical Recipes LCG advanced on each draw:
+
+```
+s = (s * 1664525 + 1013904223) >>> 0        // advance the per-instance RNG word
+idx = Math.floor(s / 2**32 * n)             // the HIGH bits, mapped into [0, n)
+```
+
+- **`sample()`** advances `s` and returns `dense[idx]` -- a pure peek (membership unchanged; it DOES advance the RNG, which is the point).
+- **`removeRandom()`** advances `s`, reads `key = dense[idx]`, then swaps the last dense entry into the hole and fixes ITS `sparse` back-pointer -- the EXACT swap `delete` uses, so the cross-check invariant stays intact -- and decrements `n`. Returns `key`.
+- Both return `undefined` on an empty set; `clear()` is `n = 0` (the store is left byte-identical and the RNG word is NOT reset).
+
+**Why the high bits, not `s % n`.** An NR LCG's LOW bits have a short period (the classic power-of-two-modulus weakness), so `s % n` would bias the pick toward small indices. Scaling by `s / 2^32 * n` reads the HIGH bits, which carry the good entropy. Verified: 100 members x 1e6 draws keeps every bucket in `[9400, 10600]` and chi-square `< 148.23` (the 99.9% critical value for 99 df), deterministically.
+
+**Why NO rejection sampling.** The textbook way to remove ALL bias from a 32-bit word is to reject-and-redraw the top residue -- but that makes a single draw UNBOUNDED in the worst case, breaking the worst-case-O(1) guarantee this member exists to make. So RandomSet does not reject; the residual multiply-bias is at most `n / 2^32` (a few indices are ~`1 + n/2^32` times likelier), utterly negligible for any `n` this substrate holds. It is DISCLOSED here, not coded around. Uniformity is STATISTICAL, not cryptographic -- draw from `crypto` and index the dense array directly for adversarial use.
+
+**Seed and determinism.** The seed is a positional 3rd ctor arg stored per-instance (NEVER module-level state), validated fail-closed at the ctor door (a non-integer / non-number throws `[lite-o1]`, typeof-guarded before the coercing `>>>`; any integer is folded into the uint32 domain via `>>> 0`). Because the seed defaults to a constant and the RNG is per-instance, two DEFAULT-seeded RandomSets holding the same members produce IDENTICAL `sample()` / `removeRandom()` sequences -- a deliberate reproducibility, not a bug. Pass distinct seeds to decorrelate.
+
+</details>
+
+### RandomSet API reference
+
+```ts
+new RandomSet(universe: number, capacity?: number, seed?: number)   // seed default 0x9e3779b1
+```
+
+- **`universe`** -- the exclusive key ceiling; an integer in `[1, 2^32]`. Keys are integers in `[0, universe)`.
+- **`capacity`** -- the maximum number of live members; an integer in `[1, universe]`, default `universe`. The constructor throws a `[lite-o1]`-tagged `RangeError` on a bad `universe` / `capacity`.
+- **`seed`** -- the RNG seed; ANY integer (coerced into the uint32 domain via `>>> 0`), default `0x9e3779b1`. Validated fail-closed at the ctor door (a non-integer / non-number throws `[lite-o1]`, typeof-guarded first so a Symbol / BigInt never reaches coercion). Stored per-instance -- never module-level RNG state.
+
+```ts
+add(k: number): this                 // insert (idempotent); O(1); throws on a bad key / when full
+has(k: number): boolean              // membership; O(1); a bad key is absent (never throws)
+delete(k: number): boolean           // remove (swap-last); O(1); absent / bad key returns false
+sample(): number | undefined         // a uniform-random live member (peek); worst-case O(1); undefined on empty
+removeRandom(): number | undefined   // remove + return a uniform-random live member; worst-case O(1); undefined on empty
+clear(): void                        // O(1) empty; resets the count; zeroes no store; does NOT reseed
+forEach(fn: (key: number, set: RandomSet) => void): void   // present keys, insertion order, alloc-free
+[Symbol.iterator](): IterableIterator<number>              // present keys, insertion order
+get size: number                     // live member count
+get capacity: number                 // max live members as constructed
+```
+
+- **`add(k)`** throws `[lite-o1] key out of universe ...` for a key that is not an integer in `[0, universe)` (including `-1`, `1.5`, `NaN`, `null`, a Symbol / BigInt, and `k === universe`), and `[lite-o1] RandomSet full ...` when a NEW key would exceed capacity. `-0` aliases key `0` (uint32 coercion).
+- **`has(k)` / `delete(k)`** never throw: a bad key is simply absent. `null` is rejected as `null`, never coerced to key `0`.
+- **`sample()` / `removeRandom()`** never throw: an empty set returns `undefined`. Because every stored key is a real uint32, `undefined` unambiguously means "empty".
+
+**Reach for RandomSet when** you need a uniform-random element of a live integer set on a hot path -- random eviction, reservoir-style sampling, randomized load-balancing, particle / agent pools, fuzz-input selection -- at worst-case O(1) with zero per-op allocation and REPRODUCIBLE (seeded) randomness, and you were about to reach for `Array.from(set)[k]`. **Avoid it when** you need cryptographic uniformity (draw from `crypto`; the pick has a disclosed `<= n/2^32` multiply-bias), weighted (non-uniform) sampling, string / object / huge-domain keys (the SparseSet caveat applies), or you want two default-seeded instances to differ (pass distinct seeds). See [`GUIDE.md`](./GUIDE.md) for the full reach-for / avoid / measure-it.
+
+---
+
 ## Composability with the ecosystem
 
 SparseSet is the dense-integer membership primitive under an ECS-style loop. A common pattern: a `SparseSet` per component tracks which entity ids currently have that component; a `@zakkster/lite-arena` `Arena` owns the component payloads by generational handle. Membership and iteration are O(1) and alloc-free; the per-frame `clear()` of a scratch set (visited masks, this-frame-touched ids) is free.
@@ -742,6 +850,20 @@ The value guard is the same branchless typeof-first check as RingDeque (`typeof 
 
 The value guard is the same branchless typeof-first check as RingDeque (`typeof v !== 'number' || v !== v`), with the `_bad` / `_full` throw builders (using `String(v)`) on the cold path. The running-extreme carry is a single compare against the prior prefix (no loop), so `push` is WORST-CASE O(1) -- not amortized -- and `pop` recomputes nothing (the prefix below the new top is already correct). The full check precedes every store, so a full-stack push is a byte-identical no-op. The torture and perf gates prove MinStack at **0 B/op** across push-churn / pop-drain / extreme-read scenarios, with a 0-delta on BOTH `Float64Array` columns (fixed capacity -- no resize) and the leak tracker back at `size() = 0`. `forEach` is the alloc-free O(k) scan; `[Symbol.iterator]` is the one op that allocates, by generator protocol.
 
+**RandomSet** allocates its two `Uint32Array` columns (dense + sparse) once, at construction, and carries one per-instance RNG word:
+
+| Operation                        | Steady-state allocations |
+| -------------------------------- | ------------------------ |
+| `add(k)` / `has(k)` / `delete(k)`| **0** (the SparseSet substrate) |
+| `sample()`                       | **0** (RNG advance + one dense read) |
+| `removeRandom()`                 | **0** (RNG advance + swap-last) |
+| `clear()`                        | **0** (`n = 0`)          |
+| `forEach(fn)`                    | **0** (O(size) scan)     |
+| `[Symbol.iterator]()`            | a `{value,done}` per step (protocol) |
+| `new RandomSet(...)`             | once, at construction (both typed arrays) |
+
+The key guard is the same branchless typeof-first check as SparseSet (`typeof k !== 'number' || (k >>> 0) !== k || k >= universe`), with the `_oob` / `_full` throw builders (using `String(k)`) on the cold path; the seed is validated once at the ctor door (typeof-guarded before `>>> 0`). `sample()` and `removeRandom()` are pure integer arithmetic -- an LCG advance (`s = (s * 1664525 + 1013904223) >>> 0`) and a high-bits index (`Math.floor(s / 2**32 * n)`) into the dense array, plus the swap-last back-pointer fix for `removeRandom` -- so no coercion and no heap double ever enters the hot body. The torture and perf gates prove RandomSet at **0 B/op** across sample-read / removeRandom-drain / add-churn / forEach-scan scenarios, with a 0-delta on BOTH `Uint32Array` columns (fixed capacity -- no resize) and the leak tracker back at `size() = 0`. `forEach` is the alloc-free O(size) scan; `[Symbol.iterator]` is the one op that allocates, by generator protocol.
+
 </details>
 
 ---
@@ -757,23 +879,24 @@ The value guard is the same branchless typeof-first check as RingDeque (`typeof 
 - **UnionFind is amortized, not worst-case, and honest about it.** Path halving (iterative, no stack -- so zero-alloc) plus union by size bound any single op at O(alpha(n)) amortized; a single `find` is O(depth) worst-case, and the witness proves the amortized line against a naive-disjoint-set foil. `reset()` and `forEachRoots()` are the O(n) exceptions (named `reset()`, not `clear()`, to flag the cost); `roots()` is the one allocating op. See [`decisions/0007`](./decisions/0007-unionfind-path-halving-union-by-size.md).
 - **MonoDeque is a caller-driven windowing primitive, amortized and honest about it.** The monotone invariant lives in the deque (`push` pops dominated back entries -- amortized O(1), a single push is O(k) worst-case); the window rule lives in the caller (`push` returns a seq, `evictOlderThan(seq)` slides). `kind` is frozen per instance (one invariant, no per-op mode branch). Two numeric `Float64Array` columns keep it zero-GC and `undefined`-on-empty unambiguous; the seq ceiling is `MAX_SEQ = 2^53` (fail closed past it). The witness prints the MAX single-op time beside the flat amortized curve. See [`decisions/0008`](./decisions/0008-monodeque-monotonic-amortized.md).
 - **MinStack is worst-case O(1), not amortized -- and its capacity is exact.** A second `Float64Array` column carries the running extreme forward in one compare per push (`ext[n] = min-or-max(v, ext[n-1])`), so `extreme()` is a single prefix read and `pop()` recomputes nothing -- both worst-case O(1), no spike. Capacity is EXACT (a stack has a linear top pointer, no `& MASK` wrap, so no power-of-two rounding), a deliberate departure from RingDeque / MonoDeque. `kind` is frozen per instance. The rejected compressed-second-stack alternative would make `pop` conditional and degrade to the same size on an adversarial feed; the honest cost of the flat column is 2x memory (so the 2^31 ceiling is a TYPE bound, not a practical size). See [`decisions/0010`](./decisions/0010-minstack.md).
+- **RandomSet reuses SparseSet's substrate and samples by the LCG's HIGH bits, no rejection.** It is a distinct, tree-shakeable class that duplicates SparseSet's dense + sparse cross-check verbatim (SparseSet's own class body stays byte-identical), so the contiguous dense array makes a uniform pick a single high-bits index -- `idx = floor(s / 2^32 * n)`, NOT `s % n` (the NR LCG's low bits are weak). No rejection sampling (it would break worst-case O(1)); the residual multiply-bias `<= n/2^32` is DISCLOSED, not coded around (statistical, not cryptographic). The seed is a per-instance positional 3rd ctor arg (never module state), so two default-seeded instances produce IDENTICAL sequences -- pass distinct seeds to decorrelate. Both `sample()` (peek) and `removeRandom()` (swap-remove) ship. See [`decisions/0011`](./decisions/0011-randomset.md).
 
 ---
 
 ## Testing
 
-**215 deterministic `node:test` cases**, plus a torture gate, a hard perf gate, and the O(1) witness gate.
+**246 deterministic `node:test` cases**, plus a torture gate, a hard perf gate, and the O(1) witness gate.
 
 ```bash
-npm test           # 215 node:test cases (contract + boundary + differential fuzz)
+npm test           # 246 node:test cases (contract + boundary + differential fuzz)
 npm run test:types # tsc --noEmit against O1.d.ts
 npm run torture    # @zakkster/lite-leak + lite-gc-profiler: 0 B/op + leak-free
 npm run witness    # the O(1) throughput-invariance harness + foils + flatness gate
 npm run test:perf  # @zakkster/lite-perf-gate: hard zero-alloc scavenge-scaling gate
-npm run verify     # all five, the publish gate
+npm run verify     # all six, the publish gate
 ```
 
-For SparseSet the suite covers: constructor validation (every bad `universe` / `capacity`), the add/has/delete/clear/iterate surface, the delete-swap back-pointer, idempotent add, insertion-order iteration, the full fail-closed key surface (`add` throws `/^\[lite-o1\]/`, `has` never throws), `null is not zero`, a **byte-identical** proof that `clear()` leaves the dense + sparse `ArrayBuffer`s untouched, and a **1,000,000-op differential fuzz** of mixed add/delete/has against a native `Set` oracle. For RingDeque: power-of-two capacity rounding, push/pop/peek at both ends, wrap-around across the `& MASK` seam, the fail-closed surface (full push throws as a byte-identical no-op; a non-number or NaN throws; a Symbol / BigInt fails closed, not raw; `+/-Infinity` accepted; empty pop/peek returns `undefined`), a byte-identical `clear()` proof, and a **1,000,000-op both-ends differential fuzz** against a plain-`Array` reference deque (0 divergences, with the full-throw and empty-undefined edges both exercised). For UnionFind: constructor validation (every bad `n`), the find/union/connected/componentSize/count/reset/forEachRoots/roots surface, `count` decrementing exactly once per true merge, a **path-halving depth-shrink proof** (a test-only peek at `_parent`), the full fail-closed element surface (a bad element -- including a Symbol / BigInt -- throws `/^\[lite-o1\]/`, never raw; `null is not zero`), and a **>= 100,000-op mixed union/find/connected differential fuzz** against a trivial no-compression / no-union-by-size oracle (0 divergences on connectivity, component size, and live count). For MonoDeque: power-of-two capacity rounding, seq assignment + dominated-pop for both `'min'` and `'max'`, `evictOlderThan` window slides, the fail-closed surface (ctor rejects a bad capacity + a bad kind; push throws on a non-number / NaN / Symbol / BigInt / object-with-valueOf, `+/-Infinity` accepted; a full push throws as a byte-identical no-op; `value` / `frontSeq` on empty return `undefined`), a byte-identical `clear()` proof, and a **>= 1,000,000-op push/evictOlderThan/value differential fuzz (both kinds)** against a brute-force sliding-window-extreme oracle (0 divergences), which also proves the monotone invariant and the amortized bound (total pops `<=` total pushes). For MinStack: exact capacity (NOT rounded), the push/pop/peek/extreme/clear surface for both `'min'` and `'max'`, the running-extreme carry + the exact restore of the prior extreme after each pop, the fail-closed surface (ctor rejects a bad capacity + a bad kind; push throws on a non-number / NaN / Symbol / BigInt / object-with-valueOf, `+/-Infinity` accepted; a full push throws as a byte-identical no-op; `pop` / `peek` / `extreme` on empty return `undefined`), a byte-identical `clear()` proof (same buffer identity), and a **>= 1,000,000-op interleaved push/pop differential fuzz (both kinds)** against a brute-force `Math.min` / `Math.max` oracle over the live array (0 divergences). No gate output is a FAIL.
+For SparseSet the suite covers: constructor validation (every bad `universe` / `capacity`), the add/has/delete/clear/iterate surface, the delete-swap back-pointer, idempotent add, insertion-order iteration, the full fail-closed key surface (`add` throws `/^\[lite-o1\]/`, `has` never throws), `null is not zero`, a **byte-identical** proof that `clear()` leaves the dense + sparse `ArrayBuffer`s untouched, and a **1,000,000-op differential fuzz** of mixed add/delete/has against a native `Set` oracle. For RingDeque: power-of-two capacity rounding, push/pop/peek at both ends, wrap-around across the `& MASK` seam, the fail-closed surface (full push throws as a byte-identical no-op; a non-number or NaN throws; a Symbol / BigInt fails closed, not raw; `+/-Infinity` accepted; empty pop/peek returns `undefined`), a byte-identical `clear()` proof, and a **1,000,000-op both-ends differential fuzz** against a plain-`Array` reference deque (0 divergences, with the full-throw and empty-undefined edges both exercised). For UnionFind: constructor validation (every bad `n`), the find/union/connected/componentSize/count/reset/forEachRoots/roots surface, `count` decrementing exactly once per true merge, a **path-halving depth-shrink proof** (a test-only peek at `_parent`), the full fail-closed element surface (a bad element -- including a Symbol / BigInt -- throws `/^\[lite-o1\]/`, never raw; `null is not zero`), and a **>= 100,000-op mixed union/find/connected differential fuzz** against a trivial no-compression / no-union-by-size oracle (0 divergences on connectivity, component size, and live count). For MonoDeque: power-of-two capacity rounding, seq assignment + dominated-pop for both `'min'` and `'max'`, `evictOlderThan` window slides, the fail-closed surface (ctor rejects a bad capacity + a bad kind; push throws on a non-number / NaN / Symbol / BigInt / object-with-valueOf, `+/-Infinity` accepted; a full push throws as a byte-identical no-op; `value` / `frontSeq` on empty return `undefined`), a byte-identical `clear()` proof, and a **>= 1,000,000-op push/evictOlderThan/value differential fuzz (both kinds)** against a brute-force sliding-window-extreme oracle (0 divergences), which also proves the monotone invariant and the amortized bound (total pops `<=` total pushes). For MinStack: exact capacity (NOT rounded), the push/pop/peek/extreme/clear surface for both `'min'` and `'max'`, the running-extreme carry + the exact restore of the prior extreme after each pop, the fail-closed surface (ctor rejects a bad capacity + a bad kind; push throws on a non-number / NaN / Symbol / BigInt / object-with-valueOf, `+/-Infinity` accepted; a full push throws as a byte-identical no-op; `pop` / `peek` / `extreme` on empty return `undefined`), a byte-identical `clear()` proof (same buffer identity), and a **>= 1,000,000-op interleaved push/pop differential fuzz (both kinds)** against a brute-force `Math.min` / `Math.max` oracle over the live array (0 divergences). For RandomSet: the full SparseSet contract (add/has/delete/clear/iterate, fail-closed bad-key + capacity, `null is not zero`, Symbol / BigInt rejected typeof-first, `-0` aliases 0), a bad-seed reject at the ctor door (typeof-first, no raw TypeError), a **>= 1,000,000-op interleaved add/delete/sample/removeRandom differential fuzz** against a native `Set` oracle (0 divergences: `sample` never mutates, `removeRandom` only ever returns a live member), a **10,000-member `removeRandom()` drain** returning every key exactly once with the sparse/dense cross-check intact throughout, empty-edge stability (1,000 empty `sample()` / `removeRandom()` calls -> `undefined`, 0 throws), a **UNIFORMITY** gate (100 members x 1,000,000 `sample()` draws at seed `0x9e3779b1`: every bucket in `[9400, 10600]` AND chi-square `< 148.23` for 99 df, reproduced deterministically across runs), and **DETERMINISM** (two same-seed instances give identical 100,000-draw sequences; distinct seeds diverge within 10 draws). No gate output is a FAIL.
 
 ---
 
@@ -781,7 +904,7 @@ For SparseSet the suite covers: constructor validation (every bad `universe` / `
 
 The **eight-dimension benchmark suite** -- the ecosystem MVP of the research notes --
 lives in `benchmark/` as repo-only dev infra (it is NOT in the published tarball and
-NOT a data-structure member). It profiles all five members against the JS built-in
+NOT a data-structure member). It profiles all six members against the JS built-in
 each one replaces, across eight axes that a single ops/ms number hides: D1 latency
 distribution (p50..max, with + without forced GC), D2 amortized drift, D3 memory,
 D4 cache behaviour (a labelled PORTABLE PROXY -- no native perf counters), D5 bundle
@@ -789,7 +912,7 @@ size + tree-shaking, D6 GC pressure + allocation curve, D7 key-type + load-facto
 scaling, and D8 workload micro-benches.
 
 ```bash
-npm run bench          # run all 40 (member x dimension) cells, one child process each
+npm run bench          # run all 48 (member x dimension) cells, one child process each
 npm run bench:report   # the above, then render a zero-dep HTML report (hand-rolled SVG)
                        #   -> benchmark/report.html (open it for the full charts + tables)
 ```
@@ -798,20 +921,22 @@ Key deterministic results (machine-independent; latency / throughput numbers var
 host and live in the report):
 
 **D5 -- bundle size + tree-shaking** (esbuild minify + gzip). A single-member import
-drops the other four; the all-member import is ~1.9 KB gzipped:
+drops the other five; the all-member import is ~2.1 KB gzipped:
 
 | import        | gzip (single) | gzip (all) | single / all |
 |---------------|---------------|------------|--------------|
-| SparseSet     | ~577 B        | ~1906 B    | ~0.30        |
-| RingDeque     | ~646 B        | ~1906 B    | ~0.34        |
-| UnionFind     | ~594 B        | ~1906 B    | ~0.31        |
-| MonoDeque     | ~817 B        | ~1906 B    | ~0.43        |
-| MinStack      | ~604 B        | ~1906 B    | ~0.32        |
+| SparseSet     | ~577 B        | ~2081 B    | ~0.28        |
+| RingDeque     | ~646 B        | ~2081 B    | ~0.31        |
+| UnionFind     | ~594 B        | ~2081 B    | ~0.29        |
+| MonoDeque     | ~817 B        | ~2081 B    | ~0.39        |
+| MinStack      | ~604 B        | ~2081 B    | ~0.29        |
+| RandomSet     | ~716 B        | ~2081 B    | ~0.34        |
 
 Tree-shaking works for every member (each lone import is smaller than the whole).
-The "< 40% of all" claim holds for SparseSet / RingDeque / UnionFind / MinStack;
-MonoDeque is the honest exception (~0.43) because it is the single heaviest member --
-nearly half the library's code -- so its lone import is inherently ~half the bundle.
+The "< 40% of all" claim holds for every member; MonoDeque is the closest to the
+line (~0.39) because it is the single heaviest member -- nearly half the library's
+code -- so its lone import is inherently the largest fraction of the bundle.
+(The single/all fractions shift with the sixth member; reproduce with `npm run bench`.)
 
 **D6 -- GC pressure curve** (n = 1e3 .. 1e6, the 0 B/op gate as a measured line):
 
@@ -822,6 +947,7 @@ nearly half the library's code -- so its lone import is inherently ~half the bun
 | UnionFind | yes        | 0            | <= 1                     |
 | MonoDeque | yes        | 0            | <= 1                     |
 | MinStack  | yes        | 0            | <= 1                     |
+| RandomSet | yes        | 0            | <= 1                     |
 
 **D3 -- memory footprint** (bytes per live element vs the theoretical minimum):
 
@@ -832,8 +958,9 @@ nearly half the library's code -- so its lone import is inherently ~half the bun
 | UnionFind | 8            | 8 (parent+size) | 1.0x     |
 | MonoDeque | sized for worst case | 16 (value+seq) | fixed-capacity: sized for a fully-monotone window, so few survivors after dominated pops |
 | MinStack  | 16           | 16 (value+ext)  | 1.0x per live element; the running-extreme column doubles a plain numeric stack |
+| RandomSet | 8            | 4 (dense slot)  | 2.0x (the sparse index doubles it, same as SparseSet) |
 
-All five are fixed-capacity by design: they reuse one backing store, so `clear()`
+All six are fixed-capacity by design: they reuse one backing store, so `clear()`
 retains the buffer (stated, not implicit). The suite's applicability matrix emits the
 string `n/a` -- never `0` -- for cells that do not apply (fail closed). D4 is labelled
 a PROXY (dense-iteration vs random-lookup + a working-set stride sweep) because a true
@@ -849,9 +976,10 @@ ADR [`0009`](./decisions/0009-benchmark-suite.md) for the design and the settled
 - **Not a splittable disjoint-set.** UnionFind is merge-only: there is no per-element un-merge / undo. `reset()` re-singletons the whole forest in O(n); rollback means keeping your own edge log and rebuilding. It also eagerly allocates two `n`-sized `Uint32Array` columns at construction, so it is not for a huge / unbounded or non-integer element domain -- and a single `find` is amortized alpha(n), not worst-case O(1).
 - **Not a general-purpose window aggregator.** MonoDeque answers only the window MIN or MAX (one, frozen at construction -- run two instances for both), not the median, k-th, or SUM of the window. It stores numbers only, is caller-driven (it does not evict on its own -- you call `evictOlderThan`), and a single `push` is amortized O(1) (O(k) worst-case).
 - **Not a general-purpose stack aggregator.** MinStack answers only the running MIN or MAX of the live stack (one, frozen at construction -- run two instances for both), not the median, k-th, or SUM. It stores numbers only, is a STACK (LIFO -- not a queue or a sliding window; reach for RingDeque or MonoDeque for those), and its running-extreme column doubles the backing memory (so its 2^31 ceiling is a TYPE bound, not a practical size).
-- **Not a growable collection.** All five members are fixed-capacity: a SparseSet key past capacity, or a RingDeque / MonoDeque / MinStack push on a full store, throws; UnionFind's element universe `n` is fixed at construction. This is deliberate (worst-case / amortized bounds, fail closed -- no hidden resize), not a missing feature. An overwrite-oldest RingDeque preset (RingLog) is a deferred future variant, not the current default.
-- **Not a payload store.** SparseSet holds membership, RingDeque holds numbers, UnionFind holds connectivity, MonoDeque holds numeric window extremes, MinStack holds numeric stack values + their running extreme -- none holds object payloads. Store component data in a parallel SoA column or `@zakkster/lite-arena` keyed by the same ids / handles.
-- **Not the full family yet.** v0.5.0 is SparseSet + RingDeque + UnionFind + MonoDeque + MinStack. SlotPool is on the roadmap, not in this release.
+- **Not a cryptographic or weighted sampler.** RandomSet's `sample()` / `removeRandom()` are UNIFORM and STATISTICAL: the pick uses the LCG's high bits with no rejection, so a disclosed multiply-bias `<= n/2^32` remains -- draw from `crypto` for adversarial use, and reach elsewhere for weighted (non-uniform) sampling. Its keys are integers in `[0, universe)` (the SparseSet caveat applies), and two default-seeded instances share a sequence (pass distinct seeds to decorrelate).
+- **Not a growable collection.** All six members are fixed-capacity: a SparseSet / RandomSet key past capacity, or a RingDeque / MonoDeque / MinStack push on a full store, throws; UnionFind's element universe `n` is fixed at construction. This is deliberate (worst-case / amortized bounds, fail closed -- no hidden resize), not a missing feature. An overwrite-oldest RingDeque preset (RingLog) is a deferred future variant, not the current default.
+- **Not a payload store.** SparseSet holds membership, RingDeque holds numbers, UnionFind holds connectivity, MonoDeque holds numeric window extremes, MinStack holds numeric stack values + their running extreme, RandomSet holds integer membership + uniform sampling -- none holds object payloads. Store component data in a parallel SoA column or `@zakkster/lite-arena` keyed by the same ids / handles.
+- **Not the full family yet.** v0.6.0 is SparseSet + RingDeque + UnionFind + MonoDeque + MinStack + RandomSet. SlotPool is on the roadmap, not in this release.
 - **Not itself a benchmark suite.** The witness proves throughput invariance (one axis); the full eight-dimension latency/memory/cache/GC suite lives in `benchmark/` as repo-only dev infra (`npm run bench:report`), NOT shipped in the published package.
 
 ---

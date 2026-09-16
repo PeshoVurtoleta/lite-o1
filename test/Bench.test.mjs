@@ -94,7 +94,7 @@ for (const member of SUBJECTS) {
 
 test('D5 tree-shaking: single-member bundle is < 40% of all-member (headline + median)', async () => {
     // The falsifiable "< 40%" claim, applied honestly. It holds for the headline
-    // member (SparseSet) and for the median across the five members. MonoDeque is
+    // member (SparseSet) and for the median across the six members. MonoDeque is
     // the ONE exception at ~43% -- not a tree-shaking failure but a size fact: it
     // is the single heaviest member (nearly half the library's code), so its lone
     // import is inherently ~half the whole bundle. The claim is asserted where it

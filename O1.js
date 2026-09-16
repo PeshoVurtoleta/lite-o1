@@ -3,9 +3,10 @@
  * that doubles as a teachable textbook: each member solves a real problem AND
  * proves its constant is real (the O(1) Witness -- see test/witness.mjs).
  *
- * v0.5.0 ships five members -- SparseSet, RingDeque, UnionFind, MonoDeque, and
- * MinStack -- plus its `VERSION` const. The five are independent (no shared mutable
- * module state), so a bundler that imports one drops the others (`sideEffects: false`).
+ * v0.6.0 ships six members -- SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
+ * and RandomSet -- plus its `VERSION` const. The six are independent (no shared
+ * mutable module state), so a bundler that imports one drops the others
+ * (`sideEffects: false`).
  *
  * The complexity class IS the product: every hot op below is O(1) worst-case and
  * allocates ZERO bytes after construction. The witness harness (never imported
@@ -16,7 +17,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '0.5.0';
+export const VERSION = '0.6.0';
 
 /** Largest universe the Uint32 substrate + the (k >>> 0) key check can honor. */
 const MAX_UNIVERSE = 0x100000000; // 2^32
@@ -941,5 +942,207 @@ export class MinStack {
     /** @private */
     _full() {
         throw new RangeError('[lite-o1] MinStack full (capacity ' + this._cap + ')');
+    }
+}
+
+/**
+ * RandomSet -- a zero-GC O(1) integer set (a dense + sparse Uint32Array pair)
+ * that ALSO samples a uniform-random live member in WORST-CASE O(1).
+ *
+ * add / has / delete / clear / iterate are the SparseSet contract, DUPLICATED
+ * verbatim: membership is the same single cross-checked double indirection
+ *
+ *     sparse[k] < n  &&  dense[sparse[k]] === k
+ *
+ * so `clear()` is O(1) (resets the count, zeroes no store) and iteration walks the
+ * dense prefix alloc-free. The dense array's insertion-order packing is exactly
+ * what makes uniform sampling O(1): a uniform index into `[0, n)` picks a uniform
+ * member with no scan, no rejection loop, no reservoir.
+ *
+ * Two random ops sit on top of that substrate:
+ *   - `sample()` -- return a uniform-random live member WITHOUT removing it. A pure
+ *     peek of the set (it DOES advance the per-instance RNG word `_s` -- that IS the
+ *     RNG state). WORST-CASE O(1), zero-alloc, `undefined` on an empty set, never throws.
+ *   - `removeRandom()` -- remove AND return a uniform-random live member, via the
+ *     same swap-last-into-hole that `delete` uses (so the sparse/dense cross-check
+ *     stays exact). WORST-CASE O(1), zero-alloc, `undefined` on empty, never throws.
+ *
+ * The RNG is a per-instance Numerical Recipes LCG advanced as
+ * `s = (s * 1664525 + 1013904223) >>> 0`, mapped to an index by the HIGH bits --
+ * `idx = floor(s / 2^32 * n)` -- NOT `s % n`: the low bits of an NR LCG are weak
+ * (short period), so a modulo would bias the pick toward small indices. The high
+ * bits carry the good entropy. NO rejection sampling is used (it would break the
+ * worst-case-O(1) guarantee); the residual multiply-bias is <= n/2^32 (negligible
+ * for any n that fits this substrate) and is DISCLOSED, not coded around (see ADR
+ * 0011). The seed is a POSITIONAL 3rd ctor arg stored in the instance field `_s`;
+ * there is NO module-level RNG state, so two RandomSets never share a stream and a
+ * given seed is fully reproducible. Two DEFAULT-seeded instances therefore produce
+ * IDENTICAL sample()/removeRandom() sequences -- pass distinct seeds to decorrelate.
+ *
+ * Universe is [0, universe); at most `capacity` entries are live at once. Fail
+ * closed exactly like SparseSet: an out-of-range or non-integer key is ABSENT
+ * (has returns false, never throws); adding one, or adding past capacity, throws a
+ * [lite-o1]-tagged error. `null` is not zero -- (null >>> 0) === null is false, so
+ * null is rejected. `-0` aliases element 0 via the uint32 coercion, not rejected.
+ * The seed is validated fail-closed at the ctor door: a non-integer / non-number
+ * throws [lite-o1] (typeof-guarded FIRST so a Symbol / BigInt never reaches `>>>`),
+ * and any integer is coerced into the uint32 domain with `>>> 0`.
+ */
+export class RandomSet {
+    /**
+     * @param {number} universe        exclusive key ceiling; integer in [1, 2^32].
+     * @param {number} [capacity=universe]  max live entries; integer in [1, universe].
+     * @param {number} [seed=0x9e3779b1]    RNG seed; any integer (coerced to uint32).
+     */
+    constructor(universe, capacity = universe, seed = 0x9e3779b1) {
+        if (!Number.isInteger(universe) || universe < 1 || universe > MAX_UNIVERSE) {
+            throw new RangeError(
+                '[lite-o1] universe must be an integer in [1, 2^32], got ' + universe);
+        }
+        if (!Number.isInteger(capacity) || capacity < 1 || capacity > universe) {
+            throw new RangeError(
+                '[lite-o1] capacity must be an integer in [1, ' + universe + '], got ' + capacity);
+        }
+        // typeof guard BEFORE any coercion: Number.isInteger never coerces (false on
+        // a Symbol / BigInt), and String(seed) in the cold message is Symbol-safe.
+        // Any integer is accepted and folded into the uint32 RNG domain via >>> 0.
+        if (typeof seed !== 'number' || !Number.isInteger(seed)) {
+            throw new RangeError(
+                '[lite-o1] seed must be an integer, got ' + String(seed));
+        }
+        this._universe = universe;
+        this._cap = capacity;
+        this._dense = new Uint32Array(capacity);  // dense[i] = the i-th member key
+        this._sparse = new Uint32Array(universe); // sparse[k] = index into _dense (valid iff cross-check holds)
+        this._n = 0;
+        this._s = seed >>> 0;                     // per-instance RNG word (never module state)
+    }
+
+    /** Number of live members. O(1). */
+    get size() { return this._n; }
+
+    /** Max live members this set was sized for. O(1). */
+    get capacity() { return this._cap; }
+
+    /**
+     * True iff k is present. O(1): one branchless key check + one cross-checked
+     * indirection. A bad key (negative, fractional, NaN, null, Symbol, BigInt,
+     * >= universe) is ABSENT, never a throw and never slot 0. The `typeof`
+     * short-circuits BEFORE `>>>` runs, because `>>>` coerces its operand first
+     * and that coercion THROWS on a Symbol or BigInt; `(k >>> 0) !== k` then
+     * rejects every non-uint32 number in one test.
+     */
+    has(k) {
+        if (typeof k !== 'number' || (k >>> 0) !== k || k >= this._universe) return false;
+        const i = this._sparse[k];
+        return i < this._n && this._dense[i] === k;
+    }
+
+    /**
+     * Add k. O(1). Idempotent -- re-adding a present key is a no-op. Fails closed:
+     * a bad key throws via _oob; a new key when full throws via _full.
+     * @returns {RandomSet} this
+     */
+    add(k) {
+        if (typeof k !== 'number' || (k >>> 0) !== k || k >= this._universe) return this._oob(k);
+        const i = this._sparse[k];
+        if (i < this._n && this._dense[i] === k) return this; // already present
+        if (this._n === this._cap) return this._full();
+        const j = this._n++;
+        this._dense[j] = k;
+        this._sparse[k] = j;
+        return this;
+    }
+
+    /**
+     * Delete k by swapping the last dense entry into its slot and fixing that
+     * entry's back-pointer. O(1). A bad or absent key returns false (never throws).
+     * @returns {boolean} true iff k was present and removed.
+     */
+    delete(k) {
+        if (typeof k !== 'number' || (k >>> 0) !== k || k >= this._universe) return false;
+        const i = this._sparse[k];
+        if (i >= this._n || this._dense[i] !== k) return false;
+        const last = --this._n;
+        const moved = this._dense[last];
+        this._dense[i] = moved;
+        this._sparse[moved] = i;
+        return true;
+    }
+
+    /**
+     * Empty the set in O(1). Resets the live count only -- the dense and sparse
+     * stores are left BYTE-IDENTICAL; the stale sparse entries fail the has()
+     * cross-check, so they can never read as present. The RNG word `_s` is NOT
+     * reset (clear empties the set, it does not reseed the stream).
+     */
+    clear() { this._n = 0; }
+
+    /**
+     * Iterate present keys in insertion order, alloc-free. O(size).
+     * @param {(key:number, set:RandomSet)=>void} fn
+     */
+    forEach(fn) {
+        const d = this._dense;
+        for (let i = 0; i < this._n; i++) fn(d[i], this);
+    }
+
+    /** Iterate present keys in insertion order. O(size). */
+    *[Symbol.iterator]() {
+        const d = this._dense;
+        for (let i = 0; i < this._n; i++) yield d[i];
+    }
+
+    /**
+     * Return a uniform-random live member WITHOUT removing it. WORST-CASE O(1),
+     * zero-alloc. `undefined` on an EMPTY set, NEVER throws (mirrors the query
+     * contract). Advances the per-instance RNG word `_s` (that IS the RNG state --
+     * a pure peek of the SET's membership, but not of the RNG). The index is the
+     * HIGH bits of the advanced word mapped into [0, n): idx = floor(s / 2^32 * n),
+     * NOT s % n (the NR LCG's low bits are weak).
+     * @returns {number|undefined}
+     */
+    sample() {
+        const n = this._n;
+        if (n === 0) return undefined;
+        const s = (this._s * 1664525 + 1013904223) >>> 0;
+        this._s = s;
+        return this._dense[Math.floor(s / 4294967296 * n)];
+    }
+
+    /**
+     * Remove AND return a uniform-random live member. WORST-CASE O(1), zero-alloc.
+     * `undefined` on an EMPTY set, NEVER throws. Advances `_s`, picks a uniform
+     * index by the HIGH bits (as sample() does), reads the key there, then swaps
+     * the last dense entry into the hole and fixes ITS back-pointer -- the exact
+     * swap delete() uses, so the sparse/dense cross-check invariant stays intact.
+     * @returns {number|undefined}
+     */
+    removeRandom() {
+        const n = this._n;
+        if (n === 0) return undefined;
+        const s = (this._s * 1664525 + 1013904223) >>> 0;
+        this._s = s;
+        const idx = Math.floor(s / 4294967296 * n);
+        const key = this._dense[idx];
+        const last = this._n = n - 1;
+        const moved = this._dense[last];
+        this._dense[idx] = moved;
+        this._sparse[moved] = idx;
+        return key;
+    }
+
+    // ---- cold path only: throw builders (string concat lives here, off the hot body) ----
+
+    /** @private */
+    _oob(k) {
+        // String(k) -- NOT '+ k' / template literal: those THROW on a Symbol,
+        // which would turn a fail-closed reject into a different crash.
+        throw new RangeError('[lite-o1] key out of universe [0, ' + this._universe + '): ' + String(k));
+    }
+
+    /** @private */
+    _full() {
+        throw new RangeError('[lite-o1] RandomSet full (capacity ' + this._cap + ')');
     }
 }

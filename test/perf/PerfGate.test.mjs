@@ -22,7 +22,7 @@
  */
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet } from '../../O1.js';
 
 const U = 1 << 16;      // universe 65536
 const CAP = 1 << 14;    // capacity 16384
@@ -514,12 +514,117 @@ const minForEachDrain = {
     statsOf(s) { return { grows: minGrows(s) }; },
 };
 
+// ===========================================================================
+// RandomSet scenarios -- two fixed Uint32Array columns (SparseSet substrate +
+// a per-instance RNG word), all WORST-CASE O(1) zero-alloc (add / sample /
+// removeRandom / forEach). The RNG advance + high-bits index map are pure int
+// arithmetic -- no coercion, no heap double, no rejection loop.
+// ===========================================================================
+
+const RAND_U = 1 << 16;   // universe 65536
+const RAND_CAP = 1 << 14; // capacity 16384
+const RAND_W = 1 << 12;   // 4096 resident window -> steady state, never full/empty
+
+/**
+ * The zero-alloc counter for RandomSet scenarios: BOTH backing Uint32Arrays'
+ * ArrayBuffer byte lengths (dense + sparse). Capacity + universe are fixed at
+ * construction, so this NEVER grows -- the delta across the window must be 0
+ * (mirrors grows / ringGrows / ufGrows / monoGrows / minGrows).
+ */
+function randGrows(s) {
+    return s.rand._dense.buffer.byteLength + s.rand._sparse.buffer.byteLength;
+}
+
+/** A RandomSet primed with a bounded resident window (steady-state churn). */
+function randFill() {
+    const rand = new RandomSet(RAND_U, RAND_CAP, 0x9e3779b1);
+    for (let i = 0; i < RAND_W; i++) rand.add(i);
+    return rand;
+}
+
+/** sample-read: a primed set; every op a uniform-random peek, int32 acc. */
+const randSampleRead = {
+    name: 'RandomSet sample-read',
+    setup() { return { rand: randFill(), acc: 0 }; },
+    hot(s, n) {
+        const rand = s.rand;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) acc = (acc + rand.sample()) | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: randGrows(s) }; },
+};
+
+/**
+ * removeRandom-drain: refill the whole resident window in one burst the instant
+ * the set empties, then removeRandom one per op -- so the measured window is
+ * dominated by REAL swap-removes (the back-pointer fix). The set oscillates
+ * 0 -> RAND_W (< RAND_CAP), never full, and every op is zero-alloc.
+ */
+const randRemoveDrain = {
+    name: 'RandomSet removeRandom-drain (bulk fill then drain)',
+    setup() { return { rand: new RandomSet(RAND_U, RAND_CAP, 0x9e3779b1) }; },
+    hot(s, n) {
+        const rand = s.rand;
+        for (let i = 0; i < n; i++) {
+            if (rand.size === 0) for (let k = 0; k < RAND_W; k++) rand.add(k);
+            rand.removeRandom();
+        }
+    },
+    statsOf(s) { return { grows: randGrows(s) }; },
+};
+
+/**
+ * add-churn: fresh keys at capacity. add is fail-closed past capacity, so clear()
+ * (O(1), zero-alloc) the instant the set is full and keep refilling -- the set
+ * never exceeds RAND_CAP and every op is a real add.
+ */
+const randAddChurn = {
+    name: 'RandomSet add-churn',
+    setup() { return { rand: new RandomSet(RAND_U, RAND_CAP, 0x9e3779b1), n: 0 }; },
+    hot(s, n) {
+        const rand = s.rand;
+        let live = s.n | 0;
+        for (let i = 0; i < n; i++) {
+            if (live === RAND_CAP) { rand.clear(); live = 0; }
+            rand.add(live);
+            live = (live + 1) | 0;
+        }
+        s.n = live | 0;
+    },
+    statsOf(s) { return { grows: randGrows(s) }; },
+};
+
+/**
+ * RandomSet forEach-scan: a primed set drained each op through a HOISTED
+ * module-scope callback (never re-created per op). Mirrors SparseSet's
+ * forEachDrain -- proves forEach itself (the alloc-free scan; the ONE documented
+ * per-protocol allocator is [Symbol.iterator], gated separately by
+ * randMustFailAlloc below) allocates nothing over its own dedicated window.
+ */
+let randDrainAcc = 0;
+function randDrainInto(k) { randDrainAcc = (randDrainAcc + k) | 0; }
+const randForEachScan = {
+    name: 'RandomSet forEach-scan',
+    setup() {
+        const rand = new RandomSet(RAND_U, RAND_CAP, 0x9e3779b1);
+        for (let i = 0; i < 256; i++) rand.add(i); // bounded resident set to drain
+        return { rand };
+    },
+    hot(s, n) {
+        const rand = s.rand;
+        for (let i = 0; i < n; i++) rand.forEach(randDrainInto);
+    },
+    statsOf(s) { return { grows: randGrows(s) }; },
+};
+
 const scenarios = [
     addChurn, hasHit, deleteChurn, clearRefill, forEachDrain,
     ringFifo, ringLifo, ringInterleave,
     ufFindHeavy, ufUnionChurn, ufConnected, ufComponentSize,
     monoPushChurn, monoEvict, monoValueRead,
     minPushChurn, minPopDrain, minExtremeRead, minForEachDrain,
+    randSampleRead, randRemoveDrain, randAddChurn, randForEachScan,
 ];
 
 /**
@@ -624,6 +729,33 @@ const minMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/**
+ * The RandomSet teeth: a per-op `[Symbol.iterator]` spread into a FRESH [] each op
+ * -- the generator + its per-step {value, done} wrappers + the array MUST trip the
+ * gate (scavenges scale with n), proving the instrument has teeth on the RandomSet
+ * surface too (its iterator is the ONE documented per-protocol allocator; forEach
+ * is the alloc-free scan). statsOf returns a constant so the failure is the
+ * allocation lanes, not a missing-counter artifact.
+ */
+const randMustFailAlloc = {
+    name: 'RandomSet [Symbol.iterator] spread into fresh array (MUST allocate)',
+    setup() {
+        const rand = new RandomSet(256, 256, 0x9e3779b1);
+        for (let i = 0; i < 64; i++) rand.add(i);
+        return { rand };
+    },
+    hot(s, n) {
+        const rand = s.rand;
+        let sink = 0;
+        for (let i = 0; i < n; i++) {
+            const arr = [...rand]; // fresh generator + array per op -> heap churn
+            sink += arr.length;
+        }
+        s.sink = sink;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -633,5 +765,5 @@ zgcSuite({
     counters: { grows: 0 },
     maxRetainedKB: 64,
     scenarios,
-    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc],
+    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc],
 });

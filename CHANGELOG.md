@@ -10,8 +10,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **8-dimension benchmark suite (`benchmark/`, repo-only -- NOT part of the
   published surface, NO version bump).** The ecosystem MVP of RESEARCH.md section 3:
-  it profiles the five shipped members (SparseSet, RingDeque, UnionFind, MonoDeque,
-  MinStack) against the JS built-ins across eight axes -- D1 latency distribution
+  it profiles the six shipped members (SparseSet, RingDeque, UnionFind, MonoDeque,
+  MinStack, RandomSet) against the JS built-ins across eight axes -- D1 latency distribution
   (p50/p90/p99/p99.9/max, with + without forced GC), D2 amortized drift over long
   mixed traces, D3 memory footprint + stability, D4 cache behaviour (a labelled
   PORTABLE PROXY: dense-iteration vs random-lookup + a working-set stride sweep; no
@@ -31,6 +31,79 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   impossible 0 fails) + FIXED-SEED DETERMINISM (two runs at seed `0x9e3779b1`
   produce byte-identical workload trace hashes, using the repo's own Numerical
   Recipes LCG -- no new PRNG introduced).
+
+## [0.6.0] - 2026-09-16
+
+The sixth member of the O(1) family: an integer set that ALSO samples a
+uniform-random live member in WORST-CASE O(1). Tree-shakeable alongside SparseSet,
+RingDeque, UnionFind, MonoDeque, and MinStack (the six share no mutable module state).
+
+### Added
+
+- **`RandomSet(universe, capacity = universe, seed = 0x9e3779b1)`** -- a zero-GC
+  O(1) integer set (a dense + sparse `Uint32Array` pair) that adds WORST-CASE O(1)
+  uniform sampling on top of SparseSet's substrate:
+  - It DUPLICATES SparseSet's cross-check substrate verbatim -- `add(k) -> this`,
+    `has(k) -> boolean`, `delete(k) -> boolean` (swap-last), `clear()` (O(1), zeroes
+    no store), `forEach(fn)` (alloc-free, insertion order), `[Symbol.iterator]`,
+    `size` / `capacity` getters -- with the SAME fail-closed + never-throw-query +
+    null-is-not-zero + `-0`-aliases-0 contract. SparseSet's own class body is left
+    BYTE-IDENTICAL.
+  - `sample() -> number|undefined` -- a uniform-random live member WITHOUT removing
+    it (a pure peek of the SET; it DOES advance the RNG word). WORST-CASE O(1),
+    zero-alloc, `undefined` on empty, NEVER throws.
+  - `removeRandom() -> number|undefined` -- remove AND return a uniform-random live
+    member via the same swap-last delete uses (the sparse/dense cross-check stays
+    exact). WORST-CASE O(1), zero-alloc, `undefined` on empty, NEVER throws.
+  - The RNG is a per-instance Numerical Recipes LCG
+    (`s = (s * 1664525 + 1013904223) >>> 0`) mapped to an index by the HIGH bits
+    (`idx = floor(s / 2^32 * n)`), NOT `s % n` (the LCG's low bits are weak). NO
+    rejection sampling (it would break worst-case O(1)); the residual multiply-bias
+    (`<= n / 2^32`) is DISCLOSED, not coded around. Uniformity is statistical, not
+    cryptographic.
+  - The seed is a POSITIONAL 3rd ctor arg stored per-instance (NEVER module-level
+    state), validated fail-closed at the ctor door (a non-integer / non-number
+    throws `[lite-o1]`, typeof-guarded before coercion; any integer is folded into
+    the uint32 domain via `>>> 0`). Two DEFAULT-seeded instances holding the same
+    members therefore produce IDENTICAL sequences -- pass distinct seeds to
+    decorrelate.
+- **`RandomSet` type surface** in `O1.d.ts` (constructor + getters + the SparseSet
+  methods + `sample` / `removeRandom`), exercised by `test/types/o1.test-d.ts`.
+- **`test/RandomSet.test.js`** -- contract + boundary + fuzz-vs-Set-oracle +
+  UNIFORMITY (100 members x 1e6 `sample()` draws at seed `0x9e3779b1`: every bucket
+  in [9400, 10600] AND chi-square < 148.23 [99.9%, 99 df], deterministic across runs)
+  + DETERMINISM (two same-seed instances give identical 1e5-draw sequences; distinct
+  seeds diverge within 10 draws) + a 10000-member `removeRandom()` drain returning
+  every key exactly once with the cross-check intact throughout.
+
+### Changed
+
+- `VERSION` -> `'0.6.0'`; `package.json` version + description + keywords
+  (`random-set`, `reservoir-sampling`, `uniform-sampling`, `random-sampling`,
+  `getrandom`). The three version sites (`package.json` / `VERSION` / `llms.txt`)
+  move together.
+
+### Proof
+
+- **Torture** (`node --expose-gc test/torture.mjs`): RandomSet added to every phase
+  -- 0 B/op on the hot path (sample + removeRandom churn), `maxMajor` 0,
+  `maxPauseMs <= 2`, arrayBuffers delta <= 0, `tracker.size()` back to 0 after the
+  retention churn. The prior five members stay 0 B/op.
+- **Witness** (`node test/witness.mjs`): RandomSet `sample()` stays FLAT from size
+  1e3 to 1e5 vs a native Set that iterates-to-the-k-th to pick uniformly (O(n)/pick,
+  walked alloc-free with `Set.forEach` -- an honest SPEED foil, NOT
+  `Array.from(set)[k]`). Flatness >= 0.70 (steady window size >= 1e4), foil flatness
+  <= 0.55, ratio >= 1.5x. NO MAX-single-op line (worst-case O(1)).
+- **Perf gate** (`npm run test:perf`): four new zero-alloc scenarios (sample-read,
+  removeRandom-drain, add-churn, forEach-scan) with a `randGrows` 0-delta counter on
+  both `Uint32Array` columns, plus an iterator-teeth `mustFail`.
+
+### ADR
+
+- [`0011`](./decisions/0011-randomset.md) -- the distinct-class-reusing-substrate
+  choice, the per-instance positional seed, the high-bits index map with the
+  residual-multiply-bias + LCG-weak-low-bits disclosure, `sample()` + `removeRandom()`,
+  the naive-Set-pick foil, and the identical-default-seed-sequences note.
 
 ## [0.5.0] - 2026-09-16
 

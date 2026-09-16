@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-Version: 0.5.0
+Version: 0.6.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -13,9 +13,9 @@ op is O(1) worst-case (or O(1)-amortized where stated) and allocates zero bytes
 after construction, and a shipped witness harness demonstrates the flat
 throughput curve against a built-in foil.
 
-v0.5.0 ships five members: SparseSet, RingDeque, UnionFind, MonoDeque, and
-MinStack. They share no mutable module state, so a bundler that imports one drops
-the others (tree-shakeable).
+v0.6.0 ships six members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
+and RandomSet. They share no mutable module state, so a bundler that imports one
+drops the others (tree-shakeable).
 
 ## Exports (from the single main file O1.js)
 
@@ -26,7 +26,9 @@ the others (tree-shakeable).
   sliding-window min / max.
 - `MinStack` -- class. A zero-GC WORST-CASE O(1) fixed-capacity numeric stack with
   a running min / max.
-- `VERSION` -- string, '0.5.0'.
+- `RandomSet` -- class. A zero-GC O(1) integer set (SparseSet substrate) with
+  WORST-CASE O(1) uniform sample() + removeRandom().
+- `VERSION` -- string, '0.6.0'.
 
 ## SparseSet
 
@@ -255,6 +257,53 @@ Memory honesty: the ext[] column DOUBLES the backing memory, so a 2^31 MinStack 
 ~32 GiB -- the ceiling is a TYPE bound (a legal index fits a Float64 slot), not a
 size any host allocates. The throw stays; the note is the disclosure.
 
+## RandomSet
+
+    new RandomSet(universe, capacity = universe, seed = 0x9e3779b1)
+
+- A SUPERSET of SparseSet: it DUPLICATES SparseSet's dense + sparse cross-check
+  substrate verbatim (same add / has / delete / clear / forEach / [Symbol.iterator]
+  contract), then adds WORST-CASE O(1) uniform sample() + removeRandom().
+- universe: exclusive key ceiling; integer in [1, 2^32]. Keys are integers in
+  [0, universe).
+- capacity: max live members; integer in [1, universe], default universe.
+- seed: RNG seed; ANY integer (coerced into the uint32 domain via >>> 0), default
+  0x9e3779b1. Validated fail-closed at the ctor door (non-integer / non-number
+  throws [lite-o1], typeof-guarded FIRST so a Symbol / BigInt never reaches
+  coercion). Stored in a per-instance field -- NEVER module-level RNG state.
+
+Hot surface (all WORST-CASE O(1), zero allocation):
+
+- add(k) -> this          Add k (idempotent). Fail closed: a bad key throws
+                          [lite-o1]; a new key past capacity throws.
+- has(k) -> boolean       True iff k is present. A bad key is ABSENT, never throws.
+- delete(k) -> boolean    Remove k (swap-last). Absent/bad key returns false, never
+                          throws.
+- sample() -> number|undefined  A uniform-random live member WITHOUT removing it
+                          (a pure peek of the SET; it DOES advance the RNG word).
+                          undefined on empty, NEVER throws.
+- removeRandom() -> number|undefined  Remove AND return a uniform-random live member
+                          via the same swap-last delete uses (cross-check stays
+                          exact). undefined on empty, NEVER throws.
+- size (getter)          Live member count.
+- capacity (getter)      Max live members as constructed.
+- clear() -> void        O(1): resets the count, touches NO store; does NOT reseed.
+- forEach(fn) -> void    O(size) alloc-free scan, insertion order; fn is (key, set).
+- [Symbol.iterator]()    O(size) scan, insertion order; ALLOCATES per protocol --
+                          use forEach for the alloc-free scan.
+
+RNG + bias (LOCKED): the index is the HIGH bits of the advanced NR LCG word --
+s = (s * 1664525 + 1013904223) >>> 0, then idx = floor(s / 2^32 * n) -- NOT s % n
+(the LCG's low bits are weak). NO rejection sampling (it would break worst-case
+O(1)); the residual multiply-bias is <= n/2^32 (negligible for any n this substrate
+holds) and is DISCLOSED, not coded around. Uniformity is STATISTICAL, not
+cryptographic (draw from crypto for adversarial use).
+
+Determinism: the seed is per-instance and defaults to a constant, so two
+DEFAULT-seeded RandomSets holding the same members produce IDENTICAL
+sample()/removeRandom() sequences -- pass distinct seeds to decorrelate. A given
+seed fully reproduces its stream. -0 aliases key 0 via the uint32 coercion.
+
 ## Design bounds
 
 - SparseSet valid key: integer in [0, universe).
@@ -274,15 +323,21 @@ size any host allocates. The throw stays; the note is the disclosure.
   frozen at construction. WORST-CASE O(1) push/pop/peek/extreme. The ext[] column
   doubles memory, so the 2^31 ceiling is a TYPE bound (see the memory note).
   forEach / [Symbol.iterator] scan TOP -> BOTTOM (iterator allocates).
+- RandomSet valid key: integer in [0, universe); fixed capacity, no growth. Fail
+  closed on add, absent on query (null is never coerced to key 0). seed: any integer
+  (coerced to uint32), per-instance. sample() / removeRandom() are WORST-CASE O(1),
+  undefined on empty (never throw). High-bits index map (not s % n); residual
+  multiply-bias <= n/2^32 disclosed, no rejection sampling. forEach / [Symbol.iterator]
+  are the O(size) scan exceptions (iterator allocates).
 
 ## Scripts
 
-- npm test           -- 215 node:test cases (contract + boundary + differential fuzz).
+- npm test           -- 246 node:test cases (contract + boundary + differential fuzz).
 - npm run test:types -- tsc --noEmit against O1.d.ts.
 - npm run torture    -- lite-leak + lite-gc-profiler: 0 B/op, 0 major GC, leak-free.
 - npm run witness    -- O(1) throughput-invariance harness + foils + flatness gate.
 - npm run test:perf  -- lite-perf-gate hard zero-alloc scavenge-scaling gate.
-- npm run verify     -- all five (publish gate).
+- npm run verify     -- all six (publish gate).
 
 ## Witness gate (locked)
 
@@ -316,6 +371,14 @@ size any host allocates. The throw stays; the note is the disclosure.
   the domain is pinned). MinStack flatness >= 0.70; naive foil flatness <= 0.55;
   MinStack/naive ratio >= 1.5x. NO MAX-single-op line: push is worst-case O(1), so
   there is no amortized spike to expose.
+- RandomSet: size-sweep [1e3, 1e4, 1e5], WORST-CASE-O(1) sample() vs a NAIVE native
+  Set that iterates-to-the-k-th element to pick uniformly (O(n)/pick, walked with
+  Set.forEach so it allocates nothing per step -- an honest SPEED foil, NOT
+  Array.from(set)[k]). ops/ms is a rate (rand batch 5e5, naive batch 300). Gated over
+  the steady window size >= 1e4 (the 1e3 point is a pure-L1 micro-case shown but not
+  gated; the 0.70 floor is unchanged, only the domain is pinned). RandomSet flatness
+  >= 0.70; naive foil flatness <= 0.55; RandomSet/naive ratio >= 1.5x. NO
+  MAX-single-op line: sample/removeRandom are worst-case O(1) (no rejection loop).
 
 ## Not yet shipped
 
@@ -324,5 +387,6 @@ release. A RingLog / overwrite-oldest RingDeque preset is a deferred future
 variant. SparseSet holds membership, not payloads (store values in a parallel SoA
 column or @zakkster/lite-arena); RingDeque holds numbers only; UnionFind holds
 disjoint-set connectivity over [0, n), not payloads; MonoDeque holds numeric
-window extremes only, and MinStack holds numeric stack values + their running
-extreme only (queue integer handles for object payloads).
+window extremes only, MinStack holds numeric stack values + their running
+extreme only, and RandomSet holds integer membership + uniform sampling over
+[0, universe) (queue integer handles for object payloads).

@@ -10,7 +10,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet } from '../O1.js';
 
 const litO1 = (e) => e instanceof Error && /^\[lite-o1]/.test(e.message);
 
@@ -700,4 +700,77 @@ test('equal-value run: extreme() stays the tied value across the whole run', () 
     assert.equal(s.extreme(), 7);
     for (let i = 0; i < 8; i++) { assert.equal(s.extreme(), 7); s.pop(); }
     assert.equal(s.extreme(), undefined);
+});
+
+// ===========================================================================
+// RandomSet boundary audits (SparseSet substrate + the two random ops)
+// ===========================================================================
+
+// --- adversarial: a Symbol / BigInt key must fail closed, not raw-crash ----
+
+test('ADVERSARIAL: RandomSet has/delete must not throw on a Symbol / BigInt key', () => {
+    const s = new RandomSet(100, 8);
+    s.add(0);
+    assert.doesNotThrow(() => s.has(Symbol('k')), 'has(Symbol) must not throw');
+    assert.equal(s.has(Symbol('k')), false);
+    assert.doesNotThrow(() => s.delete(5n), 'delete(BigInt) must not throw');
+    assert.equal(s.delete(5n), false);
+    // add must be a [lite-o1] reject, never a raw TypeError from coercion.
+    assert.throws(() => s.add(Symbol('k')), litO1, 'add(Symbol) must be [lite-o1]');
+    assert.throws(() => s.add(5n), litO1, 'add(BigInt) must be [lite-o1]');
+});
+
+test('ADVERSARIAL: RandomSet ctor must not throw a raw TypeError on a Symbol / BigInt seed', () => {
+    assert.throws(() => new RandomSet(10, 10, Symbol('s')), litO1, 'seed=Symbol must be [lite-o1]');
+    assert.throws(() => new RandomSet(10, 10, 5n), litO1, 'seed=BigInt must be [lite-o1]');
+});
+
+// --- -0 aliases key 0 -------------------------------------------------------
+
+test('RandomSet: -0 aliases key 0 (uint32 coercion), sample()/removeRandom() honor it', () => {
+    const s = new RandomSet(8, 4, 1);
+    s.add(-0);
+    assert.equal(s.size, 1);
+    assert.equal(s.has(0), true);
+    assert.equal(s.sample(), 0);            // -0 stored as 0
+    assert.equal(s.removeRandom(), 0);
+    assert.equal(s.size, 0);
+});
+
+// --- universe=1 boundary ----------------------------------------------------
+
+test('RandomSet universe=1: only key 0; sample/removeRandom on the sole member', () => {
+    const s = new RandomSet(1, 1, 99);
+    assert.equal(s.sample(), undefined);    // empty
+    s.add(0);
+    assert.equal(s.sample(), 0);
+    assert.equal(s.has(0), true);           // sample did not remove
+    assert.equal(s.removeRandom(), 0);
+    assert.equal(s.size, 0);
+    assert.throws(() => s.add(1), litO1);   // universe===1
+});
+
+// --- re-entrant sample()/removeRandom() from inside forEach -----------------
+
+test('re-entrant sample()/removeRandom() from inside forEach does not throw or corrupt state', () => {
+    const s = new RandomSet(64, 16, 0x9e3779b1);
+    for (const k of [10, 20, 30, 40]) s.add(k);
+    const seen = [];
+    let mutated = false;
+    assert.doesNotThrow(() => {
+        s.forEach((k) => {
+            seen.push(k);
+            // one re-entrant peek (no mutation) + one swap-remove, on the first cb.
+            if (!mutated) {
+                mutated = true;
+                assert.ok(s.has(s.sample()));     // peek never mutates
+                s.removeRandom();                 // removes one live member
+            }
+        });
+    });
+    // forEach captured count=4 at entry; the removeRandom swapped the last dense
+    // entry into a hole, so the pass may re-observe a swapped element -- documented
+    // swap semantics, not corruption. The POST-STATE must be self-consistent.
+    assert.equal(s.size, 3);
+    for (const k of [...s]) assert.equal(s.has(k), true);
 });

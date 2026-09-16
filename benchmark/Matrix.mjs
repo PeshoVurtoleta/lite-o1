@@ -13,13 +13,14 @@
  *   - UnionFind vs a naive disjoint-set (no compression, no union-by-size)
  *   - MonoDeque vs a naive O(W) window rescan
  *   - MinStack vs a naive plain-array stack that rescans for the extreme
+ *   - RandomSet vs a native Set that iterates to the k-th element to pick uniformly
  */
 
 /** Sentinel for a cell that does not apply. NEVER 0. */
 export const NA = 'n/a';
 
-/** The five shipped members, in build order. */
-export const SUBJECTS = ['SparseSet', 'RingDeque', 'UnionFind', 'MonoDeque', 'MinStack'];
+/** The six shipped members, in build order. */
+export const SUBJECTS = ['SparseSet', 'RingDeque', 'UnionFind', 'MonoDeque', 'MinStack', 'RandomSet'];
 
 /** The eight measurement dimensions (RESEARCH.md section 3). */
 export const DIMENSIONS = ['D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7', 'D8'];
@@ -43,6 +44,7 @@ export const BASELINE = {
     UnionFind: 'naive-DSU',
     MonoDeque: 'naive-window',
     MinStack: 'naive-stack',
+    RandomSet: 'naive-Set-pick',
 };
 
 /**
@@ -72,7 +74,7 @@ export function baselineFor(member, dim) {
  */
 export function supportsKeyType(member, keyType) {
     if (!SUBJECTS.includes(member)) return false;
-    return keyType === 'int'; // all four members are integer/numeric substrates
+    return keyType === 'int'; // all six members are integer/numeric substrates
 }
 
 /**

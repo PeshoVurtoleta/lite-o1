@@ -5,7 +5,7 @@
  * fails `npm run test:types`. Not executed; only type-checked.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, VERSION } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, VERSION } from '../../O1.js';
 
 // VERSION is a string.
 const v: string = VERSION;
@@ -243,3 +243,55 @@ new MinStack('1024', 'min');
 new MinStack(1024, 'mid');
 // @ts-expect-error -- push takes a number.
 ms.push('3');
+
+// --- RandomSet -------------------------------------------------------------
+
+// Constructor: universe required; capacity + seed optional (both numbers).
+const rs: RandomSet = new RandomSet(1000);
+const rsCap: RandomSet = new RandomSet(1000, 256);
+const rsSeed: RandomSet = new RandomSet(1000, 256, 0x12345678);
+void rsCap; void rsSeed;
+
+// Getters: size / capacity are readonly numbers.
+const rssize: number = rs.size;
+const rscap: number = rs.capacity;
+void rssize; void rscap;
+
+// @ts-expect-error -- size is readonly.
+rs.size = 5;
+// @ts-expect-error -- capacity is readonly.
+rs.capacity = 5;
+
+// add -> this (chainable); has/delete -> boolean; clear -> void.
+const chainedRs: RandomSet = rs.add(1).add(2);
+const rshas: boolean = rs.has(1);
+const rsdel: boolean = rs.delete(1);
+const rscleared: void = rs.clear();
+void chainedRs; void rshas; void rsdel; void rscleared;
+
+// sample / removeRandom -> number | undefined.
+const rssample: number | undefined = rs.sample();
+const rsremove: number | undefined = rs.removeRandom();
+void rssample; void rsremove;
+
+// forEach callback gets (key, set).
+rs.forEach((k, set) => {
+    const kk: number = k;
+    const st: RandomSet = set;
+    void kk; void st;
+});
+
+// Iterable of number.
+for (const k of rs) {
+    const kk: number = k;
+    void kk;
+}
+const rsspread: number[] = [...rs];
+void rsspread;
+
+// @ts-expect-error -- universe must be a number.
+new RandomSet('1000');
+// @ts-expect-error -- seed must be a number.
+new RandomSet(1000, 256, 'seed');
+// @ts-expect-error -- add takes a number.
+rs.add('3');
