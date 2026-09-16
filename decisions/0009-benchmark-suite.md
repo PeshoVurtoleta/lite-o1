@@ -128,3 +128,59 @@ now runs 72 cells (9 members x 8 dimensions), not 32.
   bucket pool are not per-live), so `theoreticalMinPerLive` states only the dense
   floor (20 B = dense + freq + bkt + nk + pk) and is NOT widened to absorb that fixed
   overhead -- the D3 overhead ratio shows the real cost rather than hiding it.
+
+## Amendment 2 (2026-09-16) -- Bench v2: the fairness audit + full statistical rigor
+
+The suite grew a fairness audit and inferential statistics, plus a portable
+blueprint for the sibling packages. Still repo-only, still NO version bump; `O1.js`
+/ `O1.d.ts` / `package.json` / `llms.txt` untouched (version stays 0.9.0). The
+new `benchmark/Template.mjs` + `benchmark/METHODOLOGY.md` are dev-infra, NOT in
+`files[]`. Bench v2 adds, all in the same fail-closed, n/a-never-0 spirit:
+
+- **Strong baselines for the strawman-fix members.** The primary foils were audited
+  FAIR-ALREADY vs STRAWMAN in `Matrix.RATIONALE` (all nine members). The three whose
+  primary foil is a strawman now also face a STRONG baseline (the fair-fight rival a
+  careful dev writes), timed INSIDE the D1 cell (not a new cell -- the matrix stays
+  72 cells): RingDeque vs a hand-rolled fixed circular array (O(1), not Array.shift);
+  MinStack vs a textbook plain-array running-min stack (O(1), not the O(depth)
+  rescan); SparseSet vs a plain object with dense integer keys (V8 packed-elements,
+  a tougher O(1) membership rival than the already-fair Set). `makeStrongBaseline`
+  is the 9th fail-closed dispatch helper: it THROWS for a non-member but returns
+  `null` for a member with no strong baseline (a legitimate NA for 6 of 9).
+- **Bootstrap CI + Mann-Whitney.** `Harness.bootstrapCI(samples, seed)` gives a 95%
+  percentile-bootstrap confidence interval for the subject median (1000 resamples);
+  its resampling draws from the repo LCG via `prng(seed)`, NEVER `Math.random`, so
+  it is a pure function of (samples, seed) and adds NO nondeterminism.
+  `Harness.mannWhitney(a, b)` is a tie-corrected (midranks) U test whose
+  `significant` flag is |z| >= 1.96 (alpha 0.05); two identical samples give z = 0
+  -> not significant (no false positive on a tie). Both fail closed (< 8 samples ->
+  the string `n/a`). D1 carries `ci`, `vsPrimary`, and `vsStrong`; the console
+  tables, `results.json`, and the HTML report all surface the band + significance.
+- **Uniform overhead-subtraction.** `Harness.calibrateOverheadNs` +
+  `Harness.subtractOverhead` factor out the ONE empty-`() => {}` calibration path
+  (previously inline in perOpTail) into a shared, clamped-at-0 discipline any lane
+  can reuse.
+- **p99.99 (fail-closed).** D1 percentiles gained p99.99, populated only when the
+  sample count is >= 1e4 (nearest-rank needs that many for a distinct tail reading);
+  the shipped in-process AND default orchestrator sizes keep ~200 samples, so
+  p99.99 reads `n/a` by design there -- real only when a caller opts into >= 1e4
+  samples. D1 now also RETAINS the raw sorted ns/op sample arrays internally (both
+  subject and each foil) so the CI + Mann-Whitney have both sample sets; the arrays
+  are NOT serialized into results.json (they would bloat it for no reader benefit).
+- **D3 load-factor curve.** D3 sweeps bytes/live over load factors 0.25/0.5/0.75/1.0
+  (a `loadFactorCurve` of `{loadFactor, bytesPerLive, overheadRatio}`), surfacing
+  FreqO1's fixed overhead as a CURVE that rises at partial load rather than a single
+  point. The single-point fields are kept for back-compat; the curve is added.
+- **Blueprint.** `benchmark/Template.mjs` is a package-agnostic core (a validated
+  MANIFEST of members + primary/strong foils + a dimension-1 witness flavor) that a
+  sibling (`lite-logn` O(log n), `lite-loglogn` O(log log U)) drops in for D1 +
+  witness, then grows the other 7 dimensions from `benchmark/Dimensions.mjs` (the
+  reference). It REUSES the same Harness primitives -- a drop-in, not a risky rewrite
+  of the working suite. `benchmark/METHODOLOGY.md` documents the whole discipline.
+  SETTLED: repo-only, no new npm package (no `@zakkster/lite-bench-kit`).
+- **Determinism note.** `results.json` is NOT byte-identical across two runs and was
+  never designed to be: it records `meta.date` (a wall-clock timestamp) and raw
+  timing measurements (ns/op percentiles) that vary run to run by nature. What IS
+  deterministic and gated is (1) the workload trace hash (unchanged) and (2) the new
+  bootstrap CI GIVEN its input samples (seeded LCG, proven byte-identical across two
+  calls in `test/Bench.test.mjs`). Bench v2 adds no new source of nondeterminism.

@@ -30,6 +30,11 @@ function num(x) {
     if (x >= 1) return x.toFixed(2);
     return x.toFixed(4);
 }
+/** Render a Mann-Whitney result as "sig p=.." / "ns p=.." / the NA string (never 0). */
+function sig(mw) {
+    if (!mw || typeof mw !== 'object') return String(mw);
+    return (mw.significant ? 'sig' : 'ns') + ' p=' + (mw.p < 0.001 ? '<.001' : mw.p.toFixed(3));
+}
 
 // ---------------------------------------------------------------------------
 // Hand-rolled SVG primitives.
@@ -200,12 +205,21 @@ export function renderHtml(payload) {
             ],
         });
         const rows = subjects.map((m) => {
-            const s = get(m, 'D1').subject; const g = get(m, 'D1').subjectGc;
-            return [m, num(s.p50), num(s.p90), num(s.p99), num(s.p999), num(s.max), num(g.p99), num(g.max)];
+            const r = get(m, 'D1');
+            const s = r.subject; const g = r.subjectGc;
+            const ci = r.ci;
+            const band = (ci && typeof ci === 'object') ? (num(ci.lo) + '..' + num(ci.hi)) : String(ci);
+            const rciw = (ci && typeof ci === 'object') ? num(ci.rciw) : String(ci);
+            return [m, num(s.p50), num(s.p90), num(s.p99), num(s.p999), String(s.p9999), num(s.max),
+                num(g.p99), num(g.max), band, rciw, sig(r.vsPrimary), sig(r.vsStrong)];
         });
-        sections.push(section('D1 -- Latency distribution',
-            'Per-op tail latency (ns/op) under sustained load, subject; last two columns are p99/max under forced GC.',
-            chart, tableRows(['member', 'p50', 'p90', 'p99', 'p99.9', 'max', 'p99(gc)', 'max(gc)'], rows)));
+        sections.push(section('D1 -- Latency distribution + fairness audit',
+            'Per-op tail latency (ns/op), subject; p99(gc)/max(gc) are under forced GC. ' +
+            'CI is the 95% bootstrap band of the subject median (rciw = relative width); ' +
+            'sig(primary)/sig(strong) are the Mann-Whitney verdicts vs the primary and STRONG ' +
+            'foils (n/a where no strong baseline exists -- never 0).',
+            chart, tableRows(['member', 'p50', 'p90', 'p99', 'p99.9', 'p99.99', 'max',
+                'p99(gc)', 'max(gc)', 'ci lo..hi', 'rciw', 'vs primary', 'vs strong'], rows)));
     }
 
     // D2 -- amortized cost.
@@ -235,12 +249,17 @@ export function renderHtml(payload) {
         });
         const rows = subjects.map((m) => {
             const r = get(m, 'D3');
+            const curve = Array.isArray(r.loadFactorCurve)
+                ? r.loadFactorCurve.map((p) => num(p.overheadRatio)).join(' / ') : 'n/a';
             return [m, String(r.peakBackingBytes), num(r.bytesPerLive), String(r.theoreticalMinPerLive),
-                num(r.overheadRatio), num(r.heapAfterClearKB) + ' KB'];
+                num(r.overheadRatio), curve, num(r.heapAfterClearKB) + ' KB'];
         });
         sections.push(section('D3 -- Memory footprint + stability',
-            'Fixed-capacity members reuse one backing store; peak bytes are constant by design. clear() retains the buffer (stated, not implicit).',
-            chart, tableRows(['member', 'peak bytes', 'B/live', 'theo min', 'overhead x', 'heap after clear'], rows)));
+            'Fixed-capacity members reuse one backing store; peak bytes are constant by design. clear() retains the buffer (stated, not implicit). ' +
+            'The overhead-x curve is bytes-per-live / theoretical-min at load factors 0.25 / 0.5 / 0.75 / 1.0 -- ' +
+            'it RISES as load falls (fixed backing over fewer live), surfacing FreqO1 free-list + universe-array overhead as a curve, not a point.',
+            chart, tableRows(['member', 'peak bytes', 'B/live', 'theo min', 'overhead x',
+                'overhead x @ 0.25/0.5/0.75/1.0', 'heap after clear'], rows)));
     }
 
     // D4 -- cache proxy.

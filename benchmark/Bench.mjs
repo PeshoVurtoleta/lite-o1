@@ -113,6 +113,12 @@ function fmt(x) {
     return x.toFixed(4);
 }
 
+/** Render a Mann-Whitney result as "sig p=.." / "ns p=.." / the NA string (never 0). */
+function sigStr(mw) {
+    if (!mw || typeof mw !== 'object') return String(mw);
+    return (mw.significant ? 'sig' : 'ns') + ' p=' + (mw.p < 0.001 ? '<.001' : mw.p.toFixed(3));
+}
+
 function printHeader(seed) {
     const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
     const cpus = os.cpus();
@@ -134,13 +140,31 @@ function printHeader(seed) {
 function summarize(results) {
     // D1 tail-latency table.
     console.log('-- D1 latency (subject, ns/op, no GC) --------------------------------------');
-    console.log('  member       p50      p90      p99      p99.9    max');
+    console.log('  member       p50      p90      p99      p99.9    p99.99   max');
     for (const m of SUBJECTS) {
         const r = results[m + '/D1'];
         const s = r.subject;
         console.log('  ' + m.padEnd(11) + ' ' +
             fmt(s.p50).padStart(8) + ' ' + fmt(s.p90).padStart(8) + ' ' +
-            fmt(s.p99).padStart(8) + ' ' + fmt(s.p999).padStart(8) + ' ' + fmt(s.max).padStart(8));
+            fmt(s.p99).padStart(8) + ' ' + fmt(s.p999).padStart(8) + ' ' +
+            String(s.p9999).padStart(8) + ' ' + fmt(s.max).padStart(8));
+    }
+    console.log('');
+
+    // D1 fairness audit: bootstrap CI band + Mann-Whitney significance vs each foil.
+    // n/a (never 0) where a comparison does not apply (no strong baseline / too few
+    // samples for the bootstrap or the U test).
+    console.log('-- D1 fairness audit (95% CI of subject median + Mann-Whitney vs foils) -----');
+    console.log('  member       ci lo..hi (ns)        rciw    vs primary     vs strong');
+    for (const m of SUBJECTS) {
+        const r = results[m + '/D1'];
+        const ci = r.ci;
+        const band = (ci && typeof ci === 'object')
+            ? (fmt(ci.lo) + '..' + fmt(ci.hi)) : String(ci);
+        const rciw = (ci && typeof ci === 'object') ? fmt(ci.rciw) : String(ci);
+        console.log('  ' + m.padEnd(11) + ' ' + band.padStart(20) + '  ' +
+            rciw.padStart(6) + '  ' + sigStr(r.vsPrimary).padStart(12) + '  ' +
+            sigStr(r.vsStrong).padStart(12));
     }
     console.log('');
 

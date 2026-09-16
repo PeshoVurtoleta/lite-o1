@@ -20,9 +20,11 @@ import {
 } from '../O1.js';
 import {
     prng, median, warm, gcNow, hasGc, percentile, collect, timeNsPerOp, foldHash,
-    perOpTail, DEFAULT_SEED,
+    perOpTail, bootstrapCI, mannWhitney, DEFAULT_SEED,
 } from './Harness.mjs';
-import { NA, baselineFor, supportsKeyType, supportsWorkload } from './Matrix.mjs';
+import {
+    NA, SUBJECTS, baselineFor, strongBaselineFor, supportsKeyType, supportsWorkload,
+} from './Matrix.mjs';
 
 /** Global sink: every timed op feeds it so V8 cannot dead-code-eliminate a batch. */
 export let SINK = 0;
@@ -283,6 +285,83 @@ export function makeBaseline(member, n) {
     throw new Error('[bench] unhandled member: ' + member);
 }
 
+/**
+ * The STRONG baseline op for a member (Bench v2 fairness audit), or `null` when the
+ * member has no strong baseline (its primary foil is FAIR-ALREADY). This is the 9th
+ * FAIL-CLOSED dispatch helper: a member NOT in SUBJECTS throws (an unknown member can
+ * never silently inherit another's construction), but a KNOWN member with no strong
+ * baseline returns null -- "no strong baseline" is a legitimate answer for 6 of the 9,
+ * NOT an error, so it is null (a distinguishable NA), not a throw.
+ *
+ * Each strong op mirrors the SUBJECT's hot-op SHAPE (same pops/pushes/reads per call)
+ * so the two are timed apples-to-apples. All three are genuinely O(1) -- a fair fight,
+ * not the strawman the primary foil is.
+ * @param {string} member
+ * @param {number} n
+ * @returns {{op:(i:number)=>void} | null}
+ */
+export function makeStrongBaseline(member, n) {
+    if (!SUBJECTS.includes(member)) throw new Error('[bench] unhandled member: ' + member);
+    if (member === 'RingDeque') {
+        // Hand-rolled FIXED CIRCULAR array with manual head/tail indices -- O(1) popFront
+        // + pushBack, the fair FIFO a careful dev writes (NOT Array.prototype.shift).
+        const cap = n + 1;
+        const buf = new Array(cap);
+        let head = 0, tail = 0;
+        for (let k = 0; k < n; k++) { buf[tail] = k; tail = tail + 1; if (tail === cap) tail = 0; }
+        let v = 0;
+        return {
+            op: () => {
+                const x = buf[head]; head = head + 1; if (head === cap) head = 0; // popFront O(1)
+                SINK += x;
+                buf[tail] = v; tail = tail + 1; if (tail === cap) tail = 0;       // pushBack O(1)
+                v = (v + 1) | 0;
+            },
+        };
+    }
+    if (member === 'MinStack') {
+        // Textbook plain-array min-stack: values[] + a running-extreme mins[] column
+        // (each push carries the min-so-far) -- O(1) extreme(), the fair opponent a
+        // careful dev writes (NOT the O(depth) rescan strawman).
+        const vals = new Array(n);
+        const mins = new Array(n);
+        let top = 0;
+        const fill = n - 1 > 0 ? n - 1 : n; // leave a slot for the transient push
+        for (let k = 0; k < fill; k++) {
+            vals[top] = k;
+            mins[top] = top > 0 ? (k < mins[top - 1] ? k : mins[top - 1]) : k;
+            top++;
+        }
+        let v = 0;
+        return {
+            op: () => {
+                v = (v + 1) | 0;
+                const val = -v;
+                vals[top] = val;
+                mins[top] = top > 0 ? (val < mins[top - 1] ? val : mins[top - 1]) : val;
+                top++;                                    // push (advance -- keeps top invariant)
+                if (mins[top - 1] !== undefined) SINK++;  // extreme O(1)
+                top--;                                    // pop (retreat -> top stable at fill)
+            },
+            // Repo-only invariant probe (NOT on the hot path): the current stack depth
+            // and the running extreme at the top. Lets the QA gate assert `top` never
+            // drifts (the push/pop must leave it at `fill`) and the running-min is
+            // correct -- catching exactly the top-drift regression the reviewer found.
+            probe: () => ({ top, extreme: top > 0 ? mins[top - 1] : undefined }),
+        };
+    }
+    if (member === 'SparseSet') {
+        // Plain object as a dense-integer membership map: V8 stores dense integer keys
+        // in the packed elements backing store, so obj[k] membership is a TOUGHER O(1)
+        // rival than native Set (the already-fair primary foil).
+        const obj = Object.create(null);
+        for (let k = 0; k < n; k++) obj[k] = 1;
+        let key = 0;
+        return { op: () => { key++; if (key >= n) key = 0; if (obj[key] === 1) SINK++; } };
+    }
+    return null; // FAIR-ALREADY members (UnionFind/MonoDeque/RandomSet/FreqO1/BucketQueue/TimerWheel)
+}
+
 /** True iff a member's baseline op is O(n) (or O(log n)) per call (so it must be timed gently). */
 const LINEAR_BASELINE = {
     SparseSet: false, RingDeque: true, UnionFind: true, MonoDeque: true, MinStack: true, RandomSet: true,
@@ -383,8 +462,22 @@ function distOf(op, batch, samples, forceGc) {
         p90: percentile(out, 90),
         p99: percentile(out, 99),
         p999: percentile(out, 99.9),
+        // p99.99 needs >= 1e4 samples for nearest-rank to land on a distinct tail
+        // reading; below that it is the NA string (never 0, never a max-in-disguise).
+        // The shipped in-process AND default orchestrator sizes both use ~200 samples,
+        // so p99.99 reads 'n/a' by design there; it becomes a real number only when a
+        // caller opts into subjSamples >= 1e4 (documented, not silently faked).
+        p9999: out.length >= 10000 ? percentile(out, 99.99) : NA,
         max: out[out.length - 1],
+        samples: out, // raw sorted ns/op samples, kept INTERNAL (CI + Mann-Whitney feed)
     };
+}
+
+/** Public projection of a dist: percentiles only, WITHOUT the raw samples array (which
+ * is kept internal -- serializing 200-plus samples per dist x 72 cells would bloat
+ * results.json for no reader benefit). */
+function pubDist(d) {
+    return { p50: d.p50, p90: d.p90, p99: d.p99, p999: d.p999, p9999: d.p9999, max: d.max };
 }
 
 export function D1(member, opts = {}) {
@@ -401,6 +494,20 @@ export function D1(member, opts = {}) {
 
     const base = makeBaseline(member, n);
     const baseNoGc = distOf(base.op, baseBatch, baseSamples, false);
+
+    // STRONG baseline (fairness audit): timed at the SAME fast batch as the subject
+    // (all three strong baselines are O(1)), so subject-vs-strong is apples-to-apples.
+    // NA (never 0) for the 6 FAIR-ALREADY members -- makeStrongBaseline returns null.
+    const strongName = strongBaselineFor(member);
+    const strong = makeStrongBaseline(member, n);
+    const strongNoGc = strong ? distOf(strong.op, subjBatch, subjSamples, false) : null;
+
+    // Bootstrap CI of the subject median (95%, 1000 resamples, seeded via prng -> a pure
+    // function of (samples, seed), deterministic across runs) + Mann-Whitney of the
+    // subject vs each foil (tie-corrected; two IDENTICAL samples -> not significant).
+    const ci = bootstrapCI(subjNoGc.samples, seed);
+    const vsPrimary = mannWhitney(subjNoGc.samples, baseNoGc.samples);
+    const vsStrong = strongNoGc ? mannWhitney(subjNoGc.samples, strongNoGc.samples) : NA;
 
     // True per-op tail (hrtime.bigint per single op, overhead-subtracted) ONLY for the
     // amortized members that wear the witness MAX-single-op line. NA (never 0) for the
@@ -426,8 +533,13 @@ export function D1(member, opts = {}) {
     return {
         dim: 'D1', member, baseline: baselineFor(member, 'D1'), n,
         unit: 'ns/op',
-        subject: subjNoGc, subjectGc: subjGc, baselineDist: baseNoGc,
-        perOpTail: perOp, // { p99, max } ns for amortized members; NA otherwise
+        subject: pubDist(subjNoGc), subjectGc: pubDist(subjGc), baselineDist: pubDist(baseNoGc),
+        strongBaseline: strongName,                                  // NA for FAIR-ALREADY members
+        strongBaselineDist: strongNoGc ? pubDist(strongNoGc) : NA,   // NA (never 0) otherwise
+        perOpTail: perOp,     // { p99, max } ns for amortized members; NA otherwise
+        ci,                   // { lo, hi, rciw } ns or 'n/a' (subject median CI)
+        vsPrimary,            // { u, z, p, significant } or 'n/a' (subject vs primary foil)
+        vsStrong,             // { u, z, p, significant } or 'n/a' (subject vs strong foil)
         _check: check,
     };
 }
@@ -648,17 +760,38 @@ export function D3(member, opts = {}) {
     const bytesPerLive = bytesFull / liveNow;
     const theoMin = theoreticalMinPerLive(member);
 
+    // Load-factor curve: bytes-per-live at each fill fraction of capacity. Since these
+    // members reuse ONE fixed-capacity backing store, the backing bytes are constant, so
+    // bytes-per-live RISES as the load falls (fixedBytes / fewer-live) -- a ~1/loadFactor
+    // curve. This makes FreqO1's fixed overhead (universe-sized sparse array + bucket
+    // free-list + the O(distinct-frequencies) bucket pool, none of them per-live) VISIBLE
+    // as a curve rather than a single point: its overheadRatio is high at full load and
+    // climbs further at partial load. UnionFind's universe is fixed (all elements always
+    // count as live), so its curve is flat by design -- stated, not hidden.
+    const loadFactorCurve = [];
+    for (const lf of (opts.loadFactors ?? [0.25, 0.5, 0.75, 1.0])) {
+        const target = Math.max(1, Math.round(live * lf));
+        fillMember(member, obj, target);
+        const b = memberBytes(member, obj);
+        const lc = Math.max(1, liveCount(member, obj));
+        const bpl = b / lc;
+        loadFactorCurve.push({ loadFactor: lf, bytesPerLive: bpl, overheadRatio: bpl / theoMin });
+    }
+    clearMember(member, obj); // leave the instance clean after the curve sweep
+
     return {
         dim: 'D3', member, baseline: baselineFor(member, 'D3'), unit: 'bytes',
         peakBackingBytes: bytesFull,
         highWaterBytes: highWater,
         bytesPerLive, theoreticalMinPerLive: theoMin,
         overheadRatio: bytesPerLive / theoMin,
+        loadFactorCurve, // [{loadFactor, bytesPerLive, overheadRatio}] over 0.25..1.0
         fixedCapacity: true,
         heapDeltaFullKB: Math.max(0, (heapFull - heapBase)) / 1024,
         heapAfterClearKB: Math.max(0, (heapAfterClear - heapBase)) / 1024,
         liveElements: liveNow,
-        _check: [bytesFull, highWater, bytesPerLive, theoMin, liveNow],
+        _check: [bytesFull, highWater, bytesPerLive, theoMin, liveNow]
+            .concat(loadFactorCurve.map((p) => p.bytesPerLive)),
     };
 }
 
@@ -1055,7 +1188,7 @@ export function vacuityCheck(result) {
         }
     }
     // Any declared point/sweep array must be non-empty.
-    for (const key of ['points', 'strideSweep', 'loadFactors']) {
+    for (const key of ['points', 'strideSweep', 'loadFactors', 'loadFactorCurve']) {
         if (Array.isArray(result[key]) && result[key].length === 0) {
             throw new Error('[bench] vacuous: ' + result.dim + '/' + result.member +
                 ' empty array ' + key);

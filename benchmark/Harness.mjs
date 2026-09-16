@@ -184,7 +184,32 @@ export function stats(samples) {
  */
 export function perOpTail(op, iters) {
     if (iters <= 0) return { p99: 0, max: 0 };
-    // Calibrate the empty-call overhead through the identical hrtime path.
+    // Calibrate the empty-call overhead through the identical hrtime path, then
+    // subtract it uniformly with subtractOverhead (the SHARED discipline).
+    const overhead = calibrateOverheadNs(iters);
+
+    const s = new Float64Array(iters);
+    for (let i = 0; i < iters; i++) {
+        const t0 = process.hrtime.bigint();
+        op(i);
+        const t1 = process.hrtime.bigint();
+        s[i] = subtractOverhead(Number(t1 - t0), overhead);
+    }
+    s.sort();
+    return { p99: percentile(s, 99), max: s[iters - 1] };
+}
+
+/**
+ * Calibrate the empty-call overhead (ns) through the identical process.hrtime.bigint()
+ * path a timed op is measured through: time an empty `() => {}` over `iters` single
+ * calls and return the MEDIAN. This is the ONE calibration path -- perOpTail and any
+ * batch-mean lane that wants an overhead-subtraction reuse it so the discipline is
+ * uniform (never a bespoke per-lane calibration). FAIL CLOSED: iters <= 0 -> 0.
+ * @param {number} iters
+ * @returns {number} median empty-call cost in ns
+ */
+export function calibrateOverheadNs(iters) {
+    if (iters <= 0) return 0;
     const noop = () => {};
     const cal = new Float64Array(iters);
     for (let i = 0; i < iters; i++) {
@@ -194,17 +219,134 @@ export function perOpTail(op, iters) {
         cal[i] = Number(t1 - t0);
     }
     cal.sort();
-    const overhead = cal[iters >> 1]; // median empty-call cost (ns)
+    return cal[iters >> 1]; // median empty-call cost (ns)
+}
 
-    const s = new Float64Array(iters);
-    for (let i = 0; i < iters; i++) {
-        const t0 = process.hrtime.bigint();
-        op(i);
-        const t1 = process.hrtime.bigint();
-        let ns = Number(t1 - t0) - overhead;
-        if (ns < 0) ns = 0; // clamp: a reading below timer overhead is not negative time
-        s[i] = ns;
+/**
+ * Shared overhead-subtraction, CLAMPED at 0 -- a reading below the timer's own
+ * overhead is not negative time. Usable by every lane (perOpTail AND the batch-mean
+ * lanes), not just perOpTail, so the subtraction discipline is uniform.
+ * @param {number} rawNs
+ * @param {number} overheadNs
+ * @returns {number} max(0, rawNs - overheadNs)
+ */
+export function subtractOverhead(rawNs, overheadNs) {
+    const v = rawNs - overheadNs;
+    return v < 0 ? 0 : v;
+}
+
+// ===========================================================================
+// Inferential statistics for the fairness audit (Bench v2). Both are PURE and
+// DETERMINISTIC given their input: bootstrapCI draws from the repo LCG via
+// prng(seed) (NEVER Math.random), so two calls at the same seed on the same
+// samples return byte-identical bounds -- the fixed-seed determinism gate holds.
+// The NA sentinel here is the STRING 'n/a' (matches Matrix.NA), never 0/NaN.
+// ===========================================================================
+
+/** NA sentinel for a statistic with too little evidence. NEVER 0. Matches Matrix.NA. */
+const STAT_NA = 'n/a';
+
+/** Bootstrap resample count (each a full-size draw with replacement). */
+export const BOOTSTRAP_RESAMPLES = 1000;
+/** Two-sided confidence level for bootstrapCI (95% -> the 2.5 / 97.5 percentiles). */
+export const CI_LEVEL = 0.95;
+/** Two-sided z threshold for mannWhitney significance (alpha = 0.05). */
+export const MW_Z_THRESHOLD = 1.96;
+
+/**
+ * A percentile-bootstrap confidence interval for the MEDIAN of `samples` at the 95%
+ * level (CI_LEVEL): resample `samples` WITH REPLACEMENT BOOTSTRAP_RESAMPLES (1000)
+ * times, take each resample's median, and return the [2.5, 97.5] percentiles of that
+ * bootstrap distribution. `rciw` is the relative CI width (hi - lo) / median (a
+ * dimensionless tightness figure; guarded when the median is 0).
+ *
+ * DETERMINISM: resampling indices come from the repo LCG via prng(seed) -- NEVER
+ * Math.random -- so the interval is a pure function of (samples, seed).
+ * FAIL CLOSED: fewer than 8 samples returns the STRING 'n/a' (never NaN/Infinity).
+ * @param {ArrayLike<number>} samples
+ * @param {number} [seed=DEFAULT_SEED]
+ * @returns {{lo:number, hi:number, rciw:number|'n/a'} | 'n/a'}
+ */
+export function bootstrapCI(samples, seed = DEFAULT_SEED) {
+    const n = samples.length;
+    if (n < 8) return STAT_NA; // fail closed: too few samples for an honest interval
+    const arr = Float64Array.from(samples);
+    const rng = prng(seed);
+    const medians = new Float64Array(BOOTSTRAP_RESAMPLES);
+    const draw = new Float64Array(n);
+    const mid = n >> 1;
+    for (let r = 0; r < BOOTSTRAP_RESAMPLES; r++) {
+        for (let i = 0; i < n; i++) draw[i] = arr[rng() % n]; // LCG index, with replacement
+        draw.sort();
+        medians[r] = (n & 1) ? draw[mid] : (draw[mid - 1] + draw[mid]) / 2;
     }
-    s.sort();
-    return { p99: percentile(s, 99), max: s[iters - 1] };
+    medians.sort();
+    const lo = percentile(medians, 2.5);
+    const hi = percentile(medians, 97.5);
+    const med = median(arr);
+    // rciw = relative CI width. Guard a zero median: NA (the string), never a numeric
+    // 0 (n/a-never-0) and never NaN/Infinity. Harmless today (timing medians are
+    // positive) but aligned with the discipline.
+    const rciw = med > 0 ? (hi - lo) / med : STAT_NA;
+    return { lo, hi, rciw };
+}
+
+/** Standard-normal CDF via the Abramowitz-Stegun 7.1.26 erf approximation. */
+function normalCdf(z) {
+    const sign = z < 0 ? -1 : 1;
+    const x = Math.abs(z) / Math.SQRT2;
+    const t = 1 / (1 + 0.3275911 * x);
+    const y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t
+        - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
+    return 0.5 * (1 + sign * y);
+}
+
+/**
+ * The Mann-Whitney U test (a distribution-free two-sample rank test) for whether
+ * `a` and `b` differ. Returns the U statistic, the tie-corrected normal-approx z,
+ * its two-sided p, and a boolean `significant` (|z| >= MW_Z_THRESHOLD, alpha 0.05).
+ *
+ * Ties use MIDRANKS with the standard tie correction on the variance, so two
+ * IDENTICAL samples give z = 0 -> significant === false (never a false positive on
+ * a tie). FAIL CLOSED: either group under 8 elements returns the STRING 'n/a'.
+ * @param {ArrayLike<number>} a
+ * @param {ArrayLike<number>} b
+ * @returns {{u:number, z:number, p:number, significant:boolean} | 'n/a'}
+ */
+export function mannWhitney(a, b) {
+    const n1 = a.length, n2 = b.length;
+    if (n1 < 8 || n2 < 8) return STAT_NA; // fail closed: too few for the normal approx
+    const N = n1 + n2;
+    const all = new Array(N);
+    for (let i = 0; i < n1; i++) all[i] = { v: a[i], g: 0 };
+    for (let i = 0; i < n2; i++) all[n1 + i] = { v: b[i], g: 1 };
+    all.sort((x, y) => x.v - y.v);
+    const rank = new Float64Array(N);
+    let tieCorrection = 0;
+    let i = 0;
+    while (i < N) {
+        let j = i;
+        while (j + 1 < N && all[j + 1].v === all[i].v) j++;
+        const avg = (i + j) / 2 + 1; // 1-based average rank over the tie run i..j
+        for (let k = i; k <= j; k++) rank[k] = avg;
+        const t = j - i + 1;
+        if (t > 1) tieCorrection += t * t * t - t;
+        i = j + 1;
+    }
+    let R1 = 0;
+    for (let k = 0; k < N; k++) if (all[k].g === 0) R1 += rank[k];
+    const U1 = R1 - (n1 * (n1 + 1)) / 2;
+    const U2 = n1 * n2 - U1;
+    const U = U1 < U2 ? U1 : U2;
+    const meanU = (n1 * n2) / 2;
+    const varU = (n1 * n2 / 12) * ((N + 1) - tieCorrection / (N * (N - 1)));
+    const sigma = varU > 0 ? Math.sqrt(varU) : 0;
+    let z = 0, p = 1, significant = false;
+    if (sigma > 0) {
+        z = (U1 - meanU) / sigma;
+        p = 2 * (1 - normalCdf(Math.abs(z)));
+        if (p < 0) p = 0; else if (p > 1) p = 1;
+        significant = Math.abs(z) >= MW_Z_THRESHOLD;
+    }
+    return { u: U, z, p, significant };
 }

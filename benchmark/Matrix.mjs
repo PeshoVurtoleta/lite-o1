@@ -54,6 +54,110 @@ export const BASELINE = {
 };
 
 /**
+ * STRONG baselines (the fairness audit, Bench v2). A STRONG baseline is the tougher,
+ * fairest rival a careful engineer would actually write -- added ONLY for the three
+ * members whose PRIMARY foil is a strawman (an obviously-bad approach a competent dev
+ * would never ship), so the member is also measured against a genuinely hard opponent:
+ *
+ *   - RingDeque -> a hand-rolled FIXED CIRCULAR Array with manual head/tail indices
+ *     (O(1) push/pop), NOT Array.prototype.shift (the O(n) strawman primary foil).
+ *   - MinStack  -> a plain-array stack that carries a running-extreme column (values[]
+ *     + mins[]), the textbook O(1) min-stack a careful dev writes -- NOT the naive
+ *     rescan-for-the-extreme (O(depth)) strawman primary foil.
+ *   - SparseSet -> a plain object as a dense-integer membership map: V8 stores dense
+ *     integer keys in the packed elements store, making it a TOUGHER O(1) membership
+ *     rival than the (already fair) native Set primary foil.
+ *
+ * Every OTHER member is NA here (no strong baseline): its primary foil is FAIR-ALREADY
+ * -- the honest textbook rival that motivates the structure -- so a second one adds
+ * nothing. NA is the STRING, never 0.
+ */
+export const STRONG_BASELINE = {
+    RingDeque: 'array-ring',        // hand-rolled fixed circular Array, head/tail, O(1)
+    MinStack: 'array-min-stack',    // plain values[]+mins[] running-extreme stack, O(1)
+    SparseSet: 'object-membership', // plain object, dense-int packed-elements membership
+    UnionFind: NA,
+    MonoDeque: NA,
+    RandomSet: NA,
+    FreqO1: NA,
+    BucketQueue: NA,
+    TimerWheel: NA,
+};
+
+/**
+ * The strong baseline name for a member, or NA when it has none. Mirrors baselineFor.
+ * A non-member reads NA (never throws here -- the throwing fail-closed guard lives in
+ * Dimensions.makeStrongBaseline, which actually builds the foil).
+ * @param {string} member
+ * @returns {string} a strong-baseline name, or NA
+ */
+export function strongBaselineFor(member) {
+    if (!SUBJECTS.includes(member)) return NA;
+    return STRONG_BASELINE[member];
+}
+
+/**
+ * The fairness-audit rationale for EVERY member: the FAIR-ALREADY vs STRAWMAN verdict
+ * on its PRIMARY foil, plus (for STRAWMAN members) the strong baseline that makes the
+ * fight fair. Factual, ASCII, honesty-first -- this is the audit trail a reviewer reads
+ * to confirm no member is beating a punching bag.
+ *
+ *   verdict  'FAIR-ALREADY' | 'STRAWMAN'
+ *   strong   the STRONG_BASELINE name, or NA for FAIR-ALREADY members
+ *   why      a one-line honest justification
+ */
+export const RATIONALE = {
+    SparseSet: {
+        verdict: 'STRAWMAN', strong: 'object-membership',
+        why: 'native Set is a fair built-in, but a plain object with dense integer keys ' +
+            'uses V8 packed-elements storage and is a TOUGHER membership rival; added so ' +
+            'SparseSet is measured against the fastest idiomatic alternative, not only Set.',
+    },
+    RingDeque: {
+        verdict: 'STRAWMAN', strong: 'array-ring',
+        why: 'the primary foil (Array.prototype.shift) is O(n) -- an obvious strawman no ' +
+            'careful dev ships; the strong baseline is a hand-rolled fixed circular array ' +
+            'with head/tail indices (O(1)), a genuinely fair FIFO fight.',
+    },
+    MinStack: {
+        verdict: 'STRAWMAN', strong: 'array-min-stack',
+        why: 'the primary foil rescans all live elements for the extreme (O(depth)) -- a ' +
+            'strawman; the strong baseline is the textbook plain-array min-stack (values[] ' +
+            '+ running-min mins[]), O(1), the fair opponent a careful dev writes.',
+    },
+    UnionFind: {
+        verdict: 'FAIR-ALREADY', strong: NA,
+        why: 'the naive disjoint-set (no path compression, no union-by-size) IS the honest ' +
+            'textbook rival that motivates the optimization -- not a strawman.',
+    },
+    MonoDeque: {
+        verdict: 'FAIR-ALREADY', strong: NA,
+        why: 'the O(W) full-window rescan is the obvious approach a dev reaches for before ' +
+            'the monotonic-deque trick -- the honest rival, not a strawman.',
+    },
+    RandomSet: {
+        verdict: 'FAIR-ALREADY', strong: NA,
+        why: 'native Set has NO random index, so iterate-to-the-kth (via alloc-free forEach) ' +
+            'is the genuine cost of uniform sampling with the built-in -- honest, not a strawman.',
+    },
+    FreqO1: {
+        verdict: 'FAIR-ALREADY', strong: NA,
+        why: 'no built-in LFU exists; a per-key count array linearly scanned for the min is ' +
+            'the naive approach the bucket forest replaces -- the honest rival.',
+    },
+    BucketQueue: {
+        verdict: 'FAIR-ALREADY', strong: NA,
+        why: 'the primary foil is already a STRONG one -- an alloc-free binary min-heap ' +
+            '(O(log n)), the real data structure a careful dev reaches for, not a strawman.',
+    },
+    TimerWheel: {
+        verdict: 'FAIR-ALREADY', strong: NA,
+        why: 'a flat array of deadlines scanned each tick (O(n)) is the naive scheduler the ' +
+            'timing wheel exists to replace -- the honest rival, not a strawman.',
+    },
+};
+
+/**
  * The baseline for a (member, dimension) cell, or NA when the dimension has no
  * meaningful head-to-head baseline. D5 (bundle size + tree-shaking) is intrinsic
  * to the library itself -- there is no built-in to compare a gzip size against --
@@ -102,13 +206,23 @@ export function supportsWorkload(member, workload) {
 /**
  * Every (member, dimension, baseline) cell the orchestrator runs -- one child
  * process per cell (clean GC/JIT state).
- * @returns {{member:string, dim:string, baseline:string}[]}
+ *
+ * The strong baseline is an EXTRA COMPARISON INSIDE an existing cell (it is timed
+ * within D1 and carried on the D1 result as strongBaselineDist), NOT a new dimension
+ * column and NOT a separate cell -- so the matrix stays exactly SUBJECTS x DIMENSIONS
+ * (72) cells. Each descriptor carries `strongBaseline` (NA for the 6 FAIR-ALREADY
+ * members) purely as metadata; it never multiplies the cell count.
+ * @returns {{member:string, dim:string, baseline:string, strongBaseline:string}[]}
  */
 export function cells() {
     const out = [];
     for (const member of SUBJECTS) {
         for (const dim of DIMENSIONS) {
-            out.push({ member, dim, baseline: baselineFor(member, dim) });
+            out.push({
+                member, dim,
+                baseline: baselineFor(member, dim),
+                strongBaseline: strongBaselineFor(member),
+            });
         }
     }
     return out;
