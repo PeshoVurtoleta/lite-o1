@@ -173,6 +173,7 @@
         .truth .primary-label { font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--accent); }
         .truth .secondary-label { font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--text-faint); }
         #jank-canvas { width: 100%; height: 46px; display: block; background: var(--bg-0); border: 1px solid var(--line); }
+        #sp-jank-canvas { width: 100%; height: 46px; display: block; background: var(--bg-0); border: 1px solid var(--line); }
         .jank-caption { font-size: 10px; color: var(--text-dim); margin-top: 4px; }
         .alloc-big { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
         .alloc-big.zero { color: var(--accent); text-shadow: var(--glow-accent); }
@@ -510,19 +511,95 @@
             </aside>
         </section>
 
-        <!-- SCENE 04: PRIORITY & SAMPLING (planned) -->
+        <!-- SCENE 04: PRIORITY & SAMPLING -->
         <section class="scene" data-scene="priority">
-            <div class="placeholder">
-                <span class="ph-badge">planned - next pass</span>
-                <h2>04 - Priority &amp; Sampling</h2>
-                <div class="ph-members">
-                    Graph + casino: BucketQueue (Dial's) runs a Dijkstra wavefront over a maze;
-                    SparseTable overlays instant O(1) range-min/max "hardest terrain" queries on the
-                    frozen cost grid (mutable-vs-immutable contrast). RandomSet samples in exact
-                    O(1); FreqO1 maintains an O(1) LFU with no sort.
-                    Members: BucketQueue, SparseTable, RandomSet, FreqO1.
+            <div class="stage" id="sp-stage">
+                <canvas id="sp-canvas"></canvas>
+                <div class="stage-overlay tl">
+                    <span class="label">graph + casino (live library instances)</span>
                 </div>
+                <div class="stage-overlay tr">
+                    <span class="label">mode</span><br>
+                    <span class="big" id="sp-mode-tag">LITE</span>
+                </div>
+                <div class="banner" id="sp-banner" data-show="false"></div>
             </div>
+
+            <aside class="panel">
+                <div class="panel-head">scene 04 - priority &amp; sampling</div>
+
+                <section>
+                    <h3>mode</h3>
+                    <div class="toggle-row">
+                        <div class="toggle" id="sp-mode-toggle" data-on="false" role="switch" aria-checked="false" tabindex="0"></div>
+                        <span class="toggle-label">path: <b id="sp-mode-label">lite (0 alloc)</b></span>
+                    </div>
+                    <p class="help-line">
+                        The <code>lite</code> path runs a Dijkstra wavefront off the real
+                        <code>BucketQueue</code> (Dial's monotone dial) and answers O(1)
+                        "hardest terrain" from an immutable <code>SparseTable</code> with 0
+                        alloc/frame. The <code>naive</code> path <code>new</code>s one object per
+                        edge relaxation -- watch the counter climb.
+                    </p>
+                </section>
+
+                <section>
+                    <h3>action</h3>
+                    <div class="btn-row">
+                        <button class="btn" id="sp-pause">pause</button>
+                        <button class="btn danger" id="sp-rewind">decreaseKey below cursor</button>
+                        <button class="btn" id="sp-restart">new wavefront</button>
+                    </div>
+                    <p class="help-line">
+                        <code>decreaseKey below cursor</code> tries to relax a frontier key to a
+                        priority under the monotone cursor -- extract order must be non-decreasing,
+                        so <code>BucketQueue</code> fails closed and shatters red. That is why the
+                        cursor never rewinds. <code>new wavefront</code> re-seeds the source.
+                    </p>
+                </section>
+
+                <section>
+                    <h3>frontier</h3>
+                    <div class="field">
+                        <label>relaxations / frame <span class="field-value" id="sp-rate-v">4</span></label>
+                        <input type="range" id="sp-rate" min="1" max="12" step="1" value="4">
+                    </div>
+                    <p class="help-line">
+                        <code>BucketQueue</code> MUTATES every frame (the frontier advances);
+                        <code>SparseTable</code> is built ONCE over the FROZEN cost grid and queried
+                        forever -- the range query is flat O(1) no matter the width, the mutable vs
+                        immutable contrast.
+                    </p>
+                </section>
+
+                <section>
+                    <h3>truth panel - the zero-GC proof</h3>
+                    <div class="truth">
+                        <div>
+                            <div class="primary-label">primary - jank detector</div>
+                            <canvas id="sp-jank-canvas"></canvas>
+                            <div class="jank-caption">each bar = one frame's dt; red = a frame blew past ~16.7ms (a dropped frame / GC pause)</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">primary - allocations since warmup</div>
+                            <div class="alloc-big zero" id="sp-alloc-big">0</div>
+                        </div>
+                        <div>
+                            <div class="stat-row"><span class="k">settled (BucketQueue)</span><span class="v accent" id="sp-settled">0</span></div>
+                            <div class="stat-row"><span class="k">frontier (live buckets)</span><span class="v accent" id="sp-frontier">0</span></div>
+                            <div class="stat-row"><span class="k">monotone cursor</span><span class="v" id="sp-cursor">0</span></div>
+                            <div class="stat-row"><span class="k">hardest terrain (row, SparseTable)</span><span class="v" id="sp-hard">0</span></div>
+                            <div class="stat-row"><span class="k">LFU evicted (FreqO1)</span><span class="v" id="sp-lfu">--</span></div>
+                            <div class="stat-row"><span class="k">frame rate</span><span class="v" id="sp-fps">--</span></div>
+                        </div>
+                        <div>
+                            <div class="secondary-label">secondary - retained heap (Chromium-only, coarse)</div>
+                            <div class="stat-row"><span class="k">usedJSHeapSize</span><span class="v" id="sp-heap">n/a</span></div>
+                            <div class="caveat">Reported only when <code>performance.memory</code> exists (Chromium, and only under crossOriginIsolated). Quantized and lazily updated -- a secondary signal, never the headline.</div>
+                        </div>
+                    </div>
+                </section>
+            </aside>
         </section>
     </main>
 
@@ -545,6 +622,8 @@
         createAllocState, naiveStep,
         createSlidingWorld, frameSlidingExtremes, naiveRescan,
         createConnectWorld, frameConnect, naiveConnectStep,
+        createSampleWorld, frameSample, restartWavefront, naiveSampleStep,
+        bqBucketHead, SP_COLS, SP_ROWS, SP_CELLS, SP_RELAX_BUDGET, SP_CHIPS, SP_MAXCOST,
     } from './kernels.mjs';
 
     const $ = (id) => document.getElementById(id);
@@ -755,6 +834,7 @@
         if (activeScene === 'sparse') updateSparseTelemetry();
         else if (activeScene === 'sliding') updateSlidingTelemetry();
         else if (activeScene === 'connect') updateConnectTelemetry();
+        else if (activeScene === 'priority') updatePriorityTelemetry();
     }
 
     function updateSparseTelemetry() {
@@ -1165,6 +1245,210 @@
     const cxRate = $('cx-rate'), cxRateV = $('cx-rate-v');
     cxRate.addEventListener('input', () => { cxWorld.perFrame = +cxRate.value; cxRateV.textContent = String(cxWorld.perFrame); });
 
+    // ==================================================================================
+    // SCENE 04 -- Priority & Sampling. Drives the REAL BucketQueue (Dial's monotone dial) +
+    // two immutable SparseTables (built ONCE over the frozen terrain grid) + RandomSet +
+    // FreqO1 (an O(1) LFU cache) via frameSample (kernels.mjs). The draw path only READS the
+    // world's SoA + the live library internals (bucket occupancy via bqBucketHead, mirroring
+    // the library's own guard) -- zero allocation per frame.
+    // ==================================================================================
+    const spWorld = createSampleWorld(0x51ed270b); // frozen terrain + frontier + casino, built once
+    let naiveSp = false;
+    let spRelaxBudget = SP_RELAX_BUDGET;
+
+    // pre-built RGB triplets so terrain/heat coloring never concatenates in the hot path
+    const SP_HEAT_RGB = '245,185,66';   // amber  -- frontier / hardest terrain
+    const SP_CYAN_RGB = '125,211,252';  // cyan   -- terrain cost heat
+    const SP_GREEN_RGB = '95,227,159';  // green  -- the source
+    const SP_TERRAIN_TITLE = 'weighted terrain  -  BucketQueue Dijkstra wavefront   (accent = settled, amber = frontier)';
+    const SP_BUCKET_TITLE = 'BucketQueue dials  -  monotone cursor never rewinds (buckets light as the frontier advances)';
+    const SP_CASINO_TITLE = 'RandomSet chips  -  FreqO1 LFU heat   (bright = most-visited, ring = LFU victim)';
+
+    const spCanvas = $('sp-canvas');
+    let spCtx = null, SP_W = 0, SP_H = 0;
+    let spGridX = 0, spGridY = 0, SP_CW = 14, SP_CH = 14;
+    const SP_GAP = 3;
+    let spCasX = 0, spCasY = 0, SP_CHIP = 16, SP_CHIP_COLS = 8;
+    let spBucketX = 0, spBucketY = 0, SP_BUCKETS_SHOWN = 48, SP_BW = 8;
+
+    function computePriorityLayout() {
+        const s = sizeCanvas(spCanvas);
+        spCtx = s.ctx; SP_W = s.w; SP_H = s.h;
+        const titleH = PAD + 26;
+        const bottomH = 84;                       // the bucket strip lives here
+        const gridAreaW = SP_W * 0.62;
+        const gridAreaH = SP_H - titleH - bottomH - PAD;
+        const cw = (gridAreaW - (SP_COLS - 1) * SP_GAP) / SP_COLS;
+        const ch = (gridAreaH - (SP_ROWS - 1) * SP_GAP) / SP_ROWS;
+        const cell = Math.max(4, Math.min(cw, ch));
+        SP_CW = cell; SP_CH = cell;
+        spGridX = PAD; spGridY = titleH;
+        // casino chip grid (right column)
+        spCasX = PAD + gridAreaW + 24;
+        spCasY = titleH;
+        const casW = SP_W - spCasX - PAD;
+        SP_CHIP_COLS = 8;
+        SP_CHIP = Math.max(8, Math.min(28, (casW - (SP_CHIP_COLS - 1) * 5) / SP_CHIP_COLS));
+        // bucket strip (bottom, full width): a window of buckets around the cursor
+        spBucketX = PAD;
+        spBucketY = SP_H - bottomH + 30;
+        const bw = SP_W - PAD * 2;
+        SP_BUCKETS_SHOWN = 64;
+        SP_BW = (bw - (SP_BUCKETS_SHOWN - 1) * 2) / SP_BUCKETS_SHOWN;
+    }
+    window.addEventListener('resize', () => { if (activeScene === 'priority') computePriorityLayout(); });
+
+    // scene-04 jank canvas
+    const spJankCanvas = $('sp-jank-canvas');
+    let spJankCtx = null, SPJW = 0, SPJH = 0;
+    function sizePriorityJank() { const s = sizeCanvas(spJankCanvas); spJankCtx = s.ctx; SPJW = s.w; SPJH = s.h; }
+
+    function stepPriority() {
+        // The kernel advances SP_RELAX_BUDGET settlements per frameSample; the slider drives extra
+        // whole-frame advances per rAF tick to speed the wavefront (still zero-alloc each call).
+        for (let b = 0; b < spRelaxBudget; b += SP_RELAX_BUDGET) frameSample(spWorld);
+        if (naiveSp) naiveSampleStep(allocState, spWorld); // the ONLY allocating path
+    }
+
+    function drawPriority(g) {
+        g.clearRect(0, 0, SP_W, SP_H);
+        g.font = LABEL_FONT;
+        const e = spWorld.epoch, cost = spWorld.cost, cols = SP_COLS, rows = SP_ROWS;
+        const settledEpoch = spWorld.settledEpoch, distEpoch = spWorld.distEpoch, src = spWorld.source;
+
+        // --- weighted terrain grid + wavefront overlay ---
+        g.fillStyle = COL_DIM; g.fillText(SP_TERRAIN_TITLE, spGridX, PAD + 14);
+        for (let c = 0; c < SP_CELLS; c++) {
+            const col = c % cols, row = (c / cols) | 0;
+            const x = spGridX + col * (SP_CW + SP_GAP);
+            const y = spGridY + row * (SP_CH + SP_GAP);
+            if (c === src) g.fillStyle = rgbaq(SP_GREEN_RGB, 0.95);
+            else if (settledEpoch[c] === e) g.fillStyle = rgbaq(ACCENT_RGB, 0.9);
+            else if (distEpoch[c] === e) g.fillStyle = rgbaq(SP_HEAT_RGB, 0.85);  // in the frontier
+            else g.fillStyle = rgbaq(SP_CYAN_RGB, 0.06 + (cost[c] / SP_MAXCOST) * 0.22); // terrain heat
+            g.fillRect(x, y, SP_CW, SP_CH);
+        }
+
+        // --- BucketQueue bucket strip around the monotone cursor ---
+        g.fillStyle = COL_DIM; g.fillText(SP_BUCKET_TITLE, spBucketX, spBucketY - 12);
+        const bq = spWorld.bq, cur = bq.cursor, ceil = bq.ceiling;
+        for (let i = 0; i < SP_BUCKETS_SHOWN; i++) {
+            const p = cur + i;                       // window starts at the live cursor
+            const x = spBucketX + i * (SP_BW + 2);
+            let occ = false;
+            if (p <= ceil) occ = bqBucketHead(bq, p) >= 0; // mirrors the library's own bucket guard
+            if (i === 0) g.fillStyle = COL_AMBER;                 // the cursor bucket
+            else if (occ) g.fillStyle = rgbaq(ACCENT_RGB, 0.9);
+            else g.fillStyle = rgbaq(STALE_RGB, 0.14);
+            g.fillRect(x, spBucketY, SP_BW, i === 0 ? 30 : 22);
+        }
+
+        // --- casino: RandomSet chips colored by FreqO1 LFU visit heat ---
+        g.fillStyle = COL_DIM; g.fillText(SP_CASINO_TITLE, spCasX, PAD + 14);
+        const fq = spWorld.fq;
+        const lfu = fq.size > 0 ? fq.peekMin() : -1;  // SMI or -1
+        const maxF = spFqMaxFreq > 0 ? spFqMaxFreq : 1;
+        for (let c = 0; c < SP_CHIPS; c++) {
+            const col = c % SP_CHIP_COLS, row = (c / SP_CHIP_COLS) | 0;
+            const x = spCasX + col * (SP_CHIP + 5);
+            const y = spCasY + 12 + row * (SP_CHIP + 5);
+            const f = fq.frequencyOf(c);              // 0 if not currently cached (SMI)
+            if (f === 0) g.fillStyle = rgbaq(STALE_RGB, 0.14);
+            else g.fillStyle = rgbaq(MAGENTA_RGB, 0.3 + (f / maxF) * 0.6);
+            g.fillRect(x, y, SP_CHIP, SP_CHIP);
+            if (c === lfu) { g.strokeStyle = COL_AMBER; g.lineWidth = 2; g.strokeRect(x - 1, y - 1, SP_CHIP + 2, SP_CHIP + 2); }
+        }
+    }
+
+    // scene-04 telemetry DOM (cached once); text updated at ~7.5Hz off the frameN mask
+    const spdom = {
+        allocBig: $('sp-alloc-big'), settled: $('sp-settled'), frontier: $('sp-frontier'),
+        cursor: $('sp-cursor'), hard: $('sp-hard'), lfu: $('sp-lfu'), fps: $('sp-fps'),
+        heap: $('sp-heap'), modeTag: $('sp-mode-tag'),
+    };
+    let spLastAlloc = -1, spLastSettled = -1, spLastFrontier = -1, spLastCursor = -1,
+        spLastHard = -1, spLastLfu = -2, spLastHeapTenths = -1;
+    let spFqMaxFreq = 1; // running max FreqO1 frequency, for chip heat normalization (draw-read)
+
+    function updatePriorityTelemetry() {
+        if (allocState.allocCount !== spLastAlloc) {
+            spLastAlloc = allocState.allocCount;
+            spdom.allocBig.textContent = String(allocState.allocCount);
+            spdom.allocBig.className = allocState.allocCount === 0 ? 'alloc-big zero' : 'alloc-big climbing';
+        }
+        // settled cells this epoch (O(cells) scan at 10Hz, off the frame path) + refresh chip max
+        const settledEpoch = spWorld.settledEpoch, e = spWorld.epoch, fq = spWorld.fq;
+        let settled = 0;
+        for (let c = 0; c < SP_CELLS; c++) if (settledEpoch[c] === e) settled++;
+        if (settled !== spLastSettled) { spLastSettled = settled; spdom.settled.textContent = String(settled); }
+        let mf = 1;
+        for (let c = 0; c < SP_CHIPS; c++) { const f = fq.frequencyOf(c); if (f > mf) mf = f; }
+        spFqMaxFreq = mf;
+        const fr = spWorld.bq.size;
+        if (fr !== spLastFrontier) { spLastFrontier = fr; spdom.frontier.textContent = String(fr); }
+        const cur = spWorld.bq.cursor;
+        if (cur !== spLastCursor) { spLastCursor = cur; spdom.cursor.textContent = String(cur); }
+        const hard = spWorld.qOut[0] | 0;
+        if (hard !== spLastHard) { spLastHard = hard; spdom.hard.textContent = String(hard); }
+        const lfu = spWorld.lastLfu;
+        if (lfu !== spLastLfu) { spLastLfu = lfu; spdom.lfu.textContent = lfu < 0 ? '--' : String(lfu); }
+        spdom.fps.textContent = String(fpsValue);
+        const m = mem();
+        if (m) {
+            const tenths = Math.floor(m / 104857.6);
+            if (tenths !== spLastHeapTenths) {
+                spLastHeapTenths = tenths;
+                spdom.heap.textContent = Math.floor(tenths / 10) + '.' + (tenths % 10) + ' MB';
+            }
+        }
+    }
+
+    // scene-04 mode toggle
+    const spModeToggle = $('sp-mode-toggle'), spModeLabel = $('sp-mode-label');
+    function setModeSp(on) {
+        naiveSp = on;
+        spModeToggle.setAttribute('data-on', on ? 'true' : 'false');
+        spModeToggle.setAttribute('aria-checked', on ? 'true' : 'false');
+        spModeLabel.textContent = on ? 'naive (allocates / relax)' : 'lite (0 alloc)';
+        spdom.modeTag.textContent = on ? 'NAIVE' : 'LITE';
+        spdom.modeTag.style.color = on ? '#e879a8' : '#9d7bff';
+    }
+    spModeToggle.addEventListener('click', () => setModeSp(!naiveSp));
+    spModeToggle.addEventListener('keydown', (e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); setModeSp(!naiveSp); } });
+
+    // scene-04 buttons
+    const spBtnPause = $('sp-pause');
+    spBtnPause.addEventListener('click', () => { setPaused(!paused); spBtnPause.textContent = paused ? 'resume' : 'pause'; });
+
+    const spBanner = $('sp-banner');
+    let spBannerTimer = 0;
+    function flashSpBanner(msg) {
+        spBanner.textContent = msg;
+        spBanner.setAttribute('data-show', 'true');
+        if (spBannerTimer) clearTimeout(spBannerTimer);
+        spBannerTimer = setTimeout(() => spBanner.setAttribute('data-show', 'false'), 2600);
+    }
+
+    $('sp-rewind').addEventListener('click', () => {
+        // Attempt an ILLEGAL relaxation: lower a frontier key BELOW the monotone cursor. Extract
+        // order must be non-decreasing, so BucketQueue fails closed -- the teaching hook.
+        const bq = spWorld.bq, cur = bq.cursor;
+        try {
+            if (cur === 0) { flashSpBanner('cursor at 0 -- let the wavefront advance first'); return; }
+            bq.decreaseKey(spWorld.source, cur - 1); // newPrio < cursor -> throws before any write
+            flashSpBanner('relaxed below the cursor without a throw (unexpected)');
+        } catch (err) {
+            flashSpBanner('monotone violation -> fail closed: ' + String(err && err.message || err));
+        }
+    });
+
+    $('sp-restart').addEventListener('click', () => { restartWavefront(spWorld); });
+
+    // scene-04 frontier-rate slider (no realloc -- the kernel budget is fixed; this drives extra
+    // whole-frame advances per rAF tick to speed the wavefront)
+    const spRate = $('sp-rate'), spRateV = $('sp-rate-v');
+    spRate.addEventListener('input', () => { spRelaxBudget = +spRate.value; spRateV.textContent = String(spRelaxBudget); });
+
     // ---- main loop ---------------------------------------------------------------------
     function loop(now) {
         const dt = now - lastTs; lastTs = now;
@@ -1188,6 +1472,10 @@
             if (!paused) stepConnect();
             drawConnect(cxCtx);
             drawJank(cxJankCtx, CXJW, CXJH);
+        } else if (activeScene === 'priority') {
+            if (!paused) stepPriority();
+            drawPriority(spCtx);
+            drawJank(spJankCtx, SPJW, SPJH);
         }
 
         frameN++;
@@ -1212,6 +1500,7 @@
         if (tab === 'sparse') { computeLayout(); sizeJank(); }
         else if (tab === 'sliding') { computeSlidingLayout(); sizeSlidingJank(); }
         else if (tab === 'connect') { computeConnectLayout(); sizeConnectJank(); }
+        else if (tab === 'priority') { computePriorityLayout(); sizePriorityJank(); }
     }
     for (let i = 0; i < tabButtons.length; i++) {
         tabButtons[i].addEventListener('click', () => activate(tabButtons[i].getAttribute('data-tab')));
@@ -1296,6 +1585,7 @@
     setMode(false);
     setModeSl(false);
     setModeCx(false);
+    setModeSp(false);
     computeLayout();
     sizeJank();
     requestAnimationFrame(loop);

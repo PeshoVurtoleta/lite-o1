@@ -18,6 +18,7 @@ import { dirname, join } from 'node:path';
 
 import { SparseSet, CuckooMap, VERSION as O1_VERSION } from '../O1.js';
 import { RingDeque, UnionFind, TimerWheel, HierarchicalTimerWheel } from '../O1.js';
+import { BucketQueue, SparseTable, RandomSet, FreqO1 } from '../O1.js';
 import {
     VERSION as KERNEL_VERSION,
     createSparseWorld, stepSparseWorld, crossCheck, layoutGrid, frameSparseWorld,
@@ -25,6 +26,9 @@ import {
     createAllocState, naiveStep,
     createSlidingWorld, frameSlidingExtremes, naiveRescan, SLIDING_STACK_CAP,
     createConnectWorld, frameConnect, naiveConnectStep, TW_SLOTS,
+    createSampleWorld, frameSample, restartWavefront, naiveSampleStep,
+    stRangeExtreme, bqBucketHead,
+    SP_COLS, SP_ROWS, SP_CELLS, SP_CEIL, SP_CHIPS, SP_FQCAP,
 } from './kernels.mjs';
 import { safePath, handle, DEFAULT_PORT } from './serve.mjs';
 
@@ -398,6 +402,239 @@ test('faithfulness: cascadeLevel matches an independent tick-wrap recompute, eve
     assert.ok(sawLevel1, 'run must observe at least one level-1 (256-tick) cascade wrap, got none');
 });
 
+/* ===================== Scene 04 -- Priority & Sampling ===================== */
+
+// An INDEPENDENT array-scan Dijkstra (O(V^2)) over the frozen cost grid from `src` -- the demo
+// never sees this. Edge weight = the terrain cost of ENTERING a cell (same as the kernel). It is
+// the external truth the BucketQueue-driven wavefront distances are checked against.
+function refDijkstra(cost, cols, rows, cells, src) {
+    const INF = Infinity;
+    const dist = new Float64Array(cells).fill(INF);
+    const done = new Uint8Array(cells);
+    dist[src] = 0;
+    for (let it = 0; it < cells; it++) {
+        let u = -1, best = INF;
+        for (let i = 0; i < cells; i++) if (!done[i] && dist[i] < best) { best = dist[i]; u = i; }
+        if (u < 0) break;
+        done[u] = 1;
+        const c = u % cols, r = (u / cols) | 0;
+        if (c > 0)        { const nd = dist[u] + cost[u - 1];    if (nd < dist[u - 1]) dist[u - 1] = nd; }
+        if (c < cols - 1) { const nd = dist[u] + cost[u + 1];    if (nd < dist[u + 1]) dist[u + 1] = nd; }
+        if (r > 0)        { const nd = dist[u] + cost[u - cols]; if (nd < dist[u - cols]) dist[u - cols] = nd; }
+        if (r < rows - 1) { const nd = dist[u] + cost[u + cols]; if (nd < dist[u + cols]) dist[u + cols] = nd; }
+    }
+    return dist;
+}
+
+test('faithfulness: the BucketQueue wavefront settles every cell at its INDEPENDENT Dijkstra distance', () => {
+    const world = createSampleWorld(0x0a11ce);
+    const { cost, cols, rows, cells } = world;
+    // Reference distances from the CURRENT source (createSampleWorld already seeded one wavefront).
+    const ref = refDijkstra(cost, cols, rows, cells, world.source);
+    const e0 = world.epoch;
+    let checked = 0;
+    // Drive frames until the FIRST restart (epoch advance == the wavefront fully drained). Every
+    // cell the demo marks settled this epoch carries its FINAL distance -- assert it equals ref.
+    for (let f = 0; f < 20000 && world.epoch === e0; f++) {
+        frameSample(world);
+        for (let k = 0; k < cells; k++) {
+            if (world.settledEpoch[k] === world.epoch) {
+                assert.equal(world.dist[k], ref[k], 'settled cell ' + k + ' must match the independent Dijkstra distance');
+                checked++;
+            }
+        }
+    }
+    assert.notEqual(world.epoch, e0, 'the wavefront must fully drain (and restart) within the frame budget');
+    assert.ok(checked > 0, 'the run must settle cells against the reference');
+});
+
+test('faithfulness: a full drained wavefront settles ALL cells at the reference distance', () => {
+    const world = createSampleWorld(0x5ca1ab1e);
+    const { cost, cols, rows, cells } = world;
+    const ref = refDijkstra(cost, cols, rows, cells, world.source);
+    const e = world.epoch;
+    // Run exactly until the wavefront drains and restarts once (epoch e -> e+1). settledEpoch is
+    // NEVER touched by restartWavefront (it only re-stamps distEpoch for the new source), so
+    // settledEpoch[k] === e persists as the durable record of "settled during epoch e".
+    let guard = 0, before = e;
+    do { before = world.epoch; frameSample(world); } while (world.epoch === e && guard++ < 40000);
+    assert.notEqual(world.epoch, e, 'the wavefront must fully drain within the frame budget');
+    // The grid is 4-connected with finite weights: every cell is reachable and must be settled.
+    for (let k = 0; k < cells; k++) {
+        assert.equal(world.settledEpoch[k], e, 'cell ' + k + ' must be settled by drain');
+        // dist is intact for every cell EXCEPT the single new source the restart re-seeded (dist 0,
+        // distEpoch e+1) -- exclude it by the distEpoch guard, then assert the reference distance.
+        if (world.distEpoch[k] === e) {
+            assert.equal(world.dist[k], ref[k], 'cell ' + k + ' must be settled at its reference distance');
+        }
+    }
+});
+
+test('faithfulness: SparseTable range extremes equal a brute scan AND st.query() over many ranges', () => {
+    const world = createSampleWorld(0xbeef01);
+    const { cost, cells, stMax, stMin } = world;
+    const rng = new Uint32Array(1); rng[0] = 0x24681357;
+    for (let t = 0; t < 6000; t++) {
+        const a = nextRand(rng) % cells, b = nextRand(rng) % cells;
+        const l = Math.min(a, b), r = Math.max(a, b);
+        let mx = -Infinity, mn = Infinity;
+        for (let i = l; i <= r; i++) { const v = cost[i]; if (v > mx) mx = v; if (v < mn) mn = v; }
+        // brute == the demo's mirrored internal read == the library's own query (all three agree).
+        assert.equal(stRangeExtreme(stMax, l, r), mx, 'internal max read must equal brute max at [' + l + ',' + r + ']');
+        assert.equal(stMax.query(l, r), mx, 'library query(max) must equal brute max');
+        assert.equal(stRangeExtreme(stMin, l, r), mn, 'internal min read must equal brute min at [' + l + ',' + r + ']');
+        assert.equal(stMin.query(l, r), mn, 'library query(min) must equal brute min');
+    }
+    // The kernel's per-frame row query (world.qOut) is the real SparseTable truth too.
+    for (let f = 0; f < 400; f++) {
+        frameSample(world);
+        const row = world.lastKey >= 0 ? (world.lastKey / world.cols) | 0 : 0;
+        const l = row * world.cols, r = l + world.cols - 1;
+        assert.equal(world.qOut[0], stMax.query(l, r), 'qOut hardest must equal library query(max) at frame ' + f);
+        assert.equal(world.qOut[1], stMin.query(l, r), 'qOut easiest must equal library query(min) at frame ' + f);
+    }
+});
+
+test('faithfulness: SparseTable is immutable -- the frozen grid never mutates as BucketQueue runs', () => {
+    const world = createSampleWorld(0xf0f0);
+    const { cost, cells, stMax } = world;
+    // Snapshot the source-of-truth the SparseTable copied at build.
+    const snap = new Uint8Array(cells);
+    for (let i = 0; i < cells; i++) snap[i] = cost[i];
+    for (let f = 0; f < 3000; f++) frameSample(world); // BucketQueue mutates every frame...
+    for (let i = 0; i < cells; i++) {
+        assert.equal(cost[i], snap[i], 'the frozen cost grid must not change as the wavefront runs');
+        assert.equal(stMax.at(i), snap[i], 'SparseTable.at must still equal the original frozen terrain');
+    }
+});
+
+test('faithfulness: bqBucketHead cross-checks against priorityOf()/has() for every occupied bucket', () => {
+    const world = createSampleWorld(0xc0ffee);
+    for (let f = 0; f < 200; f++) frameSample(world);
+    const bq = world.bq;
+    let occupied = 0;
+    for (let p = 0; p < bq.ceiling + 1; p++) {
+        const key = bqBucketHead(bq, p);
+        if (key >= 0) {
+            occupied++;
+            assert.equal(bq.priorityOf(key), p, 'bucket-head key must report priorityOf === bucket index');
+            assert.equal(bq.has(key), true, 'bucket-head key must be present in the queue');
+        }
+    }
+    assert.ok(occupied > 0, 'the wavefront must leave live frontier buckets to cross-check');
+    // Out-of-range bucket indices are a safe -1 (no OOB read), mirroring the never-throw contract.
+    assert.equal(bqBucketHead(bq, -1), -1, 'a negative bucket index must return -1');
+    assert.equal(bqBucketHead(bq, bq.ceiling + 1), -1, 'a bucket past the ceiling must return -1');
+});
+
+test('adversarial: bqBucketHead voids a STALE bucket head left by clear()-before-drain, never a false hit', () => {
+    // The Scene-04 world always drains a BucketQueue to fully empty (every bucket's own head
+    // pointer reset to NIL by extraction) BEFORE calling clear() -- so the cross-check test above,
+    // however long it runs, can never exercise O1.js's own documented stale-head case (see O1.js
+    // BucketQueue class doc: "clear() ... zeroes NO store -- but the static _bHead / _bTail retain
+    // stale dense indices from the prior generation"). bqBucketHead is a general-purpose read
+    // helper, not scoped to this one demo usage pattern, so its guard must ALSO be proven against
+    // the case the demo's own drive loop cannot reach: clear() called on a queue that still has a
+    // LIVE (undrained) key in some bucket, leaving that bucket's _bHead stale, followed by a fresh
+    // generation reusing the same low dense index at a DIFFERENT priority.
+    const bq = new BucketQueue(100, 50, 100);
+    bq.insert(5, 3);           // key 5 -> dense index 0, bucket 3's head = 0 (never drained)
+    bq.clear();                // _n resets to 0; bucket 3's stale head is UNTOUCHED, still 0
+    bq.insert(7, 9);           // fresh generation reuses dense index 0 for key 7, in bucket 9
+    // Bucket 3 is genuinely EMPTY this generation (key 5 is gone, the whole queue was cleared).
+    // A guard that checks ONLY `h >= _n` (dropping the `_prio[h] !== p` half) would wrongly treat
+    // the reused dense index 0 as still belonging to bucket 3 and hand back key 7 -- exactly the
+    // false-hit this test exists to forbid.
+    assert.equal(bqBucketHead(bq, 3), -1, 'a bucket voided by clear()-before-drain must read -1, never a stale hit');
+    assert.equal(bq.has(5), false, 'the cleared key must be genuinely absent');
+    // Bucket 9 (the key's REAL home this generation) must cross-check correctly.
+    const head9 = bqBucketHead(bq, 9);
+    assert.equal(head9, 7, 'bucket 9 must report the genuinely-live key');
+    assert.equal(bq.priorityOf(head9), 9, 'bucket-head key must report priorityOf === bucket index');
+    assert.equal(bq.has(head9), true, 'bucket-head key must be present in the queue');
+});
+
+test('teaching hook: a decreaseKey BELOW the monotone cursor throws [lite-o1]; a valid one does not', () => {
+    const bq = new BucketQueue(16, 100, 16);
+    bq.insert(0, 10);
+    bq.insert(1, 40);
+    bq.insert(2, 60);
+    assert.equal(bq.extractMin(), 0, 'the min-priority key extracts first');
+    assert.ok(bq.cursor >= 10, 'the monotone cursor advanced to the extracted priority');
+    // A decreaseKey to a priority BELOW the cursor is the fail-closed teaching throw.
+    assert.throws(() => bq.decreaseKey(2, 5), /\[lite-o1\]/, 'newPrio below the cursor must throw');
+    assert.throws(() => bq.decreaseKey(2, bq.cursor - 1), /\[lite-o1\]/, 'newPrio == cursor-1 must throw');
+    // A decreaseKey AT OR ABOVE the cursor (and below the key's current priority) is valid.
+    const cur = bq.cursor;
+    assert.doesNotThrow(() => bq.decreaseKey(2, cur), 'newPrio == cursor is a legal relaxation');
+    assert.equal(bq.priorityOf(2), cur, 'the valid decreaseKey lowered the priority to the cursor');
+    // The throw is a byte-identical no-op: key 1 is untouched.
+    assert.equal(bq.priorityOf(1), 40, 'a rejected decreaseKey must leave other keys unchanged');
+});
+
+test('faithfulness: the lite Dijkstra never trips the BucketQueue monotone throw over a long run', () => {
+    // Dial's extracts in non-decreasing priority, so every kernel decreaseKey is >= the cursor.
+    // If the kernel ever relaxed below the cursor, frameSample would throw here (it must not).
+    const world = createSampleWorld(0xd1a1);
+    assert.doesNotThrow(() => { for (let f = 0; f < 8000; f++) frameSample(world); },
+        'the lite wavefront must never trip the monotone-cursor throw');
+});
+
+test('faithfulness: RandomSet.sample() always returns a LIVE member; removeRandom churn stays consistent', () => {
+    const rs = new RandomSet(SP_CHIPS, SP_CHIPS, 0x1357);
+    for (let c = 0; c < SP_CHIPS; c++) rs.add(c);
+    for (let t = 0; t < 20000; t++) {
+        const s = rs.sample();
+        assert.notEqual(s, undefined, 'a non-empty RandomSet must always sample a member');
+        assert.equal(rs.has(s), true, 'every sample() must be a genuinely live member');
+    }
+    // removeRandom returns a member that WAS present; re-adding keeps the set consistent.
+    for (let t = 0; t < 5000; t++) {
+        const g = rs.removeRandom();
+        assert.notEqual(g, undefined, 'removeRandom on a non-empty set must return a member');
+        assert.equal(rs.has(g), false, 'the removed member must no longer be present');
+        rs.add(g);
+        assert.equal(rs.has(g), true, 're-adding restores membership');
+    }
+    assert.equal(rs.size, SP_CHIPS, 'the churn leaves the set full and consistent');
+});
+
+test('faithfulness: FreqO1.popMin() drains keys in NON-DECREASING frequency order (a real O(1) LFU)', () => {
+    // A scripted access stream: key k gets exactly (k+1) accesses, so its final frequency is k+1.
+    const N = 20;
+    const fq = new FreqO1(N, N);
+    for (let k = 0; k < N; k++) {
+        fq.add(k);
+        for (let i = 0; i < k; i++) fq.increment(k); // (k) increments -> frequency k+1
+        assert.equal(fq.frequencyOf(k), k + 1, 'scripted frequency must be exactly k+1');
+    }
+    // Drain via popMin: frequencies must come out non-decreasing (the min-bucket head each time).
+    let prev = -1, drained = 0;
+    while (fq.size > 0) {
+        const key = fq.popMin();
+        assert.notEqual(key, undefined, 'popMin on a non-empty LFU must return a key');
+        const f = key + 1; // the scripted frequency of that key
+        assert.ok(f >= prev, 'popMin frequencies must be non-decreasing (got ' + f + ' after ' + prev + ')');
+        prev = f;
+        drained++;
+    }
+    assert.equal(drained, N, 'popMin must drain every key');
+    assert.equal(fq.popMin(), undefined, 'popMin on an empty LFU returns undefined, never throws');
+});
+
+test('faithfulness: the Scene-04 kernel FreqO1 stays a bounded LFU cache (popMin head is the library min)', () => {
+    const world = createSampleWorld(0x1eaf);
+    const fq = world.fq;
+    for (let f = 0; f < 6000; f++) frameSample(world);
+    assert.ok(fq.size <= SP_FQCAP, 'the LFU cache must never exceed its capacity, got ' + fq.size);
+    if (fq.size > 0) {
+        // peekMin is the head of the min-frequency bucket -- assert no live key has a lower freq.
+        const minKey = fq.peekMin();
+        const minFreq = fq.frequencyOf(minKey);
+        fq.forEach((k) => { assert.ok(fq.frequencyOf(k) >= minFreq, 'peekMin must be a genuine minimum-frequency key'); });
+    }
+});
+
 /* ==================== owned allocation counter (Truth Panel) =============== */
 
 test('owned allocation counter: 0 after N lite frames, > 0 after N naive frames (a real count)', () => {
@@ -463,6 +700,38 @@ test('owned allocation counter: Scene-03 lite frames leave it 0; the naive path 
     }
     assert.equal(alloc.allocCount, expected, 'naive path must allocate exactly one object per drained event, got ' + alloc.allocCount);
     assert.ok(expected > 0, 'the run must fire drained events so the naive counter is non-trivially > 0');
+    const junk = alloc.naiveJunk;
+    assert.ok(junk.length > 0 && junk.length <= 6000, 'naiveJunk must be capped, got ' + junk.length);
+    assert.notEqual(junk[junk.length - 1], junk[0], 'retained objects must be distinct instances, not one shared object');
+});
+
+test('owned allocation counter: Scene-04 lite frames leave it 0; the naive path allocates one object per relaxation', () => {
+    const N = 800;
+    // A liteAlloc object that frameSample is never handed would read 0 forever regardless of what
+    // frameSample actually does -- that is near-vacuous, not proof. The honest, bites-under-mutation
+    // replacement: frameSample's own declared arity is exactly 1 (world), so there is structurally
+    // NO allocState channel to wire through it, unlike naiveSampleStep which explicitly takes
+    // (state, world) -- the ONLY Scene-04 function the suite lets touch the counter. If a future
+    // change threaded a hidden debug/alloc parameter into frameSample (defeating the zero-alloc
+    // contract this whole suite exists to police), this assertion fails immediately.
+    assert.equal(frameSample.length, 1,
+        'frameSample must take exactly one argument (world) -- no allocation-counter side channel is wireable');
+    assert.equal(naiveSampleStep.length, 2,
+        'naiveSampleStep must take (state, world) -- the ONLY Scene-04 function allowed an allocation channel');
+
+    // Naive path: allocate exactly one {cell,dist} object per relaxation this frame -- a REAL
+    // per-event count, not a decorative constant. Sum the per-frame relaxation counts independently.
+    const world = createSampleWorld(0x0badcafe);
+    const alloc = createAllocState();
+    let expected = 0;
+    for (let i = 0; i < N; i++) {
+        frameSample(world);
+        const got = naiveSampleStep(alloc, world);
+        assert.equal(got, world.lastRelaxN, 'naiveSampleStep must allocate exactly lastRelaxN objects');
+        expected += world.lastRelaxN;
+    }
+    assert.equal(alloc.allocCount, expected, 'naive path must allocate exactly one object per relaxation, got ' + alloc.allocCount);
+    assert.ok(expected > 0, 'the run must relax edges so the naive counter is non-trivially > 0');
     const junk = alloc.naiveJunk;
     assert.ok(junk.length > 0 && junk.length <= 6000, 'naiveJunk must be capped, got ' + junk.length);
     assert.notEqual(junk[junk.length - 1], junk[0], 'retained objects must be distinct instances, not one shared object');
@@ -622,6 +891,57 @@ test('0-B/op: 200k Scene-03 connectivity+timers frames allocate ~0 bytes/op and 
     assert.equal(s.gc.minor, 0, '200k Scene-03 frames must trigger 0 minor GC, got ' + s.gc.minor);
     assert.ok(report.ok, 'checkNoGc must report ok: ' + JSON.stringify(report.violations));
     assert.ok(bytesPerOp < 1, 'Scene-03 lite frame kernel must allocate ~0 B/op, got ' + bytesPerOp.toFixed(3));
+});
+
+test('0-B/op: 200k Scene-04 priority+sampling frames allocate ~0 bytes/op and trigger 0 GC', async (t) => {
+    if (typeof global.gc !== 'function') {
+        t.skip('needs --expose-gc: node --expose-gc --test demo/Demo.test.mjs');
+        return;
+    }
+    // World allocated ONCE, outside the measured loop (mirrors the torture harness). This frame
+    // drives FOUR structures: BucketQueue (extractMin + neighbour relax via insert/decreaseKey +
+    // O(1) epoch-restart on drain), two immutable SparseTables (mirrored O(1) range reads),
+    // RandomSet (sample/removeRandom), and a FreqO1 LFU cache (add/increment/popMin). No per-frame
+    // closure and no boxed HeapNumber -- if either existed, this gate's maxMinor:0 would catch it.
+    const world = createSampleWorld(0x51ed270b);
+    // 60k warmup: heavy frame, and this gate runs AFTER the faithfulness suite (warmer/noisier
+    // heap + JIT), so let every inlined typed-array access settle before the measured window.
+    for (let i = 0; i < 60000; i++) frameSample(world);
+
+    // Double full GC before measuring: this gate runs LAST, after prior suites left young-gen
+    // survivors; one collection promotes them, the second clears, so the measured window starts
+    // from a genuinely empty young gen (measurement hygiene, NOT a budget change).
+    global.gc();
+    global.gc();
+    const heapBefore = process.memoryUsage().heapUsed;
+    const gc = new GcProfiler().start();
+
+    const HOT = 200000;
+    let sink = 0;
+    for (let i = 0; i < HOT; i++) {
+        sink += frameSample(world);
+        if ((i & 8191) === 0) gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
+    }
+    assert.ok(sink >= 0, 'sink keeps the swept work live (never dead-code eliminated)');
+
+    await new Promise((r) => setTimeout(r, 50)); // GC entries arrive asynchronously
+    const s = gc.summary();
+    // maxMinor: 0 is load-bearing: a per-frame closure (e.g. a non-hoisted relax callback) or a
+    // boxed HeapNumber from a method returning number|undefined would die young -- invisible to the
+    // heap-delta check below but it WOULD fire a minor GC. Gate BOTH major and minor.
+    const report = checkNoGc(s, { maxMajor: 0, maxMinor: 0, maxPauseMs: 4 });
+    gc.stop();
+    global.gc();
+    const heapAfter = process.memoryUsage().heapUsed;
+
+    const bytesPerOp = (heapAfter - heapBefore) / HOT;
+    process.stdout.write('  demo Scene-04 gate: alloc=' + (bytesPerOp <= 0 ? 0 : bytesPerOp.toFixed(3)) +
+        ' B/op | gc major=' + s.gc.major + ' minor=' + s.gc.minor + ' maxMs=' + s.gc.maxMs.toFixed(2) + '\n');
+
+    assert.equal(s.gc.major, 0, '200k Scene-04 frames must trigger 0 major GC, got ' + s.gc.major);
+    assert.equal(s.gc.minor, 0, '200k Scene-04 frames must trigger 0 minor GC, got ' + s.gc.minor);
+    assert.ok(report.ok, 'checkNoGc must report ok: ' + JSON.stringify(report.violations));
+    assert.ok(bytesPerOp < 1, 'Scene-04 lite frame kernel must allocate ~0 B/op, got ' + bytesPerOp.toFixed(3));
 });
 
 /* ============================ serve.mjs ================================== */

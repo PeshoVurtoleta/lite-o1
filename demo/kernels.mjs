@@ -11,7 +11,8 @@
 // factory at warmup; the hot frame kernels allocate nothing. ASCII-only per suite law.
 
 import { SparseSet, CuckooMap, RingLog, RingDeque, MonoDeque, MinStack,
-    UnionFind, TimerWheel, HierarchicalTimerWheel, VERSION } from '../O1.js';
+    UnionFind, TimerWheel, HierarchicalTimerWheel,
+    BucketQueue, SparseTable, RandomSet, FreqO1, VERSION } from '../O1.js';
 
 // Re-export the SHIPPED VERSION so index.html and Demo.test.mjs read the one true source
 // (never a hardcoded string -- the version-trinity test in Demo.test.mjs gates this).
@@ -527,6 +528,259 @@ export function naiveConnectStep(state, world) {
     for (let i = 0; i < n; i++) {
         const id = world.drained[i];
         const o = { a: world.edgeA[id], b: world.edgeB[id], id: id }; // the alloc the lite path refuses
+        state.naiveJunk.push(o);
+        state.allocCount++;
+    }
+    if (state.naiveJunk.length > 6000) state.naiveJunk.splice(0, state.naiveJunk.length - 6000);
+    return n;
+}
+
+// =======================================================================================
+// Scene 04 -- Priority & Sampling (graph + casino). Drives FOUR real O1.js members:
+//   - BucketQueue (Dial's monotone bucket PQ) -- the Dijkstra frontier over a weighted
+//     terrain grid; the monotone cursor only advances, and a decreaseKey BELOW it is the
+//     fail-closed teaching throw (exercised out-of-band from index.html, never here).
+//   - SparseTable (static RMQ) -- built ONCE over the FROZEN terrain-cost grid; answers
+//     O(1) range-max "hardest terrain" / range-min "easiest terrain" over the active row.
+//     The mutable-vs-immutable contrast: BucketQueue mutates every frame, SparseTable never.
+//   - RandomSet -- casino: uniform O(1) picks via sample() + removeRandom().
+//   - FreqO1 -- an O(1) LFU cache of "visits" via intrusive-list promotions; popMin() is the
+//     min-bucket head, no .sort().
+// Zero allocation after warmup: the maze/cost grid + the four instances + every scratch
+// typed array are built ONCE; the per-frame kernel drives the real structures with pure index
+// math and epoch-int visited marking (NO Set/array alloc, NO per-frame closure). ASCII-only.
+// =======================================================================================
+
+/** Terrain grid dimensions (the BucketQueue universe is SP_COLS*SP_ROWS cells). */
+export const SP_COLS = 30;
+export const SP_ROWS = 18;
+export const SP_CELLS = SP_COLS * SP_ROWS;
+/** Per-cell terrain cost band (the edge weight for entering a cell); integers in [1, 9]. */
+export const SP_MINCOST = 1;
+export const SP_MAXCOST = 9;
+/** BucketQueue priority ceiling: an upper bound on any shortest-path distance (a simple path
+ *  visits each cell at most once, so max distance < SP_CELLS * SP_MAXCOST). O(ceiling) buckets. */
+export const SP_CEIL = SP_CELLS * SP_MAXCOST;
+/** Frontier relaxations budget: cells the wavefront settles (extractMin) per frame. */
+export const SP_RELAX_BUDGET = 4;
+/** Casino chip universe (RandomSet size) and picks/frame. */
+export const SP_CHIPS = 64;
+export const SP_CASINO_RATE = 2;
+/** FreqO1 LFU cache capacity over the SP_CHIPS universe (< universe -> real eviction). */
+export const SP_FQCAP = 24;
+/** RandomSet churn cadence (a removeRandom()+add() every 1<<n frames). */
+export const SP_EVICT_MASK = 15;
+
+/**
+ * The extreme (max or min, per st's frozen kind) over the INCLUSIVE range [l, r] read via
+ * SparseTable's OWN index math -- the sanctioned internal-read technique (Scene 01/02/03
+ * precedent). It mirrors query()'s guard byte-for-byte (short-circuit BEFORE any table index,
+ * so a bad range returns undefined and never reads OOB), then does the identical two-read
+ * idempotent-overlap combine. The faithfulness test asserts this equals st.query() AND a brute
+ * scan, so the draw path stays provably the library's own truth. Zero-alloc (terrain costs are
+ * small integers -> the reads are SMIs, never boxed HeapNumbers).
+ * @param {SparseTable} st  a built SparseTable (min or max)
+ * @param {number} l  inclusive left index
+ * @param {number} r  inclusive right index
+ * @returns {number|undefined}
+ */
+export function stRangeExtreme(st, l, r) {
+    const len = st._len;
+    if (l < 0 || r < l || r >= len) return undefined; // mirror query's own never-throw guard
+    const table = st._table;
+    const k = 31 - Math.clz32(r - l + 1);  // floor(log2(width)); width >= 1 so k >= 0
+    const base = k * len;
+    const a = table[base + l];
+    const b = table[base + (r - (1 << k) + 1)];
+    return st._min ? (a < b ? a : b) : (a > b ? a : b);
+}
+
+/**
+ * The key at the FIFO head of BucketQueue bucket p, or -1 if p is out of range or the bucket is
+ * empty -- read via the library's OWN bucket cross-check (Scene-03 ring-occupancy precedent). The
+ * `p >= _ceilP1` short-circuit runs BEFORE any _bHead index (a sentinel never reads OOB); the
+ * `h >= _n || _prio[h] !== p` test is exactly the emptiness guard peekMin/extractMin use. The
+ * faithfulness test cross-checks the returned key against priorityOf()/has(). Zero-alloc.
+ * @param {BucketQueue} bq
+ * @param {number} p  a priority/bucket index
+ * @returns {number} the head key, or -1 if the bucket is empty / p is out of range
+ */
+export function bqBucketHead(bq, p) {
+    if (p < 0 || p >= bq._ceilP1) return -1;
+    const h = bq._bHead[p];
+    if (h >= bq._n || bq._prio[h] !== p) return -1; // the library's own bucket emptiness guard
+    return bq._dense[h];
+}
+
+/**
+ * Restart the Dijkstra wavefront (cold-ish path -- called at warmup and each time the frontier
+ * drains). Zero-alloc: bumps an integer EPOCH (so a stale dist/settled marker from the prior run
+ * reads as Infinity/unsettled without touching a single backing cell -- guardrail 6), clears the
+ * BucketQueue in O(1), rotates the source deterministically, and seeds it. The epoch only wraps
+ * after 2^32 restarts; the (astronomically unreachable) wrap is handled fail-safe by a one-time
+ * fill, off the measured frame path.
+ * @param {object} world
+ */
+export function restartWavefront(world) {
+    let e = (world.epoch + 1) >>> 0;
+    if (e === 0) { e = 1; world.distEpoch.fill(0); world.settledEpoch.fill(0); } // 2^32-restart wrap
+    world.epoch = e;
+    world.bq.clear();
+    const src = nextRand(world.rng) % world.cells;
+    world.source = src;
+    world.dist[src] = 0;
+    world.distEpoch[src] = e;
+    world.parent[src] = -1;
+    world.bq.insert(src, 0);
+    world.done = false;
+}
+
+/**
+ * Relax the edge from settled cell `from` into neighbour `nb` (edge weight = the terrain cost of
+ * entering nb). Module-level helper (NOT a per-frame closure) reading the world's preallocated
+ * SoA. First discovery -> BucketQueue.insert; a strictly-better distance -> decreaseKey; an
+ * already-settled neighbour is skipped. Because Dial's extracts in non-decreasing priority, every
+ * newPrio here is >= the cursor, so decreaseKey NEVER trips its monotone throw on this path.
+ * @returns {number} 1 if the edge relaxed (insert or decreaseKey), else 0 (an SMI fold)
+ */
+function _spRelax(world, from, nb, dk, e) {
+    const nd = dk + world.cost[nb];
+    if (world.settledEpoch[nb] === e) return 0;      // already finalized -> ignore
+    if (world.distEpoch[nb] !== e) {                 // first discovery -> insert into the frontier
+        world.dist[nb] = nd;
+        world.distEpoch[nb] = e;
+        world.parent[nb] = from;
+        world.bq.insert(nb, nd);
+        return 1;
+    }
+    if (nd < world.dist[nb]) {                        // strictly better -> monotone decreaseKey
+        world.bq.decreaseKey(nb, nd);
+        world.dist[nb] = nd;
+        world.parent[nb] = from;
+        return 1;
+    }
+    return 0;
+}
+
+/**
+ * Build the Scene-04 world ONCE (warmup). Generates the FROZEN terrain-cost grid, builds the two
+ * immutable SparseTables over it (max = hardest, min = easiest), creates the BucketQueue frontier
+ * plus the casino RandomSet (all chips live) + FreqO1 LFU cache, and every flat SoA scratch buffer
+ * the frame + draw paths reuse forever. Fails closed on any bad size via each class's own ctor
+ * guard. Seed-only (nextRand over an integer state word -- no wall-clock entropy).
+ * @param {number} [seed]  optional uint32 seed for the deterministic terrain + event stream
+ */
+export function createSampleWorld(seed) {
+    const rng = new Uint32Array(1);
+    rng[0] = (seed >>> 0) || 0x5eed0404;
+    const cols = SP_COLS, rows = SP_ROWS, cells = SP_CELLS;
+    // frozen terrain: costs in [SP_MINCOST, SP_MAXCOST]; the SparseTables are immutable over it.
+    const cost = new Uint8Array(cells);
+    for (let i = 0; i < cells; i++) cost[i] = SP_MINCOST + (nextRand(rng) % (SP_MAXCOST - SP_MINCOST + 1));
+    const stMax = new SparseTable(cost, 'max'); // range-max = hardest terrain (built ONCE)
+    const stMin = new SparseTable(cost, 'min'); // range-min = easiest terrain (built ONCE)
+
+    const bq = new BucketQueue(cells, SP_CEIL, cells);
+    const rs = new RandomSet(SP_CHIPS, SP_CHIPS, (rng[0] ^ 0x1234abcd) >>> 0);
+    for (let c = 0; c < SP_CHIPS; c++) rs.add(c);   // all chips live -> uniform sampling
+    const fq = new FreqO1(SP_CHIPS, SP_FQCAP);      // LFU cache: capacity < universe -> eviction
+
+    const world = {
+        rng, cols, rows, cells, cost, stMax, stMin, bq, rs, fq,
+        // per-cell SoA (epoch-int marked -- no per-restart array clear, guardrail 6)
+        dist: new Uint32Array(cells),        // dist[c] valid iff distEpoch[c] === epoch
+        distEpoch: new Uint32Array(cells),
+        settledEpoch: new Uint32Array(cells),// settled iff settledEpoch[c] === epoch
+        parent: new Int32Array(cells).fill(-1),
+        epoch: 0, source: 0, done: false,
+        // per-frame scratch (doubles live in a Float64Array, never a boxed object field)
+        qOut: new Float64Array(2),           // [hardestRow, easiestRow] for the draw path
+        rowHard: new Float64Array(rows),     // hardest terrain cached per row (draw overlay)
+        // frame counters (all SMIs -> plain fields do not box)
+        frame: 0, relaxN: 0, lastRelaxN: 0, settledN: 0, poppedN: 0,
+        lastKey: -1, lastPick: -1, lastLfu: -1,
+    };
+    restartWavefront(world);
+    return world;
+}
+
+/**
+ * One full lite-path frame of Scene 04. Order (mirrored by Demo.test.mjs):
+ *   1. advance the Dijkstra wavefront up to SP_RELAX_BUDGET settlements: extractMin off the real
+ *      BucketQueue, mark settled by epoch, relax 4 neighbours via pure index math; a drained
+ *      frontier restarts (zero-alloc epoch bump).
+ *   2. SparseTable O(1) hardest/easiest terrain over the active cell's row (mirrored internal read).
+ *   3. casino tick: RandomSet.sample() picks + FreqO1 LFU promote/evict (popMin, no sort), with a
+ *      periodic RandomSet.removeRandom()+add() churn.
+ * Every produced value is written into preallocated typed arrays / SMI fields, so the frame
+ * allocates ZERO bytes after warmup -- Demo.test.mjs gates it at 0 B/op with maxMinor:0.
+ * @returns {number} settledN + relaxN + (hard|0) + (easy|0) (an SMI fold; the swept work survives)
+ */
+export function frameSample(world) {
+    const bq = world.bq, cols = world.cols, rows = world.rows;
+    const dist = world.dist, e = world.epoch, settledEpoch = world.settledEpoch;
+
+    // --- 1. advance the wavefront (bounded settlements this frame) ---
+    let relaxN = 0, settledN = 0, popped = 0;
+    for (let b = 0; b < SP_RELAX_BUDGET; b++) {
+        const k = bq.extractMin();               // SMI cell id, or undefined when drained
+        if (k === undefined) { restartWavefront(world); break; }
+        popped++;
+        settledEpoch[k] = e;
+        settledN++;
+        world.lastKey = k;
+        const dk = dist[k];
+        const col = k % cols;
+        const row = (k / cols) | 0;
+        if (col > 0)        relaxN += _spRelax(world, k, k - 1, dk, e);
+        if (col < cols - 1) relaxN += _spRelax(world, k, k + 1, dk, e);
+        if (row > 0)        relaxN += _spRelax(world, k, k - cols, dk, e);
+        if (row < rows - 1) relaxN += _spRelax(world, k, k + cols, dk, e);
+    }
+    world.lastRelaxN = relaxN; world.relaxN = relaxN;
+    world.settledN = settledN; world.poppedN = popped;
+
+    // --- 2. SparseTable O(1) hardest/easiest terrain over the active row (mirrored read) ---
+    const row = world.lastKey >= 0 ? (world.lastKey / cols) | 0 : 0;
+    const l = row * cols, r = l + cols - 1;
+    const hard = stRangeExtreme(world.stMax, l, r);
+    const easy = stRangeExtreme(world.stMin, l, r);
+    world.qOut[0] = hard; world.qOut[1] = easy;
+    world.rowHard[row] = hard;
+
+    // --- 3. casino: RandomSet sampling + FreqO1 LFU of visits (no sort) ---
+    const rs = world.rs, fq = world.fq;
+    for (let t = 0; t < SP_CASINO_RATE; t++) {
+        const c = rs.sample();                   // SMI live chip, or undefined if empty
+        if (c !== undefined) {
+            if (fq.has(c)) fq.increment(c);      // promote a repeat visit
+            else {                                // a fresh visit -> evict LFU if the cache is full
+                if (fq.size >= fq.capacity) { const lfu = fq.popMin(); if (lfu !== undefined) world.lastLfu = lfu; }
+                fq.add(c);
+            }
+            world.lastPick = c;
+        }
+    }
+    if ((world.frame & SP_EVICT_MASK) === 0) {   // periodic RandomSet churn (exercise removeRandom)
+        const g = rs.removeRandom(); if (g !== undefined) rs.add(g);
+    }
+    world.frame++;
+    return settledN + relaxN + (hard | 0) + (easy | 0);
+}
+
+/**
+ * The Scene-04 naive foil: allocates one fresh {cell, dist} object PER relaxation this frame and
+ * bumps the owned allocation counter by that count -- the exact per-event allocation the lite path
+ * refuses (its counter stays pinned at 0). Retained garbage is capped so the foil's own process
+ * survives a long session. This is the ONLY Scene-04 code allowed to allocate.
+ * @returns {number} the number of objects allocated this frame (== world.lastRelaxN)
+ */
+export function naiveSampleStep(state, world) {
+    const n = world.lastRelaxN;
+    const k = world.lastKey;
+    const d = k >= 0 ? world.dist[k] : 0;
+    for (let i = 0; i < n; i++) {
+        const o = { cell: k, dist: d }; // the alloc the lite path refuses
         state.naiveJunk.push(o);
         state.allocCount++;
     }
