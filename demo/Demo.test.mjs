@@ -17,13 +17,14 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 import { SparseSet, CuckooMap, VERSION as O1_VERSION } from '../O1.js';
-import { RingDeque } from '../O1.js';
+import { RingDeque, UnionFind, TimerWheel, HierarchicalTimerWheel } from '../O1.js';
 import {
     VERSION as KERNEL_VERSION,
     createSparseWorld, stepSparseWorld, crossCheck, layoutGrid, frameSparseWorld,
     createCuckooWorld, stepCuckooWorld, frameCuckooWorld, nextRand,
     createAllocState, naiveStep,
     createSlidingWorld, frameSlidingExtremes, naiveRescan, SLIDING_STACK_CAP,
+    createConnectWorld, frameConnect, naiveConnectStep, TW_SLOTS,
 } from './kernels.mjs';
 import { safePath, handle, DEFAULT_PORT } from './serve.mjs';
 
@@ -282,6 +283,121 @@ test('faithfulness: driving RingDeque past capacity fails closed at capacity+1 (
     assert.ok(slid.size <= slid.capacity, 'the safe slide keeps the deque within capacity forever');
 });
 
+/* ===================== Scene 03 -- Connectivity + Timers =================== */
+
+// Independent component count for an edge stream: a FRESH UnionFind the demo never sees.
+function refLargest(ref, nodes) {
+    const parent = ref._parent, size = ref._size;
+    let best = 0;
+    for (let i = 0; i < nodes; i++) if (parent[i] === i && size[i] > best) best = size[i];
+    return best;
+}
+
+test('faithfulness: UnionFind count + largest island equal an INDEPENDENT recompute, every frame', () => {
+    const world = createConnectWorld(96, 2048, 0x11223344);
+    const nodes = world.nodes;
+    // A separate UnionFind fed the SAME drained-edge stream, in the same order. If the demo's
+    // uf ever drifts from the library's own merge semantics, count/largest diverge here.
+    const ref = new UnionFind(nodes);
+    let totalDrained = 0;
+    for (let i = 0; i < 8000; i++) {
+        frameConnect(world);
+        for (let d = 0; d < world.drainedN; d++) {
+            const id = world.drained[d];
+            ref.union(world.edgeA[id], world.edgeB[id]);
+        }
+        totalDrained += world.drainedN;
+        assert.equal(world.uf.count, ref.count, 'demo UnionFind.count must equal the independent recompute at frame ' + i);
+        assert.equal(world.largestSize, refLargest(ref, nodes), 'demo largest island must equal the independent recompute at frame ' + i);
+        // componentSize of the recorded largest root is the live library truth for that island.
+        assert.equal(world.uf.componentSize(world.largestRoot), world.largestSize, 'largestSize must equal componentSize(largestRoot)');
+    }
+    assert.ok(totalDrained > 2000, 'run must fire many edge events, got ' + totalDrained);
+});
+
+test('faithfulness: the set of ids HTW drains each frame equals an independent "due this tick" recompute', () => {
+    const world = createConnectWorld(96, 2048, 0x55667788);
+    const U = world.universe;
+    // An independent shadow of every scheduled expiry the demo never reads back. "Due this tick"
+    // is computed here as {id : refExp[id] === drainTick} -- our OWN logic, not the kernel's --
+    // and must match exactly the set HTW actually fired (world.drained). A wrong cascade or slot
+    // math would drain the wrong ids and diverge.
+    const refExp = new Float64Array(U).fill(-1);
+    const seen = new Uint8Array(U);
+    let matchedDrains = 0;
+    for (let i = 0; i < 8000; i++) {
+        frameConnect(world);
+        const T = world.drainTick;
+        // Apply this frame's schedules to the shadow (they happened at now === T, delay >= 1).
+        for (let s = 0; s < world.schedN; s++) refExp[world.schedIds[s]] = world.schedExp[s];
+        // Independent due set at T.
+        let dueCount = 0;
+        for (let id = 0; id < U; id++) if (refExp[id] === T) dueCount++;
+        assert.equal(world.drainedN, dueCount, 'HTW must drain exactly the count due at tick ' + T + ' (frame ' + i + ')');
+        // Every fired id must have been genuinely due at T; clear the shadow for fired ids.
+        for (let d = 0; d < world.drainedN; d++) {
+            const id = world.drained[d];
+            assert.equal(refExp[id], T, 'fired id ' + id + ' must have been due at tick ' + T);
+            seen[id] = 1;
+            refExp[id] = -1;
+        }
+        // And no still-scheduled id was left behind that should have fired at T.
+        for (let id = 0; id < U; id++) assert.notEqual(refExp[id], T, 'no id due at ' + T + ' may be left un-drained');
+        matchedDrains += world.drainedN;
+    }
+    assert.ok(matchedDrains > 2000, 'run must fire many timers, got ' + matchedDrains);
+});
+
+test('faithfulness: TimerWheel horizon overflow THROWS at delay >= slots, succeeds at slots-1 (the teaching hook is real)', () => {
+    const tw = new TimerWheel(64, TW_SLOTS); // TW_SLOTS is a power of two -> slots === TW_SLOTS
+    const slots = tw.slots;
+    // The last representable delay is slots-1: it must NOT throw.
+    assert.doesNotThrow(() => tw.schedule(0, slots - 1), 'delay === slots-1 must be schedulable');
+    tw.cancel(0);
+    // delay === slots (the horizon) and beyond CANNOT be represented -> fail closed.
+    assert.throws(() => tw.schedule(1, slots), /\[lite-o1\]/, 'delay === slots must throw (past the horizon)');
+    assert.throws(() => tw.schedule(1, slots + 5), /\[lite-o1\]/, 'delay > slots must throw');
+    // The throw is a byte-identical no-op: nothing scheduled.
+    assert.equal(tw.has(1), false, 'a rejected overflow schedule must leave no timer behind');
+});
+
+test('faithfulness: HTW cascade is real -- a timer beyond 256 ticks is invisible-then-due at EXACTLY its expiry', () => {
+    const htw = new HierarchicalTimerWheel(8, 8);
+    const DELAY = 300; // > 256 -> starts in level 1, must cascade DOWN to level 0 before firing
+    htw.schedule(0, DELAY);
+    let firedAt = -1;
+    // A hoisted-in-scope recorder is fine here (this is the test, not the rAF loop).
+    const rec = (id) => { firedAt = htw.now; };
+    for (let step = 0; step < DELAY; step++) {
+        assert.equal(htw.has(0), true, 'the timer must stay scheduled (invisible) until its expiry at step ' + step);
+        htw.drainDue(rec);
+        assert.equal(firedAt, -1, 'the timer must NOT fire before its expiry (step ' + step + ')');
+        htw.advance(1);
+    }
+    // now === DELAY: this is the tick it becomes due.
+    assert.equal(htw.now, DELAY, 'clock must have advanced to the expiry tick');
+    htw.drainDue(rec);
+    assert.equal(firedAt, DELAY, 'HTW must fire the timer at EXACTLY tick ' + DELAY + ' (cascade faithful)');
+    assert.equal(htw.has(0), false, 'the fired timer must be gone after its drain');
+});
+
+test('faithfulness: cascadeLevel matches an independent tick-wrap recompute, every frame', () => {
+    // Independent recompute via MODULO (not the kernel's bitmask), so a mask typo (e.g. 0xFF
+    // vs 0x1FF) diverges here even though it is silent to every other Scene-03 assertion --
+    // cascadeLevel is otherwise only consumed by index.html's cascade-pulse animation.
+    const world = createConnectWorld(64, 512, 0x9e3779b9);
+    let sawLevel1 = false;
+    for (let i = 0; i < 20000; i++) {
+        frameConnect(world);
+        const t = world.htw.now;
+        let expected = 0;
+        if (t % 256 === 0) { expected = 1; if (t % 16384 === 0) { expected = 2; if (t % 1048576 === 0) expected = 3; } }
+        assert.equal(world.cascadeLevel, expected, 'cascadeLevel must equal the independent tick-wrap recompute at frame ' + i + ' (t=' + t + ')');
+        if (expected >= 1) sawLevel1 = true;
+    }
+    assert.ok(sawLevel1, 'run must observe at least one level-1 (256-tick) cascade wrap, got none');
+});
+
 /* ==================== owned allocation counter (Truth Panel) =============== */
 
 test('owned allocation counter: 0 after N lite frames, > 0 after N naive frames (a real count)', () => {
@@ -324,6 +440,32 @@ test('owned allocation counter: Scene-02 lite frames leave it 0; the O(k) rescan
     for (let i = 0; i < N; i++) naiveRescan(alloc2, wide);
     assert.ok(alloc2.allocCount > alloc.allocCount, 'a wider window must climb the counter faster');
     assert.equal(alloc2.allocCount, N * wide.window, 'wide-window rescan count must equal N * window');
+});
+
+test('owned allocation counter: Scene-03 lite frames leave it 0; the naive path allocates one object per drained event', () => {
+    const N = 800;
+    // Lite path: drive the REAL structures, never call naiveConnectStep -> counter stays 0.
+    const lite = createConnectWorld(96, 2048, 0x0badf00d);
+    const liteAlloc = createAllocState();
+    for (let i = 0; i < N; i++) frameConnect(lite);
+    assert.equal(liteAlloc.allocCount, 0, 'the Scene-03 lite path must never touch the allocation counter');
+
+    // Naive path: allocate exactly one edge object per drained event this frame -- a REAL
+    // per-event count, not a decorative constant. Sum the per-frame drained counts independently.
+    const world = createConnectWorld(96, 2048, 0x0badf00d);
+    const alloc = createAllocState();
+    let expected = 0;
+    for (let i = 0; i < N; i++) {
+        frameConnect(world);
+        const got = naiveConnectStep(alloc, world);
+        assert.equal(got, world.drainedN, 'naiveConnectStep must allocate exactly drainedN objects');
+        expected += world.drainedN;
+    }
+    assert.equal(alloc.allocCount, expected, 'naive path must allocate exactly one object per drained event, got ' + alloc.allocCount);
+    assert.ok(expected > 0, 'the run must fire drained events so the naive counter is non-trivially > 0');
+    const junk = alloc.naiveJunk;
+    assert.ok(junk.length > 0 && junk.length <= 6000, 'naiveJunk must be capped, got ' + junk.length);
+    assert.notEqual(junk[junk.length - 1], junk[0], 'retained objects must be distinct instances, not one shared object');
 });
 
 /* ============================ layout math ================================= */
@@ -430,6 +572,56 @@ test('0-B/op: 200k Scene-02 sliding-extremes frames allocate ~0 bytes/op and tri
     assert.equal(s.gc.minor, 0, '200k Scene-02 frames must trigger 0 minor GC, got ' + s.gc.minor);
     assert.ok(report.ok, 'checkNoGc must report ok: ' + JSON.stringify(report.violations));
     assert.ok(bytesPerOp < 1, 'Scene-02 lite frame kernel must allocate ~0 B/op, got ' + bytesPerOp.toFixed(3));
+});
+
+test('0-B/op: 200k Scene-03 connectivity+timers frames allocate ~0 bytes/op and trigger 0 GC', async (t) => {
+    if (typeof global.gc !== 'function') {
+        t.skip('needs --expose-gc: node --expose-gc --test demo/Demo.test.mjs');
+        return;
+    }
+    // World allocated ONCE, outside the measured loop (mirrors the torture harness). This frame
+    // drives THREE structures (HTW schedule/drain/advance-with-cascade, a single-level TimerWheel,
+    // and a UnionFind full flatten) -- the drainDue callbacks are hoisted module functions, so no
+    // per-frame closure is created; if one were, this gate's maxMinor:0 would catch it.
+    const world = createConnectWorld(96, 2048, 0x51ed270b);
+    // 60k warmup: heavy frame, and this gate runs AFTER the faithfulness suite (warmer/noisier
+    // heap + JIT), so let every inlined typed-array access settle before the measured window.
+    for (let i = 0; i < 60000; i++) frameConnect(world);
+
+    // Double full GC before measuring: this gate runs LAST, after prior suites left young-gen
+    // survivors; one collection promotes them, the second clears, so the measured window starts
+    // from a genuinely empty young gen (measurement hygiene, NOT a budget change).
+    global.gc();
+    global.gc();
+    const heapBefore = process.memoryUsage().heapUsed;
+    const gc = new GcProfiler().start();
+
+    const HOT = 200000;
+    let sink = 0;
+    for (let i = 0; i < HOT; i++) {
+        sink += frameConnect(world);
+        if ((i & 8191) === 0) gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
+    }
+    assert.ok(sink >= 0, 'sink keeps the swept work live (never dead-code eliminated)');
+
+    await new Promise((r) => setTimeout(r, 50)); // GC entries arrive asynchronously
+    const s = gc.summary();
+    // maxMinor: 0 is load-bearing: a per-frame drainDue closure (or a boxed HeapNumber from a
+    // method returning number|undefined) would die young -- invisible to the heap-delta check
+    // below but it WOULD fire a minor GC. Gate BOTH major and minor.
+    const report = checkNoGc(s, { maxMajor: 0, maxMinor: 0, maxPauseMs: 4 });
+    gc.stop();
+    global.gc();
+    const heapAfter = process.memoryUsage().heapUsed;
+
+    const bytesPerOp = (heapAfter - heapBefore) / HOT;
+    process.stdout.write('  demo Scene-03 gate: alloc=' + (bytesPerOp <= 0 ? 0 : bytesPerOp.toFixed(3)) +
+        ' B/op | gc major=' + s.gc.major + ' minor=' + s.gc.minor + ' maxMs=' + s.gc.maxMs.toFixed(2) + '\n');
+
+    assert.equal(s.gc.major, 0, '200k Scene-03 frames must trigger 0 major GC, got ' + s.gc.major);
+    assert.equal(s.gc.minor, 0, '200k Scene-03 frames must trigger 0 minor GC, got ' + s.gc.minor);
+    assert.ok(report.ok, 'checkNoGc must report ok: ' + JSON.stringify(report.violations));
+    assert.ok(bytesPerOp < 1, 'Scene-03 lite frame kernel must allocate ~0 B/op, got ' + bytesPerOp.toFixed(3));
 });
 
 /* ============================ serve.mjs ================================== */

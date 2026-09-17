@@ -10,7 +10,8 @@
 // own per-frame math must itself be zero-GC. Every function below allocates ONLY through a
 // factory at warmup; the hot frame kernels allocate nothing. ASCII-only per suite law.
 
-import { SparseSet, CuckooMap, RingLog, RingDeque, MonoDeque, MinStack, VERSION } from '../O1.js';
+import { SparseSet, CuckooMap, RingLog, RingDeque, MonoDeque, MinStack,
+    UnionFind, TimerWheel, HierarchicalTimerWheel, VERSION } from '../O1.js';
 
 // Re-export the SHIPPED VERSION so index.html and Demo.test.mjs read the one true source
 // (never a hardcoded string -- the version-trinity test in Demo.test.mjs gates this).
@@ -355,4 +356,180 @@ export function naiveRescan(state, world) {
     state.allocCount += window;
     if (state.naiveJunk.length > 400) state.naiveJunk.splice(0, state.naiveJunk.length - 400);
     return hi;
+}
+
+// =======================================================================================
+// Scene 03 -- Connectivity + Timers (game loop). Drives the REAL TimerWheel (single-level
+// ring) + HierarchicalTimerWheel (Linux tvec: 1x256 + 3x64) + UnionFind, all from ../O1.js.
+// Each frame HTW fires the due timers; every fired timer is an EDGE EVENT that UnionFind
+// merges; componentSize colorizes the largest island. Zero allocation after warmup: the
+// drainDue callbacks are SINGLE HOISTED module-level functions (created ONCE, never per
+// frame), reading a module-level active-world pointer and writing only primitives into the
+// world's preallocated SoA buffers. No closure, object/array literal, or string concat is
+// on the frame path. ASCII-only per suite law.
+// =======================================================================================
+
+/** Graph vertex count (UnionFind universe) -- the island world drawn in the stage. */
+export const CX_NODES = 96;
+/** HTW timer id ceiling AND capacity. >= perFrame*maxDelay so a busy loop never overflows. */
+export const CX_UNIVERSE = 2048;
+/** HTW timers scheduled per frame (steady-state ~= drained per frame). */
+export const CX_PERFRAME = 3;
+/** HTW delay range [1, CX_MAXDELAY): spans level 0 (<256) AND level 1 (>=256), so cascade fires. */
+export const CX_MAXDELAY = 300;
+/** Single-level TimerWheel: slot count (the ring) and id ceiling. Horizon = TW_SLOTS. */
+export const TW_SLOTS = 64;
+export const TW_UNIVERSE = 256;
+
+// The one pointer the hoisted drain callbacks read. Set immediately BEFORE each drainDue and
+// read inside the fn -- this is what lets the callback reach the world WITHOUT being a
+// per-frame closure (a fresh closure every frame is exactly the allocation the demo forbids).
+let _cxActiveWorld = null;
+
+/**
+ * The HTW drain callback -- HOISTED, created ONCE. Fires for each due timer id: unions the
+ * edge endpoints the schedule stamped for that id (edgeA/edgeB), clears its recorded expiry,
+ * and records the fired id into the world's preallocated `drained` buffer. Allocates NOTHING
+ * (primitive reads, one uf.union, index writes). fn signature is (id, wheel); wheel unused.
+ * @param {number} id  the fired timer id
+ */
+function _cxOnDue(id) {
+    const w = _cxActiveWorld;
+    w.uf.union(w.edgeA[id], w.edgeB[id]);
+    w.expiryOf[id] = -1;
+    w.drained[w.drainedN++] = id;
+}
+
+/** The single-level TimerWheel drain callback -- HOISTED, created ONCE. Counts fired timers. */
+function _twOnDrain() {
+    _cxActiveWorld.twDrained++;
+}
+
+/**
+ * Build the Scene-03 world ONCE (warmup). Allocates the REAL UnionFind + TimerWheel +
+ * HierarchicalTimerWheel plus every flat SoA buffer the frame + draw paths reuse forever.
+ * Fails closed on a bad size via each class's own constructor guard.
+ * @param {number} [nodes]     UnionFind vertex count (islands)
+ * @param {number} [universe]  HTW timer id ceiling / capacity
+ * @param {number} [seed]      optional uint32 seed for the deterministic event stream
+ */
+export function createConnectWorld(nodes, universe, seed) {
+    const N = nodes || CX_NODES;
+    const U = universe || CX_UNIVERSE;
+    const rng = new Uint32Array(1);
+    rng[0] = (seed >>> 0) || 0x03c0ffee;
+
+    const uf = new UnionFind(N);
+    const tw = new TimerWheel(TW_UNIVERSE, TW_SLOTS);
+    const htw = new HierarchicalTimerWheel(U, U);
+
+    return {
+        uf, tw, htw, rng,
+        nodes: N, universe: U,
+        perFrame: CX_PERFRAME, maxDelay: CX_MAXDELAY,
+        // per-timer-id SoA: the edge a fired id merges + its recorded expiry (-1 == unscheduled)
+        edgeA: new Uint32Array(U),
+        edgeB: new Uint32Array(U),
+        expiryOf: new Float64Array(U).fill(-1),
+        // per-frame event records (read by Demo.test.mjs for the independent recompute)
+        schedIds: new Uint32Array(U), schedExp: new Float64Array(U), schedN: 0,
+        drained: new Uint32Array(U), drainedN: 0, drainTick: 0,
+        // draw state: each node's flattened root (path-halving made visible) + largest island
+        rootOf: new Uint32Array(N),
+        largestRoot: 0, largestSize: 0,
+        // HTW cascade depth THIS advance (0 none, 1..3 = levels that wrapped) + tw drain count
+        cascadeLevel: 0, twDrained: 0,
+        cursor: 0, twCursor: 0,
+    };
+}
+
+/**
+ * One full lite-path frame of Scene 03. Order matters (mirrored exactly by Demo.test.mjs):
+ *   1. schedule up to perFrame fresh HTW timers (free id, delay >= 1, deterministic edge)
+ *   2. drain the HTW due list at now === drainTick: each fired timer merges its edge (UnionFind)
+ *   3. advance the HTW one tick (cascades a coarser level DOWN on a 256-tick wrap)
+ *   4. run the single-level TimerWheel ring one tick in lockstep (schedule/drain/advance)
+ *   5. flatten every UnionFind tree via find (path-halving visible) + find the largest island
+ * Every value is written into the world's preallocated SoA buffers, so the frame allocates
+ * ZERO bytes after warmup -- Demo.test.mjs gates it at 0 B/op with maxMinor:0.
+ * @returns {number} largestSize + drainedN (an SMI fold so the swept work is never DCE'd)
+ */
+export function frameConnect(world) {
+    const htw = world.htw, U = world.universe, nodes = world.nodes, rng = world.rng;
+
+    // --- 1. schedule fresh timers (skip live ids; delay >= 1 so nothing is due THIS tick) ---
+    const now = htw.now;
+    world.schedN = 0;
+    let id = world.cursor;
+    for (let s = 0; s < world.perFrame; s++) {
+        let tries = 0;
+        while (tries < U && htw.has(id)) { id = id + 1 === U ? 0 : id + 1; tries++; }
+        if (htw.has(id)) break; // wheel effectively full -> stop scheduling this frame
+        const r = nextRand(rng);
+        const delay = 1 + (r % (world.maxDelay - 1)); // [1, maxDelay-1] -- within HTW L0+L1
+        const a = r % nodes;
+        const b = (r >>> 12) % nodes;
+        const expiry = now + delay;
+        world.edgeA[id] = a; world.edgeB[id] = b;
+        world.expiryOf[id] = expiry;
+        htw.schedule(id, delay);
+        world.schedIds[world.schedN] = id;
+        world.schedExp[world.schedN] = expiry;
+        world.schedN++;
+        id = id + 1 === U ? 0 : id + 1;
+    }
+    world.cursor = id;
+
+    // --- 2. drain the due timers -> edge merges (hoisted callback, zero-alloc) ---
+    world.drainedN = 0;
+    world.drainTick = htw.now;
+    _cxActiveWorld = world;
+    htw.drainDue(_cxOnDue);
+
+    // --- 3. advance one tick + record the cascade depth this wrap (architecture, not a stall) ---
+    htw.advance(1);
+    const t = htw.now;
+    let lvl = 0;
+    if ((t & 0xFF) === 0) { lvl = 1; if ((t & 0x3FFF) === 0) { lvl = 2; if ((t & 0xFFFFF) === 0) lvl = 3; } }
+    world.cascadeLevel = lvl;
+
+    // --- 4. single-level TimerWheel ring in lockstep (schedule safe, drain, advance) ---
+    const tw = world.tw, slots = tw.slots;
+    const rt = nextRand(rng);
+    const tid = rt % TW_UNIVERSE;
+    if (!tw.has(tid) && tw.size < tw.capacity) tw.schedule(tid, 1 + (rt % (slots - 1))); // delay in [1, slots-1]
+    _cxActiveWorld = world;
+    tw.drainDue(_twOnDrain);
+    tw.advance(1);
+    world.twCursor = tw.now & (slots - 1);
+
+    // --- 5. flatten every tree (path-halving visible on find) + colorize the largest island ---
+    const uf = world.uf, rootOf = world.rootOf, parent = uf._parent, size = uf._size;
+    for (let i = 0; i < nodes; i++) rootOf[i] = uf.find(i);
+    let best = 0, bestSize = 0;
+    for (let i = 0; i < nodes; i++) {
+        if (parent[i] === i) { const sz = size[i]; if (sz > bestSize) { bestSize = sz; best = i; } }
+    }
+    world.largestRoot = best; world.largestSize = bestSize;
+
+    return bestSize + world.drainedN;
+}
+
+/**
+ * The Scene-03 naive foil: allocates one fresh edge object PER drained event this frame and
+ * bumps the owned allocation counter by that count -- the exact per-event allocation the lite
+ * path refuses (its counter stays pinned at 0). Retained garbage is capped so the foil's own
+ * process survives a long session. This is the ONLY Scene-03 code allowed to allocate.
+ * @returns {number} the number of objects allocated this frame (== drainedN)
+ */
+export function naiveConnectStep(state, world) {
+    const n = world.drainedN;
+    for (let i = 0; i < n; i++) {
+        const id = world.drained[i];
+        const o = { a: world.edgeA[id], b: world.edgeB[id], id: id }; // the alloc the lite path refuses
+        state.naiveJunk.push(o);
+        state.allocCount++;
+    }
+    if (state.naiveJunk.length > 6000) state.naiveJunk.splice(0, state.naiveJunk.length - 6000);
+    return n;
 }

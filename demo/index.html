@@ -422,19 +422,92 @@
             </aside>
         </section>
 
-        <!-- SCENE 03: CONNECTIVITY + TIMERS (planned) -->
+        <!-- SCENE 03: CONNECTIVITY + TIMERS -->
         <section class="scene" data-scene="connect">
-            <div class="placeholder">
-                <span class="ph-badge">planned - next pass</span>
-                <h2>03 - Connectivity + Timers</h2>
-                <div class="ph-members">
-                    Game loop: TimerWheel schedules on a ring until a delay past the horizon
-                    cannot be represented -- the teaching hook for hierarchy. HierarchicalTimerWheel
-                    draws the Linux tvec geometry (1x256 + 3x64) as concentric dials cascading on a
-                    wrap. UnionFind merges randomized edge events and colorizes the largest island.
-                    Members: TimerWheel, HierarchicalTimerWheel, UnionFind.
+            <div class="stage" id="cx-stage">
+                <canvas id="cx-canvas"></canvas>
+                <div class="stage-overlay tl">
+                    <span class="label">game loop (live library instances)</span>
                 </div>
+                <div class="stage-overlay tr">
+                    <span class="label">mode</span><br>
+                    <span class="big" id="cx-mode-tag">LITE</span>
+                </div>
+                <div class="banner" id="cx-banner" data-show="false"></div>
             </div>
+
+            <aside class="panel">
+                <div class="panel-head">scene 03 - connectivity + timers</div>
+
+                <section>
+                    <h3>mode</h3>
+                    <div class="toggle-row">
+                        <div class="toggle" id="cx-mode-toggle" data-on="false" role="switch" aria-checked="false" tabindex="0"></div>
+                        <span class="toggle-label">path: <b id="cx-mode-label">lite (0 alloc)</b></span>
+                    </div>
+                    <p class="help-line">
+                        The <code>lite</code> path fires timers off the real
+                        <code>HierarchicalTimerWheel</code> and merges each event into
+                        <code>UnionFind</code> with 0 alloc/frame. The <code>naive</code> path
+                        <code>new</code>s one edge object per fired event -- watch the counter climb.
+                    </p>
+                </section>
+
+                <section>
+                    <h3>action</h3>
+                    <div class="btn-row">
+                        <button class="btn" id="cx-pause">pause</button>
+                        <button class="btn danger" id="cx-overflow">overflow TimerWheel</button>
+                        <button class="btn" id="cx-reset">reset islands</button>
+                    </div>
+                    <p class="help-line">
+                        <code>overflow TimerWheel</code> schedules past the single-level horizon
+                        (<code>delay &gt;= slots</code>) -- it CANNOT be represented, so it fails
+                        closed and shatters red. That overflow is why the hierarchy exists.
+                        <code>reset islands</code> re-singletons <code>UnionFind</code>.
+                    </p>
+                </section>
+
+                <section>
+                    <h3>topology</h3>
+                    <div class="field">
+                        <label>edge events / frame <span class="field-value" id="cx-rate-v">3</span></label>
+                        <input type="range" id="cx-rate" min="1" max="6" step="1" value="3">
+                    </div>
+                    <p class="help-line">
+                        Each frame HTW may cascade a coarser dial DOWN into the finer wheel on a
+                        256-tick wrap -- the amortized max-single-op spike is architecture, not a
+                        stall. TimerWheel (single ring) has no hierarchy to cascade into.
+                    </p>
+                </section>
+
+                <section>
+                    <h3>truth panel - the zero-GC proof</h3>
+                    <div class="truth">
+                        <div>
+                            <div class="primary-label">primary - jank detector</div>
+                            <canvas id="cx-jank-canvas"></canvas>
+                            <div class="jank-caption">each bar = one frame's dt; red = a frame blew past ~16.7ms (a dropped frame / GC pause)</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">primary - allocations since warmup</div>
+                            <div class="alloc-big zero" id="cx-alloc-big">0</div>
+                        </div>
+                        <div>
+                            <div class="stat-row"><span class="k">components (UnionFind)</span><span class="v accent" id="cx-count">0</span></div>
+                            <div class="stat-row"><span class="k">largest island</span><span class="v accent" id="cx-island">0</span></div>
+                            <div class="stat-row"><span class="k">HTW live timers</span><span class="v" id="cx-htw">0</span></div>
+                            <div class="stat-row"><span class="k">last cascade (levels)</span><span class="v" id="cx-cascade">0</span></div>
+                            <div class="stat-row"><span class="k">frame rate</span><span class="v" id="cx-fps">--</span></div>
+                        </div>
+                        <div>
+                            <div class="secondary-label">secondary - retained heap (Chromium-only, coarse)</div>
+                            <div class="stat-row"><span class="k">usedJSHeapSize</span><span class="v" id="cx-heap">n/a</span></div>
+                            <div class="caveat">Reported only when <code>performance.memory</code> exists (Chromium, and only under crossOriginIsolated). Quantized and lazily updated -- a secondary signal, never the headline.</div>
+                        </div>
+                    </div>
+                </section>
+            </aside>
         </section>
 
         <!-- SCENE 04: PRIORITY & SAMPLING (planned) -->
@@ -471,6 +544,7 @@
         createCuckooWorld, stepCuckooWorld, nextRand,
         createAllocState, naiveStep,
         createSlidingWorld, frameSlidingExtremes, naiveRescan,
+        createConnectWorld, frameConnect, naiveConnectStep,
     } from './kernels.mjs';
 
     const $ = (id) => document.getElementById(id);
@@ -680,6 +754,7 @@
     function updateTelemetry() {
         if (activeScene === 'sparse') updateSparseTelemetry();
         else if (activeScene === 'sliding') updateSlidingTelemetry();
+        else if (activeScene === 'connect') updateConnectTelemetry();
     }
 
     function updateSparseTelemetry() {
@@ -884,6 +959,212 @@
         computeSlidingLayout();
     });
 
+    // ==================================================================================
+    // SCENE 03 -- Connectivity + Timers. Drives the REAL HierarchicalTimerWheel (1x256 +
+    // 3x64 tvec dials) + single-level TimerWheel (ring) + UnionFind (islands) via frameConnect
+    // (kernels.mjs). The draw path only READS the world's SoA + the live library internals --
+    // zero allocation per frame (drainDue callbacks are hoisted inside kernels.mjs).
+    // ==================================================================================
+    const TAU = Math.PI * 2;
+    const cxWorld = createConnectWorld(); // defaults: 96 nodes, 2048 universe
+    let naiveCx = false;
+
+    // palette of pre-built RGB triplets so island coloring never concatenates in the hot path
+    const CX_PALETTE = ['157,123,255', '125,211,252', '245,185,66', '232,121,168', '95,227,159', '248,113,113'];
+    const CX_HTW_TITLE = 'HierarchicalTimerWheel  -  Linux tvec dials (1x256 + 3x64), cascade DOWN on a 256-tick wrap';
+    const CX_TW_TITLE = 'TimerWheel  -  single ring (no hierarchy)';
+    const CX_ISL_TITLE = 'UnionFind  -  edge events merge islands   (bright = largest, dim hue = other components)';
+
+    const cxCanvas = $('cx-canvas');
+    let cxCtx = null, CX_W = 0, CX_H = 0;
+    let cxDialCX = 0, cxDialCY = 0, CX_R = 0;
+    let cxTwCX = 0, cxTwCY = 0, CX_TWR = 0;
+    let cxGridX = 0, cxGridY = 0, CX_COLS = 24, cxRows = 4, CX_CW = 16, CX_CH = 16, CX_CGAP = 3;
+
+    function computeConnectLayout() {
+        const s = sizeCanvas(cxCanvas);
+        cxCtx = s.ctx; CX_W = s.w; CX_H = s.h;
+        const topH = CX_H * 0.60;
+        CX_R = Math.max(40, Math.min(CX_W * 0.20, topH * 0.42));
+        cxDialCX = CX_W * 0.30; cxDialCY = PAD + 26 + topH * 0.5;
+        CX_TWR = Math.max(28, Math.min(CX_W * 0.15, topH * 0.30));
+        cxTwCX = CX_W * 0.74; cxTwCY = PAD + 26 + topH * 0.5;
+        // island grid strip along the bottom
+        cxGridY = PAD + 26 + topH + 24;
+        const gridW = CX_W - PAD * 2;
+        CX_COLS = 24;
+        cxRows = Math.ceil(cxWorld.nodes / CX_COLS);
+        CX_CGAP = 3;
+        CX_CW = (gridW - (CX_COLS - 1) * CX_CGAP) / CX_COLS;
+        const availH = CX_H - cxGridY - PAD;
+        CX_CH = Math.max(6, Math.min(CX_CW, (availH - (cxRows - 1) * CX_CGAP) / cxRows));
+        cxGridX = PAD;
+    }
+    window.addEventListener('resize', () => { if (activeScene === 'connect') computeConnectLayout(); });
+
+    // cascade animation pulse (set when a wrap cascades a level; decays over CX_CASCADE_FRAMES)
+    const CX_CASCADE_FRAMES = 42;
+    let cxCascadePulse = 0, cxCascadeLvl = 0;
+
+    // scene-03 jank canvas
+    const cxJankCanvas = $('cx-jank-canvas');
+    let cxJankCtx = null, CXJW = 0, CXJH = 0;
+    function sizeConnectJank() { const s = sizeCanvas(cxJankCanvas); cxJankCtx = s.ctx; CXJW = s.w; CXJH = s.h; }
+
+    function stepConnect() {
+        frameConnect(cxWorld);
+        if (cxWorld.cascadeLevel > 0) { cxCascadePulse = CX_CASCADE_FRAMES; cxCascadeLvl = cxWorld.cascadeLevel; }
+        if (cxCascadePulse > 0) cxCascadePulse--;
+        if (naiveCx) naiveConnectStep(allocState, cxWorld); // the ONLY allocating path
+        // Keep the demo alive: re-singleton once everything has merged (O(n), zero-alloc, OFF the
+        // measured kernel -- frameConnect itself never resets, so the honesty gate stays faithful).
+        if (cxWorld.uf.count <= 1) cxWorld.uf.reset();
+    }
+
+    // Draw one HTW dial level: `lvl` 0..3, `count` slots, reading the live _head cross-check.
+    function drawHtwLevel(g, cx, cy, radius, lvl, count, cursor) {
+        const htw = cxWorld.htw, head = htw._head, listOf = htw._listOf, size = htw._size;
+        const base = lvl === 0 ? 0 : 256 + (lvl - 1) * 64;
+        const dot = lvl === 0 ? 1.4 : 2.6;
+        for (let sl = 0; sl < count; sl++) {
+            const ang = -Math.PI / 2 + (sl / count) * TAU;
+            const x = cx + Math.cos(ang) * radius;
+            const y = cy + Math.sin(ang) * radius;
+            const list = base + sl;
+            const h = head[list];
+            const occ = h < size && listOf[h] === list;
+            if (sl === cursor) g.fillStyle = COL_AMBER;
+            else if (occ) g.fillStyle = rgbaq(ACCENT_RGB, 0.9);
+            else g.fillStyle = rgbaq(STALE_RGB, 0.16);
+            g.beginPath(); g.arc(x, y, sl === cursor ? dot + 1.4 : dot, 0, TAU); g.fill();
+        }
+    }
+
+    function drawConnect(g) {
+        g.clearRect(0, 0, CX_W, CX_H);
+        g.font = LABEL_FONT;
+
+        // --- HTW concentric dials (L0 outer .. L3 inner) ---
+        g.fillStyle = COL_DIM; g.fillText(CX_HTW_TITLE, PAD, PAD + 14);
+        const now = cxWorld.htw.now;
+        // cascade glow on the level that last cascaded (coarser dial emptying into the finer one)
+        if (cxCascadePulse > 0) {
+            const a = cxCascadePulse / CX_CASCADE_FRAMES;
+            const rr = CX_R * (cxCascadeLvl === 1 ? 0.72 : cxCascadeLvl === 2 ? 0.5 : 0.32);
+            g.strokeStyle = rgbaq('245,185,66', 0.7 * a); g.lineWidth = 3;
+            g.beginPath(); g.arc(cxDialCX, cxDialCY, rr, 0, TAU); g.stroke();
+        }
+        drawHtwLevel(g, cxDialCX, cxDialCY, CX_R, 0, 256, now & 0xFF);
+        drawHtwLevel(g, cxDialCX, cxDialCY, CX_R * 0.72, 1, 64, (now >>> 8) & 0x3F);
+        drawHtwLevel(g, cxDialCX, cxDialCY, CX_R * 0.5, 2, 64, (now >>> 14) & 0x3F);
+        drawHtwLevel(g, cxDialCX, cxDialCY, CX_R * 0.32, 3, 64, (now >>> 20) & 0x3F);
+
+        // --- single-level TimerWheel ring ---
+        g.fillStyle = COL_DIM; g.fillText(CX_TW_TITLE, cxTwCX - CX_TWR, PAD + 14);
+        const tw = cxWorld.tw, tHead = tw._sHead, slotOf = tw._slotOf, tSize = tw._size, slots = tw.slots;
+        const tCursor = tw.now & (slots - 1);
+        for (let sl = 0; sl < slots; sl++) {
+            const ang = -Math.PI / 2 + (sl / slots) * TAU;
+            const x = cxTwCX + Math.cos(ang) * CX_TWR;
+            const y = cxTwCY + Math.sin(ang) * CX_TWR;
+            const h = tHead[sl];
+            const occ = h < tSize && slotOf[h] === sl;
+            if (sl === tCursor) g.fillStyle = COL_AMBER;
+            else if (occ) g.fillStyle = rgbaq(MAGENTA_RGB, 0.85);
+            else g.fillStyle = rgbaq(STALE_RGB, 0.16);
+            g.beginPath(); g.arc(x, y, sl === tCursor ? 4 : 2.6, 0, TAU); g.fill();
+        }
+
+        // --- UnionFind island grid ---
+        g.fillStyle = COL_DIM; g.fillText(CX_ISL_TITLE, cxGridX, cxGridY - 8);
+        const rootOf = cxWorld.rootOf, largest = cxWorld.largestRoot, nodes = cxWorld.nodes;
+        for (let i = 0; i < nodes; i++) {
+            const col = i % CX_COLS, row = (i / CX_COLS) | 0;
+            const x = cxGridX + col * (CX_CW + CX_CGAP);
+            const y = cxGridY + row * (CX_CH + CX_CGAP);
+            const root = rootOf[i];
+            if (root === largest) g.fillStyle = rgbaq(ACCENT_RGB, 0.95);
+            else g.fillStyle = rgbaq(CX_PALETTE[root % 6], 0.5);
+            g.fillRect(x, y, CX_CW, CX_CH);
+        }
+    }
+
+    // scene-03 telemetry DOM (cached once); text updated at ~7.5Hz off the frameN mask
+    const cxdom = {
+        allocBig: $('cx-alloc-big'), count: $('cx-count'), island: $('cx-island'),
+        htw: $('cx-htw'), cascade: $('cx-cascade'), fps: $('cx-fps'), heap: $('cx-heap'), modeTag: $('cx-mode-tag'),
+    };
+    let cxLastAlloc = -1, cxLastCount = -1, cxLastIsland = -1, cxLastHtw = -1, cxLastCascade = -1, cxLastHeapTenths = -1;
+
+    function updateConnectTelemetry() {
+        if (allocState.allocCount !== cxLastAlloc) {
+            cxLastAlloc = allocState.allocCount;
+            cxdom.allocBig.textContent = String(allocState.allocCount);
+            cxdom.allocBig.className = allocState.allocCount === 0 ? 'alloc-big zero' : 'alloc-big climbing';
+        }
+        const c = cxWorld.uf.count;
+        if (c !== cxLastCount) { cxLastCount = c; cxdom.count.textContent = String(c); }
+        const isl = cxWorld.largestSize;
+        if (isl !== cxLastIsland) { cxLastIsland = isl; cxdom.island.textContent = String(isl); }
+        const h = cxWorld.htw.size;
+        if (h !== cxLastHtw) { cxLastHtw = h; cxdom.htw.textContent = String(h); }
+        const cl = cxCascadePulse > 0 ? cxCascadeLvl : 0;
+        if (cl !== cxLastCascade) { cxLastCascade = cl; cxdom.cascade.textContent = String(cl); }
+        cxdom.fps.textContent = String(fpsValue);
+        const m = mem();
+        if (m) {
+            const tenths = Math.floor(m / 104857.6);
+            if (tenths !== cxLastHeapTenths) {
+                cxLastHeapTenths = tenths;
+                cxdom.heap.textContent = Math.floor(tenths / 10) + '.' + (tenths % 10) + ' MB';
+            }
+        }
+    }
+
+    // scene-03 mode toggle
+    const cxModeToggle = $('cx-mode-toggle'), cxModeLabel = $('cx-mode-label');
+    function setModeCx(on) {
+        naiveCx = on;
+        cxModeToggle.setAttribute('data-on', on ? 'true' : 'false');
+        cxModeToggle.setAttribute('aria-checked', on ? 'true' : 'false');
+        cxModeLabel.textContent = on ? 'naive (allocates / event)' : 'lite (0 alloc)';
+        cxdom.modeTag.textContent = on ? 'NAIVE' : 'LITE';
+        cxdom.modeTag.style.color = on ? '#e879a8' : '#9d7bff';
+    }
+    cxModeToggle.addEventListener('click', () => setModeCx(!naiveCx));
+    cxModeToggle.addEventListener('keydown', (e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); setModeCx(!naiveCx); } });
+
+    // scene-03 buttons
+    const cxBtnPause = $('cx-pause');
+    cxBtnPause.addEventListener('click', () => { setPaused(!paused); cxBtnPause.textContent = paused ? 'resume' : 'pause'; });
+
+    const cxBanner = $('cx-banner');
+    let cxBannerTimer = 0;
+    function flashCxBanner(msg) {
+        cxBanner.textContent = msg;
+        cxBanner.setAttribute('data-show', 'true');
+        if (cxBannerTimer) clearTimeout(cxBannerTimer);
+        cxBannerTimer = setTimeout(() => cxBanner.setAttribute('data-show', 'false'), 2600);
+    }
+
+    $('cx-overflow').addEventListener('click', () => {
+        // Schedule PAST the single-level horizon (delay >= slots): the ring cannot represent it,
+        // so TimerWheel fails closed -- the teaching hook for why the hierarchy exists.
+        const tw = cxWorld.tw;
+        try {
+            tw.schedule(7, tw.slots); // delay === slots -> past the horizon
+            flashCxBanner('scheduled past horizon without a throw (unexpected)');
+        } catch (e) {
+            flashCxBanner('horizon overflow -> needs hierarchy: ' + String(e && e.message || e));
+        }
+    });
+
+    $('cx-reset').addEventListener('click', () => { cxWorld.uf.reset(); });
+
+    // scene-03 rate slider (no realloc -- buffers are sized to universe; changing rate is safe)
+    const cxRate = $('cx-rate'), cxRateV = $('cx-rate-v');
+    cxRate.addEventListener('input', () => { cxWorld.perFrame = +cxRate.value; cxRateV.textContent = String(cxWorld.perFrame); });
+
     // ---- main loop ---------------------------------------------------------------------
     function loop(now) {
         const dt = now - lastTs; lastTs = now;
@@ -903,6 +1184,10 @@
             if (!paused) stepSliding();
             drawSliding();
             drawJank(slJankCtx, SLJW, SLJH);
+        } else if (activeScene === 'connect') {
+            if (!paused) stepConnect();
+            drawConnect(cxCtx);
+            drawJank(cxJankCtx, CXJW, CXJH);
         }
 
         frameN++;
@@ -926,6 +1211,7 @@
         activeScene = tab;
         if (tab === 'sparse') { computeLayout(); sizeJank(); }
         else if (tab === 'sliding') { computeSlidingLayout(); sizeSlidingJank(); }
+        else if (tab === 'connect') { computeConnectLayout(); sizeConnectJank(); }
     }
     for (let i = 0; i < tabButtons.length; i++) {
         tabButtons[i].addEventListener('click', () => activate(tabButtons[i].getAttribute('data-tab')));
@@ -1009,6 +1295,7 @@
     // ---- boot --------------------------------------------------------------------------
     setMode(false);
     setModeSl(false);
+    setModeCx(false);
     computeLayout();
     sizeJank();
     requestAnimationFrame(loop);
