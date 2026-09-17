@@ -1,0 +1,755 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>lite-o1 - sparse world</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Space+Mono:wght@400;700&display=swap"
+          rel="stylesheet">
+    <style>
+        /* Reset + tokens ---------------------------------------------------- */
+        *, *::before, *::after { box-sizing: border-box; }
+
+        :root {
+            --bg-0: #07090d;
+            --bg-1: #0d1117;
+            --bg-2: #131922;
+            --bg-3: #1a2230;
+            --line: rgba(255, 255, 255, 0.06);
+            --line-strong: rgba(255, 255, 255, 0.14);
+            --text: #d8d6d2;
+            --text-dim: #8b8d94;
+            --text-faint: #555960;
+            /* lite-o1 accent: constant-time violet (the ONLY swap from the LiteSignal chassis) */
+            --accent: #9d7bff;
+            --accent-dim: #4a3a86;
+            --cyan: #7dd3fc;
+            --amber: #f5b942;
+            --magenta: #e879a8;
+            --red: #f87171;
+            --green: #5fe39f;
+            --glow-accent: 0 0 12px rgba(157, 123, 255, 0.6), 0 0 30px rgba(157, 123, 255, 0.22);
+            --glow-red: 0 0 12px rgba(248, 113, 113, 0.6);
+        }
+
+        html, body { height: 100%; margin: 0; }
+
+        body {
+            font-family: 'JetBrains Mono', ui-monospace, monospace;
+            font-size: 13px;
+            line-height: 1.5;
+            color: var(--text);
+            background: var(--bg-0);
+            overflow: hidden;
+            font-feature-settings: "ss01", "ss02", "cv02", "cv11", "tnum";
+        }
+
+        body::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            background-image: radial-gradient(circle at 20% 0%, rgba(157, 123, 255, 0.04) 0%, transparent 40%),
+            radial-gradient(circle at 80% 100%, rgba(125, 211, 252, 0.03) 0%, transparent 50%);
+            z-index: 0;
+        }
+
+        body::after {
+            content: "";
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            background: repeating-linear-gradient(0deg, transparent 0, transparent 2px,
+                    rgba(255, 255, 255, 0.012) 2px, rgba(255, 255, 255, 0.012) 3px);
+            z-index: 1;
+        }
+
+        #app { position: relative; z-index: 2; height: 100vh; display: flex; flex-direction: column; }
+
+        /* Header ------------------------------------------------------------ */
+        header.top {
+            display: flex;
+            align-items: center;
+            gap: 24px;
+            padding: 14px 24px;
+            border-bottom: 1px solid var(--line);
+            background: linear-gradient(to bottom, var(--bg-1), var(--bg-0));
+        }
+
+        .brand { display: flex; align-items: baseline; gap: 12px; font-family: 'Space Mono', 'JetBrains Mono', monospace; }
+        .brand .mark { color: var(--accent); font-weight: 700; font-size: 16px; letter-spacing: -0.02em; text-shadow: var(--glow-accent); }
+        .brand .pkg { color: var(--text); font-weight: 700; font-size: 15px; letter-spacing: -0.01em; }
+        .brand .ver { color: var(--text-faint); font-size: 11px; }
+
+        .tagline { color: var(--text-dim); font-size: 11px; margin-left: auto; letter-spacing: 0.04em; text-transform: uppercase; }
+        .tagline .dot {
+            display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+            background: var(--accent); box-shadow: var(--glow-accent); margin-right: 6px;
+            animation: pulse 2s infinite ease-in-out; vertical-align: 1px;
+        }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+        /* Tab nav ----------------------------------------------------------- */
+        nav.tabs { display: flex; background: var(--bg-1); border-bottom: 1px solid var(--line); padding: 0 18px; }
+        nav.tabs button {
+            background: none; border: 0; color: var(--text-dim); font-family: inherit; font-size: 12px;
+            padding: 12px 18px; cursor: pointer; letter-spacing: 0.02em; position: relative; transition: color .15s;
+        }
+        @media (hover: hover) { nav.tabs button:hover { color: var(--text); } }
+        nav.tabs button[aria-current="true"] { color: var(--accent); }
+        nav.tabs button[aria-current="true"]::after {
+            content: ""; position: absolute; left: 12px; right: 12px; bottom: -1px; height: 2px;
+            background: var(--accent); box-shadow: var(--glow-accent);
+        }
+        nav.tabs .scene-num { color: var(--text-faint); margin-right: 8px; font-weight: 300; }
+
+        /* Scene container --------------------------------------------------- */
+        main { flex: 1; min-height: 0; display: flex; position: relative; }
+        .scene { flex: 1; display: none; min-height: 0; }
+        .scene[data-active] { display: flex; }
+        .stage { flex: 1; min-height: 0; position: relative; overflow: hidden; }
+        .stage canvas { display: block; width: 100%; height: 100%; }
+
+        .panel {
+            width: 340px; border-left: 1px solid var(--line); background: var(--bg-1);
+            display: flex; flex-direction: column; overflow-y: auto;
+        }
+        .panel .panel-head {
+            padding: 16px 20px 8px; font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase;
+            color: var(--text-faint); border-bottom: 1px solid var(--line);
+        }
+        .panel section { padding: 16px 20px; border-bottom: 1px solid var(--line); }
+        .panel section h3 {
+            margin: 0 0 12px; font-size: 10px; font-weight: 700; letter-spacing: 0.16em;
+            text-transform: uppercase; color: var(--cyan);
+        }
+
+        /* Inputs & buttons -------------------------------------------------- */
+        button.btn {
+            font-family: inherit; font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase;
+            background: var(--bg-3); color: var(--text); border: 1px solid var(--line-strong);
+            padding: 8px 14px; cursor: pointer; transition: all .12s;
+        }
+        @media (hover: hover) {
+            button.btn:hover { background: var(--bg-2); border-color: var(--accent-dim); color: var(--accent); }
+            button.btn.danger:hover { border-color: var(--red); color: var(--red); }
+            button.btn.primary:hover { background: var(--accent); color: var(--bg-0); }
+        }
+        button.btn.primary { background: var(--accent-dim); color: var(--text); border-color: var(--accent); font-weight: 700; }
+        button.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        .btn-row { display: flex; gap: 6px; flex-wrap: wrap; }
+
+        .field { margin-bottom: 12px; }
+        .field label {
+            display: block; font-size: 10px; letter-spacing: 0.08em; color: var(--text-faint);
+            text-transform: uppercase; margin-bottom: 4px;
+        }
+        .field input[type="range"] { width: 100%; accent-color: var(--accent); }
+        .field-value { color: var(--accent); font-weight: 700; font-variant-numeric: tabular-nums; }
+
+        .help-line { color: var(--text-dim); font-size: 11px; line-height: 1.55; margin: 10px 0 0; }
+        .help-line code { color: var(--accent); background: rgba(157, 123, 255, 0.08); padding: 0 4px; border-radius: 3px; }
+
+        /* Toggle ------------------------------------------------------------ */
+        .toggle-row { display: flex; align-items: center; gap: 10px; }
+        .toggle {
+            position: relative; width: 46px; height: 24px; border-radius: 12px;
+            background: var(--bg-3); border: 1px solid var(--line-strong); cursor: pointer; transition: all .15s;
+        }
+        .toggle::after {
+            content: ""; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%;
+            background: var(--accent); transition: transform .15s, background .15s;
+        }
+        .toggle[data-on="true"] { border-color: var(--magenta); background: rgba(232, 121, 168, 0.15); }
+        .toggle[data-on="true"]::after { transform: translateX(22px); background: var(--magenta); }
+        .toggle-label { font-size: 11px; letter-spacing: 0.04em; }
+        .toggle-label b { color: var(--accent); }
+        .toggle[data-on="true"] ~ .toggle-label b { color: var(--magenta); }
+
+        /* Truth panel ------------------------------------------------------- */
+        .truth { display: flex; flex-direction: column; gap: 12px; }
+        .truth .primary-label { font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--accent); }
+        .truth .secondary-label { font-size: 9px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--text-faint); }
+        #jank-canvas { width: 100%; height: 46px; display: block; background: var(--bg-0); border: 1px solid var(--line); }
+        .jank-caption { font-size: 10px; color: var(--text-dim); margin-top: 4px; }
+        .alloc-big { font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
+        .alloc-big.zero { color: var(--accent); text-shadow: var(--glow-accent); }
+        .alloc-big.climbing { color: var(--magenta); }
+        .stat-row { display: flex; justify-content: space-between; font-size: 12px; padding: 3px 0; }
+        .stat-row .k { color: var(--text-faint); }
+        .stat-row .v { color: var(--text); font-variant-numeric: tabular-nums; }
+        .stat-row .v.accent { color: var(--accent); font-weight: 700; }
+        .caveat { font-size: 10px; color: var(--text-faint); line-height: 1.5; }
+
+        /* Stage overlays ---------------------------------------------------- */
+        .stage-overlay { position: absolute; padding: 8px 12px; font-size: 10px; pointer-events: none; z-index: 3; }
+        .stage-overlay.tl { top: 12px; left: 16px; }
+        .stage-overlay.tr { top: 12px; right: 16px; text-align: right; }
+        .stage-overlay .label { color: var(--text-faint); letter-spacing: 0.1em; text-transform: uppercase; }
+        .stage-overlay .big { color: var(--accent); font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+        .banner {
+            position: absolute; left: 50%; top: 18px; transform: translateX(-50%); z-index: 5;
+            padding: 8px 16px; border-radius: 4px; font-size: 12px; border: 1px solid var(--red);
+            color: var(--red); background: rgba(248, 113, 113, 0.1); box-shadow: var(--glow-red);
+            opacity: 0; transition: opacity .2s; pointer-events: none; max-width: 70%;
+        }
+        .banner[data-show="true"] { opacity: 1; }
+
+        /* Placeholder scenes ------------------------------------------------ */
+        .placeholder {
+            flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+            gap: 14px; color: var(--text-dim); text-align: center; padding: 40px;
+        }
+        .placeholder .ph-badge {
+            font-size: 10px; letter-spacing: 0.2em; text-transform: uppercase; color: var(--accent);
+            border: 1px solid var(--accent-dim); border-radius: 999px; padding: 5px 14px;
+        }
+        .placeholder h2 { margin: 0; font-size: 20px; color: var(--text); font-weight: 700; }
+        .placeholder .ph-members { font-size: 12px; color: var(--text-faint); max-width: 520px; line-height: 1.7; }
+
+        /* Footer ------------------------------------------------------------ */
+        footer.bottom {
+            display: flex; gap: 18px; align-items: center; padding: 8px 24px;
+            border-top: 1px solid var(--line); background: var(--bg-1); font-size: 10px; color: var(--text-faint);
+        }
+        footer.bottom .sep { color: var(--line-strong); }
+        footer.bottom kbd {
+            background: var(--bg-3); border: 1px solid var(--line-strong); border-radius: 3px;
+            padding: 1px 5px; color: var(--text-dim); font-family: inherit;
+        }
+    </style>
+</head>
+<body>
+<div id="app">
+
+    <!-- HEADER -->
+    <header class="top">
+        <div class="brand">
+            <span class="mark">[o1]</span>
+            <span class="pkg">@zakkster/lite-o1</span>
+            <span class="ver" id="brand-version">v-.-.-</span>
+        </div>
+        <div class="tagline"><span class="dot"></span>sparse world - memory architecture, proven zero-GC</div>
+    </header>
+
+    <!-- TAB NAV -->
+    <nav class="tabs" id="tabs">
+        <button data-tab="sparse" aria-current="true"><span class="scene-num">01</span>Sparse World</button>
+        <button data-tab="sliding"><span class="scene-num">02</span>Sliding Extremes</button>
+        <button data-tab="connect"><span class="scene-num">03</span>Connectivity + Timers</button>
+        <button data-tab="priority"><span class="scene-num">04</span>Priority &amp; Sampling</button>
+    </nav>
+
+    <main>
+        <!-- SCENE 01: SPARSE WORLD -->
+        <section class="scene" data-scene="sparse" data-active>
+            <div class="stage" id="stage">
+                <canvas id="stage-canvas"></canvas>
+                <div class="stage-overlay tl">
+                    <span class="label">structures (live library instances)</span>
+                </div>
+                <div class="stage-overlay tr">
+                    <span class="label">mode</span><br>
+                    <span class="big" id="mode-tag">LITE</span>
+                </div>
+                <div class="banner" id="banner" data-show="false"></div>
+            </div>
+
+            <aside class="panel">
+                <div class="panel-head">scene 01 - sparse world</div>
+
+                <section>
+                    <h3>mode</h3>
+                    <div class="toggle-row">
+                        <div class="toggle" id="mode-toggle" data-on="false" role="switch" aria-checked="false" tabindex="0"></div>
+                        <span class="toggle-label">path: <b id="mode-label">lite (0 alloc)</b></span>
+                    </div>
+                    <p class="help-line">
+                        The <code>lite</code> path drives the REAL <code>SparseSet</code> +
+                        <code>CuckooMap</code> and allocates nothing per frame. The
+                        <code>naive</code> path <code>new</code>s an object per entity every
+                        frame -- watch the allocation counter and jank bars react.
+                    </p>
+                </section>
+
+                <section>
+                    <h3>action</h3>
+                    <div class="btn-row">
+                        <button class="btn" id="btn-pause">pause</button>
+                        <button class="btn" id="btn-clear">SparseSet.clear()</button>
+                        <button class="btn danger" id="btn-ceiling">push past 0.90</button>
+                    </div>
+                    <p class="help-line">
+                        <code>clear()</code> zeroes NOTHING -- it resets the live count only;
+                        the stale sparse cells stay in memory but fail the
+                        <code>sparse[k]&lt;n &amp;&amp; dense[sparse[k]]===k</code> cross-check,
+                        so they read inert. <code>push past 0.90</code> drives CuckooMap into
+                        its fail-closed throw at the load ceiling.
+                    </p>
+                </section>
+
+                <section>
+                    <h3>topology</h3>
+                    <div class="field">
+                        <label>SparseSet universe <span class="field-value" id="uni-v">240</span></label>
+                        <input type="range" id="uni" min="72" max="480" step="24" value="240">
+                    </div>
+                    <div class="field">
+                        <label>SparseSet live count <span class="field-value" id="live-v">80</span></label>
+                        <input type="range" id="live" min="0" max="120" step="1" value="80">
+                    </div>
+                    <div class="field">
+                        <label>CuckooMap load factor <span class="field-value" id="load-v">0.55</span></label>
+                        <input type="range" id="load" min="0" max="0.90" step="0.01" value="0.55">
+                    </div>
+                </section>
+
+                <section>
+                    <h3>truth panel - the zero-GC proof</h3>
+                    <div class="truth">
+                        <div>
+                            <div class="primary-label">primary - jank detector</div>
+                            <canvas id="jank-canvas"></canvas>
+                            <div class="jank-caption">each bar = one frame's dt; red = a frame blew past ~16.7ms (a dropped frame / GC pause)</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">primary - allocations since warmup</div>
+                            <div class="alloc-big zero" id="alloc-big">0</div>
+                        </div>
+                        <div>
+                            <div class="stat-row"><span class="k">SparseSet size</span><span class="v accent" id="ss-size">0</span></div>
+                            <div class="stat-row"><span class="k">CuckooMap size</span><span class="v accent" id="cm-size">0</span></div>
+                            <div class="stat-row"><span class="k">CuckooMap load</span><span class="v" id="cm-load">0.00</span></div>
+                            <div class="stat-row"><span class="k">frame rate</span><span class="v" id="fps">--</span></div>
+                        </div>
+                        <div>
+                            <div class="secondary-label">secondary - retained heap (Chromium-only, coarse)</div>
+                            <div class="stat-row"><span class="k">usedJSHeapSize</span><span class="v" id="heap">n/a</span></div>
+                            <div class="caveat">Reported only when <code>performance.memory</code> exists (Chromium, and only under crossOriginIsolated). Quantized and lazily updated -- a secondary signal, never the headline.</div>
+                        </div>
+                    </div>
+                </section>
+            </aside>
+        </section>
+
+        <!-- SCENE 02: SLIDING EXTREMES (planned) -->
+        <section class="scene" data-scene="sliding">
+            <div class="placeholder">
+                <span class="ph-badge">planned - next pass</span>
+                <h2>02 - Sliding Extremes</h2>
+                <div class="ph-members">
+                    Telemetry: a noisy waveform scrolls a reused Float64Array. RingLog overwrites
+                    oldest while RingDeque shatters red the instant input would exceed capacity
+                    (lossy vs fail-closed over the identical ring substrate). MonoDeque draws the
+                    sliding-window min/max envelope; MinStack (kind=max) drives the upper rail.
+                    Members: RingLog, RingDeque, MonoDeque, MinStack.
+                </div>
+            </div>
+        </section>
+
+        <!-- SCENE 03: CONNECTIVITY + TIMERS (planned) -->
+        <section class="scene" data-scene="connect">
+            <div class="placeholder">
+                <span class="ph-badge">planned - next pass</span>
+                <h2>03 - Connectivity + Timers</h2>
+                <div class="ph-members">
+                    Game loop: TimerWheel schedules on a ring until a delay past the horizon
+                    cannot be represented -- the teaching hook for hierarchy. HierarchicalTimerWheel
+                    draws the Linux tvec geometry (1x256 + 3x64) as concentric dials cascading on a
+                    wrap. UnionFind merges randomized edge events and colorizes the largest island.
+                    Members: TimerWheel, HierarchicalTimerWheel, UnionFind.
+                </div>
+            </div>
+        </section>
+
+        <!-- SCENE 04: PRIORITY & SAMPLING (planned) -->
+        <section class="scene" data-scene="priority">
+            <div class="placeholder">
+                <span class="ph-badge">planned - next pass</span>
+                <h2>04 - Priority &amp; Sampling</h2>
+                <div class="ph-members">
+                    Graph + casino: BucketQueue (Dial's) runs a Dijkstra wavefront over a maze;
+                    SparseTable overlays instant O(1) range-min/max "hardest terrain" queries on the
+                    frozen cost grid (mutable-vs-immutable contrast). RandomSet samples in exact
+                    O(1); FreqO1 maintains an O(1) LFU with no sort.
+                    Members: BucketQueue, SparseTable, RandomSet, FreqO1.
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer class="bottom">
+        <span>how to read this: accent cells/slots are LIVE; dim are inert. The lite path's allocation counter stays pinned at 0 after warmup -- that IS the zero-GC claim.</span>
+        <span class="sep">|</span>
+        <span><kbd>1</kbd>-<kbd>4</kbd> switch scene</span>
+        <span class="sep">|</span>
+        <span><kbd>space</kbd> pause</span>
+    </footer>
+</div>
+
+<script type="module">
+    // The demo drives the REAL shipped classes + the repo's Scene-01 kernels. VERSION is read
+    // from the shipped module -- NEVER hardcoded (Demo.test.mjs version-trinity gate).
+    import { VERSION } from '../O1.js';
+    import {
+        createSparseWorld, stepSparseWorld, crossCheck,
+        createCuckooWorld, stepCuckooWorld, nextRand,
+        createAllocState, naiveStep,
+    } from './kernels.mjs';
+
+    const $ = (id) => document.getElementById(id);
+
+    // Brand version straight from the shipped VERSION const.
+    $('brand-version').textContent = 'v' + VERSION;
+
+    // ---- high-DPI canvas sizing (reallocates ONLY here / on resize) --------------------
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    function sizeCanvas(c) {
+        const r = c.getBoundingClientRect();
+        c.width = Math.max(1, Math.floor(r.width * dpr));
+        c.height = Math.max(1, Math.floor(r.height * dpr));
+        const ctx = c.getContext('2d');
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        return { ctx, w: r.width, h: r.height };
+    }
+
+    // ---- built-once rgba cache (styling allocates only during warmup, never per frame) --
+    const _rgba = Object.create(null);
+    function rgbaq(rgb, a) {
+        let row = _rgba[rgb];
+        if (row === undefined) row = _rgba[rgb] = [];
+        const q = a <= 0 ? 0 : a >= 1 ? 20 : (a * 20 + 0.5) | 0;
+        let s = row[q];
+        if (s === undefined) s = row[q] = 'rgba(' + rgb + ',' + (q / 20) + ')';
+        return s;
+    }
+
+    function mem() { return (performance.memory && performance.memory.usedJSHeapSize) || 0; }
+
+    // ---- palette (pre-built RGB triplets so rgbaq never concatenates in the hot path) ---
+    const ACCENT_RGB = '157,123,255';
+    const STALE_RGB = '120,125,140';
+    const MAGENTA_RGB = '232,121,168';
+    const COL_AMBER = '#f5b942';
+    const COL_FAINT = '#555960';
+    const COL_DIM = '#8b8d94';
+    const COL_CYAN = '#7dd3fc';
+    const LABEL_FONT = '11px "JetBrains Mono", monospace';
+
+    // Pre-built static canvas labels (no per-frame string construction).
+    const SS_TITLE = 'SparseSet  -  universe grid   (accent = live, dim = inert/stale)';
+    const DS_TITLE = 'dense array  -  contiguous, O(1) swap-and-pop, no holes';
+    const CM_TITLE = 'CuckooMap  -  2 tables x 4 slots   (bucketized cuckoo hashing)';
+
+    // ---- worlds (allocated ONCE, at warmup) --------------------------------------------
+    let UNIVERSE = 240;
+    const SS_CAP = 120;
+    const CM_CAP = 96;
+    let ssWorld = createSparseWorld(UNIVERSE, SS_CAP);
+    const cmWorld = createCuckooWorld(CM_CAP, 0x51ed270b);
+
+    // ---- geometry (recomputed ONLY on resize / topology change) -------------------------
+    const stageCanvas = $('stage-canvas');
+    let stageCtx = null, STAGE_W = 0, STAGE_H = 0;
+    const PAD = 24;
+    let SS_COLS = 24, ssRows = 10, ssX = 0, ssY = 0, SS_CW = 20, SS_CH = 20, SS_GAP = 3;
+    let dsX = 0, dsY = 0, DS_CW = 6, DS_CH = 14;
+    let cmY = 0, CM_RH = 14, CM_CH = 12, CM_CW = 16, CM_GAP = 2, cmT0X = 0, cmT1X = 0;
+
+    function computeLayout() {
+        const s = sizeCanvas(stageCanvas);
+        stageCtx = s.ctx; STAGE_W = s.w; STAGE_H = s.h;
+        const gridW = STAGE_W - PAD * 2;
+        SS_COLS = 24;
+        ssRows = Math.ceil(UNIVERSE / SS_COLS);
+        SS_GAP = 3;
+        SS_CW = (gridW - (SS_COLS - 1) * SS_GAP) / SS_COLS;
+        SS_CH = SS_CW;
+        ssX = PAD; ssY = PAD + 20;
+        dsX = PAD; dsY = ssY + ssRows * (SS_CH + SS_GAP) + 34;
+        DS_CW = gridW / SS_CAP; DS_CH = 16;
+        // CuckooMap region: bottom of the stage, two tables of B buckets x 4 slots.
+        const B = cmWorld.map._B;
+        cmY = dsY + DS_CH + 44;
+        const cmRegionH = STAGE_H - cmY - PAD;
+        CM_RH = Math.max(6, cmRegionH / B);
+        CM_CH = Math.max(4, CM_RH - 2);
+        CM_CW = 18; CM_GAP = 3;
+        const tableW = 4 * (CM_CW + CM_GAP);
+        cmT0X = STAGE_W * 0.5 - tableW - 46;
+        cmT1X = STAGE_W * 0.5 + 46;
+    }
+
+    window.addEventListener('resize', computeLayout);
+
+    // ---- controls / state --------------------------------------------------------------
+    let paused = false, naive = false;
+    const allocState = createAllocState(); // owned allocation counter -- lite pins at 0
+    let ssTarget = 80, cmTargetLoad = 0.55;
+
+    // dt ring for the jank strip (power-of-two, bitmask index -- no per-frame alloc)
+    const DT = new Float64Array(128);
+    const DT_MASK = 127;
+    let dtPtr = 0;
+    let lastTs = performance.now();
+    let frameN = 0;
+
+    // fps sampling
+    let fpsLast = performance.now(), fpsFrames = 0, fpsValue = 60;
+
+    // telemetry DOM (cached once)
+    const dom = {
+        allocBig: $('alloc-big'), ssSize: $('ss-size'), cmSize: $('cm-size'),
+        cmLoad: $('cm-load'), fps: $('fps'), heap: $('heap'), modeTag: $('mode-tag'),
+    };
+    let lastAlloc = -1, lastSsSize = -1, lastCmSize = -1, lastHeapTenths = -1;
+
+    // jank strip canvas
+    const jankCanvas = $('jank-canvas');
+    let jankCtx = null, JW = 0, JH = 0;
+    function sizeJank() { const s = sizeCanvas(jankCanvas); jankCtx = s.ctx; JW = s.w; JH = s.h; }
+
+    // ---- simulation step ---------------------------------------------------------------
+    function liteStep() {
+        stepSparseWorld(ssWorld, ssTarget);
+        stepSparseWorld(ssWorld, ssTarget);
+        stepCuckooWorld(cmWorld, cmTargetLoad);
+        stepCuckooWorld(cmWorld, cmTargetLoad);
+    }
+
+    // The contrast: the naive path allocates one object per entity, every frame. This is the
+    // ONLY code that is ALLOWED to allocate -- it exists to make the lite path's 0 legible.
+    // (naiveStep itself is imported from kernels.mjs so Demo.test.mjs can prove it is a REAL
+    // allocation counter, not a decorative tick -- see the honesty suite.)
+
+    function stepSim() {
+        liteStep();                       // structures advance either way (faithful visualization)
+        if (naive) naiveStep(allocState);  // extra per-entity garbage only on the naive path
+    }
+
+    // ---- draw --------------------------------------------------------------------------
+    function drawStage() {
+        const g = stageCtx;
+        g.clearRect(0, 0, STAGE_W, STAGE_H);
+        g.font = LABEL_FONT;
+
+        // --- SparseSet universe grid ---
+        g.fillStyle = COL_DIM; g.fillText(SS_TITLE, ssX, ssY - 8);
+        const set = ssWorld.set, sparse = set._sparse, dense = set._dense, n = set.size;
+        const lastKey = ssWorld.lastKey;
+        for (let k = 0; k < UNIVERSE; k++) {
+            const col = k % SS_COLS, row = (k / SS_COLS) | 0;
+            const x = ssX + col * (SS_CW + SS_GAP);
+            const y = ssY + row * (SS_CH + SS_GAP);
+            if (crossCheck(sparse, dense, n, k)) g.fillStyle = rgbaq(ACCENT_RGB, 0.92);
+            else g.fillStyle = rgbaq(STALE_RGB, 0.14);
+            g.fillRect(x, y, SS_CW, SS_CH);
+            if (k === lastKey) {
+                g.strokeStyle = COL_AMBER; g.lineWidth = 2;
+                g.strokeRect(x - 1, y - 1, SS_CW + 2, SS_CH + 2);
+            }
+        }
+
+        // --- dense array strip (contiguous live prefix; the O(1) compaction has no holes) ---
+        g.fillStyle = COL_FAINT; g.fillText(DS_TITLE, dsX, dsY - 8);
+        for (let i = 0; i < SS_CAP; i++) {
+            const x = dsX + i * DS_CW;
+            if (i < n) g.fillStyle = rgbaq(ACCENT_RGB, 0.82);
+            else g.fillStyle = rgbaq(STALE_RGB, 0.10);
+            g.fillRect(x, dsY, DS_CW - 1, DS_CH);
+        }
+
+        // --- CuckooMap two tables (2 x B buckets x 4 slots) ---
+        g.fillStyle = COL_DIM; g.fillText(CM_TITLE, cmT0X, cmY - 12);
+        const map = cmWorld.map, occ = map._occ, keys = map._keys, fourB = map._fourB, B = map._B;
+        const cmLast = cmWorld.lastKey;
+        for (let t = 0; t < 2; t++) {
+            const tableX = t === 0 ? cmT0X : cmT1X;
+            const base = t * fourB;
+            for (let b = 0; b < B; b++) {
+                const y = cmY + b * CM_RH;
+                for (let sN = 0; sN < 4; sN++) {
+                    const idx = base + b * 4 + sN;
+                    const x = tableX + sN * (CM_CW + CM_GAP);
+                    if (occ[idx]) {
+                        const hot = keys[idx] === cmLast;
+                        g.fillStyle = hot ? rgbaq(MAGENTA_RGB, 0.95) : rgbaq(ACCENT_RGB, 0.85);
+                    } else {
+                        g.fillStyle = rgbaq(STALE_RGB, 0.12);
+                    }
+                    g.fillRect(x, y, CM_CW, CM_CH);
+                }
+            }
+        }
+    }
+
+    // jank strip: one bar per dt sample, red when a frame blew past ~16.7ms
+    const JANK_MS = 18;
+    function drawJank() {
+        const g = jankCtx;
+        g.clearRect(0, 0, JW, JH);
+        const bw = JW / 128;
+        for (let i = 0; i < 128; i++) {
+            const idx = (dtPtr + i) & DT_MASK;
+            const dt = DT[idx];
+            if (dt <= 0) continue;
+            const over = dt > JANK_MS;
+            const h = Math.min(JH, (dt / 33) * JH); // full height ~ 33ms (two dropped frames)
+            g.fillStyle = over ? rgbaq('248,113,113', 0.95) : rgbaq(ACCENT_RGB, 0.55);
+            g.fillRect(i * bw, JH - h, bw - 0.5, h);
+        }
+    }
+
+    // ---- telemetry (10Hz, off a frame-counter mask -- no toFixed/concat at 60Hz) --------
+    function updateTelemetry() {
+        if (allocState.allocCount !== lastAlloc) {
+            lastAlloc = allocState.allocCount;
+            dom.allocBig.textContent = String(allocState.allocCount);
+            if (allocState.allocCount === 0) { dom.allocBig.className = 'alloc-big zero'; }
+            else { dom.allocBig.className = 'alloc-big climbing'; }
+        }
+        const ssn = ssWorld.set.size;
+        if (ssn !== lastSsSize) { lastSsSize = ssn; dom.ssSize.textContent = String(ssn); }
+        const cmn = cmWorld.map.size;
+        if (cmn !== lastCmSize) {
+            lastCmSize = cmn;
+            dom.cmSize.textContent = String(cmn);
+            const load = cmWorld.map.load;
+            dom.cmLoad.textContent = (Math.round(load * 100) / 100).toFixed(2);
+        }
+        dom.fps.textContent = String(fpsValue);
+        const m = mem();
+        if (m) {
+            const tenths = Math.floor(m / 104857.6);
+            if (tenths !== lastHeapTenths) {
+                lastHeapTenths = tenths;
+                dom.heap.textContent = Math.floor(tenths / 10) + '.' + (tenths % 10) + ' MB';
+            }
+        }
+    }
+
+    // ---- main loop ---------------------------------------------------------------------
+    function loop(now) {
+        const dt = now - lastTs; lastTs = now;
+        DT[dtPtr] = dt; dtPtr = (dtPtr + 1) & DT_MASK;
+
+        fpsFrames++;
+        if (now - fpsLast >= 500) {
+            fpsValue = Math.round(fpsFrames * 1000 / (now - fpsLast));
+            fpsLast = now; fpsFrames = 0;
+        }
+
+        if (!paused && sparseActive) stepSim();
+        if (sparseActive) { drawStage(); drawJank(); }
+
+        frameN++;
+        if ((frameN & 7) === 0) updateTelemetry();
+        requestAnimationFrame(loop);
+    }
+
+    // ---- tabs --------------------------------------------------------------------------
+    let sparseActive = true;
+    const scenes = document.querySelectorAll('.scene');
+    const tabButtons = document.querySelectorAll('#tabs button');
+    function activate(tab) {
+        for (let i = 0; i < scenes.length; i++) {
+            const on = scenes[i].getAttribute('data-scene') === tab;
+            if (on) scenes[i].setAttribute('data-active', '');
+            else scenes[i].removeAttribute('data-active');
+        }
+        for (let i = 0; i < tabButtons.length; i++) {
+            tabButtons[i].setAttribute('aria-current', tabButtons[i].getAttribute('data-tab') === tab ? 'true' : 'false');
+        }
+        sparseActive = tab === 'sparse';
+        if (sparseActive) { computeLayout(); sizeJank(); }
+    }
+    for (let i = 0; i < tabButtons.length; i++) {
+        tabButtons[i].addEventListener('click', () => activate(tabButtons[i].getAttribute('data-tab')));
+    }
+
+    // ---- mode toggle -------------------------------------------------------------------
+    const modeToggle = $('mode-toggle'), modeLabel = $('mode-label');
+    function setMode(on) {
+        naive = on;
+        modeToggle.setAttribute('data-on', on ? 'true' : 'false');
+        modeToggle.setAttribute('aria-checked', on ? 'true' : 'false');
+        modeLabel.textContent = on ? 'naive (allocates / frame)' : 'lite (0 alloc)';
+        dom.modeTag.textContent = on ? 'NAIVE' : 'LITE';
+        dom.modeTag.style.color = on ? '#e879a8' : '#9d7bff';
+    }
+    modeToggle.addEventListener('click', () => setMode(!naive));
+    modeToggle.addEventListener('keydown', (e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); setMode(!naive); } });
+
+    // ---- action buttons ----------------------------------------------------------------
+    const btnPause = $('btn-pause');
+    function setPaused(p) { paused = p; btnPause.textContent = p ? 'resume' : 'pause'; }
+    btnPause.addEventListener('click', () => setPaused(!paused));
+
+    $('btn-clear').addEventListener('click', () => {
+        // clear() resets the live count only; the stale sparse cells persist but read inert.
+        ssWorld.set.clear();
+        ssWorld.lastKey = -1;
+    });
+
+    const banner = $('banner');
+    let bannerTimer = 0;
+    function flashBanner(msg) {
+        banner.textContent = msg;
+        banner.setAttribute('data-show', 'true');
+        if (bannerTimer) clearTimeout(bannerTimer);
+        bannerTimer = setTimeout(() => banner.setAttribute('data-show', 'false'), 2600);
+    }
+
+    $('btn-ceiling').addEventListener('click', () => {
+        // Drive CuckooMap fresh keys until it fails closed at the 0.90 load ceiling.
+        const map = cmWorld.map;
+        try {
+            let guard = 0;
+            while (guard++ < 500000) {
+                const k = (nextRand(cmWorld.rng) % (map.capacity * 64)) + 2000000;
+                map.set(k, 1);
+            }
+            flashBanner('reached guard without a throw (unexpected)');
+        } catch (e) {
+            flashBanner('fail-closed: ' + String(e && e.message || e));
+        }
+    });
+
+    // ---- sliders -----------------------------------------------------------------------
+    const uni = $('uni'), uniV = $('uni-v');
+    uni.addEventListener('input', () => {
+        UNIVERSE = +uni.value;
+        uniV.textContent = String(UNIVERSE);
+        // Topology change -> rebuild the SparseSet world (reallocation allowed OFF the frame loop).
+        const cap = Math.min(SS_CAP, UNIVERSE);
+        ssWorld = createSparseWorld(UNIVERSE, cap);
+        if (ssTarget > cap) { ssTarget = cap; }
+        computeLayout();
+    });
+
+    const live = $('live'), liveV = $('live-v');
+    live.addEventListener('input', () => { ssTarget = +live.value; liveV.textContent = String(ssTarget); });
+
+    const load = $('load'), loadV = $('load-v');
+    load.addEventListener('input', () => { cmTargetLoad = +load.value; loadV.textContent = (+load.value).toFixed(2); });
+
+    // ---- keyboard ----------------------------------------------------------------------
+    window.addEventListener('keydown', (e) => {
+        if (e.key === '1') activate('sparse');
+        else if (e.key === '2') activate('sliding');
+        else if (e.key === '3') activate('connect');
+        else if (e.key === '4') activate('priority');
+        else if (e.key === ' ' && e.target === document.body) { e.preventDefault(); setPaused(!paused); }
+    });
+
+    // ---- boot --------------------------------------------------------------------------
+    setMode(false);
+    computeLayout();
+    sizeJank();
+    requestAnimationFrame(loop);
+</script>
+</body>
+</html>
