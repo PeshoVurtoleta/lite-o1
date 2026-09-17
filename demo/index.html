@@ -335,19 +335,91 @@
             </aside>
         </section>
 
-        <!-- SCENE 02: SLIDING EXTREMES (planned) -->
+        <!-- SCENE 02: SLIDING EXTREMES -->
         <section class="scene" data-scene="sliding">
-            <div class="placeholder">
-                <span class="ph-badge">planned - next pass</span>
-                <h2>02 - Sliding Extremes</h2>
-                <div class="ph-members">
-                    Telemetry: a noisy waveform scrolls a reused Float64Array. RingLog overwrites
-                    oldest while RingDeque shatters red the instant input would exceed capacity
-                    (lossy vs fail-closed over the identical ring substrate). MonoDeque draws the
-                    sliding-window min/max envelope; MinStack (kind=max) drives the upper rail.
-                    Members: RingLog, RingDeque, MonoDeque, MinStack.
+            <div class="stage" id="sl-stage">
+                <canvas id="sl-canvas"></canvas>
+                <div class="stage-overlay tl">
+                    <span class="label">telemetry (live library instances)</span>
                 </div>
+                <div class="stage-overlay tr">
+                    <span class="label">mode</span><br>
+                    <span class="big" id="sl-mode-tag">LITE</span>
+                </div>
+                <div class="banner" id="sl-banner" data-show="false"></div>
             </div>
+
+            <aside class="panel">
+                <div class="panel-head">scene 02 - sliding extremes</div>
+
+                <section>
+                    <h3>mode</h3>
+                    <div class="toggle-row">
+                        <div class="toggle" id="sl-mode-toggle" data-on="false" role="switch" aria-checked="false" tabindex="0"></div>
+                        <span class="toggle-label">path: <b id="sl-mode-label">lite (0 alloc)</b></span>
+                    </div>
+                    <p class="help-line">
+                        The <code>lite</code> path keeps the window min/max in O(1) via two
+                        <code>MonoDeque</code>s and never allocates. The <code>naive</code> path
+                        rescans the whole window every frame into a fresh <code>O(k)</code> array --
+                        watch the allocation counter CLIMB as you widen the window.
+                    </p>
+                </section>
+
+                <section>
+                    <h3>action</h3>
+                    <div class="btn-row">
+                        <button class="btn" id="sl-pause">pause</button>
+                        <button class="btn danger" id="sl-overflow">overflow RingDeque</button>
+                        <button class="btn" id="sl-reset">reset all-time rail</button>
+                    </div>
+                    <p class="help-line">
+                        <code>RingLog</code> overwrites its oldest sample forever (lossy, never
+                        throws). <code>overflow RingDeque</code> pushes the SAME ring substrate past
+                        capacity so it fails closed and shatters red. <code>reset all-time rail</code>
+                        clears the <code>MinStack</code>, restarting the stack-lifetime max.
+                    </p>
+                </section>
+
+                <section>
+                    <h3>topology</h3>
+                    <div class="field">
+                        <label>window size (samples) <span class="field-value" id="sl-win-v">96</span></label>
+                        <input type="range" id="sl-win" min="16" max="256" step="8" value="96">
+                    </div>
+                    <p class="help-line">
+                        The window is the ONLY place buffers reallocate -- off the frame loop, never
+                        inside it. The lite ops/ms stays flat as you slide; the naive rescan climbs.
+                    </p>
+                </section>
+
+                <section>
+                    <h3>truth panel - the zero-GC proof</h3>
+                    <div class="truth">
+                        <div>
+                            <div class="primary-label">primary - jank detector</div>
+                            <canvas id="sl-jank-canvas"></canvas>
+                            <div class="jank-caption">each bar = one frame's dt; red = a frame blew past ~16.7ms (a dropped frame / GC pause)</div>
+                        </div>
+                        <div>
+                            <div class="primary-label">primary - allocations since warmup</div>
+                            <div class="alloc-big zero" id="sl-alloc-big">0</div>
+                        </div>
+                        <div>
+                            <div class="stat-row"><span class="k">window min (MonoDeque)</span><span class="v accent" id="sl-wmin">0.00</span></div>
+                            <div class="stat-row"><span class="k">window max (MonoDeque)</span><span class="v accent" id="sl-wmax">0.00</span></div>
+                            <div class="stat-row"><span class="k">all-time max (MinStack)</span><span class="v" id="sl-life">0.00</span></div>
+                            <div class="stat-row"><span class="k">RingLog size / cap</span><span class="v" id="sl-rl">0 / 0</span></div>
+                            <div class="stat-row"><span class="k">frame rate</span><span class="v" id="sl-fps">--</span></div>
+                        </div>
+                        <div>
+                            <div class="secondary-label">secondary - retained heap (Chromium-only, coarse)</div>
+                            <div class="stat-row"><span class="k">usedJSHeapSize</span><span class="v" id="sl-heap">n/a</span></div>
+                            <div class="caveat">Reported only when <code>performance.memory</code> exists (Chromium, and only under crossOriginIsolated). Quantized and lazily updated -- a secondary signal, never the headline.</div>
+                        </div>
+                    </div>
+                </section>
+            </aside>
         </section>
 
         <!-- SCENE 03: CONNECTIVITY + TIMERS (planned) -->
@@ -398,6 +470,7 @@
         createSparseWorld, stepSparseWorld, crossCheck,
         createCuckooWorld, stepCuckooWorld, nextRand,
         createAllocState, naiveStep,
+        createSlidingWorld, frameSlidingExtremes, naiveRescan,
     } from './kernels.mjs';
 
     const $ = (id) => document.getElementById(id);
@@ -586,25 +659,30 @@
         }
     }
 
-    // jank strip: one bar per dt sample, red when a frame blew past ~16.7ms
+    // jank strip: one bar per dt sample, red when a frame blew past ~16.7ms. Parametrized on the
+    // target (each scene owns its own jank canvas); the DT ring is shared (frame dt is global).
     const JANK_MS = 18;
-    function drawJank() {
-        const g = jankCtx;
-        g.clearRect(0, 0, JW, JH);
-        const bw = JW / 128;
+    function drawJank(g, jw, jh) {
+        g.clearRect(0, 0, jw, jh);
+        const bw = jw / 128;
         for (let i = 0; i < 128; i++) {
             const idx = (dtPtr + i) & DT_MASK;
             const dt = DT[idx];
             if (dt <= 0) continue;
             const over = dt > JANK_MS;
-            const h = Math.min(JH, (dt / 33) * JH); // full height ~ 33ms (two dropped frames)
+            const h = Math.min(jh, (dt / 33) * jh); // full height ~ 33ms (two dropped frames)
             g.fillStyle = over ? rgbaq('248,113,113', 0.95) : rgbaq(ACCENT_RGB, 0.55);
-            g.fillRect(i * bw, JH - h, bw - 0.5, h);
+            g.fillRect(i * bw, jh - h, bw - 0.5, h);
         }
     }
 
     // ---- telemetry (10Hz, off a frame-counter mask -- no toFixed/concat at 60Hz) --------
     function updateTelemetry() {
+        if (activeScene === 'sparse') updateSparseTelemetry();
+        else if (activeScene === 'sliding') updateSlidingTelemetry();
+    }
+
+    function updateSparseTelemetry() {
         if (allocState.allocCount !== lastAlloc) {
             lastAlloc = allocState.allocCount;
             dom.allocBig.textContent = String(allocState.allocCount);
@@ -631,6 +709,181 @@
         }
     }
 
+    // ==================================================================================
+    // SCENE 02 -- Sliding Extremes. Drives the REAL RingLog / RingDeque / MonoDeque(min|max) /
+    // MinStack(max) via frameSlidingExtremes (kernels.mjs). Every per-frame value is read from
+    // the world's reused Float64Arrays; the draw path only READS -- zero allocation per frame.
+    // ==================================================================================
+    let SL_WIN = 96;
+    const SL_WAVELEN = 1024;
+    let slWorld = createSlidingWorld(SL_WAVELEN, SL_WIN, 0x51ed270b);
+    let naiveSl = false;
+
+    // scene-02 stage canvas + plot geometry (recomputed on resize / window-size change ONLY)
+    const slCanvas = $('sl-canvas');
+    let slCtx = null, SL_W = 0, SL_H = 0;
+    let slPlotX = 0, slPlotY = 0, slPlotW = 0, slPlotH = 0;
+    const SL_VMIN = -1.25, SL_VMAX = 1.25; // fixed value axis (waveform range ~[-1, 1])
+    const SL_TITLE = 'waveform + sliding-window envelope   (accent band = MonoDeque min..max, amber = MinStack all-time max)';
+
+    function slValY(v) {
+        let t = (v - SL_VMIN) / (SL_VMAX - SL_VMIN);
+        if (t < 0) t = 0; else if (t > 1) t = 1;
+        return slPlotY + (1 - t) * slPlotH; // top of the plot = VMAX
+    }
+
+    function computeSlidingLayout() {
+        const s = sizeCanvas(slCanvas);
+        slCtx = s.ctx; SL_W = s.w; SL_H = s.h;
+        slPlotX = PAD; slPlotY = PAD + 26;
+        slPlotW = SL_W - PAD * 2;
+        slPlotH = SL_H - slPlotY - PAD - 20;
+        if (slPlotH < 20) slPlotH = 20;
+    }
+    window.addEventListener('resize', () => { if (activeScene === 'sliding') computeSlidingLayout(); });
+
+    // scene-02 jank canvas (each scene owns its own; the DT ring is shared)
+    const slJankCanvas = $('sl-jank-canvas');
+    let slJankCtx = null, SLJW = 0, SLJH = 0;
+    function sizeSlidingJank() { const s = sizeCanvas(slJankCanvas); slJankCtx = s.ctx; SLJW = s.w; SLJH = s.h; }
+
+    function stepSliding() {
+        frameSlidingExtremes(slWorld);
+        if (naiveSl) naiveRescan(allocState, slWorld); // the O(k) foil -- the ONLY allocating path
+    }
+
+    function drawSliding() {
+        const g = slCtx;
+        g.clearRect(0, 0, SL_W, SL_H);
+        g.font = LABEL_FONT;
+        g.fillStyle = COL_DIM; g.fillText(SL_TITLE, slPlotX, slPlotY - 10);
+
+        // zero axis
+        const yZero = slValY(0);
+        g.strokeStyle = rgbaq(STALE_RGB, 0.18); g.lineWidth = 1;
+        g.beginPath(); g.moveTo(slPlotX, yZero); g.lineTo(slPlotX + slPlotW, yZero); g.stroke();
+
+        const w = slWorld;
+        const n = w.railCount, head = w.railHead, mask = w.railMask, cap = w.railCap;
+        if (n === 0) return;
+        const denom = cap > 1 ? cap - 1 : 1;
+        const rl = w.ringlog;
+
+        // sliding-window envelope band: max across (left->right), then min back (right->left),
+        // one closed path filled translucent. No per-frame allocation (path is engine-internal).
+        g.beginPath();
+        for (let i = 0; i < n; i++) {
+            const x = slPlotX + (i / denom) * slPlotW;
+            const y = slValY(w.railMax[(head + i) & mask]);
+            if (i === 0) g.moveTo(x, y); else g.lineTo(x, y);
+        }
+        for (let i = n - 1; i >= 0; i--) {
+            const x = slPlotX + (i / denom) * slPlotW;
+            g.lineTo(x, slValY(w.railMin[(head + i) & mask]));
+        }
+        g.closePath();
+        g.fillStyle = rgbaq(ACCENT_RGB, 0.16); g.fill();
+
+        // waveform line straight off RingLog (oldest -> newest) -- the lossy trailing window
+        g.beginPath();
+        for (let i = 0; i < n; i++) {
+            const x = slPlotX + (i / denom) * slPlotW;
+            const y = slValY(rl.get(i));
+            if (i === 0) g.moveTo(x, y); else g.lineTo(x, y);
+        }
+        g.strokeStyle = rgbaq(ACCENT_RGB, 0.95); g.lineWidth = 1.5; g.stroke();
+
+        // MinStack all-time max rail (amber): the flat stack-lifetime extreme, follows nothing down
+        g.beginPath();
+        for (let i = 0; i < n; i++) {
+            const x = slPlotX + (i / denom) * slPlotW;
+            const y = slValY(w.railLife[(head + i) & mask]);
+            if (i === 0) g.moveTo(x, y); else g.lineTo(x, y);
+        }
+        g.strokeStyle = COL_AMBER; g.lineWidth = 1.5; g.stroke();
+    }
+
+    // scene-02 telemetry DOM (cached once); text updated at ~7.5Hz off the frameN mask
+    const sldom = {
+        allocBig: $('sl-alloc-big'), wmin: $('sl-wmin'), wmax: $('sl-wmax'),
+        life: $('sl-life'), rl: $('sl-rl'), fps: $('sl-fps'), heap: $('sl-heap'), modeTag: $('sl-mode-tag'),
+    };
+    let slLastAlloc = -1, slLastRl = -1, slLastHeapTenths = -1;
+
+    function updateSlidingTelemetry() {
+        if (allocState.allocCount !== slLastAlloc) {
+            slLastAlloc = allocState.allocCount;
+            sldom.allocBig.textContent = String(allocState.allocCount);
+            sldom.allocBig.className = allocState.allocCount === 0 ? 'alloc-big zero' : 'alloc-big climbing';
+        }
+        const out = slWorld.out; // [sample, windowMin, windowMax, lifetimeMax]
+        sldom.wmin.textContent = (Math.round(out[1] * 100) / 100).toFixed(2);
+        sldom.wmax.textContent = (Math.round(out[2] * 100) / 100).toFixed(2);
+        sldom.life.textContent = (Math.round(out[3] * 100) / 100).toFixed(2);
+        const size = slWorld.ringlog.size;
+        if (size !== slLastRl) { slLastRl = size; sldom.rl.textContent = size + ' / ' + slWorld.ringlog.capacity; }
+        sldom.fps.textContent = String(fpsValue);
+        const m = mem();
+        if (m) {
+            const tenths = Math.floor(m / 104857.6);
+            if (tenths !== slLastHeapTenths) {
+                slLastHeapTenths = tenths;
+                sldom.heap.textContent = Math.floor(tenths / 10) + '.' + (tenths % 10) + ' MB';
+            }
+        }
+    }
+
+    // scene-02 mode toggle
+    const slModeToggle = $('sl-mode-toggle'), slModeLabel = $('sl-mode-label');
+    function setModeSl(on) {
+        naiveSl = on;
+        slModeToggle.setAttribute('data-on', on ? 'true' : 'false');
+        slModeToggle.setAttribute('aria-checked', on ? 'true' : 'false');
+        slModeLabel.textContent = on ? 'naive (O(k) rescan / frame)' : 'lite (0 alloc)';
+        sldom.modeTag.textContent = on ? 'NAIVE' : 'LITE';
+        sldom.modeTag.style.color = on ? '#e879a8' : '#9d7bff';
+    }
+    slModeToggle.addEventListener('click', () => setModeSl(!naiveSl));
+    slModeToggle.addEventListener('keydown', (e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); setModeSl(!naiveSl); } });
+
+    // scene-02 buttons
+    const slBtnPause = $('sl-pause');
+    slBtnPause.addEventListener('click', () => { setPaused(!paused); slBtnPause.textContent = paused ? 'resume' : 'pause'; });
+
+    const slBanner = $('sl-banner');
+    let slBannerTimer = 0;
+    function flashSlBanner(msg) {
+        slBanner.textContent = msg;
+        slBanner.setAttribute('data-show', 'true');
+        if (slBannerTimer) clearTimeout(slBannerTimer);
+        slBannerTimer = setTimeout(() => slBanner.setAttribute('data-show', 'false'), 2600);
+    }
+
+    $('sl-overflow').addEventListener('click', () => {
+        // Push the RingDeque past capacity on the SAME ring substrate RingLog absorbs losslessly:
+        // RingDeque fails closed (throws) where RingLog would have overwritten -- the teaching pair.
+        const dq = slWorld.deque;
+        try {
+            let guard = 0;
+            while (guard++ < 2000000) dq.pushBack(0.5);
+            flashSlBanner('reached guard without a throw (unexpected)');
+        } catch (e) {
+            flashSlBanner('fail-closed: ' + String(e && e.message || e));
+        }
+    });
+
+    $('sl-reset').addEventListener('click', () => { slWorld.stackMax.clear(); });
+
+    // scene-02 window-size slider: the ONLY place buffers reallocate (off the frame loop)
+    const slWin = $('sl-win'), slWinV = $('sl-win-v');
+    slWin.addEventListener('input', () => {
+        SL_WIN = +slWin.value;
+        slWinV.textContent = String(SL_WIN);
+        slWorld = createSlidingWorld(SL_WAVELEN, SL_WIN, 0x51ed270b);
+        slLastRl = -1;
+        computeSlidingLayout();
+    });
+
     // ---- main loop ---------------------------------------------------------------------
     function loop(now) {
         const dt = now - lastTs; lastTs = now;
@@ -642,8 +895,15 @@
             fpsLast = now; fpsFrames = 0;
         }
 
-        if (!paused && sparseActive) stepSim();
-        if (sparseActive) { drawStage(); drawJank(); }
+        if (activeScene === 'sparse') {
+            if (!paused) stepSim();
+            drawStage();
+            drawJank(jankCtx, JW, JH);
+        } else if (activeScene === 'sliding') {
+            if (!paused) stepSliding();
+            drawSliding();
+            drawJank(slJankCtx, SLJW, SLJH);
+        }
 
         frameN++;
         if ((frameN & 7) === 0) updateTelemetry();
@@ -651,7 +911,7 @@
     }
 
     // ---- tabs --------------------------------------------------------------------------
-    let sparseActive = true;
+    let activeScene = 'sparse';
     const scenes = document.querySelectorAll('.scene');
     const tabButtons = document.querySelectorAll('#tabs button');
     function activate(tab) {
@@ -663,8 +923,9 @@
         for (let i = 0; i < tabButtons.length; i++) {
             tabButtons[i].setAttribute('aria-current', tabButtons[i].getAttribute('data-tab') === tab ? 'true' : 'false');
         }
-        sparseActive = tab === 'sparse';
-        if (sparseActive) { computeLayout(); sizeJank(); }
+        activeScene = tab;
+        if (tab === 'sparse') { computeLayout(); sizeJank(); }
+        else if (tab === 'sliding') { computeSlidingLayout(); sizeSlidingJank(); }
     }
     for (let i = 0; i < tabButtons.length; i++) {
         tabButtons[i].addEventListener('click', () => activate(tabButtons[i].getAttribute('data-tab')));
@@ -747,6 +1008,7 @@
 
     // ---- boot --------------------------------------------------------------------------
     setMode(false);
+    setModeSl(false);
     computeLayout();
     sizeJank();
     requestAnimationFrame(loop);

@@ -17,11 +17,13 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 import { SparseSet, CuckooMap, VERSION as O1_VERSION } from '../O1.js';
+import { RingDeque } from '../O1.js';
 import {
     VERSION as KERNEL_VERSION,
     createSparseWorld, stepSparseWorld, crossCheck, layoutGrid, frameSparseWorld,
     createCuckooWorld, stepCuckooWorld, frameCuckooWorld, nextRand,
     createAllocState, naiveStep,
+    createSlidingWorld, frameSlidingExtremes, naiveRescan, SLIDING_STACK_CAP,
 } from './kernels.mjs';
 import { safePath, handle, DEFAULT_PORT } from './serve.mjs';
 
@@ -173,6 +175,113 @@ test('faithfulness: frameCuckooWorld probed count is the real CuckooMap truth, n
     }
 });
 
+/* ===================== Scene 02 -- Sliding Extremes ======================== */
+
+// Brute-force the min OR max over the last `w` samples of an independently-recorded stream --
+// the demo NEVER sees this; it is the external truth the MonoDeque envelope is checked against.
+function bruteWindow(rec, count, w, wantMax) {
+    const start = count - w < 0 ? 0 : count - w;
+    let ext = wantMax ? -Infinity : Infinity;
+    for (let i = start; i < count; i++) {
+        const v = rec[i];
+        if (wantMax ? v > ext : v < ext) ext = v;
+    }
+    return ext;
+}
+
+test('faithfulness: MonoDeque min/max value() equals a brute-force window recompute, every frame', () => {
+    const W = 48;
+    const world = createSlidingWorld(1024, W, 0x13572468);
+    const rec = new Float64Array(20000);
+    let count = 0;
+    for (let i = 0; i < 20000; i++) {
+        frameSlidingExtremes(world);
+        const sample = world.out[0];
+        rec[count++] = sample;
+        // world.out[1]/[2] are dqMin.value()/dqMax.value(); compare to an INDEPENDENT recompute
+        // over the same recorded stream. A wrong evict threshold or a seq drift diverges here.
+        const wantMin = bruteWindow(rec, count, W, false);
+        const wantMax = bruteWindow(rec, count, W, true);
+        assert.equal(world.out[1], wantMin, 'MonoDeque(min).value() must equal brute-force window min at frame ' + i);
+        assert.equal(world.out[2], wantMax, 'MonoDeque(max).value() must equal brute-force window max at frame ' + i);
+        // And the library object itself must agree (not just the cached out[] copy).
+        assert.equal(world.dqMin.value(), wantMin, 'dqMin.value() live-read must equal brute min');
+        assert.equal(world.dqMax.value(), wantMax, 'dqMax.value() live-read must equal brute max');
+    }
+    assert.ok(count === 20000, 'the run must have fed the full stream');
+});
+
+test('faithfulness: RingLog contents + newest() equal the last-W samples of the fed stream', () => {
+    const W = 48;
+    const world = createSlidingWorld(1024, W, 0x0a0b0c0d);
+    const rl = world.ringlog;
+    const cap = rl.capacity; // pow2(W)
+    const rec = new Float64Array(8000);
+    let count = 0;
+    for (let i = 0; i < 8000; i++) {
+        frameSlidingExtremes(world);
+        rec[count++] = world.out[0];
+        if ((i & 255) === 0) {
+            const size = rl.size;
+            assert.equal(size, count < cap ? count : cap, 'RingLog size must track fill then saturate at capacity');
+            assert.equal(rl.newest(), rec[count - 1], 'RingLog.newest() must equal the last fed sample');
+            assert.equal(rl.oldest(), rec[count - size], 'RingLog.oldest() must equal the oldest retained sample');
+            // Every oldest->newest slot must equal the corresponding tail sample (independent recompute).
+            for (let j = 0; j < size; j++) {
+                assert.equal(rl.get(j), rec[count - size + j], 'RingLog.get(' + j + ') must equal the fed tail sample');
+            }
+        }
+    }
+});
+
+test('faithfulness: the rail history mirrors RingLog oldest->newest and MinStack extreme equals a scan', () => {
+    const W = 32;
+    const world = createSlidingWorld(1024, W, 0x77777777);
+    const st = world.stackMax;
+    for (let i = 0; i < 6000; i++) {
+        frameSlidingExtremes(world);
+        // The kernel's own amber-rail read (world.out[3], mirrored into railLife) must equal
+        // the library's live .extreme() EVERY frame -- not just the value column at the end.
+        // This is the independent check: if the kernel read the wrong column/index internally
+        // (e.g. the raw value instead of the running extreme), out[3] would diverge from
+        // st.extreme() even though st.extreme() itself stays correct (it never touches the
+        // kernel's read at all).
+        assert.equal(world.out[3], st.extreme(), 'out[3] (amber rail) must equal MinStack(max).extreme() at frame ' + i);
+        const ri = (world.railHead + world.railCount - 1) & world.railMask;
+        assert.equal(world.railLife[ri], st.extreme(), 'railLife newest slot must equal MinStack(max).extreme() at frame ' + i);
+    }
+    const rl = world.ringlog, size = rl.size;
+    // The parallel rail ring the draw path reads must line up head/count with RingLog exactly.
+    assert.equal(world.railCount, size, 'rail count must equal RingLog size');
+    assert.equal(world.railHead, rl._head, 'rail head must mirror RingLog head');
+    // MinStack(max).extreme() must equal an INDEPENDENT max scan of its own live value column
+    // (via forEach, which reads the value column, not the running-extreme prefix extreme() uses).
+    let scanMax = -Infinity;
+    st.forEach((v) => { if (v > scanMax) scanMax = v; });
+    assert.equal(st.extreme(), scanMax, 'MinStack(max).extreme() must equal a scan of its live values');
+    assert.equal(world.out[3], scanMax, 'out[3] (amber rail) must equal an independent scan of the live value column');
+    assert.ok(st.size > 0 && st.size <= SLIDING_STACK_CAP, 'stack size must be within its horizon');
+});
+
+test('faithfulness: driving RingDeque past capacity fails closed at capacity+1 (the shatter is real)', () => {
+    const W = 40;
+    const dq = new RingDeque(W);
+    const cap = dq.capacity; // pow2(W)
+    // Exactly `cap` pushBacks must succeed...
+    for (let i = 0; i < cap; i++) dq.pushBack(i * 0.5);
+    assert.equal(dq.size, cap, 'RingDeque must accept exactly capacity elements');
+    // ...and the (cap+1)-th must throw fail-closed as a byte-identical no-op.
+    assert.throws(() => dq.pushBack(1.0), /\[lite-o1\] RingDeque full/, 'push past capacity must fail closed');
+    assert.equal(dq.size, cap, 'size must be unchanged after the fail-closed throw (no half-write)');
+    // The sliding discipline the demo uses (popFront then pushBack) never trips the throw.
+    const slid = new RingDeque(W);
+    for (let i = 0; i < 5000; i++) {
+        if (slid.size === slid.capacity) slid.popFront();
+        slid.pushBack(i * 0.25); // must never throw
+    }
+    assert.ok(slid.size <= slid.capacity, 'the safe slide keeps the deque within capacity forever');
+});
+
 /* ==================== owned allocation counter (Truth Panel) =============== */
 
 test('owned allocation counter: 0 after N lite frames, > 0 after N naive frames (a real count)', () => {
@@ -196,6 +305,25 @@ test('owned allocation counter: 0 after N lite frames, > 0 after N naive frames 
     const last = junk[junk.length - 1];
     assert.equal(last.id, alloc.allocCount - 1, 'the last retained object must carry the final id');
     assert.notEqual(last, junk[0], 'retained objects must be distinct instances, not one shared object');
+});
+
+test('owned allocation counter: Scene-02 lite frames leave it 0; the O(k) rescan climbs with W', () => {
+    const N = 500;
+    const world = createSlidingWorld(1024, 64, 0x2468ace0);
+    const alloc = createAllocState();
+    for (let i = 0; i < N; i++) frameSlidingExtremes(world); // lite path: never touches the counter
+    assert.equal(alloc.allocCount, 0, 'the Scene-02 lite path must never touch the allocation counter');
+
+    // The naive O(k) rescan bumps the counter by EXACTLY `window` per call -- a real per-element
+    // count that grows with the window, not a decorative constant.
+    for (let i = 0; i < N; i++) naiveRescan(alloc, world);
+    assert.equal(alloc.allocCount, N * world.window, 'naive rescan must allocate exactly window elements/frame');
+    // And it must literally climb faster for a wider window (the pedagogical O(k) point).
+    const wide = createSlidingWorld(1024, 128, 0x2468ace0);
+    const alloc2 = createAllocState();
+    for (let i = 0; i < N; i++) naiveRescan(alloc2, wide);
+    assert.ok(alloc2.allocCount > alloc.allocCount, 'a wider window must climb the counter faster');
+    assert.equal(alloc2.allocCount, N * wide.window, 'wide-window rescan count must equal N * window');
 });
 
 /* ============================ layout math ================================= */
@@ -254,6 +382,54 @@ test('0-B/op: 200k lite frames allocate ~0 bytes/op and trigger 0 major GC', asy
     assert.ok(report.ok, 'checkNoGc must report ok: ' + JSON.stringify(report.violations));
     // The lite kernels must not grow the heap (a tiny epsilon absorbs measurement jitter).
     assert.ok(bytesPerOp < 1, 'lite frame kernels must allocate ~0 B/op, got ' + bytesPerOp.toFixed(3));
+});
+
+test('0-B/op: 200k Scene-02 sliding-extremes frames allocate ~0 bytes/op and trigger 0 GC', async (t) => {
+    if (typeof global.gc !== 'function') {
+        t.skip('needs --expose-gc: node --expose-gc --test demo/Demo.test.mjs');
+        return;
+    }
+    // World allocated ONCE, outside the measured loop (mirrors the torture harness).
+    const world = createSlidingWorld(1024, 96, 0x51ed270b);
+    // 60k warmup (heavier than Scene 01: this frame drives FIVE structures, so the JIT needs
+    // longer to fully settle every inlined typed-array access before the measured window --
+    // and this gate runs AFTER the faithfulness suite, so the heap/JIT state is warmer/noisier).
+    for (let i = 0; i < 60000; i++) frameSlidingExtremes(world);
+
+    // Double full GC before measuring: this gate runs LAST, after the faithfulness suite left
+    // young-gen survivors; one collection promotes them, the second clears, so the measured
+    // window starts from a genuinely empty young gen (measurement hygiene, NOT a budget change).
+    global.gc();
+    global.gc();
+    const heapBefore = process.memoryUsage().heapUsed;
+    const gc = new GcProfiler().start();
+
+    const HOT = 200000;
+    let sink = 0;
+    for (let i = 0; i < HOT; i++) {
+        sink += frameSlidingExtremes(world);
+        if ((i & 8191) === 0) gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
+    }
+    assert.ok(sink >= 0, 'sink keeps the swept work live (never dead-code eliminated)');
+
+    await new Promise((r) => setTimeout(r, 50)); // GC entries arrive asynchronously
+    const s = gc.summary();
+    // maxMinor: 0 is load-bearing: a doubled sample stored into an OBJECT property (instead of
+    // the reused Float64Arrays this kernel uses) would box a per-frame HeapNumber that dies young
+    // -- invisible to the heap-delta check below but it WOULD fire a minor GC. Gate both.
+    const report = checkNoGc(s, { maxMajor: 0, maxMinor: 0, maxPauseMs: 4 });
+    gc.stop();
+    global.gc();
+    const heapAfter = process.memoryUsage().heapUsed;
+
+    const bytesPerOp = (heapAfter - heapBefore) / HOT;
+    process.stdout.write('  demo Scene-02 gate: alloc=' + (bytesPerOp <= 0 ? 0 : bytesPerOp.toFixed(3)) +
+        ' B/op | gc major=' + s.gc.major + ' minor=' + s.gc.minor + ' maxMs=' + s.gc.maxMs.toFixed(2) + '\n');
+
+    assert.equal(s.gc.major, 0, '200k Scene-02 frames must trigger 0 major GC, got ' + s.gc.major);
+    assert.equal(s.gc.minor, 0, '200k Scene-02 frames must trigger 0 minor GC, got ' + s.gc.minor);
+    assert.ok(report.ok, 'checkNoGc must report ok: ' + JSON.stringify(report.violations));
+    assert.ok(bytesPerOp < 1, 'Scene-02 lite frame kernel must allocate ~0 B/op, got ' + bytesPerOp.toFixed(3));
 });
 
 /* ============================ serve.mjs ================================== */

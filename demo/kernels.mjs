@@ -10,7 +10,7 @@
 // own per-frame math must itself be zero-GC. Every function below allocates ONLY through a
 // factory at warmup; the hot frame kernels allocate nothing. ASCII-only per suite law.
 
-import { SparseSet, CuckooMap, VERSION } from '../O1.js';
+import { SparseSet, CuckooMap, RingLog, RingDeque, MonoDeque, MinStack, VERSION } from '../O1.js';
 
 // Re-export the SHIPPED VERSION so index.html and Demo.test.mjs read the one true source
 // (never a hardcoded string -- the version-trinity test in Demo.test.mjs gates this).
@@ -198,4 +198,161 @@ export function naiveStep(state) {
         state.allocCount++;
     }
     if (state.naiveJunk.length > 6000) state.naiveJunk.splice(0, state.naiveJunk.length - 6000);
+}
+
+// =======================================================================================
+// Scene 02 -- Sliding Extremes (telemetry). Drives the REAL RingLog + RingDeque + two
+// MonoDeques (min/max) + a MinStack(max), all from ../O1.js, over a pre-generated noisy
+// waveform. Zero allocation after warmup: the wave is generated ONCE, and every per-frame
+// value the demo shows is written into reused Float64Arrays (never object properties, which
+// would box a non-SMI double into a per-frame HeapNumber and trip the maxMinor:0 gate).
+// =======================================================================================
+
+/** Smallest power of two >= n (n a small positive integer). Cold-path only (warmup). */
+function _pow2(n) { let p = 1; while (p < n) p <<= 1; return p; }
+
+/**
+ * Fill `wave` (a preallocated Float64Array of length `len`, a power of two) with a
+ * deterministic noisy waveform: two out-of-phase sines plus seeded noise, range ~[-1, 1].
+ * Called ONCE at warmup off the rAF path; drives the scroll by a ring index, never RNG per
+ * frame. Seed-only (uses nextRand over `rng`, never wall-clock or engine entropy).
+ */
+export function fillWave(wave, len, rng) {
+    for (let i = 0; i < len; i++) {
+        const base = Math.sin(i * 0.06) * 0.5 + Math.sin(i * 0.017) * 0.3;
+        const noise = (nextRand(rng) / 4294967296 - 0.5) * 0.4; // [-0.2, 0.2)
+        wave[i] = base + noise;
+    }
+}
+
+/**
+ * Build the Scene-02 world ONCE (warmup). Allocates the REAL library instances plus every
+ * flat scratch buffer the draw path reuses forever. The two MonoDeques and the RingLog/
+ * RingDeque share the window; the MinStack keeps a longer stack-lifetime horizon (the flat
+ * all-time rail contrasted against MonoDeque's sliding rail). Fails closed on a bad window
+ * via each class's own constructor guard.
+ * @param {number} waveLen  pre-generated sample count (rounded up to a power of two)
+ * @param {number} windowSize  the sliding window W (samples)
+ * @param {number} [seed]  optional uint32 seed for the waveform noise
+ */
+export function createSlidingWorld(waveLen, windowSize, seed) {
+    const wlen = _pow2(waveLen);
+    const rng = new Uint32Array(1);
+    rng[0] = (seed >>> 0) || 0xC0FFEE11;
+    const wave = new Float64Array(wlen);
+    fillWave(wave, wlen, rng);
+
+    const ringlog = new RingLog(windowSize);       // trailing window, lossy overwrite-oldest
+    const deque = new RingDeque(windowSize);       // same substrate, fail-closed reject
+    const dqMin = new MonoDeque(windowSize, 'min'); // sliding-window minimum envelope
+    const dqMax = new MonoDeque(windowSize, 'max'); // sliding-window maximum envelope
+    const stackMax = new MinStack(SLIDING_STACK_CAP, 'max'); // stack-lifetime max rail
+
+    const railCap = ringlog.capacity;              // pow2(windowSize); rails mirror RingLog
+    return {
+        wave, waveLen: wlen, waveMask: wlen - 1, pos: 0,
+        window: windowSize, sampleNo: 0,
+        ringlog, deque, dqMin, dqMax, stackMax,
+        railCap, railMask: railCap - 1, railHead: 0, railCount: 0,
+        railMin: new Float64Array(railCap),
+        railMax: new Float64Array(railCap),
+        railLife: new Float64Array(railCap),
+        out: new Float64Array(4), // [sample, windowMin, windowMax, lifetimeMax] -- read by the draw path + test
+    };
+}
+
+/** Fixed MinStack horizon for the stack-lifetime rail (independent of the window). */
+export const SLIDING_STACK_CAP = 2048;
+
+/**
+ * One full lite-path frame of Scene 02. Emits the next waveform sample (advancing a ring
+ * index, no per-frame RNG) and feeds it through EVERY real structure:
+ *   - RingLog.push  -- lossy overwrite-oldest (always succeeds)
+ *   - RingDeque     -- slid SAFELY (popFront when full, then pushBack), so it never throws
+ *                      here; the fail-closed shatter is exercised out-of-band (draw path)
+ *   - two MonoDeques -- evict-before-push by seq keeps them <= capacity even when W is a
+ *                      power of two, so `value()` is the exact sliding-window min / max
+ *   - MinStack(max) -- the stack-lifetime max; cleared + reseeded when it fills
+ * Every produced value is written into reused Float64Arrays (rails + out), so the frame
+ * allocates ZERO bytes -- Demo.test.mjs gates it at 0 B/op with maxMinor:0.
+ * @returns {number} the rail sample count (an SMI fold so the swept work is never DCE'd)
+ */
+export function frameSlidingExtremes(world) {
+    const sample = world.wave[world.pos];
+    world.pos = (world.pos + 1) & world.waveMask;
+
+    // teaching pair: RingLog absorbs (lossy), RingDeque slides safely on the same stream.
+    world.ringlog.push(sample);
+    const dq = world.deque;
+    if (dq.size === dq.capacity) dq.popFront();
+    dq.pushBack(sample);
+
+    // sliding-window min / max. Evict BEFORE push (threshold = sampleNo - W): the stored seq
+    // a push assigns equals sampleNo, so this keeps exactly the last W samples and never lets
+    // the live count exceed W (safe even when capacity == W for a power-of-two window).
+    const s = world.sampleNo;
+    const lo = s - world.window;
+    const dmin = world.dqMin, dmax = world.dqMax;
+    dmin.evictOlderThan(lo);
+    dmax.evictOlderThan(lo);
+    dmin.push(sample);
+    dmax.push(sample);
+    // Read the extreme straight off the front slot of the value column, NOT via value(): a
+    // method that returns `number | undefined` boxes a per-frame HeapNumber at the return
+    // boundary (invisible to a heap-delta check but it fires a minor GC and trips maxMinor:0).
+    // This is the SAME reach-into-internals the Scene-01 kernel uses (_sparse / _occ); the
+    // faithfulness test proves this front-slot read equals dqMin.value() AND a brute-force
+    // window recompute, so the draw path stays provably the library's own truth. Both deques
+    // are non-empty here (we just pushed), so _head indexes a live slot.
+    const wmin = dmin._val[dmin._head];
+    const wmax = dmax._val[dmax._head];
+
+    // stack-lifetime max (the flat all-time rail): clear + reseed on a full stack. Read the
+    // running-extreme prefix at the top directly (same reason: extreme() would box its union
+    // return); the faithfulness test proves _ext[_n-1] equals stackMax.extreme().
+    const st = world.stackMax;
+    if (st.size === st.capacity) st.clear();
+    st.push(sample);
+    const life = st._ext[st._n - 1];
+
+    // Mirror RingLog's ring discipline into the parallel rail history (same cap/head/count),
+    // so rail index i lines up with ringlog.get(i) oldest -> newest in the draw path.
+    const cap = world.railCap, rmask = world.railMask;
+    if (world.railCount === cap) {
+        const h = world.railHead;
+        world.railMin[h] = wmin; world.railMax[h] = wmax; world.railLife[h] = life;
+        world.railHead = (h + 1) & rmask;
+    } else {
+        const i = (world.railHead + world.railCount) & rmask;
+        world.railMin[i] = wmin; world.railMax[i] = wmax; world.railLife[i] = life;
+        world.railCount++;
+    }
+
+    world.out[0] = sample; world.out[1] = wmin; world.out[2] = wmax; world.out[3] = life;
+    world.sampleNo = s + 1;
+    return world.railCount;
+}
+
+/**
+ * The Scene-02 naive foil: the O(k)-window-rescan. Allocates a FRESH window-sized array every
+ * call and scans it for the min/max -- the exact allocation the lite path refuses -- and bumps
+ * the owned allocation counter by `window` (a REAL per-element count that CLIMBS as the window
+ * grows, unlike the lite path's flat 0). Retained garbage is capped so the foil process itself
+ * survives a long session. This is the ONLY Scene-02 code allowed to allocate.
+ * @returns {number} the rescanned window max (folded so the scan is never DCE'd)
+ */
+export function naiveRescan(state, world) {
+    const window = world.window, wave = world.wave, mask = world.waveMask, pos = world.pos;
+    const tmp = new Array(window); // the O(k) allocation the lite path refuses
+    let lo = Infinity, hi = -Infinity;
+    for (let i = 0; i < window; i++) {
+        const v = wave[(pos - 1 - i) & mask];
+        tmp[i] = v;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+    }
+    state.naiveJunk.push(tmp);
+    state.allocCount += window;
+    if (state.naiveJunk.length > 400) state.naiveJunk.splice(0, state.naiveJunk.length - 400);
+    return hi;
 }
