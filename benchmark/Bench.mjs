@@ -33,6 +33,9 @@ function parseArg(name, fallback) {
     return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : fallback;
 }
 
+/** Bench v3 opt-in: --deep extends the D4 stride sweep toward a DRAM-resident working set. */
+const DEEP = process.argv.includes('--deep');
+
 /** Threshold above which the drift sentinel discloses thermal / turbo noise. */
 export const DRIFT_LIMIT = 0.10;
 
@@ -65,7 +68,7 @@ async function runCell() {
         process.stderr.write('[bench] bad cell: member=' + member + ' dim=' + dim + '\n');
         process.exit(2);
     }
-    const result = await runDimension(member, dim, { seed });
+    const result = await runDimension(member, dim, { seed, deep: DEEP });
     result.baseline = baselineFor(member, dim);
     vacuityCheck(result); // fail closed: an empty array or an impossible 0 -> throw -> non-zero exit
     process.stdout.write(JSON.stringify(result));
@@ -94,10 +97,12 @@ export function parseCellResult(member, dim, stdout) {
 }
 
 function spawnCell(member, dim, seed) {
-    const r = spawnSync(process.execPath, [
+    const args = [
         '--expose-gc', THIS_FILE, '--cell',
         '--member', member, '--dim', dim, '--seed', String(seed),
-    ], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+    ];
+    if (DEEP) args.push('--deep'); // forward the opt-in DRAM-reach sweep to the child cell
+    const r = spawnSync(process.execPath, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
     if (r.status !== 0) {
         const err = (r.stderr || '').trim() || ('exit ' + r.status);
         throw new Error('[bench] cell ' + member + '/' + dim + ' FAILED: ' + err);

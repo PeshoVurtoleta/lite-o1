@@ -14,6 +14,8 @@
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { paretoFrontier, sparseTax } from './Template.mjs';
+import { CAPACITY_KNOB, NA } from './Matrix.mjs';
 
 const RESULTS_PATH = fileURLToPath(new URL('./results.json', import.meta.url));
 const REPORT_PATH = fileURLToPath(new URL('./report.html', import.meta.url));
@@ -147,14 +149,65 @@ function lineChartSvg(spec) {
         ticks + paths + legend + '</svg>';
 }
 
+/** Space-time Pareto scatter: x = bytes/live (compact <-), y = ops/ms (fast ^). Points
+ * on the dominance frontier are drawn filled + connected; dominated points are hollow. */
+function scatterChartSvg(spec) {
+    const W = 640, H = 320, PADL = 60, PADB = 56, PADT = 28, PADR = 16;
+    const plotW = W - PADL - PADR, plotH = H - PADT - PADB;
+    const pts = spec.points; // [{label, x, y, onFrontier}]
+    let xmin = Infinity, xmax = -Infinity, ymax = 0;
+    for (const p of pts) {
+        if (p.x < xmin) xmin = p.x; if (p.x > xmax) xmax = p.x;
+        if (p.y > ymax) ymax = p.y;
+    }
+    if (!isFinite(xmin)) { xmin = 0; xmax = 1; }
+    if (xmax <= xmin) xmax = xmin + 1;
+    if (ymax <= 0) ymax = 1;
+    const sx = (x) => PADL + ((x - xmin) / (xmax - xmin)) * plotW;
+    const sy = (y) => PADT + plotH - (y / ymax) * plotH;
+    let ticks = '';
+    for (let t = 0; t <= 4; t++) {
+        const vy = (ymax * t) / 4, yy = PADT + plotH - (t / 4) * plotH;
+        ticks += '<line x1="' + PADL + '" y1="' + yy.toFixed(1) + '" x2="' + (W - PADR) + '" y2="' +
+            yy.toFixed(1) + '" stroke="#e2e8f0"/>';
+        ticks += '<text x="' + (PADL - 6) + '" y="' + (yy + 4).toFixed(1) +
+            '" font-size="10" text-anchor="end" fill="#64748b">' + num(vy) + '</text>';
+        const vx = xmin + ((xmax - xmin) * t) / 4, xx = PADL + (t / 4) * plotW;
+        ticks += '<text x="' + xx.toFixed(1) + '" y="' + (H - PADB + 16) +
+            '" font-size="10" text-anchor="middle" fill="#64748b">' + num(vx) + '</text>';
+    }
+    // Connect the frontier points left-to-right (ascending bytes/live).
+    const front = pts.filter((p) => p.onFrontier).slice().sort((a, b) => a.x - b.x);
+    let path = '';
+    for (let i = 0; i < front.length; i++) {
+        path += (i === 0 ? 'M' : 'L') + sx(front[i].x).toFixed(1) + ' ' + sy(front[i].y).toFixed(1) + ' ';
+    }
+    let dots = '';
+    if (path) dots += '<path d="' + path.trim() + '" fill="none" stroke="#2563eb" stroke-width="1.5" stroke-dasharray="4 3"/>';
+    for (const p of pts) {
+        const cx = sx(p.x).toFixed(1), cy = sy(p.y).toFixed(1);
+        dots += '<circle cx="' + cx + '" cy="' + cy + '" r="4" fill="' +
+            (p.onFrontier ? '#2563eb' : 'none') + '" stroke="#2563eb" stroke-width="1.5"/>';
+        dots += '<text x="' + (sx(p.x) + 6).toFixed(1) + '" y="' + (sy(p.y) - 6).toFixed(1) +
+            '" font-size="9" fill="#334155">' + esc(p.label) + '</text>';
+    }
+    return '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" role="img" aria-label="' + esc(spec.title) + '">' +
+        '<text x="' + (W / 2) + '" y="' + (H - 6) + '" font-size="11" text-anchor="middle" fill="#475569">' +
+        esc(spec.xlabel || '') + '</text>' +
+        '<text x="14" y="' + (PADT + plotH / 2) + '" font-size="11" text-anchor="middle" fill="#475569" transform="rotate(-90 14 ' +
+        (PADT + plotH / 2) + ')">' + esc(spec.ylabel || '') + '</text>' +
+        ticks + dots + '</svg>';
+}
+
 /**
  * Render one chart spec to an <svg> string.
- * @param {{type:'bar'|'line'}} spec
+ * @param {{type:'bar'|'line'|'scatter'}} spec
  * @returns {string}
  */
 export function renderSvg(spec) {
     if (spec.type === 'bar') return barChartSvg(spec);
     if (spec.type === 'line') return lineChartSvg(spec);
+    if (spec.type === 'scatter') return scatterChartSvg(spec);
     throw new Error('[report] unknown chart type ' + String(spec.type));
 }
 
@@ -210,16 +263,22 @@ export function renderHtml(payload) {
             const ci = r.ci;
             const band = (ci && typeof ci === 'object') ? (num(ci.lo) + '..' + num(ci.hi)) : String(ci);
             const rciw = (ci && typeof ci === 'object') ? num(ci.rciw) : String(ci);
+            // Bench v3: the max single op's KERNEL-SUPPLIED structural tag (from the untimed
+            // replay), with its spikeRatio = max/p99. 'steady' is a truth, not a gap.
+            const a = r.attribution;
+            const tag = (a && typeof a === 'object') ? (a.tag + ' (' + num(a.spikeRatio) + 'x)') : String(a);
             return [m, num(s.p50), num(s.p90), num(s.p99), num(s.p999), String(s.p9999), num(s.max),
-                num(g.p99), num(g.max), band, rciw, sig(r.vsPrimary), sig(r.vsStrong)];
+                num(g.p99), num(g.max), band, rciw, sig(r.vsPrimary), sig(r.vsStrong), tag];
         });
         sections.push(section('D1 -- Latency distribution + fairness audit',
             'Per-op tail latency (ns/op), subject; p99(gc)/max(gc) are under forced GC. ' +
             'CI is the 95% bootstrap band of the subject median (rciw = relative width); ' +
             'sig(primary)/sig(strong) are the Mann-Whitney verdicts vs the primary and STRONG ' +
-            'foils (n/a where no strong baseline exists -- never 0).',
+            'foils (n/a where no strong baseline exists -- never 0). max tag = the structural ' +
+            'event behind the worst single op (kernel-supplied via an untimed replay, never ' +
+            'timing-inferred; n/a for the worst-case-O(1) members with no tail).',
             chart, tableRows(['member', 'p50', 'p90', 'p99', 'p99.9', 'p99.99', 'max',
-                'p99(gc)', 'max(gc)', 'ci lo..hi', 'rciw', 'vs primary', 'vs strong'], rows)));
+                'p99(gc)', 'max(gc)', 'ci lo..hi', 'rciw', 'vs primary', 'vs strong', 'max tag'], rows)));
     }
 
     // D2 -- amortized cost.
@@ -231,10 +290,23 @@ export function renderHtml(payload) {
                 points: get(m, 'D2').points.map((p) => ({ x: p.ops, y: p.nsPerOp })),
             })),
         });
-        const rows = subjects.map((m) => [m, num(get(m, 'D2').drift)]);
+        const rows = subjects.map((m) => {
+            const r = get(m, 'D2');
+            // Bench v3: boundary-crossing trace -- the tag + the op indices where a
+            // structural boundary is crossed MULTIPLE times (spikes align there, the
+            // steady segments between stay flat). n/a for members with no periodic boundary.
+            const b = r.boundary;
+            const bd = (b && typeof b === 'object')
+                ? (b.tag + ' x' + b.crossings.length + ' [' + b.crossings.slice(0, 6).join(',') +
+                    (b.crossings.length > 6 ? ',...' : '') + ']')
+                : String(b);
+            return [m, num(r.drift), bd];
+        });
         sections.push(section('D2 -- Amortized cost over a long mixed trace',
-            'Cumulative ns/op at power-of-two checkpoints; a flat line (drift ~ 1.0) proves the amortized bound holds.',
-            chart, tableRows(['member', 'drift (last/first)'], rows)));
+            'Cumulative ns/op at power-of-two checkpoints; a flat line (drift ~ 1.0) proves the amortized bound holds. ' +
+            'boundary-crossing = the structural event + the op indices where the trace crosses a ' +
+            'capacity/period boundary repeatedly (the spikes align there); n/a where a member has no periodic boundary.',
+            chart, tableRows(['member', 'drift (last/first)', 'boundary-crossing trace'], rows)));
     }
 
     // D3 -- memory.
@@ -262,6 +334,55 @@ export function renderHtml(payload) {
                 'overhead x @ 0.25/0.5/0.75/1.0', 'heap after clear'], rows)));
     }
 
+    // Space-time Pareto + build-cost + sparse-tax (Bench v3, upgrade 3).
+    {
+        // Pareto: the 12 capacity-knob members on the ops/ms (from D1: 1e6/p50) vs
+        // bytes/live (D3) plane -- REAL measured cells, a pure dominance filter (no fit).
+        const knob = subjects.filter((m) => CAPACITY_KNOB[m]);
+        const raw = knob.map((m) => {
+            const d1 = get(m, 'D1'); const d3 = get(m, 'D3');
+            const p50 = d1.subject.p50;
+            return { member: m, opsPerMs: p50 > 0 ? 1e6 / p50 : 0, bytesPerLive: d3.bytesPerLive };
+        });
+        const front = paretoFrontier(raw);
+        const onFront = new Set(front.map((p) => p.member));
+        const chart = renderSvg({
+            type: 'scatter', title: 'Space-time Pareto',
+            xlabel: 'bytes / live element (more compact <-)', ylabel: 'ops / ms (faster ^)',
+            points: raw.map((p) => ({ label: p.member, x: p.bytesPerLive, y: p.opsPerMs, onFrontier: onFront.has(p.member) })),
+        });
+        const paretoRows = raw.map((p) => [p.member, num(p.opsPerMs), num(p.bytesPerLive),
+            onFront.has(p.member) ? 'FRONTIER' : 'dominated']);
+
+        // Sparse tax: the fixed-cap "pay for the worst case even when sparse" ratio
+        // (bytes/live @ 0.25 / @ 1.0), read off the EXISTING D3 loadFactorCurve (no new run).
+        const taxRows = subjects.map((m) => {
+            const d3 = get(m, 'D3');
+            const tax = Array.isArray(d3.loadFactorCurve) ? sparseTax(d3.loadFactorCurve) : NA;
+            return [m, (typeof tax === 'number' ? num(tax) + 'x' : String(tax))];
+        });
+
+        // Build-cost panel: the STATIC member's build cost is on NEITHER Pareto axis, so
+        // it gets its own row -- buildNs + buildBytes, a DISTINCT key from any query latency.
+        const staticRows = subjects.filter((m) => !CAPACITY_KNOB[m]).map((m) => {
+            const d3 = get(m, 'D3'); const d1 = get(m, 'D1');
+            return [m, num(d3.buildNs) + ' ns', String(d3.buildBytes) + ' B', num(d1.subject.p50) + ' ns/query'];
+        });
+
+        sections.push(section('Space-time Pareto + build cost + sparse tax',
+            'The 12 capacity-knob members on the space-time plane: ops/ms (D1, 1e6/p50) vs bytes/live (D3) ' +
+            '-- REAL measured points, a pure dominance filter (filled = on the frontier, hollow = dominated), ' +
+            'no curve fit. Sparse tax = bytes/live at load 0.25 / at load 1.0 (fixed-cap members reserve for the ' +
+            'ceiling, so it sits above 1x). The static SparseTable is shown separately: its build cost is a ' +
+            'DISTINCT number, never folded into the O(1) query latency.',
+            chart,
+            tableRows(['member', 'ops/ms', 'bytes/live', 'pareto'], paretoRows) +
+            '<h2>Sparse tax (bytes/live @0.25 / @1.0)</h2>' +
+            tableRows(['member', 'sparse tax'], taxRows) +
+            '<h2>Static build cost (separate from query latency)</h2>' +
+            tableRows(['member', 'build ns', 'build bytes', 'query latency'], staticRows)));
+    }
+
     // D4 -- cache proxy.
     {
         const chart = renderSvg({
@@ -271,13 +392,23 @@ export function renderHtml(payload) {
                 points: get(m, 'D4').strideSweep.map((p) => ({ x: p.workingSet, y: p.nsPerElem })),
             })),
         });
+        const tierRatio = (t) => (t && typeof t === 'object') ? num(t.ratio) : String(t);
         const rows = subjects.map((m) => {
             const r = get(m, 'D4');
-            return [m, num(r.denseNsPerOp), num(r.randomNsPerOp), num(r.gap)];
+            const bands = r.strideSweep.map((p) => p.band).join('/');
+            const t = r.tiers || {};
+            return [m, bands, tierRatio(t.L1), tierRatio(t.L2), tierRatio(t.L3), tierRatio(t.DRAM),
+                num(r.denseNsPerOp), num(r.randomNsPerOp), num(r.gap)];
         });
-        sections.push(section('D4 -- Cache behaviour (PROXY)',
-            'PROXY ONLY: no native perf counters. Dense-iteration ns/element rising with the working set is the cache-pressure proxy; dense-vs-random gap where random access exists (n/a otherwise).',
-            chart, tableRows(['member', 'dense ns/op', 'random ns/op', 'gap (random/dense)'], rows)));
+        sections.push(section('D4 -- Cache behaviour (PROXY, NOMINAL bands)',
+            'PROXY ONLY: no native perf counters. Each working-set point carries a NOMINAL cache-tier ' +
+            'band (L1 <= 32 KiB, L2 <= 1 MiB, L3 <= 32 MiB, else DRAM) from the measured backing bytes ' +
+            '-- a legibility label, NOT a measured cache miss. The per-tier dense/random ratio (n/a where ' +
+            'a member has no random-access lookup or a tier is unreached -- never 0) shows the SoA ' +
+            'advantage widen as the working set leaves L3. Run `npm run bench -- --deep` to extend the ' +
+            'sweep toward a DRAM-resident working set.',
+            chart, tableRows(['member', 'sweep bands', 'L1 r/d', 'L2 r/d', 'L3 r/d', 'DRAM r/d',
+                'dense ns/op', 'random ns/op', 'gap (random/dense)'], rows)));
     }
 
     // D5 -- bundle.
@@ -322,7 +453,9 @@ export function renderHtml(payload) {
     {
         const rows = subjects.map((m) => {
             const r = get(m, 'D7');
-            const lf = r.loadFactors.map((l) => num(l.nsPerOp)).join(' / ');
+            // SparseTable is static: loadFactors is the NA string, never an array.
+            const lf = Array.isArray(r.loadFactors)
+                ? r.loadFactors.map((l) => num(l.nsPerOp)).join(' / ') : String(r.loadFactors);
             return [m, String(r.keyTypes.int), String(r.keyTypes.string), String(r.keyTypes.object),
                 lf, num(r.nearFullNs), String(r.justResizedNs)];
         });

@@ -25,7 +25,11 @@ import {
 } from './Harness.mjs';
 import {
     NA, SUBJECTS, baselineFor, strongBaselineFor, supportsKeyType, supportsWorkload,
+    MEMBER_TAGS, RANDOM_LOOKUP,
 } from './Matrix.mjs';
+import {
+    SPIKE_TAGS, tagByte, attributeMax, bandOf, sparseTax,
+} from './Template.mjs';
 
 /** Global sink: every timed op feeds it so V8 cannot dead-code-eliminate a batch. */
 export let SINK = 0;
@@ -186,6 +190,166 @@ export function makeSubject(member, n, rng) {
         };
     }
     throw new Error('[bench] unhandled member: ' + member);
+}
+
+// ===========================================================================
+// Bench v3 -- spike ATTRIBUTION lanes (UNTIMED). A tag lane is a per-op Uint8Array
+// of frozen-enum bytes (Template.SPIKE_TAGS) produced by an OBSERVABLE structural
+// probe -- it re-runs the member's steady op stream OUTSIDE any timed region and
+// records the real structural event per op (never a timing guess). The timed
+// kernels (makeSubject) gain ZERO new work; attribution reads this lane after the
+// fact via Template.attributeMax. Deterministic given the seed: two runs at the
+// same seed produce a byte-identical lane (a Math.random / wall-clock leak breaks
+// that -- the gate catches it).
+// ===========================================================================
+
+/**
+ * Build the per-op structural tag lane for a member's steady op stream. Fills a
+ * PREALLOCATED Uint8Array(iters) by running the exact makeSubject op `iters` times
+ * and observing real state (HTW `now`, RingLog head, CuckooMap `seed`). Members with
+ * no rare event leave the lane all-zero ('steady'). FAIL CLOSED on an unknown member.
+ *
+ * `warmup` ops are run FIRST (state-advancing, NOT recorded) so the lane aligns
+ * byte-for-byte with a timed stream that was warmed the same amount (D1 warms its tail
+ * subject before perOpTail; the lane must record from the SAME internal-state point or
+ * a periodic event -- HTW cascade -- would land on the wrong index). Deterministic:
+ * the lane is a pure function of (member, n, seed, iters, warmup).
+ * @param {string} member
+ * @param {number} n
+ * @param {number} seed
+ * @param {number} iters
+ * @param {number} [warmup=0]
+ * @returns {Uint8Array}
+ */
+export function makeTagLane(member, n, seed, iters, warmup = 0) {
+    if (!SUBJECTS.includes(member)) throw new Error('[bench] unhandled member: ' + member);
+    const lane = new Uint8Array(iters); // byte 0 = 'steady' by construction
+    const { obj, op } = makeSubject(member, n, prng(seed));
+    for (let w = 0; w < warmup; w++) op(w); // advance to the timed stream's starting state
+    if (member === 'HierarchicalTimerWheel') {
+        // Cascade fires on the level-0 wrap: `now` crossing a 256-tick boundary.
+        const CASCADE = tagByte('cascade');
+        for (let i = 0; i < iters; i++) { op(i); if ((obj.now & 0xFF) === 0) lane[i] = CASCADE; }
+    } else if (member === 'RingLog') {
+        // Wrap: the overwrite head returns to slot 0 once per capacity pushes.
+        const WRAP = tagByte('wrap');
+        for (let i = 0; i < iters; i++) { op(i); if (obj._head === 0) lane[i] = WRAP; }
+    } else if (member === 'CuckooMap') {
+        // Reseed: the public `.seed` getter changes. At the ~0.5 steady load this NEVER
+        // fires (0 reseeds -- the semantic-fidelity gate); the lane stays flat here and
+        // the reseed spike lives in its own attribution lane (makeReseedSubject).
+        const RESEED = tagByte('reseed');
+        let prev = obj.seed;
+        for (let i = 0; i < iters; i++) { op(i); const s = obj.seed; if (s !== prev) { lane[i] = RESEED; prev = s; } }
+    } else {
+        // No rare structural event in the steady op stream: all 'steady'.
+        for (let i = 0; i < iters; i++) op(i);
+    }
+    return lane;
+}
+
+// ---- CuckooMap re-seed attribution lane (a SEPARATE, bounded, fail-closed lane) --
+// A local hash replica that MUST mirror O1.js CuckooMap (_cuFmix32 / _cuHash) so the
+// collider search is exact. This is the SAME recipe test/witness.mjs uses to FORCE a
+// real re-seed: 9 keys sharing ONE (h1,h2) bucket pair fill that pair's 8 slots, and
+// the 9th trips MaxLoop -> the O(capacity) in-place re-seed. This lane is DISTINCT
+// from the D1/D8 ~0.5-load cells (which never reseed); it does not perturb them.
+//
+// SOURCE OF TRUTH: O1.js `_cuFmix32` (O1.js:3068) and `_cuHash` (O1.js:3088) are the
+// canonical hash; the two functions below are a byte-faithful COPY (verified against
+// O1.js today). If O1.js's hash ever drifts, this replica goes stale -- but the drift
+// is GUARDED, not silent: test/Bench.test.mjs asserts the real `m.seed` actually
+// changes when the lane runs, so a stale replica (colliders that no longer collide ->
+// no stall -> no re-seed) FAILS that test rather than shipping a wrong attribution.
+function cuFmix32(h) {
+    h = h ^ (h >>> 16);
+    h = Math.imul(h, 0x85ebca6b);
+    h = h ^ (h >>> 13);
+    h = Math.imul(h, 0xc2b2ae35);
+    h = h ^ (h >>> 16);
+    return h | 0;
+}
+function cuHash(key, seed) {
+    let neg = 0, a = key;
+    if (a < 0) { a = -a; neg = 1; }
+    const lo = a >>> 0;
+    const hi = (a - lo) / 4294967296;
+    let h = cuFmix32((seed ^ lo) | 0);
+    h = (h ^ Math.imul(hi | 0, 0x9e3779b1)) ^ neg;
+    return cuFmix32(h | 0);
+}
+
+/** Default cap on the collider search -- BOUNDED + FAIL-CLOSED (never an unbounded hang). */
+export const RESEED_MAX_ATTEMPTS = 4000000;
+
+/**
+ * Build the SEPARATE attribution-only CuckooMap re-seed lane. Constructs a map at
+ * ~0.55 load, primes the 8 slots of one collider bucket pair, and returns an op stream
+ * whose op at `reseedIndex` trips the 9th collider -> a genuine in-place re-seed (the
+ * O(capacity) spike), every other op a steady in-place update. The tag lane marks the
+ * reseed op 'reseed'. Timed via perOpTail, the reseed op is the argmax; attributeMax
+ * then reads 'reseed' off the lane.
+ *
+ * FAIL CLOSED: the collider search is capped at `maxAttempts` and THROWS [bench] on
+ * exhaustion -- an unlucky seed can never hang the gate on an unbounded scan.
+ * @param {number} cap        requested CuckooMap capacity
+ * @param {number} seed       uint32 seed for reproducible collisions
+ * @param {number} iters      lane length
+ * @param {number} [maxAttempts=RESEED_MAX_ATTEMPTS]
+ * @returns {{obj:CuckooMap, op:(i:number)=>void, lane:Uint8Array, reseedIndex:number}}
+ */
+export function makeReseedSubject(cap, seed, iters, maxAttempts = RESEED_MAX_ATTEMPTS) {
+    if (iters <= 0) throw new Error('[bench] makeReseedSubject: iters must be > 0');
+    const m = new CuckooMap(cap, seed >>> 0);
+    const s1 = m.seed, s2 = cuFmix32((s1 ^ 0x85ebca6b) | 0), B = m._B, mask = B - 1;
+    // BOUNDED scan for 9 keys sharing ONE (h1,h2) bucket pair.
+    const bins = new Map();
+    let colliders = null;
+    for (let k = 0; k < maxAttempts && !colliders; k++) {
+        const bin = (cuHash(k, s1) & mask) * B + (cuHash(k, s2) & mask);
+        let arr = bins.get(bin); if (!arr) { arr = []; bins.set(bin, arr); }
+        arr.push(k);
+        if (arr.length >= 9) colliders = arr.slice(0, 9);
+    }
+    if (!colliders) {
+        throw new Error('[bench] makeReseedSubject: no 9-way collider found in ' +
+            maxAttempts + ' attempts (fail closed -- never an unbounded search)');
+    }
+    // The shared (b1,b2) home pair of ALL 9 colliders (they share one (h1,h2)).
+    const b1 = cuHash(colliders[0], s1) & mask, b2 = cuHash(colliders[0], s2) & mask;
+    // Fill a real population (~0.5 load) of non-colliders so the re-seed rehashes many,
+    // but NEVER let a non-collider touch the collider pair's buckets -- otherwise it
+    // would occupy a collider slot and the 9th collider could be placed WITHOUT a stall.
+    // Keeping b1/b2 pure GUARANTEES the 8 colliders fill them and the 9th trips MaxLoop.
+    const fillN = Math.min(Math.floor(m.capacity * 0.5), m.capacity - 12);
+    // BOUNDED + FAIL-CLOSED (matches the collider search above): only ~4/B keys collide
+    // with the pair, so fillN keys are found in ~fillN attempts, but cap it explicitly and
+    // throw [bench] on exhaustion so NO loop in the lane is unbounded.
+    const fillCap = 10000000 + fillN * 64 + 1024;
+    let added = 0, k = 10000000;
+    for (; added < fillN && k < fillCap; k++) {
+        const cb1 = cuHash(k, s1) & mask, cb2 = cuHash(k, s2) & mask;
+        if (cb1 === b1 || cb1 === b2 || cb2 === b1 || cb2 === b2) continue; // never pollute the pair
+        m.set(k, k); added++;
+    }
+    if (added < fillN) {
+        throw new Error('[bench] makeReseedSubject: non-collider fill exhausted its bound (' +
+            (fillCap - 10000000) + ' attempts) before reaching ' + fillN + ' keys (fail closed)');
+    }
+    if (m.seed !== s1) {
+        throw new Error('[bench] makeReseedSubject: unexpected re-seed during fill (recipe assumption violated)');
+    }
+    for (let i = 0; i < 8; i++) m.set(colliders[i], colliders[i]); // fill the pair's 8 slots
+    const steadyKey = colliders[0]; // present key -> a pure in-place update (no growth)
+    const reseedIndex = iters >> 1;
+    const lane = new Uint8Array(iters);
+    lane[reseedIndex] = tagByte('reseed');
+    let fired = false;
+    const op = (i) => {
+        if (i === reseedIndex && !fired) { m.set(colliders[8], colliders[8]); fired = true; }
+        else { m.set(steadyKey, i); } // steady update-in-place (no eviction, no growth)
+    };
+    return { obj: m, op, lane, reseedIndex };
 }
 
 export function makeBaseline(member, n) {
@@ -708,15 +872,25 @@ export function D1(member, opts = {}) {
     // amortized members that wear the witness MAX-single-op line. NA (never 0) for the
     // worst-case-O(1) members, whose batch-mean distribution above is the full story.
     let perOp = NA;
+    let attribution = NA;
     const check = [
         subjNoGc.p50, subjNoGc.p90, subjNoGc.p99, subjNoGc.p999, subjNoGc.max,
         subjGc.p50, subjGc.max, baseNoGc.p50, baseNoGc.p99, baseNoGc.max,
     ];
     if (AMORTIZED[member]) {
         const tailSubj = makeSubject(member, n, prng(seed));
+        const warmOps = 2 * Math.min(2000, subjBatch); // warm rounds x batch (see below)
         warm(tailSubj.op, Math.min(2000, subjBatch), 2);
         const tailIters = opts.tailIters ?? 20000;
-        perOp = perOpTail(tailSubj.op, tailIters); // { p99, max } ns, clamped >= 0
+        perOp = perOpTail(tailSubj.op, tailIters); // { p99, max, maxIndex } ns, clamped >= 0
+        // UNTIMED spike attribution: replay the IDENTICAL seeded op stream into a tag
+        // lane (Bench v3), warmed the SAME amount as the timed tail so a periodic event
+        // (HTW cascade) lands on the matching index, and resolve the max single op's
+        // STRUCTURAL tag from the lane byte at the timed argmax index -- never a timing
+        // guess. The timed kernel above gained zero new work. tag is 'steady' for the
+        // ~0.5-load / drain-bounded cells (no dominating spike); its truth is the point.
+        const lane = makeTagLane(member, n, seed, tailIters, warmOps);
+        attribution = attributeMax(lane, perOp.maxIndex >= 0 ? perOp.maxIndex : 0, perOp.max, perOp.p99);
         // Feed the tail into _check for these 3 members only. perOpTail CLAMPS at 0 (a
         // single op below the timer's own overhead is legitimately 0 ns), and the vacuity
         // gate rejects a 0 -- so a genuine sub-overhead reading falls back to the (always
@@ -731,7 +905,8 @@ export function D1(member, opts = {}) {
         subject: pubDist(subjNoGc), subjectGc: pubDist(subjGc), baselineDist: pubDist(baseNoGc),
         strongBaseline: strongName,                                  // NA for FAIR-ALREADY members
         strongBaselineDist: strongNoGc ? pubDist(strongNoGc) : NA,   // NA (never 0) otherwise
-        perOpTail: perOp,     // { p99, max } ns for amortized members; NA otherwise
+        perOpTail: perOp,     // { p99, max, maxIndex } ns for amortized members; NA otherwise
+        attribution,          // { maxIndex, tag, spikeRatio } for amortized members; NA otherwise
         ci,                   // { lo, hi, rciw } ns or 'n/a' (subject median CI)
         vsPrimary,            // { u, z, p, significant } or 'n/a' (subject vs primary foil)
         vsStrong,             // { u, z, p, significant } or 'n/a' (subject vs strong foil)
@@ -936,9 +1111,30 @@ export function D2(member, opts = {}) {
     const reason = member === 'SparseTable'
         ? 'static/immutable: no mutation trace to amortize; points are the flat query trace' : undefined;
 
+    // Bench v3 -- BOUNDARY-CROSSING trace: replay the member's steady op stream into an
+    // UNTIMED tag lane and record the op indices where a STRUCTURAL boundary is crossed
+    // MULTIPLE times (HTW cascade every 256-tick wrap, RingLog wrap every capacity). The
+    // spikes in the amortized line align with these indices; the steady segments between
+    // them stay flat. A member with no periodic boundary reads n/a (its declared tag
+    // vocabulary is ['steady'] -- a truth, not a gap). Deterministic: same seed -> same
+    // crossings. The tag is kernel-supplied (observed), never inferred from the timing.
+    const vocab = MEMBER_TAGS[member] || ['steady'];
+    let boundary = NA;
+    if (vocab.length > 1) {
+        // Scale the trace with cap so a capacity-period boundary (RingLog wraps once per
+        // `capacity` pushes) is crossed MULTIPLE times; a fixed-period one (HTW cascade
+        // every 256 ticks) is crossed far more. >= 4x cap guarantees >= 3 crossings.
+        const bIters = opts.boundaryIters ?? Math.max(4096, cap * 4);
+        const lane = makeTagLane(member, cap, opts.seed ?? DEFAULT_SEED, bIters);
+        const crossings = [];
+        let tag = 'steady';
+        for (let i = 0; i < bIters; i++) if (lane[i] !== 0) { crossings.push(i); tag = SPIKE_TAGS[lane[i]]; }
+        boundary = crossings.length ? { crossings, tag, iters: bIters } : NA;
+    }
+
     return {
         dim: 'D2', member, baseline: baselineFor(member, 'D2'), unit: 'ns/op',
-        points, drift, reason,
+        points, drift, reason, boundary,
         _check: points.map((p) => p.nsPerOp).concat([points[points.length - 1].ops]),
     };
 }
@@ -1151,36 +1347,93 @@ function denseIterNsPerElem(member, obj, reps) {
     return dt > 0 ? (dt * 1e6) / elems : 1e-3;
 }
 
+/** The four NOMINAL cache-tier bands, in ascending order (Bench v3 D4 labelling). */
+const D4_TIERS = ['L1', 'L2', 'L3', 'DRAM'];
+
+/** --deep DRAM-reach byte budget: the doubling sweep NEVER builds a working set past
+ * this, so an unlucky member (or a superlinear one) fails closed to 'n/a' for the DRAM
+ * tier rather than exhausting memory. Opt-in only; the default sweep never runs it. */
+const DEEP_BYTE_BUDGET = 96 * 1024 * 1024;
+
+/** Measure dense-sequential vs random-pattern lookup ns/op on a member at size n (for
+ * the members with a random-access lookup -- RANDOM_LOOKUP). Pure timing, fed to SINK.
+ * The default (batch 5000, samples 60) is the PRE-Session-B regime the top-level gap
+ * base metric uses -- it must match exactly so the 104 base cells stay unperturbed; the
+ * new per-tier ratios pass a lighter regime since they are additive Session-B cells. */
+function denseRandomAt(member, n, seed, batch = 5000, samples = 60) {
+    const built = makeSubject(member, n, prng(seed));
+    const obj = built.obj;
+    const rng = prng((seed ?? DEFAULT_SEED) ^ 0x55555555); // pre-Session-B seed handling (prng coerces >>>0)
+    const lookup = member === 'SparseSet' ? (k) => { if (obj.has(k)) SINK++; } : (k) => { SINK += obj.find(k); };
+    const seqOp = (() => { let i = 0; return () => { lookup(i); i = i + 1; if (i >= n) i = 0; }; })();
+    const rndOp = () => { lookup(rng() % n); };
+    const dense = median(collect(seqOp, batch, samples));
+    const random = median(collect(rndOp, batch, samples));
+    return {
+        denseNsPerOp: dense, randomNsPerOp: random,
+        ratio: dense > 0 ? random / dense : NA, bytes: memberBytes(member, obj),
+    };
+}
+
 export function D4(member, opts = {}) {
     const sizes = opts.sizes ?? [1e3, 1e4, 1e5, 1e6];
     const reps = opts.reps ?? 200;
+    const seed = opts.seed ?? DEFAULT_SEED;
+    const deep = !!opts.deep;
+    const hasRandom = !!RANDOM_LOOKUP[member];
 
-    // Stride / working-set sweep: dense iteration ns/element as the working set
-    // grows past each cache level. A rising curve IS the proxy for cache pressure.
+    // Stride / working-set sweep: dense iteration ns/element as the working set grows
+    // past each cache level, each point LABELLED with its NOMINAL cache-tier band from
+    // the measured backing bytes (bandOf -- fixed thresholds, NOT a measured miss). A
+    // rising curve IS the proxy for cache pressure; the band makes the axis legible.
     const strideSweep = [];
     for (const raw of sizes) {
         const s = raw | 0;
-        const built = makeSubject(member, s, prng(opts.seed ?? DEFAULT_SEED));
+        const built = makeSubject(member, s, prng(seed));
+        const bytes = memberBytes(member, built.obj);
         const r = Math.max(2, Math.round(reps / Math.max(1, s / 1e3)));
-        strideSweep.push({ workingSet: s, nsPerElem: denseIterNsPerElem(member, built.obj, r) });
+        strideSweep.push({ workingSet: s, nsPerElem: denseIterNsPerElem(member, built.obj, r), band: bandOf(bytes), bytes });
     }
 
-    // Dense-vs-random gap: only members with a random-access lookup (SparseSet has,
-    // UnionFind find) can express this; RingDeque / MonoDeque have NO random access
-    // by design, so the gap reads NA (never 0).
+    // --deep (OPT-IN): extend the sweep by DOUBLING n until the working set is DRAM-
+    // resident OR the byte budget is hit (fail-closed, never an OOM). A member whose
+    // footprint cannot cross the DRAM threshold under budget leaves the DRAM tier 'n/a'.
+    if (deep) {
+        let dn = (sizes[sizes.length - 1] | 0) * 2;
+        for (let guard = 0; guard < 40; guard++) {
+            const built = makeSubject(member, dn | 0, prng(seed));
+            const bytes = memberBytes(member, built.obj);
+            const band = bandOf(bytes);
+            const r = Math.max(2, Math.round(reps / Math.max(1, dn / 1e3)));
+            strideSweep.push({ workingSet: dn | 0, nsPerElem: denseIterNsPerElem(member, built.obj, r), band, bytes });
+            if (band === 'DRAM' || bytes > DEEP_BYTE_BUDGET) break;
+            dn = dn * 2;
+        }
+    }
+
+    // Per-tier dense-vs-random ratio, SYSTEMATICALLY across every applicable member (the
+    // SoA advantage should widen as the working set leaves L3). Inapplicable members (no
+    // random-access lookup) AND unreached tiers read the STRING 'n/a', NEVER numeric 0.
+    const tiers = {};
+    for (const t of D4_TIERS) tiers[t] = NA; // every tier starts n/a (never 0)
+    if (hasRandom) {
+        for (const p of strideSweep) {
+            // Additive Session-B cell: lighter regime (4000/40) across the sweep points.
+            const dr = denseRandomAt(member, p.workingSet | 0, seed, 4000, 40);
+            tiers[bandOf(dr.bytes)] = {
+                denseNsPerOp: dr.denseNsPerOp, randomNsPerOp: dr.randomNsPerOp, ratio: dr.ratio,
+            };
+        }
+    }
+
+    // Top-level dense/random gap summary (a PRE-Session-B base metric): the ORIGINAL
+    // fixed gapN + the ORIGINAL batch 5000 / samples 60 regime -- unchanged so these
+    // base numbers stay unperturbed (Session B only ADDS, never shifts, existing cells).
     let denseNsPerOp = NA, randomNsPerOp = NA, gap = NA;
-    if (member === 'SparseSet' || member === 'UnionFind') {
-        const n = opts.gapN ?? 1e5 | 0;
-        const built = makeSubject(member, n, prng(opts.seed ?? DEFAULT_SEED));
-        const obj = built.obj;
-        const rng = prng((opts.seed ?? DEFAULT_SEED) ^ 0x55555555);
-        const lookup = member === 'SparseSet' ? (k) => { if (obj.has(k)) SINK++; } : (k) => { SINK += obj.find(k); };
-        const seqOp = (() => { let i = 0; return () => { lookup(i); i = i + 1; if (i >= n) i = 0; }; })();
-        const rndOp = () => { lookup(rng() % n); };
-        const batch = 5000, samples = 60;
-        denseNsPerOp = median(collect(seqOp, batch, samples));
-        randomNsPerOp = median(collect(rndOp, batch, samples));
-        gap = denseNsPerOp > 0 ? randomNsPerOp / denseNsPerOp : NA;
+    if (hasRandom) {
+        const gapN = opts.gapN ?? (1e5 | 0);
+        const dr = denseRandomAt(member, gapN, seed); // default 5000/60 = original regime
+        denseNsPerOp = dr.denseNsPerOp; randomNsPerOp = dr.randomNsPerOp; gap = dr.ratio;
     }
 
     const check = strideSweep.map((p) => p.nsPerElem);
@@ -1188,8 +1441,8 @@ export function D4(member, opts = {}) {
 
     return {
         dim: 'D4', member, baseline: baselineFor(member, 'D4'), unit: 'ns',
-        proxy: true,
-        strideSweep, denseNsPerOp, randomNsPerOp, gap,
+        proxy: true, deep,
+        strideSweep, tiers, denseNsPerOp, randomNsPerOp, gap,
         _check: check,
     };
 }

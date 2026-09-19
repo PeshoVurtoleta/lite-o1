@@ -36,6 +36,160 @@ export const NA = 'n/a';
 /** The witness flavors a sibling package can declare for dimension 1. */
 export const WITNESS_FLAVORS = ['O(1)', 'O(log n)', 'O(log log U)'];
 
+// ===========================================================================
+// Bench v3 (SHARED): spike-attribution + cache-band + space-time-Pareto kit.
+// These are the PORTABLE mechanisms the whole family inherits: a sibling copies
+// Template.mjs and swaps only the per-member tables in its Matrix.mjs -- the
+// mechanisms below never change per package. All are PURE + deterministic; none
+// infers a structural tag from timing (a timing-inferred tag is noise).
+// ===========================================================================
+
+/**
+ * The FROZEN spike-tag enum. The byte a member kernel writes into its untimed
+ * replay lane indexes THIS array (0 -> 'steady'). It is kernel-supplied, never
+ * timing-inferred, and closed: a member with no rare event declares ['steady'].
+ * The ordering is load-bearing (lane byte 0 must be 'steady'); do not reorder.
+ */
+export const SPIKE_TAGS = Object.freeze(['steady', 'grow', 'wrap', 'cascade', 'compress', 'reseed']);
+
+/**
+ * Fail closed on an unknown spike tag. A kernel that emits a tag outside the frozen
+ * enum is a bug (a typo, or a new event that was never registered) -- throw with a
+ * pointed message rather than silently labelling a spike with garbage.
+ * @param {string} tag
+ * @returns {string} the same tag, when valid
+ */
+export function assertTag(tag) {
+    if (SPIKE_TAGS.indexOf(tag) < 0) {
+        throw new Error('[template] unknown spike tag: ' + String(tag) +
+            ' (frozen enum: ' + SPIKE_TAGS.join('/') + ')');
+    }
+    return tag;
+}
+
+/** The lane BYTE for a tag (its index in the frozen enum). Fail closed on unknown. */
+export function tagByte(tag) {
+    const b = SPIKE_TAGS.indexOf(tag);
+    if (b < 0) throw new Error('[template] unknown spike tag: ' + String(tag));
+    return b;
+}
+
+/**
+ * Attribute a measured max single op to a STRUCTURAL event, PURELY: given the
+ * untimed deterministic replay lane (a Uint8Array of frozen-enum bytes), the timed
+ * argmax index, and the max / p99 readings, produce { maxIndex, tag, spikeRatio }.
+ * The tag is read from the lane byte at maxIndex (byte 0 -> 'steady'); it is NEVER
+ * inferred from timing. spikeRatio = max / p99 (the dominance of the worst op over
+ * the tail). FAIL CLOSED: a maxIndex outside the lane, or a lane byte outside the
+ * frozen enum, throws -- a garbage index can never silently mislabel a spike.
+ * @param {Uint8Array} lane   per-op structural tag bytes (untimed replay)
+ * @param {number} maxIndex   the timed argmax op index (from perOpTail)
+ * @param {number} max        the max single-op reading
+ * @param {number} p99        the p99 single-op reading
+ * @returns {{maxIndex:number, tag:string, spikeRatio:number}}
+ */
+export function attributeMax(lane, maxIndex, max, p99) {
+    if (!(lane instanceof Uint8Array)) {
+        throw new Error('[template] attributeMax: lane must be a Uint8Array');
+    }
+    if (typeof maxIndex !== 'number' || !Number.isInteger(maxIndex) ||
+        maxIndex < 0 || maxIndex >= lane.length) {
+        throw new Error('[template] attributeMax: maxIndex out of range: ' + String(maxIndex) +
+            ' (lane length ' + lane.length + ')');
+    }
+    const byte = lane[maxIndex];
+    if (byte >= SPIKE_TAGS.length) {
+        throw new Error('[template] attributeMax: lane byte ' + byte + ' outside the frozen enum');
+    }
+    const tag = SPIKE_TAGS[byte]; // byte 0 -> 'steady' by construction
+    assertTag(tag);
+    const spikeRatio = p99 > 0 ? max / p99 : (max > 0 ? Infinity : 0);
+    return { maxIndex, tag, spikeRatio };
+}
+
+/**
+ * NOMINAL cache-tier byte thresholds. These are LEGIBILITY bands for the working-set
+ * axis, NOT a measured cache miss -- a working set under CACHE_BANDS.L1 bytes is
+ * NOMINALLY L1-resident on a typical machine, nothing more. A real os cache size (if
+ * the host exposes one) is a meta-note only; the gate + the report use THESE portable
+ * thresholds so results compare across machines. (See METHODOLOGY.md.)
+ */
+export const CACHE_BANDS = Object.freeze({
+    L1: 32 * 1024,          // <= 32 KiB
+    L2: 1024 * 1024,        // <= 1 MiB
+    L3: 32 * 1024 * 1024,   // <= 32 MiB  (else DRAM)
+});
+
+/**
+ * The NOMINAL cache-tier band for a working-set byte size: 'L1' | 'L2' | 'L3' |
+ * 'DRAM'. Fixed thresholds (never a measured miss). FAIL CLOSED on a non-finite /
+ * negative byte count. An unreached tier in a sweep reads the STRING 'n/a' (that is
+ * the caller's job -- bandOf itself always classifies a real byte count).
+ * @param {number} bytes
+ * @returns {'L1'|'L2'|'L3'|'DRAM'}
+ */
+export function bandOf(bytes) {
+    if (typeof bytes !== 'number' || !isFinite(bytes) || bytes < 0) {
+        throw new Error('[template] bandOf: bytes must be a non-negative finite number, got ' + String(bytes));
+    }
+    if (bytes <= CACHE_BANDS.L1) return 'L1';
+    if (bytes <= CACHE_BANDS.L2) return 'L2';
+    if (bytes <= CACHE_BANDS.L3) return 'L3';
+    return 'DRAM';
+}
+
+/**
+ * The space-time Pareto frontier of a set of members by (max ops/ms, min bytes/live):
+ * a pure DOMINANCE filter (no curve fit). A point q DOMINATES p iff q is at least as
+ * fast (opsPerMs >=) AND at least as compact (bytesPerLive <=) with at least one
+ * strict -- p is kept iff nothing dominates it. Ties (identical points) are both kept
+ * (neither strictly dominates the other). Input points are REAL measured cells; this
+ * only filters, never synthesizes.
+ * @param {{member:string, opsPerMs:number, bytesPerLive:number}[]} points
+ * @returns {typeof points} the subset on the frontier, in input order
+ */
+export function paretoFrontier(points) {
+    if (!Array.isArray(points)) throw new Error('[template] paretoFrontier: points must be an array');
+    const out = [];
+    for (let i = 0; i < points.length; i++) {
+        const p = points[i];
+        let dominated = false;
+        for (let j = 0; j < points.length && !dominated; j++) {
+            if (i === j) continue;
+            const q = points[j];
+            if (q.opsPerMs >= p.opsPerMs && q.bytesPerLive <= p.bytesPerLive &&
+                (q.opsPerMs > p.opsPerMs || q.bytesPerLive < p.bytesPerLive)) {
+                dominated = true;
+            }
+        }
+        if (!dominated) out.push(p);
+    }
+    return out;
+}
+
+/**
+ * The "pay for the worst case even when sparse" tax of a fixed-capacity member:
+ * bytes/live at load 0.25 divided by bytes/live at load 1.0, read off an existing D3
+ * loadFactorCurve (NO new run). A fixed backing store spread over fewer live elements
+ * pushes this ABOVE 1 (a fixed-cap member reserves for the ceiling). FAIL CLOSED: a
+ * missing endpoint or a non-positive full-load figure returns the NA string, never a
+ * misleading number.
+ * @param {{loadFactor:number, bytesPerLive:number}[]} loadFactorCurve
+ * @returns {number|'n/a'}
+ */
+export function sparseTax(loadFactorCurve) {
+    if (!Array.isArray(loadFactorCurve)) {
+        throw new Error('[template] sparseTax: loadFactorCurve must be an array');
+    }
+    const at = (lf) => {
+        const p = loadFactorCurve.find((x) => x && x.loadFactor === lf);
+        return p && typeof p.bytesPerLive === 'number' ? p.bytesPerLive : null;
+    };
+    const low = at(0.25), full = at(1.0);
+    if (low == null || full == null || !(full > 0)) return NA;
+    return low / full;
+}
+
 /**
  * Validate a package MANIFEST, FAIL CLOSED. A malformed manifest is an error with a
  * pointed message (never a silent default), so a sibling wiring the template up learns

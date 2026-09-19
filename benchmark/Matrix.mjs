@@ -199,6 +199,66 @@ export const RATIONALE = {
     },
 };
 
+// ===========================================================================
+// Bench v3 (WIRING): the per-member tables the SHARED Template mechanisms read.
+// The sibling re-adopt is a clean Template.mjs copy + a swap of THESE tables --
+// the mechanisms in Template.mjs never change per package, only this data does.
+// ===========================================================================
+
+/**
+ * The spike-tag VOCABULARY each member's replay lane may emit (a subset of the frozen
+ * Template.SPIKE_TAGS enum, always including 'steady'). A member with NO rare event in
+ * its steady op stream declares exactly ['steady'] -- that is a TRUTH, not a gap. The
+ * few members with a deterministic periodic structural event declare it:
+ *   - HierarchicalTimerWheel: 'cascade' every 256-tick level-0 wrap (now & 0xFF === 0)
+ *   - RingLog: 'wrap' each time the overwrite head wraps back to slot 0
+ *   - CuckooMap: 'reseed' -- NOT in the ~0.5 steady lane (0 reseeds, see the semantic-
+ *     fidelity gate); it appears ONLY in the separate attribution-only reseed lane
+ *     (makeReseedSubject), so the vocabulary lists it while the steady lane stays flat.
+ * The tag is KERNEL-SUPPLIED (makeTagLane observes real structural state), never
+ * inferred from timing.
+ */
+export const MEMBER_TAGS = {
+    SparseSet: ['steady'],
+    RingDeque: ['steady'],
+    UnionFind: ['steady'],   // pre-flattened in the bench op -> no compress spike on the hot path
+    MonoDeque: ['steady'],
+    MinStack: ['steady'],
+    RandomSet: ['steady'],
+    FreqO1: ['steady'],
+    BucketQueue: ['steady'],
+    TimerWheel: ['steady'],
+    HierarchicalTimerWheel: ['steady', 'cascade'],
+    RingLog: ['steady', 'wrap'],
+    CuckooMap: ['steady', 'reseed'],
+    SparseTable: ['steady'],
+};
+
+/**
+ * Members with a RANDOM-ACCESS lookup (so D4 can report a dense-iter-vs-random-lookup
+ * ratio). SparseSet (has) + UnionFind (find) express this; every other member has no
+ * random-index read by design, so its D4 ratio reads the NA string, never 0.
+ */
+export const RANDOM_LOOKUP = {
+    SparseSet: true, UnionFind: true,
+    RingDeque: false, MonoDeque: false, MinStack: false, RandomSet: false,
+    FreqO1: false, BucketQueue: false, TimerWheel: false, HierarchicalTimerWheel: false,
+    RingLog: false, CuckooMap: false, SparseTable: false,
+};
+
+/**
+ * Members with a mutable CAPACITY / load knob -- the 12 plotted on the space-time
+ * Pareto (ops/ms vs bytes/live). SparseTable is the lone static build-once member: its
+ * cost is a BUILD cost on neither Pareto axis, so it is excluded here and shown in its
+ * own build-cost panel instead.
+ */
+export const CAPACITY_KNOB = {
+    SparseSet: true, RingDeque: true, UnionFind: true, MonoDeque: true, MinStack: true,
+    RandomSet: true, FreqO1: true, BucketQueue: true, TimerWheel: true,
+    HierarchicalTimerWheel: true, RingLog: true, CuckooMap: true,
+    SparseTable: false, // static build-once: cost is a build cost, not on the Pareto axes
+};
+
 /**
  * The baseline for a (member, dimension) cell, or NA when the dimension has no
  * meaningful head-to-head baseline. D5 (bundle size + tree-shaking) is intrinsic

@@ -178,25 +178,34 @@ export function stats(samples) {
  * hrtime.bigint() itself allocates a BigInt per call, but that is the ONLY portable
  * per-op nanosecond clock in Node and it is charged to BOTH the op and the empty
  * baseline, so it cancels in the subtraction.
+ * ATTRIBUTION (Bench v3): the op INDEX in the seeded stream that produced the max
+ * is captured as `maxIndex` via two scalars tracked in the timed loop BEFORE the
+ * sort (zero new allocation -- two locals, no array). Existing callers reading only
+ * `{p99, max}` are unaffected (the field is purely additive). The STRUCTURAL tag is
+ * NOT inferred here (timing never names a structural event); the caller resolves it
+ * from a deterministic, untimed replay lane via Template.attributeMax.
  * @param {(i:number) => void} op
  * @param {number} iters  number of single-op timings to take
- * @returns {{p99:number, max:number}} nanoseconds, overhead-subtracted, clamped >= 0
+ * @returns {{p99:number, max:number, maxIndex:number}} nanoseconds, overhead-subtracted, clamped >= 0
  */
 export function perOpTail(op, iters) {
-    if (iters <= 0) return { p99: 0, max: 0 };
+    if (iters <= 0) return { p99: 0, max: 0, maxIndex: -1 };
     // Calibrate the empty-call overhead through the identical hrtime path, then
     // subtract it uniformly with subtractOverhead (the SHARED discipline).
     const overhead = calibrateOverheadNs(iters);
 
     const s = new Float64Array(iters);
+    let maxVal = -Infinity, maxIdx = -1; // two scalars: no per-op allocation
     for (let i = 0; i < iters; i++) {
         const t0 = process.hrtime.bigint();
         op(i);
         const t1 = process.hrtime.bigint();
-        s[i] = subtractOverhead(Number(t1 - t0), overhead);
+        const v = subtractOverhead(Number(t1 - t0), overhead);
+        s[i] = v;
+        if (v > maxVal) { maxVal = v; maxIdx = i; } // argmax BEFORE the sort
     }
     s.sort();
-    return { p99: percentile(s, 99), max: s[iters - 1] };
+    return { p99: percentile(s, 99), max: s[iters - 1], maxIndex: maxIdx };
 }
 
 /**

@@ -23,12 +23,18 @@ throughput anchor with seven more axes a real consumer feels:
 
 - D1 Latency distribution -- p50/p90/p99/p99.9/p99.99 (+ under forced GC), the true
   per-op tail for amortized members, and (Bench v2) a 95% bootstrap CI + a
-  Mann-Whitney test vs each foil.
-- D2 Amortized cost over a long mixed trace -- cumulative ns/op stays flat.
+  Mann-Whitney test vs each foil. (Bench v3) the worst single op is ATTRIBUTED to a
+  structural event via `Template.attributeMax`.
+- D2 Amortized cost over a long mixed trace -- cumulative ns/op stays flat. (Bench v3)
+  a boundary-crossing trace records the op indices where a periodic structural
+  boundary is crossed, so the spikes align there and the steady segments stay flat.
 - D3 Memory footprint + stability -- bytes/live vs a theoretical floor, AND a
-  load-factor CURVE (0.25/0.5/0.75/1.0) that surfaces fixed overhead honestly.
+  load-factor CURVE (0.25/0.5/0.75/1.0) that surfaces fixed overhead honestly. (Bench
+  v3) a space-time Pareto (ops/ms vs bytes/live) + a static build-cost panel + the
+  fixed-cap sparse tax (bytes/live @0.25 / @1.0) make the trade-offs one glance.
 - D4 Cache behaviour -- a PORTABLE PROXY (dense-iter vs random-lookup + stride
-  sweep), labelled PROXY (no native perf counters, no perf-stat shell-out).
+  sweep), labelled PROXY (no native perf counters, no perf-stat shell-out). (Bench v3)
+  each working-set point carries a NOMINAL cache-tier band.
 - D5 Bundle size + tree-shaking -- esbuild min + gzip, single import << all import.
 - D6 GC pressure -- the 0 B/op gate as a measured curve over n = 1e3..1e6.
 - D7 Scalability across key types + load factors.
@@ -148,5 +154,35 @@ still throws -- fail-closed on the truly-unknown, NA on the legitimately-absent.
 4. Grow D2..D8 at the marked fill-in points, copying the shape of
    `benchmark/Dimensions.mjs` (the reference implementation) -- keeping n/a-never-0,
    the fail-closed dispatch, and the anti-vacuity `_check` list.
+
+## Bench v3 -- the three Tier-A honesty upgrades (SHARED template)
+
+Three upgrades landed in the shared kit (`Template.mjs` mechanisms + per-member tables
+in `Matrix.mjs`), so every sibling inherits them on the next adopt.
+
+- Spike attribution. The worst single op is labelled with a KERNEL-SUPPLIED structural
+  tag from the frozen enum `Template.SPIKE_TAGS`
+  (`steady/grow/wrap/cascade/compress/reseed`) -- NEVER inferred from timing (a
+  timing-inferred tag is noise). The tag comes from an UNTIMED, deterministic REPLAY of
+  the seeded op stream (`Dimensions.makeTagLane`) that observes real structural state
+  (HTW `now`, RingLog head, CuckooMap `seed`); the timed kernel gains zero new work.
+  `Template.attributeMax` resolves `{maxIndex, tag, spikeRatio}` purely. The CuckooMap
+  re-seed spike is measured in a SEPARATE attribution-only lane
+  (`Dimensions.makeReseedSubject`) whose collider search is BOUNDED and FAIL-CLOSED (a
+  capped attempt count, a loud `[bench]` throw on exhaustion -- never an unbounded scan
+  that could hang the gate); the D1/D8 ~0.5-load cells are untouched by it and still
+  reseed zero times.
+- Cache-tier labelling. Each D4 working-set point carries a NOMINAL cache band from
+  FIXED byte thresholds (`Template.CACHE_BANDS`: L1 <= 32 KiB, L2 <= 1 MiB, L3 <= 32
+  MiB, else DRAM), classified on the already-measured backing bytes. These are NOMINAL
+  legibility bands, explicitly NOT a measured cache miss -- any real `os` cache size is a
+  meta-note only, never gating, so results compare across machines. A DRAM-reach sweep is
+  OPT-IN via `--deep`; unreached tiers read the STRING `n/a`, never 0.
+- Space-time Pareto + build cost + sparse tax. The capacity-knob members are plotted on
+  the ops/ms-vs-bytes/live plane as a pure dominance filter (`Template.paretoFrontier`,
+  no curve fit) over REAL D1 x D3 cells; the static member's build cost is a distinct
+  number in its own panel (never folded into the query line); and the fixed-cap sparse
+  tax (`Template.sparseTax` = bytes/live @0.25 / @1.0, reusing the existing D3 curve, no
+  new run) quantifies "pay for the worst case even when sparse".
 
 Repo-only, no version bump, no new npm package (settled in ADR 0009 amendment 2).
