@@ -331,3 +331,130 @@ export function cells() {
     }
     return out;
 }
+
+// ===========================================================================
+// Claim-honesty classification (the witness/docs session). THREE claim classes,
+// not two -- the doc gate + the O1.js comments key off this shared table:
+//   - alloc : deterministically PROVEN by the torture gate (0 B/op under
+//             --expose-gc -- a deterministic assertion, not a noisy observation),
+//             so the wording KEEPS "proven".
+//   - timing: EMPIRICALLY WITNESSED on a host (the complexity-flatness claim AND
+//             the constant-factor claim are observed, not deduced), so the wording
+//             must read "witness" / "empirical validation" / "we observe" -- NEVER
+//             "proven".
+//   - cited : "proven" refers to CITED LITERATURE (the fmix32 finalizer), not a
+//             measurement on this host, so the wording KEEPS "proven" (it is a
+//             citation, not a claim this suite asserts it measured).
+// A blanket find-replace of "proven" is a BUG: each hit is classified FIRST.
+// ===========================================================================
+
+/** The three claim classes. Frozen so a typo is a reference error, not a silent miss. */
+export const CLAIM_CLASS = Object.freeze({
+    alloc: 'alloc',
+    timing: 'timing',
+    cited: 'cited',
+});
+
+/**
+ * The signatures the doc gate uses to recognize a NON-timing "prove*" hit. A line
+ * that matches a CITED marker is class `cited`; else a line that matches an ALLOC
+ * marker is class `alloc`; a "prove*" hit matching NEITHER is class `timing` and MUST
+ * read witness/empirical, never proven. Order matters: cited is checked before alloc.
+ */
+export const CLAIM_MARKERS = Object.freeze({
+    cited: [/non-colliding/i, /sub-hashes/i, /fmix/i],
+    alloc: [/0 ?B\/op/i, /zero-alloc/i, /byte-identical/i, /path-halving depth-shrink/i, /\btorture\b/i],
+});
+
+/**
+ * Classify a single line/segment that contains a "prove*" hit into its CLAIM_CLASS.
+ * Pure. A line with no alloc/cited marker is a TIMING claim (the default) -- so a
+ * softened timing line re-hardened back to "proven" classifies as `timing` and the
+ * doc gate FAILS it. Fail closed: a non-string is a timing claim (caught).
+ * @param {string} line
+ * @returns {'alloc'|'timing'|'cited'}
+ */
+export function classifyClaim(line) {
+    const s = typeof line === 'string' ? line : '';
+    for (const re of CLAIM_MARKERS.cited) if (re.test(s)) return CLAIM_CLASS.cited;
+    for (const re of CLAIM_MARKERS.alloc) if (re.test(s)) return CLAIM_CLASS.alloc;
+    return CLAIM_CLASS.timing;
+}
+
+// ===========================================================================
+// clear() invariance witness (proposal #1). ELEVATED to a first-class witness for
+// EXACTLY the four general-purpose container members whose O(1) clear-and-reuse is a
+// HEADLINE guarantee: clear() returns the structure to its pristine EMPTY invariant
+// (size 0), allocates ZERO bytes, retains the backing store, and leaves it reusable.
+//
+// Member-scoped ON PURPOSE. 12 of 13 members expose a reset surface (only SparseTable
+// has none), so the witness is NOT "everything with a clear()". The EXCLUDED table
+// below records, per member, WHY it is out of the witness scope -- so the narrow set
+// reads deliberate, not arbitrary (an excluded member is NAMED with a reason, never
+// silently dropped -- the same honesty discipline as the NA-never-0 rule).
+// ===========================================================================
+
+/** The four members whose clear()+reuse cycle is an elevated first-class witness. */
+export const CLEAR_WITNESS = ['SparseSet', 'RingDeque', 'RandomSet', 'RingLog'];
+
+/**
+ * The nine members EXCLUDED from CLEAR_WITNESS, each with a short honest reason.
+ * SparseTable is static (no mutators at all); UnionFind's reset surface is reset()
+ * (an O(n) bulk primitive, not an O(1) clear()); CuckooMap's clear() fills an
+ * occupancy map (O(capacity), touches a store) rather than a pure counter reset; the
+ * rest expose an O(1) clear() but couple it to specialized state (a frozen kind, a
+ * cursor, a pool, a clock) -- transitively covered by the four canonical witnesses,
+ * so a redundant elevation would dilute the witness, not add honesty.
+ */
+export const CLEAR_WITNESS_EXCLUDED = Object.freeze({
+    UnionFind: 'reset()-O(n) bulk primitive, not an O(1) clear()',
+    MonoDeque: 'sliding-window; reuse idiom is evictOlderThan, clear() incidental',
+    MinStack: 'O(1) clear() identical to SparseSet; LIFO reuse transitively covered',
+    FreqO1: 'clear() resets the LFU bucket-forest pool; specialized, not a container',
+    BucketQueue: 'clear() resets the monotone cursor; specialized priority queue',
+    TimerWheel: 'clear() also resets the clock (now); specialized scheduler',
+    HierarchicalTimerWheel: 'clear() also resets the clock (now) + cascade levels',
+    CuckooMap: 'clear() is an O(capacity) occupancy fill, not a pure counter reset',
+    SparseTable: 'static/no-mutators -- build-once, no clear() surface at all',
+});
+
+// ===========================================================================
+// Per-op honesty class (proposal #2). Instead of ONE aggregate O(1) witness, each
+// (member x op) declares its OWN honesty class -- painting every op as worst-case-O(1)
+// is the dishonesty this table exists to prevent. Ops:
+//   insert   -- the add/push/set/union/schedule mutation
+//   delete   -- the remove/pop/extractMin/cancel mutation (n/a where none exists:
+//               UnionFind and RingLog have no delete op)
+//   iterate  -- forEach / [Symbol.iterator]: O(n)-work-PER-CALL (per-element flat,
+//               NOT per-call O(1)) for every mutable member -- calling it per-call
+//               O(1) would be the exact overclaim this table guards against.
+// Classes: 'worst-case-O(1)' | 'amortized-O(1)' | 'O(n)-per-call' | 'n/a' (the STRING).
+// SparseTable is the STATIC member: its query/traversal surface reads an immutable
+// copy, not a mutable-collection op, so the whole row is 'n/a' (the string, never 0).
+// ===========================================================================
+
+/** The op triad each per-op witness classes. */
+export const OPS = ['insert', 'delete', 'iterate'];
+
+/**
+ * The honest per-op class table (member -> {insert, delete, iterate}). insert stays
+ * amortized where a rare run/cohort exists (UnionFind find-flatten, MonoDeque
+ * dominated-pop run, CuckooMap eviction chain + reseed cohort); delete stays
+ * worst-case-O(1) where a bounded op is genuinely constant (CuckooMap's <= 8-slot
+ * probe) and amortized where a cursor/eviction run exists (BucketQueue extractMin).
+ */
+export const OP_CLASS = Object.freeze({
+    SparseSet: { insert: 'worst-case-O(1)', delete: 'worst-case-O(1)', iterate: 'O(n)-per-call' },
+    RingDeque: { insert: 'worst-case-O(1)', delete: 'worst-case-O(1)', iterate: 'O(n)-per-call' },
+    UnionFind: { insert: 'amortized-O(1)', delete: NA, iterate: 'O(n)-per-call' },
+    MonoDeque: { insert: 'amortized-O(1)', delete: 'amortized-O(1)', iterate: 'O(n)-per-call' },
+    MinStack: { insert: 'worst-case-O(1)', delete: 'worst-case-O(1)', iterate: 'O(n)-per-call' },
+    RandomSet: { insert: 'worst-case-O(1)', delete: 'worst-case-O(1)', iterate: 'O(n)-per-call' },
+    FreqO1: { insert: 'worst-case-O(1)', delete: 'worst-case-O(1)', iterate: 'O(n)-per-call' },
+    BucketQueue: { insert: 'worst-case-O(1)', delete: 'amortized-O(1)', iterate: 'O(n)-per-call' },
+    TimerWheel: { insert: 'worst-case-O(1)', delete: 'worst-case-O(1)', iterate: 'O(n)-per-call' },
+    HierarchicalTimerWheel: { insert: 'worst-case-O(1)', delete: 'worst-case-O(1)', iterate: 'O(n)-per-call' },
+    RingLog: { insert: 'worst-case-O(1)', delete: NA, iterate: 'O(n)-per-call' },
+    CuckooMap: { insert: 'amortized-O(1)', delete: 'worst-case-O(1)', iterate: 'O(n)-per-call' },
+    SparseTable: { insert: NA, delete: NA, iterate: NA },
+});

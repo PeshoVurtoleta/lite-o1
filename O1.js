@@ -1,9 +1,9 @@
 /**
  * @zakkster/lite-o1 -- a tree-shakeable, zero-GC family of O(1) data structures
  * that doubles as a teachable textbook: each member solves a real problem AND
- * proves its constant is real (the O(1) Witness -- see test/witness.mjs).
+ * witnesses its constant on a host (the O(1) Witness -- see test/witness.mjs).
  *
- * v1.3.0 ships thirteen members -- SparseSet, RingDeque, UnionFind, MonoDeque,
+ * v1.3.1 ships thirteen members -- SparseSet, RingDeque, UnionFind, MonoDeque,
  * MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel,
  * RingLog, CuckooMap, and SparseTable -- plus its `VERSION` const. The thirteen are
  * independent (no shared mutable module state), so a bundler that imports one drops
@@ -11,14 +11,15 @@
  *
  * The complexity class IS the product: every hot op below is O(1) worst-case and
  * allocates ZERO bytes after construction. The witness harness (never imported
- * here) proves the throughput stays FLAT from n=1e3 to n=1e7 while a native Set
- * (or Array.prototype.shift) decays -- that flat line is the theorem made visible.
+ * here) empirically witnesses the throughput staying FLAT from n=1e3 to n=1e7 while
+ * a native Set (or Array.prototype.shift) decays -- that flat line is the constant
+ * made visible, an observation on a host, not a deduction.
  *
  * @license MIT
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.3.0';
+export const VERSION = '1.3.1';
 
 /** Largest universe the Uint32 substrate + the (k >>> 0) key check can honor. */
 const MAX_UNIVERSE = 0x100000000; // 2^32
@@ -551,7 +552,7 @@ const MAX_SEQ = 2 ** 53; // 2^53 (Number.MAX_SAFE_INTEGER + 1)
  * push is O(1) AMORTIZED, NOT worst-case: a single push can pop O(k) dominated back
  * entries (its worst case), but every element is pushed once and popped at most
  * once, so the pops charged across a run of pushes total at most that run's length.
- * The witness proves the amortized ops/ms stays FLAT while a naive window-rescan
+ * The witness observes the amortized ops/ms stay FLAT while a naive window-rescan
  * foil (O(W) per element) collapses, and it reports the MAX single-op time so a
  * hidden worst-case spike would show as a tall bar. `value()` / `frontSeq()` /
  * `evictOlderThan()` are cheap (front-only) reads/writes.

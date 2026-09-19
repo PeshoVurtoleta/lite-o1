@@ -57,7 +57,7 @@ Truth Panel's primary signal (Section 4) are ours.
 
 ## 2. Roster -> scene map (all 13 real members)
 
-The 13 public members of O1.js (v1.3.0): SparseSet, RingDeque, UnionFind,
+The 13 public members of O1.js (v1.3.1): SparseSet, RingDeque, UnionFind,
 MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel,
 HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable. (`IS` in O1.js is an
 internal helper, NOT a public member -- it does not appear in the demo. There is

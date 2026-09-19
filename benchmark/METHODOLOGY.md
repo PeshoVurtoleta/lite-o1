@@ -116,7 +116,7 @@ matrix stays exactly SUBJECTS x DIMENSIONS (13 x 8 = 104 cells for lite-o1).
 ## Witness-as-dimension-1
 
 Every package in this family has an analytical ANCHOR: a single measurement whose
-SHAPE is the proof of the complexity class.
+SHAPE is the empirical witness of the complexity class.
 
 - lite-o1: the O(1) Witness -- ops/ms that stays FLAT as n grows across orders of
   magnitude (flatness = last/first over a steady, cache-resident window). A true

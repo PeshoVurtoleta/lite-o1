@@ -19,9 +19,10 @@ import { spawnSync } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
-import { runDimension, vacuityCheck } from './Dimensions.mjs';
+import { runDimension, vacuityCheck, clearWitness } from './Dimensions.mjs';
 import {
     SUBJECTS, DIMENSIONS, DIMENSION_TITLES, baselineFor, cells,
+    CLEAR_WITNESS, CLEAR_WITNESS_EXCLUDED, OP_CLASS, OPS,
 } from './Matrix.mjs';
 import { DEFAULT_SEED } from './Harness.mjs';
 
@@ -274,9 +275,17 @@ async function orchestrate() {
         },
         subjects: SUBJECTS, dimensions: DIMENSIONS, titles: DIMENSION_TITLES,
         results,
+        // proposal #1: clear() invariance witness (four members) + the EXCLUDED-with-reasons
+        // table so the narrow scope reads deliberate. Deterministic; not a timed cell.
+        clearWitness: clearWitness({ seed }),
+        clearWitnessExcluded: CLEAR_WITNESS_EXCLUDED,
+        // proposal #2: the honest per-op class table (member x {insert,delete,iterate}).
+        opClass: OP_CLASS, ops: OPS,
     };
     writeFileSync(RESULTS_PATH, JSON.stringify(payload, null, 2));
     console.log('results written to benchmark/results.json (' + all.length + ' cells)');
+    console.log('clear() witness: ' + CLEAR_WITNESS.join(', ') +
+        ' (' + Object.keys(CLEAR_WITNESS_EXCLUDED).length + ' members excluded with reasons)');
 }
 
 // Guard: only run the CLI (single-cell or orchestrator) when this file is the

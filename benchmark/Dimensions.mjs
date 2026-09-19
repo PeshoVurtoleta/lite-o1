@@ -25,7 +25,7 @@ import {
 } from './Harness.mjs';
 import {
     NA, SUBJECTS, baselineFor, strongBaselineFor, supportsKeyType, supportsWorkload,
-    MEMBER_TAGS, RANDOM_LOOKUP,
+    MEMBER_TAGS, RANDOM_LOOKUP, CLEAR_WITNESS,
 } from './Matrix.mjs';
 import {
     SPIKE_TAGS, tagByte, attributeMax, bandOf, sparseTax,
@@ -1777,6 +1777,77 @@ export function D8(member, opts = {}) {
         ecs, cache, churn, query,
         _check: check,
     };
+}
+
+// ===========================================================================
+// clear() invariance witness (proposal #1). A first-class, member-scoped witness
+// for EXACTLY the four Matrix.CLEAR_WITNESS members: clear() returns the structure
+// to its pristine EMPTY invariant (size 0), retains the fixed backing store (a
+// byte-for-byte-stable footprint across many fill/clear cycles -- zero-alloc), and
+// leaves it reusable (a refill after clear brings size back up). This is the same
+// retention contract the torture gate proves at 0 B/op; here it is surfaced as a
+// named, rendered witness. Fail closed on an unhandled member.
+// ===========================================================================
+
+/** Refill a CLEAR_WITNESS member to its bounded steady state (mirrors makeSubject). */
+function clearWitnessFill(member, obj, n) {
+    if (member === 'SparseSet' || member === 'RandomSet') {
+        const cap = obj.capacity; const fill = Math.min(n, cap);
+        for (let k = 0; k < fill; k++) obj.add(k);
+        return fill;
+    }
+    if (member === 'RingDeque') {
+        const cap = obj.capacity; const fill = Math.min(n, cap - 1 > 0 ? cap - 1 : cap);
+        for (let k = 0; k < fill; k++) obj.pushBack(k);
+        return fill;
+    }
+    if (member === 'RingLog') {
+        const cap = obj.capacity; for (let k = 0; k < cap; k++) obj.push(k);
+        return cap;
+    }
+    throw new Error('[bench] clearWitness: unhandled member ' + member);
+}
+
+/**
+ * Run the clear() invariance witness for the four CLEAR_WITNESS members.
+ * Returns per-member { sizeAfterClear, reusable, cycles, baseBytes, finalBytes,
+ * bytesDelta, zeroAlloc, pristine }. Deterministic (no timing in the verdict).
+ * @param {{n?:number, cycles?:number, seed?:number}} [opts]
+ */
+export function clearWitness(opts = {}) {
+    const n = opts.n ?? 4096;
+    const cycles = opts.cycles ?? 1000;
+    const seed = opts.seed ?? DEFAULT_SEED;
+    const results = {};
+    for (const member of CLEAR_WITNESS) {
+        const { obj } = makeSubject(member, n, prng(seed)); // built + filled to steady state
+        const baseBytes = memberBytes(member, obj);
+        obj.clear();
+        const sizeAfterClear = obj.size;                     // MUST be 0
+        const refilled = clearWitnessFill(member, obj, n);   // reuse after clear
+        const sizeAfterRefill = obj.size;                    // MUST be > 0 (non-vacuous)
+        let grew = false;
+        for (let c = 0; c < cycles; c++) {
+            obj.clear();
+            clearWitnessFill(member, obj, n);
+            if (memberBytes(member, obj) !== baseBytes) grew = true; // backing store must not grow
+        }
+        obj.clear();
+        const finalBytes = memberBytes(member, obj);
+        results[member] = {
+            member,
+            sizeAfterClear,
+            pristine: sizeAfterClear === 0,
+            reusable: sizeAfterRefill > 0 && refilled > 0,
+            refilledTo: sizeAfterRefill,
+            cycles,
+            baseBytes,
+            finalBytes,
+            bytesDelta: finalBytes - baseBytes,               // MUST be 0 (buffer retained)
+            zeroAlloc: !grew && finalBytes === baseBytes,
+        };
+    }
+    return { probe: 'clearWitness', members: CLEAR_WITNESS.slice(), results };
 }
 
 // ===========================================================================

@@ -8,6 +8,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.3.1] - 2026-09-19
+
+Documentation / wording patch. No runtime-code logic change: `O1.js` hot bodies are
+byte-stable (only the `VERSION` const bump + three comment-wording changes), the
+torture gate stays 0 B/op x13, and the thirteen-member public API is unchanged.
+
+### Changed
+
+- **Honesty-of-language: timing/complexity/constant-factor claims now read "witness"
+  / "empirical" / "we observe", not "proven".** The O(1)-flatness and constant-factor
+  claims are EMPIRICALLY WITNESSED on a host, not deductively proven, so their wording
+  is softened across `README.md`, `llms.txt`, and the `O1.js` header/MonoDeque
+  comments. Three claim classes are distinguished, not blanket-replaced: `alloc` (the
+  deterministic 0-B/op torture-gate claim KEEPS "proven"), `timing` (softened), and
+  `cited` (the fmix32 finalizer's "proven non-colliding-in-practice" KEEPS "proven",
+  it is a citation, not a host measurement). The classification lives in
+  `benchmark/Matrix.mjs` (`CLAIM_CLASS` / `classifyClaim`) and a doc gate enforces it.
+
+### Added (repo-only benchmark infra; not shipped in the package)
+
+- **`clear()` invariance witness** for exactly the four container members
+  (`SparseSet`, `RingDeque`, `RandomSet`, `RingLog`): post-clear size 0, backing store
+  retained (zero-alloc across many fill/clear cycles), reusable -- surfaced in the
+  report with an EXCLUDED-with-reasons table for the other nine members
+  (`Matrix.CLEAR_WITNESS` + `Dimensions.clearWitness`).
+- **Per-op honesty class table** (`Matrix.OP_CLASS`): each `(member x {insert, delete,
+  iterate})` carries its OWN class (`worst-case-O(1)` / `amortized-O(1)` /
+  `O(n)-per-call` / `n/a`) instead of one aggregate O(1) claim -- iterate is
+  O(n)-work-per-call, not per-call O(1); the static `SparseTable` row is `n/a`.
+- **Report layout**: the corroborating D6 (GC pressure / allocation-rate curve) and
+  D8 (workload) dimensions now render ADJACENT to the D2 amortized/flatness witness
+  plot, alongside the clear() + per-op witnesses.
+
 ## [1.3.0] - 2026-09-16
 
 ### Added

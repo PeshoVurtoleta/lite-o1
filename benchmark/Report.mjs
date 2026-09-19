@@ -303,7 +303,7 @@ export function renderHtml(payload) {
             return [m, num(r.drift), bd];
         });
         sections.push(section('D2 -- Amortized cost over a long mixed trace',
-            'Cumulative ns/op at power-of-two checkpoints; a flat line (drift ~ 1.0) proves the amortized bound holds. ' +
+            'Cumulative ns/op at power-of-two checkpoints; a flat line (drift ~ 1.0) witnesses the amortized bound holding. ' +
             'boundary-crossing = the structural event + the op indices where the trace crosses a ' +
             'capacity/period boundary repeatedly (the spikes align there); n/a where a member has no periodic boundary.',
             chart, tableRows(['member', 'drift (last/first)', 'boundary-crossing trace'], rows)));
@@ -427,7 +427,7 @@ export function renderHtml(payload) {
                 r.ratio.toFixed(3), r.underForty ? 'yes' : 'NO'];
         });
         sections.push(section('D5 -- Bundle size + tree-shaking',
-            'esbuild minify + gzip. A single-member import must be < 40% of the all-member import (tree-shaking proof).',
+            'esbuild minify + gzip. A single-member import must be < 40% of the all-member import (tree-shaking evidence).',
             chart, tableRows(['member', 'single min', 'single gz', 'all min', 'all gz', 'ratio', '< 40%?'], rows)));
     }
 
@@ -480,6 +480,73 @@ export function renderHtml(payload) {
             null, tableRows(['member', 'ECS (ns)', 'cache hot-subset ns/op', 'churn ns/op', 'query ns/op'], rows)));
     }
 
+    // clear() invariance witness (proposal #1) -- a first-class, member-scoped witness.
+    {
+        const cw = payload.clearWitness;
+        const excl = payload.clearWitnessExcluded || {};
+        if (cw && cw.results && Array.isArray(cw.members)) {
+            const firstCycles = cw.results[cw.members[0]] ? cw.results[cw.members[0]].cycles : 0;
+            const rows = cw.members.map((m) => {
+                const r = cw.results[m];
+                return [m, String(r.sizeAfterClear), r.pristine ? 'yes' : 'NO',
+                    r.reusable ? 'yes' : 'NO', String(r.cycles), String(r.bytesDelta) + ' B',
+                    r.zeroAlloc ? 'yes' : 'NO'];
+            });
+            const exclRows = Object.keys(excl).map((m) => [m, String(excl[m])]);
+            sections.push(section('clear() invariance witness (4 members)',
+                'clear() returns the structure to its pristine EMPTY invariant (size 0), retains the ' +
+                'fixed backing store (bytes delta 0 across ' + firstCycles + ' fill/clear cycles -- ' +
+                'zero-alloc), and leaves it reusable (a refill after clear brings size back up). ' +
+                'Member-scoped ON PURPOSE: the EXCLUDED table names every other member with its reason, ' +
+                'so the narrow set is deliberate, not arbitrary (named with a reason, never dropped).',
+                null,
+                tableRows(['member', 'size after clear', 'pristine', 'reusable', 'cycles', 'bytes delta', 'zero-alloc'], rows) +
+                '<h2>Excluded from the clear() witness (with reasons)</h2>' +
+                tableRows(['member', 'reason'], exclRows)));
+        }
+    }
+
+    // Per-op honesty class (proposal #2): member x {insert, delete, iterate} -> honest class.
+    {
+        const oc = payload.opClass;
+        const opsList = Array.isArray(payload.ops) ? payload.ops : ['insert', 'delete', 'iterate'];
+        if (oc) {
+            const rows = subjects.map((m) => {
+                const row = oc[m] || {};
+                return [m].concat(opsList.map((op) => String(row[op])));
+            });
+            sections.push(section('Per-op honesty class (insert / delete / iterate)',
+                'Each (member x op) carries its OWN honesty class -- painting every op worst-case-O(1) ' +
+                'is the overclaim this table prevents. insert stays amortized where a run/cohort exists ' +
+                '(UnionFind flatten, MonoDeque dominated-pop, CuckooMap eviction/reseed); iterate is ' +
+                'O(n)-work-PER-CALL (per-element flat, NOT per-call O(1)); a static member (SparseTable) ' +
+                'has no mutable-collection op, so its row reads n/a (the string, never 0).',
+                null, tableRows(['member'].concat(opsList), rows)));
+        }
+    }
+
+    // Emit order (proposal #4): the corroborating GC-pressure (D6) + workload (D8) dimensions
+    // render ADJACENT to the D2 amortized/flatness witness plot, with the clear() + per-op
+    // witnesses -- so the reader sees the witness AND its corroboration in one view. Picked by
+    // title so the order is robust to the section-build order above.
+    const orderTitles = [
+        'D1 -- Latency distribution',
+        'D2 -- Amortized cost',
+        'clear() invariance witness',
+        'Per-op honesty class',
+        'D6 -- GC pressure',
+        'D8 -- Workload micro-benchmarks',
+        'D3 -- Memory footprint',
+        'Space-time Pareto',
+        'D4 -- Cache behaviour',
+        'D5 -- Bundle size',
+        'D7 -- Scalability',
+    ];
+    const ordered = orderTitles
+        .map((t) => sections.find((s) => s.startsWith('<section><h2>' + t)))
+        .filter(Boolean);
+    for (const s of sections) if (!ordered.includes(s)) ordered.push(s); // fail-open for any future section
+
     const meta = payload.meta;
     const head = '<header><h1>@zakkster/lite-o1 -- benchmark report</h1>' +
         '<p class="meta">seed 0x' + (meta.seed >>> 0).toString(16) + ' | node ' + esc(meta.node) +
@@ -490,7 +557,7 @@ export function renderHtml(payload) {
     return '<!doctype html><html lang="en"><head><meta charset="utf-8">' +
         '<meta name="viewport" content="width=device-width, initial-scale=1">' +
         '<title>lite-o1 benchmark report</title><style>' + STYLE + '</style></head><body>' +
-        head + sections.join('') + '</body></html>';
+        head + ordered.join('') + '</body></html>';
 }
 
 const STYLE =

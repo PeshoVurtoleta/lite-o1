@@ -27,12 +27,15 @@ import assert from 'node:assert/strict';
 import {
     D1, D2, D3, D4, D5, D6, D7, D8, traceHash, vacuityCheck,
     memberBytes, theoreticalMinPerLive, makeSubject, makeBaseline, makeStrongBaseline, churnNs,
-    makeTagLane, makeReseedSubject, RESEED_MAX_ATTEMPTS,
+    makeTagLane, makeReseedSubject, RESEED_MAX_ATTEMPTS, clearWitness,
 } from '../benchmark/Dimensions.mjs';
 import {
     SUBJECTS, DIMENSIONS, cells, supportsWorkload, RATIONALE, STRONG_BASELINE,
     strongBaselineFor, NA, MEMBER_TAGS, RANDOM_LOOKUP, CAPACITY_KNOB,
+    CLAIM_CLASS, classifyClaim, CLEAR_WITNESS, CLEAR_WITNESS_EXCLUDED, OP_CLASS, OPS,
 } from '../benchmark/Matrix.mjs';
+import { renderHtml } from '../benchmark/Report.mjs';
+import { VERSION } from '../O1.js';
 import {
     SPIKE_TAGS, assertTag, tagByte, attributeMax, bandOf, CACHE_BANDS,
     paretoFrontier, sparseTax,
@@ -44,7 +47,7 @@ import {
 } from '../benchmark/Harness.mjs';
 import { createBenchKit, validateManifest } from '../benchmark/Template.mjs';
 import { driftFraction, driftExceeds, DRIFT_LIMIT } from '../benchmark/Bench.mjs';
-import { CuckooMap } from '../O1.js';
+import { CuckooMap, SparseSet, RingDeque, RandomSet, RingLog } from '../O1.js';
 
 const SEED = 0x9e3779b1 >>> 0;
 
@@ -692,10 +695,10 @@ test('adoption: D3 memberBytes is stable across 5 fill/clear cycles (no backing-
         'SparseTable of equal length must have equal backing bytes');
 });
 
-test('adoption: repo-only discipline -- package.json.version is still 1.3.0 (no bump)', () => {
+test('shipping discipline -- package.json.version is the 1.3.1 patch bump; benchmark/ stays repo-only', () => {
     const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
-    assert.equal(pkg.version, '1.3.0', 'Session A is repo-only: no version bump');
-    // benchmark/ must NOT be shipped (it is repo-only infra).
+    assert.equal(pkg.version, '1.3.1', 'witness/docs session ships the 1.3.1 patch bump');
+    // benchmark/ must NOT be shipped (it is repo-only infra) even in a shipping session.
     assert.ok(!pkg.files.includes('benchmark'), 'benchmark/ must not appear in package.json files[]');
 });
 
@@ -905,4 +908,306 @@ test('v3 Pareto + build-cost + sparse-tax: known frontier; real cells; sparse ta
     const st = D3('SparseTable', OPTS.D3);
     assert.ok(st.buildNs > 0 && st.buildBytes > 0, 'SparseTable build cost must be real');
     assert.notEqual(D1('SparseTable', OPTS.D1).subject.p50, st.buildNs, 'build cost is not the query latency');
+});
+
+// ===========================================================================
+// Witness/docs session (1.3.1) -- honesty-of-language + witness surfacing.
+// ===========================================================================
+
+const README = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+const LLMS = readFileSync(new URL('../llms.txt', import.meta.url), 'utf8');
+const O1SRC = readFileSync(new URL('../O1.js', import.meta.url), 'utf8');
+const GUIDE = readFileSync(new URL('../GUIDE.md', import.meta.url), 'utf8');
+const METHODOLOGY = readFileSync(new URL('../benchmark/METHODOLOGY.md', import.meta.url), 'utf8');
+const REPORTSRC = readFileSync(new URL('../benchmark/Report.mjs', import.meta.url), 'utf8');
+const PROVE_RE = /prove|proof|proven/i;
+
+test('#1 CLAIM_CLASS classifier: alloc="proven" (torture/0 B-op), timing softens, cited=fmix keeps', () => {
+    assert.deepEqual(Object.keys(CLAIM_CLASS).sort(), ['alloc', 'cited', 'timing']);
+    // A deterministic 0-B/op allocation claim stays PROVEN.
+    assert.equal(classifyClaim('The torture and perf gates prove RingDeque at 0 B/op'), CLAIM_CLASS.alloc);
+    assert.equal(classifyClaim('byte-identical proof that clear() leaves the buffers untouched'), CLAIM_CLASS.alloc);
+    // A cited-literature "proven" (the fmix32 finalizer) stays PROVEN.
+    assert.equal(classifyClaim('two seeds (proven non-colliding-in-practice by the differential fuzz)'), CLAIM_CLASS.cited);
+    // A timing/complexity/constant claim is class timing -> MUST NOT read "proven".
+    assert.equal(classifyClaim('the witness proves the throughput stays FLAT as n grows'), CLAIM_CLASS.timing);
+    assert.equal(classifyClaim('ops/ms flat is the proof of O(1)'), CLAIM_CLASS.timing);
+});
+
+test('#3 doc gate: 0 timing-class "prove*" in README/llms.txt/GUIDE/METHODOLOGY/Report; alloc claim stays "proven"', () => {
+    // Every "prove*" hit in the shipped docs AND the shared bench kit (which lite-logn /
+    // lite-loglogn inherit on re-adopt) must be alloc- or cited-class -- never timing. A
+    // softened timing line hardened back to "proven" classifies as timing -> this FAILS.
+    // METHODOLOGY.md + Report.mjs are in scope because their language propagates to siblings;
+    // GUIDE.md is in scope because it is a version-bumped, hand-maintained doc.
+    for (const [name, text] of [
+        ['README.md', README], ['llms.txt', LLMS],
+        ['GUIDE.md', GUIDE], ['benchmark/METHODOLOGY.md', METHODOLOGY], ['benchmark/Report.mjs', REPORTSRC],
+    ]) {
+        for (const line of text.split('\n')) {
+            if (!PROVE_RE.test(line)) continue;
+            const cls = classifyClaim(line);
+            assert.notEqual(cls, CLAIM_CLASS.timing,
+                name + ' has a timing-class "prove*" claim (must read witness/empirical): ' + line.trim().slice(0, 90));
+        }
+    }
+    // POSITIVE anchor: the deterministic 0-B/op allocation claim STILL reads "proven" in
+    // README. Softening the alloc line (prove -> witness) would drop this count to 0 -> FAIL.
+    const allocProven = README.split('\n').filter((l) => /gates prove/.test(l) && /0 ?B\/op/.test(l));
+    assert.ok(allocProven.length >= 10, 'the per-member torture/perf "gates prove ... 0 B/op" alloc claim must survive');
+    // The tagline no longer PROVES a timing constant (it WITNESSES it).
+    assert.ok(/that WITNESS their constant/.test(README), 'README tagline must WITNESS, not PROVE, the constant');
+    assert.ok(!/that PROVE their constant/.test(README), 'README tagline must not re-harden to PROVE');
+});
+
+// Each member's "Zero-GC design notes" mini-section opens with this exact marker, in
+// SUBJECTS order -- used to scope the per-member paragraph attribution below (a plain
+// `l.includes(member)` line-level check is a FALSE-POSITIVE trap: many members'
+// paragraphs cross-reference a sibling by name -- e.g. "the same check as RingDeque" --
+// which keeps a naive per-line count non-zero even after RingDeque's OWN claim is
+// softened; QA proved this specific failure mode by mutation).
+const ALLOC_SECTION_MARKER = Object.freeze({
+    SparseSet: 'A SparseSet allocates',
+    RingDeque: '**RingDeque** allocates',
+    UnionFind: '**UnionFind** allocates',
+    MonoDeque: '**MonoDeque** allocates',
+    MinStack: '**MinStack** allocates',
+    RandomSet: '**RandomSet** allocates',
+    FreqO1: '**FreqO1** allocates',
+    BucketQueue: '**BucketQueue** allocates',
+    TimerWheel: '**TimerWheel** allocates',
+    HierarchicalTimerWheel: '**HierarchicalTimerWheel** allocates',
+    RingLog: '**RingLog** allocates',
+    CuckooMap: '**CuckooMap** allocates',
+    SparseTable: '**SparseTable** allocates',
+});
+
+test('#3 doc gate hardened: EVERY one of the 13 members carries its OWN per-member alloc-"proven" ' +
+    'claim, attributed by PARAGRAPH SEGMENT not a bare line-includes(name) check (QA: the >= 10 ' +
+    'aggregate threshold above is vacuous to softening any ONE of the 11 "gates prove" lines, since ' +
+    '11-1=10 still clears it; a naive per-member l.includes(m) check is ALSO vacuous, because ' +
+    'sibling paragraphs cross-reference other members by name -- this closes both gaps)', () => {
+    assert.deepEqual(Object.keys(ALLOC_SECTION_MARKER).sort(), [...SUBJECTS].sort(),
+        'the marker table must cover exactly the 13 SUBJECTS');
+    const positions = SUBJECTS.map((m) => {
+        const marker = ALLOC_SECTION_MARKER[m];
+        const at = README.indexOf(marker);
+        assert.ok(at >= 0, m + ' design-notes section marker "' + marker + '" must be present');
+        return { m, at };
+    }).sort((a, b) => a.at - b.at);
+    for (let i = 0; i < positions.length; i++) {
+        const { m, at } = positions[i];
+        const end = i + 1 < positions.length ? positions[i + 1].at : README.length;
+        const segment = README.slice(at, end);
+        // PROXIMITY, not mere co-occurrence: the prove*-word must sit within 40 chars
+        // IMMEDIATELY BEFORE the "0 B/op" text (matches every real phrasing -- "gates
+        // prove X at **0 B/op**", "gate proves X at **0 B/op**", "proves it: **0 B/op**").
+        // A bare same-line/same-segment co-occurrence check is a FALSE-NEGATIVE-MISS trap:
+        // QA found that softening SparseSet's own "proves it: 0 B/op" to "witnesses it:
+        // 0 B/op" left the segment's single run-on line still passing a same-line check,
+        // because a LATER, unrelated clause in that same line ("proven non-vacuously by
+        // asserting the tracker held them") still contains a prove*-word -- the co-occurrence
+        // check could not tell the two clauses apart. Requiring the word to directly PRECEDE
+        // "0 B/op" ties the claim to the number it modifies, closing that gap.
+        const claimRe = /(prove[sd]?|proof|proven)\b[\s\S]{0,40}?0 ?B\/op/i;
+        assert.ok(claimRe.test(segment),
+            m + ' design-notes SEGMENT must contain its own "prove* ... 0 B/op" claim, the ' +
+            'prove*-word directly preceding the number (a softened claim in THIS member\'s own ' +
+            'segment must vanish here even if an unrelated clause elsewhere in the same run-on ' +
+            'paragraph still contains an unrelated prove*-word, or a sibling segment mentions ' +
+            m + ' by name in a cross-reference)');
+        // Every "0 B/op" occurrence directly preceded by a prove*-word in this segment must
+        // classify as alloc (never timing) -- catches a hardened TIMING claim smuggled in
+        // with an adjacent "0 B/op" mention.
+        const g = new RegExp(claimRe.source, 'gi');
+        let match;
+        let checked = 0;
+        while ((match = g.exec(segment))) {
+            assert.equal(classifyClaim(match[0]), CLAIM_CLASS.alloc,
+                m + ' 0-B/op prove* claim must classify as alloc, not timing: ' + match[0].slice(0, 90));
+            checked++;
+        }
+        assert.ok(checked >= 1, m + ' must have classified at least one alloc claim');
+    }
+});
+
+test('#3 O1.js comments: the 3 timing comments softened; the fmix32 (cited) "proven" KEPT', () => {
+    for (const line of O1SRC.split('\n')) {
+        if (!PROVE_RE.test(line)) continue;
+        // The only surviving "prove*" in O1.js is the CITED fmix32 finalizer line.
+        assert.equal(classifyClaim(line), CLAIM_CLASS.cited,
+            'O1.js has a non-cited "prove*" comment (timing must soften): ' + line.trim().slice(0, 90));
+    }
+    assert.ok(/proven/.test(O1SRC) && /non-colliding/.test(O1SRC),
+        'the cited fmix32 "proven ... non-colliding" must be KEPT in O1.js');
+});
+
+test('#1 CLEAR_WITNESS is EXACTLY the four container members; each has a clear()', () => {
+    assert.equal(CLEAR_WITNESS.length, 4, 'exactly four members');
+    assert.deepEqual([...CLEAR_WITNESS].sort(), ['RandomSet', 'RingDeque', 'RingLog', 'SparseSet']);
+    // Adding SparseTable (static, no clear) to the set must be catchable as wrong.
+    assert.ok(!CLEAR_WITNESS.includes('SparseTable'), 'the static SparseTable is NOT a clear() witness');
+    for (const m of CLEAR_WITNESS) {
+        const { obj } = makeSubject(m, 256, null);
+        assert.equal(typeof obj.clear, 'function', m + ' must expose clear()');
+    }
+    // The EXCLUDED table names the other nine, each with a reason (never silently dropped).
+    const excl = Object.keys(CLEAR_WITNESS_EXCLUDED);
+    assert.equal(excl.length, 9, 'nine members excluded with reasons');
+    assert.equal(excl.length + CLEAR_WITNESS.length, SUBJECTS.length, 'every member is either in or excluded');
+    for (const m of excl) {
+        assert.ok(SUBJECTS.includes(m), m + ' must be a real member');
+        assert.ok(!CLEAR_WITNESS.includes(m), m + ' cannot be both in and excluded');
+        assert.ok(typeof CLEAR_WITNESS_EXCLUDED[m] === 'string' && CLEAR_WITNESS_EXCLUDED[m].length > 0,
+            m + ' needs a non-empty exclusion reason');
+    }
+});
+
+test('#2 OP_CLASS: iterate is O(n)-per-call for the 12 non-static members; SparseTable row is all n/a', () => {
+    for (const m of SUBJECTS) {
+        const row = OP_CLASS[m];
+        assert.ok(row, m + ' must have an OP_CLASS row');
+        assert.deepEqual(Object.keys(row).sort(), [...OPS].sort(), m + ' row covers exactly the op triad');
+        if (m === 'SparseTable') {
+            for (const op of OPS) assert.equal(row[op], NA, 'SparseTable ' + op + ' is n/a (string, never 0)');
+            continue;
+        }
+        // Non-static members: iterate is O(n)-work-PER-CALL, NEVER flattened to per-call O(1).
+        assert.equal(row.iterate, 'O(n)-per-call', m + ' iterate must be O(n)-per-call');
+        assert.notEqual(row.iterate, 'O(1)', m + ' iterate must not be flattened to O(1)');
+        // Each op is a known honesty class or the n/a string -- never a number 0.
+        for (const op of OPS) {
+            assert.notEqual(row[op], 0, m + ' ' + op + ' must never be the number 0');
+            assert.ok(['worst-case-O(1)', 'amortized-O(1)', 'O(n)-per-call', NA].includes(row[op]),
+                m + ' ' + op + ' has an unknown class ' + String(row[op]));
+        }
+    }
+    // The load-bearing per-op honesty examples from the brief.
+    assert.equal(OP_CLASS.CuckooMap.insert, 'amortized-O(1)', 'CuckooMap set is amortized (reseed cohort)');
+    assert.equal(OP_CLASS.CuckooMap.delete, 'worst-case-O(1)', 'CuckooMap delete is a bounded probe');
+    assert.equal(OP_CLASS.UnionFind.delete, NA, 'UnionFind has no delete op');
+    assert.equal(OP_CLASS.RingLog.delete, NA, 'RingLog has no delete op');
+});
+
+test('#1 clearWitness probe: the four members return size 0 + zero-alloc + reusable over the cycles', () => {
+    const cw = clearWitness({ n: 512, cycles: 200 });
+    assert.deepEqual(cw.members, CLEAR_WITNESS);
+    for (const m of CLEAR_WITNESS) {
+        const r = cw.results[m];
+        assert.equal(r.sizeAfterClear, 0, m + ' size must be 0 after clear');
+        assert.ok(r.pristine, m + ' must be pristine after clear');
+        assert.ok(r.reusable, m + ' must be reusable after clear (refill grows size)');
+        assert.equal(r.bytesDelta, 0, m + ' backing store must not grow across cycles (zero-alloc)');
+        assert.ok(r.zeroAlloc, m + ' clear-witness must report zero-alloc');
+    }
+});
+
+test('#1 clearWitness probe is NON-VACUOUS: it must actually call each member\'s REAL clear() ' +
+    'exactly cycles+2 times (QA: a fabricated/stubbed probe that never touches the real object ' +
+    'was found to pass the assertions above trivially -- this closes that gap by spying on the ' +
+    'prototype method rather than trusting the probe\'s self-reported booleans)', () => {
+    const CLASSES = { SparseSet, RingDeque, RandomSet, RingLog };
+    assert.deepEqual(Object.keys(CLASSES).sort(), [...CLEAR_WITNESS].sort(),
+        'the spy table must cover exactly the CLEAR_WITNESS members');
+    const counts = {};
+    const originals = {};
+    for (const m of CLEAR_WITNESS) {
+        counts[m] = 0;
+        originals[m] = CLASSES[m].prototype.clear;
+        assert.equal(typeof originals[m], 'function', m + ' must have a real clear() to spy on');
+        CLASSES[m].prototype.clear = function (...args) {
+            counts[m]++;
+            return originals[m].apply(this, args);
+        };
+    }
+    try {
+        // cycles is an ODD, non-default number so a coincidental match is astronomically
+        // unlikely -- the probe must call clear() exactly 1 (initial) + cycles + 1 (final).
+        const cycles = 37;
+        const cw = clearWitness({ n: 64, cycles });
+        assert.equal(cw.members.length, 4);
+        for (const m of CLEAR_WITNESS) {
+            assert.equal(counts[m], cycles + 2,
+                m + ' clearWitness must invoke the REAL prototype clear() exactly cycles+2 ' +
+                'times (1 initial + ' + cycles + ' loop + 1 final); a stubbed/fabricated probe ' +
+                'that skips the real call (or hardcodes the verdict) reads 0 here');
+        }
+    } finally {
+        for (const m of CLEAR_WITNESS) CLASSES[m].prototype.clear = originals[m];
+    }
+    // The spy must be fully restored (no leaked patch onto the shared O1.js prototypes).
+    for (const m of CLEAR_WITNESS) {
+        assert.equal(CLASSES[m].prototype.clear, originals[m], m + ' prototype.clear must be restored');
+    }
+});
+
+test('#1 retention: 1000 clear cycles on each CLEAR_WITNESS member -> size 0 + no memberBytes growth', () => {
+    for (const m of CLEAR_WITNESS) {
+        const { obj } = makeSubject(m, 1024, null);
+        const base = memberBytes(m, obj);
+        assert.ok(base > 0, m + ' backing bytes must be positive');
+        for (let c = 0; c < 1000; c++) {
+            obj.clear();
+            assert.equal(obj.size, 0, m + ' size must be 0 after clear (cycle ' + c + ')');
+            if (m === 'SparseSet' || m === 'RandomSet') { for (let k = 0; k < 512; k++) obj.add(k); }
+            else if (m === 'RingDeque') { for (let k = 0; k < 512; k++) obj.pushBack(k); }
+            else { for (let k = 0; k < 512; k++) obj.push(k); } // RingLog
+        }
+        obj.clear();
+        assert.equal(obj.size, 0, m + ' size must be 0 after the final clear');
+        assert.equal(memberBytes(m, obj), base, m + ' memberBytes delta must be exactly 0 across 1000 cycles');
+    }
+});
+
+test('#4 report: D6 + D8 render ADJACENT to the D2 witness plot; clear + per-op witnesses sit with them', () => {
+    const fakeCell = (dim) => {
+        if (dim === 'D1') return { subject: { p50: 1, p90: 1, p99: 1, p999: 1, p9999: 'n/a', max: 1 }, subjectGc: { p99: 1, max: 1 }, ci: { lo: 1, hi: 2, rciw: 0.1 }, attribution: { tag: 'steady', spikeRatio: 1 }, vsPrimary: 'n/a', vsStrong: 'n/a' };
+        if (dim === 'D2') return { points: [{ ops: 1000, nsPerOp: 1 }, { ops: 2000, nsPerOp: 1 }], drift: 1, boundary: 'n/a' };
+        if (dim === 'D3') return { bytesPerLive: 8, theoreticalMinPerLive: 8, peakBackingBytes: 1024, overheadRatio: 1, loadFactorCurve: [{ overheadRatio: 1, loadFactor: 0.25, bytesPerLive: 8 }], heapAfterClearKB: 0, buildNs: 1, buildBytes: 1 };
+        if (dim === 'D4') return { strideSweep: [{ workingSet: 1000, nsPerElem: 1, band: 'L1' }], tiers: { L1: { ratio: 1 }, L2: 'n/a', L3: 'n/a', DRAM: 'n/a' }, denseNsPerOp: 1, randomNsPerOp: 1, gap: 1 };
+        if (dim === 'D5') return { single: { min: 100, gzip: 50 }, all: { min: 1000, gzip: 500 }, ratio: 0.1, underForty: true };
+        if (dim === 'D6') return { points: [{ n: 1000, opsPerMs: 1 }], zeroAlloc: true, maxMajor: 0, maxPauseMsPerMillion: 0 };
+        if (dim === 'D7') return { keyTypes: { int: 1, string: 'n/a', object: 'n/a' }, loadFactors: [{ nsPerOp: 1 }], nearFullNs: 1, justResizedNs: 'n/a' };
+        return { ecs: 'n/a', cache: 'n/a', churn: { nsPerOp: 1 }, query: 'n/a' }; // D8
+    };
+    const results = {};
+    for (const m of SUBJECTS) for (const d of DIMENSIONS) results[m + '/' + d] = fakeCell(d);
+    const payload = {
+        meta: { seed: 1, node: 'v', arch: 'a', platform: 'p', date: 'd' },
+        subjects: SUBJECTS, dimensions: DIMENSIONS,
+        results,
+        clearWitness: clearWitness({ n: 256, cycles: 20 }),
+        clearWitnessExcluded: CLEAR_WITNESS_EXCLUDED,
+        opClass: OP_CLASS, ops: OPS,
+    };
+    const html = renderHtml(payload);
+    const iD2 = html.indexOf('D2 -- Amortized cost');
+    const iD6 = html.indexOf('D6 -- GC pressure');
+    const iD8 = html.indexOf('D8 -- Workload micro-benchmarks');
+    const iD3 = html.indexOf('D3 -- Memory footprint');
+    const iClear = html.indexOf('clear() invariance witness');
+    const iOp = html.indexOf('Per-op honesty class');
+    for (const [n, i] of [['D2', iD2], ['D6', iD6], ['D8', iD8], ['D3', iD3], ['clear', iClear], ['opClass', iOp]]) {
+        assert.ok(i > 0, n + ' section must render');
+    }
+    // Adjacency: D6 + D8 (and the two witnesses) sit AFTER D2 and BEFORE D3 -- next to the plot.
+    assert.ok(iD2 < iClear && iClear < iOp && iOp < iD6 && iD6 < iD8, 'D2 -> clear -> per-op -> D6 -> D8 order');
+    assert.ok(iD8 < iD3, 'D6 + D8 must come BEFORE D3 (adjacent to the D2 witness, not buried after it)');
+    // Honesty: n/a cells stay the STRING, never rendered as 0.
+    assert.ok(html.includes('n/a'), 'inapplicable cells must render the n/a string');
+});
+
+test('#6 trinity + shipping surface: VERSION 1.3.1 across O1.js/package.json/llms.txt; benchmark/ not shipped', () => {
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+    assert.equal(VERSION, '1.3.1', 'O1.js VERSION const');
+    assert.equal(pkg.version, '1.3.1', 'package.json version');
+    const m = LLMS.match(/^Version:\s*(\S+)/m);
+    assert.ok(m, 'llms.txt Version header present');
+    assert.equal(m[1], '1.3.1', 'llms.txt Version header');
+    assert.equal(VERSION, pkg.version, 'trinity string-equal (VERSION === package.json)');
+    assert.equal(VERSION, m[1], 'trinity string-equal (VERSION === llms.txt)');
+    // README + llms.txt are shipped; benchmark/ is repo-only.
+    assert.ok(pkg.files.includes('README.md') && pkg.files.includes('llms.txt'), 'README + llms.txt ship');
+    assert.ok(!pkg.files.includes('benchmark'), 'benchmark/ stays repo-only');
+    assert.equal(cells().length, 104, 'bench grid stays 13 x 8 = 104 cells');
 });

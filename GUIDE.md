@@ -1,7 +1,7 @@
 # lite-o1 -- which structure to pick (GUIDE)
 
 A repo-only decision guide for the O(1) family: which member, reach-for / avoid,
-and how to measure the constant yourself. At v1.3.0 the family is STABLE at thirteen
+and how to measure the constant yourself. At v1.3.1 the family is STABLE at thirteen
 members and this guide is complete for them -- still open (a new section lands with
 each future member), but no longer a skeleton. It is NOT an API encyclopedia (that
 is the README + `O1.d.ts`); it answers "which member, and is my constant real?"
@@ -16,7 +16,7 @@ up top, then reach-for / avoid + measure-it per member. No re-documenting signat
 > Is the headline op O(1) on a REAL engine, or only on paper?
 
 lite-o1's answer is the O(1) Witness: ops/ms that stays flat as `n` grows is the
-proof. Every "reach for it" below is conditional on the witness staying above its
+empirical witness of O(1). Every "reach for it" below is conditional on the witness staying above its
 flatness floor for YOUR workload -- run `npm run witness` and read the shape.
 
 ---
@@ -652,7 +652,7 @@ OUTSIDE the timed query, like every member's construction), not a per-op spike.
 
 ## Roadmap members (not yet shipped, planned)
 
-The public API is stable at v1.3.0's thirteen members; these are planned, not shipped.
+The public API is stable at v1.3.1's thirteen members; these are planned, not shipped.
 Placeholders so the decision axes are visible early; each fills in on release.
 
 - **SlotPool** -- free-list slot allocator with generational (ABA-safe) handles.
