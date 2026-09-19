@@ -32,7 +32,7 @@ throughput anchor with seven more axes a real consumer feels:
 - D5 Bundle size + tree-shaking -- esbuild min + gzip, single import << all import.
 - D6 GC pressure -- the 0 B/op gate as a measured curve over n = 1e3..1e6.
 - D7 Scalability across key types + load factors.
-- D8 Workload micro-benchmarks (ECS / cache / churn).
+- D8 Workload micro-benchmarks (ECS / cache / churn / query).
 
 Dimension 1 is also where the WITNESS lives: the analytical anchor of the whole
 family (see "Witness-as-dimension-1" below).
@@ -46,12 +46,17 @@ records, for ALL members, a `RATIONALE` with a `FAIR-ALREADY` vs `STRAWMAN`
 verdict, and adds a STRONG baseline for every STRAWMAN member so it is also
 measured against a genuinely hard opponent.
 
-lite-o1's audit (nine members):
+lite-o1's audit (thirteen members):
 
 - FAIR-ALREADY (primary foil is the honest rival, no strong baseline needed):
   UnionFind (naive disjoint-set), MonoDeque (O(W) window rescan), RandomSet (Set
   iterate-to-kth), FreqO1 (linear LFU scan), BucketQueue (an alloc-free binary
-  min-heap -- itself a STRONG O(log n) foil), TimerWheel (O(n) deadline scan).
+  min-heap -- itself a STRONG O(log n) foil), TimerWheel (O(n) deadline scan),
+  HierarchicalTimerWheel (an alloc-free 4-ary min-heap, a STRONG O(log n) foil),
+  RingLog (a growing Array-backed log trimmed by an O(n) shift -- or one that never
+  trims and leaks memory unboundedly), CuckooMap (a native Map, the built-in
+  general-key exact map -- already fair; the zero-dep law governs SHIPPED code, not
+  a bench baseline), SparseTable (an alloc-free O(len) range-scan fold per query).
 - STRAWMAN (primary foil is a punching bag -> a strong baseline is added):
   RingDeque (primary Array.shift is O(n); strong = hand-rolled fixed circular
   array, O(1)), MinStack (primary rescan is O(depth); strong = textbook plain-array
@@ -60,9 +65,23 @@ lite-o1's audit (nine members):
   and is a TOUGHER O(1) membership rival -- added so the headline member faces the
   fastest idiomatic alternative, not only Set).
 
+Two of the three newest members have a per-member applicability shape worth stating
+so the `n/a` cells read as TRUTHS, not gaps:
+
+- RingLog is LOSSY (push-only, overwrite-oldest -- there is no delete / drain). Its
+  churn is a real PUSH-only churn (D8) and its load-factor sweep is real (the ring
+  is always bounded); nothing else reads n/a. Its foil pays the memory RingLog saves.
+- SparseTable is STATIC (build-once, immutable -- no mutators, no clear). Its query
+  is a genuine worst-case-O(1) family op (D1 real), and its build + space are a
+  DISCLOSED co-headline (D3 carries buildNs + buildBytes and the real backing bytes),
+  NOT folded into the per-op claim -- so it wears NO max-single-op line. Because it
+  has no mutation path, its amortized-DRIFT (D2), load-factor sweep (D7), and churn
+  (D8) read n/a (the STRING, never 0); its D8 workload is the QUERY instead, and its
+  D2 keeps a real flat query trace so the cell stays non-vacuous.
+
 The strong baseline is an EXTRA COMPARISON INSIDE the D1 cell (carried as
 `strongBaselineDist` + `vsStrong`), NOT a new dimension and NOT a new cell -- the
-matrix stays exactly SUBJECTS x DIMENSIONS (72 cells for lite-o1).
+matrix stays exactly SUBJECTS x DIMENSIONS (13 x 8 = 104 cells for lite-o1).
 
 ## The statistics
 
@@ -114,7 +133,7 @@ builder, byte-footprint, theoretical-min, trace-hash, ...) is an EXPLICIT branch
 per member ending in a loud `throw` for an unknown member. A new member can never
 silently inherit another's construction. The ONE deliberate exception is
 `makeStrongBaseline`: a KNOWN member with no strong baseline returns `null` (a
-legitimate "no strong baseline" answer for 6 of 9), but a member NOT in `SUBJECTS`
+legitimate "no strong baseline" answer for 10 of 13), but a member NOT in `SUBJECTS`
 still throws -- fail-closed on the truly-unknown, NA on the legitimately-absent.
 
 ## How a sibling package adopts the template

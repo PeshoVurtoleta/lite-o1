@@ -17,6 +17,7 @@
 import {
     SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet,
     FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel,
+    RingLog, CuckooMap, SparseTable,
 } from '../O1.js';
 import {
     prng, median, warm, gcNow, hasGc, percentile, collect, timeNsPerOp, foldHash,
@@ -142,6 +143,46 @@ export function makeSubject(member, n, rng) {
         return {
             obj: d,
             op: () => { const seq = d.push(nextVal()); d.evictOlderThan(seq - W); if (d.value() !== undefined) SINK++; },
+        };
+    }
+    if (member === 'RingLog') {
+        // A lossy overwrite-oldest ring primed to STEADY FULL, so every hot push takes the
+        // worst-case-O(1) overwrite branch (read-oldest + one overwrite + head advance) and
+        // returns the evicted value -- folded into SINK so V8 cannot elide the eviction read.
+        const r = new RingLog(n);
+        const cap = r.capacity;
+        for (let k = 0; k < cap; k++) r.push(k);
+        let v = 0;
+        return { obj: r, op: () => { SINK += (r.push(v) | 0); v = (v + 1) | 0; } };
+    }
+    if (member === 'CuckooMap') {
+        // A bounded-probe exact map at a MODERATE steady load (~0.5, far from the 0.90 ceiling
+        // and any re-seed), churned in place: delete a walking key then re-insert it (the
+        // amortized-O(1) set path, incl. the occasional eviction chain -> the perOpTail spike),
+        // then read it back with has (the worst-case-O(1) bounded lookup). Size returns to the
+        // resident window every op; keys are SMI ints so the hot body allocates zero bytes.
+        const m = new CuckooMap(n);
+        const live = Math.max(1, Math.min(n, m.capacity >> 1));
+        for (let k = 0; k < live; k++) m.set(k, k);
+        let key = 0;
+        return {
+            obj: m,
+            op: () => { m.delete(key); m.set(key, key); if (m.has(key)) SINK++; key++; if (key >= live) key = 0; },
+        };
+    }
+    if (member === 'SparseTable') {
+        // A STATIC build-once range-min table (built here, OUTSIDE the timed op -- the O(n log n)
+        // build is the disclosed co-headline, EXCLUDED from the per-op claim). The hot op is a
+        // WIDE-range query over a walking window (worst-case O(1): a floor-log2 + two table reads
+        // + one compare, independent of the range width). The query return folds into SINK.
+        const src = new Float64Array(n);
+        for (let k = 0; k < n; k++) src[k] = (k * 2654435761) & 0x7fffffff;
+        const t = new SparseTable(src, 'min');
+        const half = n > 1 ? (n >> 1) : 1;
+        let l = 0;
+        return {
+            obj: t,
+            op: () => { const r = l + half; SINK += (t.query(l, r < n ? r : n - 1) | 0); l++; if (l >= half) l = 0; },
         };
     }
     throw new Error('[bench] unhandled member: ' + member);
@@ -345,6 +386,51 @@ export function makeBaseline(member, n) {
             },
         };
     }
+    if (member === 'RingLog') {
+        // A never-evicting growing Array as a naive bounded log: keep pushing and shift() the
+        // oldest off the front once it overflows capacity -- the O(n) shift is the price of not
+        // having a ring, the honest cost RingLog's worst-case-O(1) overwrite removes. The array
+        // also grows/reallocs (its memory downside is the D3 co-story). O(n) per op -> gentle.
+        const arr = [];
+        let v = 0;
+        return {
+            op: () => {
+                arr.push(v); v = (v + 1) | 0;
+                if (arr.length > n) SINK += arr.shift(); // O(n) shift to bound (the ring's job)
+                else SINK += arr.length;
+            },
+        };
+    }
+    if (member === 'CuckooMap') {
+        // The native Map as the primary foil (fair-already): the built-in general-key exact map.
+        // Same churn SHAPE as the subject -- delete a walking key, re-insert it, has() it back --
+        // so the two are timed apples-to-apples. Map ops are O(1), so timed at the fast batch.
+        const map = new Map();
+        const live = Math.max(1, n >> 1);
+        for (let k = 0; k < live; k++) map.set(k, k);
+        let key = 0;
+        return {
+            op: () => { map.delete(key); map.set(key, key); if (map.has(key)) SINK++; key++; if (key >= live) key = 0; },
+        };
+    }
+    if (member === 'SparseTable') {
+        // An alloc-free O(len) range-scan fold: recompute the extreme by scanning [l, r] on every
+        // query -- the obvious approach before the sparse-table precompute. A full factor of the
+        // range width lost per query, so it collapses as the range widens -> O(len), timed gently.
+        const arr = new Float64Array(n);
+        for (let k = 0; k < n; k++) arr[k] = (k * 2654435761) & 0x7fffffff;
+        const half = n > 1 ? (n >> 1) : 1;
+        let l = 0;
+        return {
+            op: () => {
+                const r = l + half < n ? l + half : n - 1;
+                let best = arr[l];
+                for (let j = l + 1; j <= r; j++) if (arr[j] < best) best = arr[j]; // O(len) rescan
+                SINK += best;
+                l++; if (l >= half) l = 0;
+            },
+        };
+    }
     throw new Error('[bench] unhandled member: ' + member);
 }
 
@@ -432,6 +518,9 @@ const LINEAR_BASELINE = {
     BucketQueue: true,   // binary-heap foil is O(log n) per op
     TimerWheel: true,    // naive-scan foil is an O(n) deadline scan
     HierarchicalTimerWheel: true, // 4-ary-heap foil is O(log n) per fired timer
+    RingLog: true,       // growing-array foil pays an O(n) shift to bound (RingLog's O(1) job)
+    CuckooMap: false,    // native Map foil is O(1) per op (a fair-already, fast rival)
+    SparseTable: true,   // scan-fold foil is an O(len) range rescan per query
 };
 
 /** Exact backing-store byte footprint of a member instance (typed-array buffers). */
@@ -473,6 +562,17 @@ export function memberBytes(member, obj) {
             obj._listOf.buffer.byteLength + obj._next.buffer.byteLength + obj._prev.buffer.byteLength +
             obj._expiry.buffer.byteLength + obj._head.buffer.byteLength + obj._tail.buffer.byteLength;
     }
+    if (member === 'RingLog') return obj._buf.buffer.byteLength; // ONE Float64 ring buffer
+    if (member === 'CuckooMap') {
+        // occupancy signal (Uint8, one byte per slot) + key column (Float64) + value column
+        // (Float64), each sized to the total slot count (8*B, O(capacity) NOT per-live).
+        return obj._occ.buffer.byteLength + obj._keys.buffer.byteLength + obj._vals.buffer.byteLength;
+    }
+    if (member === 'SparseTable') {
+        // immutable source copy (Float64, n cells) + the flat sparse table (Float64,
+        // n*(floor(log2 n)+1) cells -- the DISCLOSED O(n log n) space co-headline).
+        return obj._src.buffer.byteLength + obj._table.buffer.byteLength;
+    }
     throw new Error('[bench] unhandled member: ' + member);
 }
 
@@ -497,12 +597,21 @@ export function theoreticalMinPerLive(member) {
     // cascade (it re-files each timer by its absolute expiry), so the dense floor is 24,
     // NOT widened to absorb the universe-sized sparse array or the fixed 449-list heads.
     if (member === 'HierarchicalTimerWheel') return 24;
+    if (member === 'RingLog') return 8;      // one Float64 slot per live value
+    if (member === 'CuckooMap') return 16;   // key (Float64, 8) + value (Float64, 8) dense
+    // payload per live entry = the actual-column-width floor (the MonoDeque value+seq=16
+    // convention). The Uint8 occupancy byte + the 0.90 load-ceiling slack are fixed overhead,
+    // NOT folded into the per-live floor -- the FreqO1 discipline.
+    if (member === 'SparseTable') return 8;  // one Float64 source cell (8) per live element =
+    // the actual-column-width floor (the source is copied into a Float64Array). The O(n log n)
+    // sparse table is the DISCLOSED space co-headline, NOT folded into the per-live floor.
     throw new Error('[bench] unhandled member: ' + member);
 }
 
 /** The member's live-element count (its `size`/`count`/`capacity` semantics). */
 function liveCount(member, obj) {
     if (member === 'UnionFind') return obj.capacity;   // fixed universe (all elements live)
+    if (member === 'SparseTable') return obj.length;   // static: source-element count (no `size`)
     return obj.size;
 }
 
@@ -518,9 +627,17 @@ function liveCount(member, obj) {
  * true per-op tail for them; every other member is worst-case O(1) (no hidden spike),
  * so its perOpTail reads NA -- the batch-mean distribution already tells the whole
  * story. (TimerWheel is NOT here: its drain-before-advance keeps every op worst-case
- * O(1); HierarchicalTimerWheel IS, because its cascade is the whole teaching point.)
+ * O(1); HierarchicalTimerWheel IS, because its cascade is the whole teaching point.
+ * CuckooMap IS, because its set() is AMORTIZED O(1): what this bench MEASURES at the
+ * working load (~0.5) is the bounded cuckoo EVICTION-CHAIN tail (<= MaxLoop resident
+ * displacements per insert), a legitimate amortized-tail story. It does NOT trigger the
+ * in-place RE-SEED spike at this load (qa: 0 seed changes over 2.5M ops via the .seed
+ * getter), so the perOpTail here is the eviction-chain cost, NOT the re-seed; re-seed
+ * attribution / labelling is DEFERRED to Session B (benchmark/UPGRADE_BRIEF.md). RingLog
+ * is NOT here (worst-case-O(1) overwrite push), and SparseTable is NOT (worst-case-O(1)
+ * query, no max line -- see decisions/0018).)
  */
-const AMORTIZED = { MonoDeque: true, UnionFind: true, BucketQueue: true, HierarchicalTimerWheel: true };
+const AMORTIZED = { MonoDeque: true, UnionFind: true, BucketQueue: true, HierarchicalTimerWheel: true, CuckooMap: true };
 
 function distOf(op, batch, samples, forceGc) {
     warm(op, batch, 2);
@@ -552,7 +669,7 @@ function distOf(op, batch, samples, forceGc) {
 }
 
 /** Public projection of a dist: percentiles only, WITHOUT the raw samples array (which
- * is kept internal -- serializing 200-plus samples per dist x 72 cells would bloat
+ * is kept internal -- serializing 200-plus samples per dist x 104 cells would bloat
  * results.json for no reader benefit). */
 function pubDist(d) {
     return { p50: d.p50, p90: d.p90, p99: d.p99, p999: d.p999, p9999: d.p9999, max: d.max };
@@ -743,8 +860,51 @@ function makeMixed(member, cap, rng) {
             if (d.value() !== undefined) SINK++;
         };
     }
+    if (member === 'RingLog') {
+        // A steady-full lossy ring: every push overwrites the oldest (worst-case O(1)) and
+        // returns it; a rolling oldest/newest read keeps the snapshot surface exercised.
+        const r = new RingLog(cap);
+        const rcap = r.capacity;
+        for (let k = 0; k < rcap; k++) r.push(k);
+        let v = 0;
+        return () => {
+            SINK += (r.push(v) | 0);
+            v = (v + 1) | 0;
+            if (r.oldest() !== undefined) SINK++;
+        };
+    }
+    if (member === 'CuckooMap') {
+        // A bounded resident map at ~0.5 load: delete a walking key, re-insert it (the
+        // amortized set path), then read it back -- size holds steady, the cursor never nears
+        // the ceiling or the re-seed, so the cumulative ns/op stays flat over the long trace.
+        const m = new CuckooMap(cap);
+        const live = Math.max(1, Math.min(cap, m.capacity >> 1));
+        for (let k = 0; k < live; k++) m.set(k, k);
+        let key = 0;
+        return () => {
+            m.delete(key); m.set(key, key);
+            if (m.has(key)) SINK++;
+            key++; if (key >= live) key = 0;
+        };
+    }
+    if (member === 'SparseTable') {
+        // STATIC / immutable: there is no mutation trace to amortize, so D2 reports drift as
+        // n/a (see D2). The trace here is a long stream of WIDE-range queries over a table
+        // built ONCE -- it proves the query cost is FLAT (constant by construction), which is
+        // what keeps the cell non-vacuous (real query nsPerOp points), never a mutation drift.
+        const src = new Float64Array(cap);
+        for (let k = 0; k < cap; k++) src[k] = (k * 2654435761) & 0x7fffffff;
+        const t = new SparseTable(src, 'min');
+        const half = cap > 1 ? (cap >> 1) : 1;
+        let l = 0;
+        return () => {
+            const r = l + half;
+            SINK += (t.query(l, r < cap ? r : cap - 1) | 0);
+            l++; if (l >= half) l = 0;
+        };
+    }
     // Fail closed (mirrors every other dispatch helper): a member NOT handled above must
-    // throw, so a future 11th member cannot silently inherit MonoDeque's mixed trace.
+    // throw, so a future member cannot silently inherit MonoDeque's mixed trace.
     throw new Error('[bench] unhandled member: ' + member);
 }
 
@@ -768,11 +928,17 @@ export function D2(member, opts = {}) {
     }
     const first = points[0].nsPerOp;
     const last = points[points.length - 1].nsPerOp;
-    const drift = first > 0 ? last / first : 0;
+    // SparseTable is STATIC / immutable: there is NO mutation trace to amortize, so the
+    // amortized-DRIFT metric is n/a (the STRING, never a numeric 0 -- "not applicable", not
+    // "measured zero"). The points above are a real WIDE-range QUERY trace, kept so the cell
+    // stays non-vacuous and shows the query cost is flat by construction.
+    const drift = member === 'SparseTable' ? NA : (first > 0 ? last / first : 0);
+    const reason = member === 'SparseTable'
+        ? 'static/immutable: no mutation trace to amortize; points are the flat query trace' : undefined;
 
     return {
         dim: 'D2', member, baseline: baselineFor(member, 'D2'), unit: 'ns/op',
-        points, drift,
+        points, drift, reason,
         _check: points.map((p) => p.nsPerOp).concat([points[points.length - 1].ops]),
     };
 }
@@ -808,6 +974,10 @@ function fillMember(member, obj, count) {
         for (let k = 0; k < count; k++) { v = (v * 1103515245 + 12345) & 0x7fffffff; obj.push(v % 1000000); }
         return;
     }
+    if (member === 'RingLog') { obj.clear(); for (let k = 0; k < count; k++) obj.push(k); return; }
+    if (member === 'CuckooMap') { obj.clear(); for (let k = 0; k < count; k++) obj.set(k, k); return; }
+    // SparseTable is STATIC (build-once, no clear / mutators): D3 handles it on a dedicated
+    // path and NEVER calls fillMember for it, so it stays fail-closed here.
     throw new Error('[bench] unhandled member: ' + member);
 }
 
@@ -816,7 +986,67 @@ function clearMember(member, obj) {
     obj.clear();
 }
 
+/**
+ * D3 for SparseTable -- the STATIC / immutable path. SparseTable has no clear / mutators, so
+ * the generic fill->delete->refill->clear flow does not apply; its backing bytes are FIXED at
+ * construction. The load-factor "curve" is measured by building FRESH tables at fractions of n
+ * (a smaller source -> fewer levels -> a genuinely different footprint), and the build cost
+ * (buildNs) + built bytes (buildBytes) are the DISCLOSED co-headline (settled call: measured
+ * numbers NOW, not the Tier-A build-cost panel). D1 query + D3 bytes are the REAL numbers that
+ * keep the vacuity gate fed for this member.
+ */
+function D3Static(member, opts) {
+    const n = opts.n ?? 65536;
+    const theoMin = theoreticalMinPerLive(member);
+    const buildOne = (len) => {
+        const src = new Float64Array(len);
+        for (let k = 0; k < len; k++) src[k] = (k * 2654435761) & 0x7fffffff;
+        return new SparseTable(src, 'min');
+    };
+
+    gcNow();
+    const heapBase = process.memoryUsage().heapUsed;
+
+    // Build cost (buildNs) measured OUTSIDE any per-op claim -- the disclosed co-headline.
+    const t0 = performance.now();
+    const obj = buildOne(n);
+    const buildNs = (performance.now() - t0) * 1e6;
+    gcNow();
+    const heapFull = process.memoryUsage().heapUsed;
+
+    const bytesFull = memberBytes(member, obj);
+    const liveNow = Math.max(1, liveCount(member, obj));
+    const bytesPerLive = bytesFull / liveNow;
+
+    // Load-factor curve: FRESH tables at 0.25/0.5/0.75/1.0 of n (static -> rebuild, never refill).
+    const loadFactorCurve = [];
+    for (const lf of (opts.loadFactors ?? [0.25, 0.5, 0.75, 1.0])) {
+        const len = Math.max(1, Math.round(n * lf));
+        const t = buildOne(len);
+        const b = memberBytes(member, t);
+        const bpl = b / Math.max(1, liveCount(member, t));
+        loadFactorCurve.push({ loadFactor: lf, bytesPerLive: bpl, overheadRatio: bpl / theoMin });
+    }
+
+    return {
+        dim: 'D3', member, baseline: baselineFor(member, 'D3'), unit: 'bytes',
+        peakBackingBytes: bytesFull,
+        highWaterBytes: bytesFull, // immutable: no refill high-water, the built size is the peak
+        bytesPerLive, theoreticalMinPerLive: theoMin,
+        overheadRatio: bytesPerLive / theoMin,
+        loadFactorCurve,
+        fixedCapacity: true,
+        buildNs, buildBytes: bytesFull,             // the DISCLOSED build + space co-headline
+        heapDeltaFullKB: Math.max(0, (heapFull - heapBase)) / 1024,
+        heapAfterClearKB: NA,                        // static: no clear() (never mutated / reset)
+        liveElements: liveNow,
+        _check: [bytesFull, bytesPerLive, theoMin, liveNow, buildNs]
+            .concat(loadFactorCurve.map((p) => p.bytesPerLive)),
+    };
+}
+
 export function D3(member, opts = {}) {
+    if (member === 'SparseTable') return D3Static(member, opts);
     const n = opts.n ?? 65536;
     let obj;
     if (member === 'SparseSet') obj = new SparseSet(n, n);
@@ -829,6 +1059,8 @@ export function D3(member, opts = {}) {
     else if (member === 'BucketQueue') obj = new BucketQueue(n, BQ_CEIL, n); // bounded priority ceiling
     else if (member === 'TimerWheel') obj = new TimerWheel(n, twSlots(n), n); // slots >= n (one per slot)
     else if (member === 'HierarchicalTimerWheel') obj = new HierarchicalTimerWheel(n, n);
+    else if (member === 'RingLog') obj = new RingLog(n);
+    else if (member === 'CuckooMap') obj = new CuckooMap(n);
     else throw new Error('[bench] unhandled member: ' + member);
 
     gcNow();
@@ -886,6 +1118,9 @@ export function D3(member, opts = {}) {
         overheadRatio: bytesPerLive / theoMin,
         loadFactorCurve, // [{loadFactor, bytesPerLive, overheadRatio}] over 0.25..1.0
         fixedCapacity: true,
+        // Build cost is a co-headline ONLY for the static member (SparseTable, via D3Static);
+        // the mutable members have no build-once precompute, so it reads n/a (never 0).
+        buildNs: NA, buildBytes: NA,
         heapDeltaFullKB: Math.max(0, (heapFull - heapBase)) / 1024,
         heapAfterClearKB: Math.max(0, (heapAfterClear - heapBase)) / 1024,
         liveElements: liveNow,
@@ -1096,6 +1331,20 @@ export function D7(member, opts = {}) {
     const baseIntNs = median(collect(makeBaseline(member, Math.min(n, LINEAR_BASELINE[member] ? 4096 : n)).op,
         LINEAR_BASELINE[member] ? 400 : 4000, 60));
 
+    // SparseTable is STATIC / immutable: it is ALWAYS fully built -- there is no fill fraction
+    // and no near-full / just-resized state, so the load-factor sweep is n/a (the STRING, never
+    // a numeric 0 -- "not applicable", not "measured zero"). The int-key QUERY throughput
+    // (keyTypes.int) + the scan-fold baseline keep the cell non-vacuous.
+    if (member === 'SparseTable') {
+        return {
+            dim: 'D7', member, baseline: baselineFor(member, 'D7'), unit: 'ns/op',
+            keyTypes, baselineIntNs: baseIntNs,
+            loadFactors: NA, nearFullNs: NA, justResizedNs: NA, resizes: false,
+            reason: 'static/immutable: always fully built, no fill fraction or resize',
+            _check: [intNs, baseIntNs],
+        };
+    }
+
     // Load factors 0.3..0.9.
     const loadFactors = [];
     for (const lf of (opts.loadFactors ?? [0.3, 0.5, 0.7, 0.9])) {
@@ -1193,6 +1442,27 @@ export function churnNs(member, n, seed) {
         const op = () => { const seq = d.push(nextVal()); d.evictOlderThan(seq - W); };
         return median(collect(op, 4000, 60));
     }
+    if (member === 'RingLog') {
+        // Push-only churn (LOSSY: the ring overwrites the oldest -- there is no delete). At
+        // steady full, every push is the worst-case-O(1) overwrite that returns the evicted.
+        const r = new RingLog(n);
+        const cap = r.capacity;
+        for (let k = 0; k < cap; k++) r.push(k);
+        let v = 0;
+        const op = () => { SINK += (r.push(v) | 0); v = (v + 1) | 0; };
+        return median(collect(op, 4000, 60));
+    }
+    if (member === 'CuckooMap') {
+        // Insert/delete the SAME walking key: delete then re-set keeps size steady (real churn).
+        const m = new CuckooMap(n);
+        const live = Math.max(1, Math.min(n, m.capacity >> 1));
+        for (let k = 0; k < live; k++) m.set(k, k);
+        let key = 0;
+        const op = () => { m.delete(key); m.set(key, key); key++; if (key >= live) key = 0; };
+        return median(collect(op, 4000, 60));
+    }
+    // SparseTable is STATIC (no insert/delete): churn is inapplicable. D8 gates it via
+    // supportsWorkload and never calls churnNs for it, so it stays fail-closed here.
     throw new Error('[bench] unhandled member: ' + member);
 }
 
@@ -1230,16 +1500,28 @@ export function D8(member, opts = {}) {
         cache = { hotSubset: HOT, nsPerOp: median(collect(op, 5000, 60)) };
     }
 
-    // Churn: insert/delete the same keys (all members).
-    const churn = { nsPerOp: churnNs(member, n, seed) };
+    // Churn: insert/delete the same keys (every MUTABLE member). SparseTable is STATIC
+    // (no insert/delete), so churn is n/a for it -- the STRING, never a numeric 0.
+    const churn = supportsWorkload(member, 'churn') ? { nsPerOp: churnNs(member, n, seed) } : NA;
 
-    const check = [churn.nsPerOp];
+    // SparseTable's D8 workload is the QUERY (its only op), the static-member analogue of churn:
+    // a stream of WIDE-range queries over a table built ONCE. This keeps the cell non-vacuous
+    // (a real query nsPerOp) even though ecs / cache / churn are all n/a for a static member.
+    let query = NA;
+    if (member === 'SparseTable') {
+        const built = makeSubject(member, n, prng(seed)); // builds the table; op = a wide query
+        query = { nsPerOp: median(collect(built.op, 5000, 60)) };
+    }
+
+    const check = [];
+    if (typeof churn === 'object') check.push(churn.nsPerOp);
     if (typeof ecs === 'object') check.push(ecs.denseIterNsPerElem, ecs.randomHasNsPerOp);
     if (typeof cache === 'object') check.push(cache.nsPerOp);
+    if (typeof query === 'object') check.push(query.nsPerOp);
 
     return {
         dim: 'D8', member, baseline: baselineFor(member, 'D8'), unit: 'ns/op',
-        ecs, cache, churn,
+        ecs, cache, churn, query,
         _check: check,
     };
 }
@@ -1260,7 +1542,8 @@ export function traceHash(member, seed = DEFAULT_SEED, length = 100000) {
     let mode;
     if (member === 'SparseSet' || member === 'UnionFind' || member === 'RandomSet' ||
         member === 'FreqO1' || member === 'BucketQueue' || member === 'TimerWheel' ||
-        member === 'HierarchicalTimerWheel') mode = 0;
+        member === 'HierarchicalTimerWheel' || member === 'RingLog' ||
+        member === 'CuckooMap' || member === 'SparseTable') mode = 0;
     else if (member === 'RingDeque' || member === 'MinStack') mode = 1;
     else if (member === 'MonoDeque') mode = 2;
     else throw new Error('[bench] unhandled member: ' + member);

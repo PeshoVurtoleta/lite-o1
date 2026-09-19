@@ -18,13 +18,16 @@
  *   - BucketQueue vs an alloc-free binary min-heap on the same monotone trace
  *   - TimerWheel vs a naive O(n)-scan scheduler that rescans all pending deadlines
  *   - HierarchicalTimerWheel vs an alloc-free 4-ary min-heap on the same tick trace
+ *   - RingLog vs a never-evicting growing Array (the foil pays unbounded memory)
+ *   - CuckooMap vs a native Map (the fair, already-strong general-key exact dict)
+ *   - SparseTable vs an alloc-free O(len) range-scan fold (recompute per query)
  */
 
 /** Sentinel for a cell that does not apply. NEVER 0. */
 export const NA = 'n/a';
 
-/** The ten shipped members, in build order. */
-export const SUBJECTS = ['SparseSet', 'RingDeque', 'UnionFind', 'MonoDeque', 'MinStack', 'RandomSet', 'FreqO1', 'BucketQueue', 'TimerWheel', 'HierarchicalTimerWheel'];
+/** The thirteen shipped members, in build order. */
+export const SUBJECTS = ['SparseSet', 'RingDeque', 'UnionFind', 'MonoDeque', 'MinStack', 'RandomSet', 'FreqO1', 'BucketQueue', 'TimerWheel', 'HierarchicalTimerWheel', 'RingLog', 'CuckooMap', 'SparseTable'];
 
 /** The eight measurement dimensions (RESEARCH.md section 3). */
 export const DIMENSIONS = ['D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7', 'D8'];
@@ -53,6 +56,9 @@ export const BASELINE = {
     BucketQueue: 'binary-heap',
     TimerWheel: 'naive-scan',
     HierarchicalTimerWheel: '4-ary-heap',
+    RingLog: 'growing-array',   // a plain Array-backed log that grows / trims via O(n) shift
+    CuckooMap: 'Map',           // the native built-in general-key exact map (fair-already)
+    SparseTable: 'scan-fold',   // an alloc-free O(len) range-scan that recomputes each query
 };
 
 /**
@@ -85,6 +91,9 @@ export const STRONG_BASELINE = {
     BucketQueue: NA,
     TimerWheel: NA,
     HierarchicalTimerWheel: NA,
+    RingLog: NA,
+    CuckooMap: NA,
+    SparseTable: NA,
 };
 
 /**
@@ -165,6 +174,29 @@ export const RATIONALE = {
             'delays outrun a simple wheel, not a strawman; the cascading wheel wins by an ' +
             'O(1)-amortized constant while wearing the max-single-op cascade spike (see the witness).',
     },
+    RingLog: {
+        verdict: 'FAIR-ALREADY', strong: NA,
+        why: 'the naive bounded log a dev writes is a plain Array they keep pushing to and ' +
+            'trim with shift() when it overflows (O(n) shift) -- OR one they never trim, ' +
+            'leaking memory unboundedly; either is the honest rival RingLog replaces with a ' +
+            'worst-case-O(1) overwrite-oldest push over ONE fixed Float64Array, not a strawman.',
+    },
+    CuckooMap: {
+        verdict: 'FAIR-ALREADY', strong: NA,
+        why: 'the primary foil is a native Map -- the built-in general-key exact map a working ' +
+            'dev reaches for, already fair (not a strawman); CuckooMap trades Map\'s object-key ' +
+            'generality for a HARD bounded-probe worst-case-O(1) lookup + zero GC over integer ' +
+            'keys. The zero-dep law governs SHIPPED code, not a bench baseline, so Map is allowed. ' +
+            'Its amortized-tail (D1 perOpTail) is the bounded cuckoo EVICTION-CHAIN cost at the ' +
+            'working load (~0.5); the in-place RE-SEED spike is NOT triggered at this load, so ' +
+            're-seed attribution is DEFERRED to Session B (UPGRADE_BRIEF.md) -- no overclaim.',
+    },
+    SparseTable: {
+        verdict: 'FAIR-ALREADY', strong: NA,
+        why: 'the foil is an alloc-free O(len) range-scan that recomputes the extreme per query ' +
+            '-- the obvious approach before the sparse-table precompute, the honest rival, not a ' +
+            'strawman; SparseTable answers in worst-case O(1) after a disclosed O(n log n) build.',
+    },
 };
 
 /**
@@ -194,21 +226,23 @@ export function baselineFor(member, dim) {
  */
 export function supportsKeyType(member, keyType) {
     if (!SUBJECTS.includes(member)) return false;
-    return keyType === 'int'; // all nine members are integer/numeric substrates
+    return keyType === 'int'; // all thirteen members are integer/numeric substrates
 }
 
 /**
  * D8 workload applicability per member. ECS dense-iter + random has/get is a
  * SparseSet workload; cache hot-subset is a membership workload (SparseSet);
- * churn (insert/delete the same keys) applies to every member. Inapplicable
- * workloads read NA in the result, never 0.
+ * churn (insert/delete the same keys) applies to every MUTABLE member.
+ * SparseTable is STATIC / immutable -- it has no insert/delete, so churn is
+ * inapplicable and reads NA (its D8 story is the query workload instead).
+ * Inapplicable workloads read NA in the result, never 0.
  * @param {string} member
  * @param {'ecs'|'cache'|'churn'} workload
  * @returns {boolean}
  */
 export function supportsWorkload(member, workload) {
     if (!SUBJECTS.includes(member)) return false;
-    if (workload === 'churn') return true;
+    if (workload === 'churn') return member !== 'SparseTable'; // static member: no mutate churn
     if (workload === 'ecs' || workload === 'cache') return member === 'SparseSet';
     return false;
 }
@@ -220,8 +254,8 @@ export function supportsWorkload(member, workload) {
  * The strong baseline is an EXTRA COMPARISON INSIDE an existing cell (it is timed
  * within D1 and carried on the D1 result as strongBaselineDist), NOT a new dimension
  * column and NOT a separate cell -- so the matrix stays exactly SUBJECTS x DIMENSIONS
- * (72) cells. Each descriptor carries `strongBaseline` (NA for the 6 FAIR-ALREADY
- * members) purely as metadata; it never multiplies the cell count.
+ * (13 x 8 = 104) cells. Each descriptor carries `strongBaseline` (NA for the 10
+ * FAIR-ALREADY members) purely as metadata; it never multiplies the cell count.
  * @returns {{member:string, dim:string, baseline:string, strongBaseline:string}[]}
  */
 export function cells() {

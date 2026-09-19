@@ -338,11 +338,13 @@ export function renderHtml(payload) {
             const ecs = typeof r.ecs === 'object'
                 ? (num(r.ecs.denseIterNsPerElem) + ' iter / ' + num(r.ecs.randomHasNsPerOp) + ' has') : String(r.ecs);
             const cache = typeof r.cache === 'object' ? num(r.cache.nsPerOp) : String(r.cache);
-            return [m, ecs, cache, num(r.churn.nsPerOp)];
+            const churn = typeof r.churn === 'object' ? num(r.churn.nsPerOp) : String(r.churn);
+            const query = typeof r.query === 'object' ? num(r.query.nsPerOp) : String(r.query);
+            return [m, ecs, cache, churn, query];
         });
         sections.push(section('D8 -- Workload micro-benchmarks',
-            'ECS dense-iter + random has (SparseSet), cache hot-subset (SparseSet), churn insert/delete same keys (all). Inapplicable workloads read n/a.',
-            null, tableRows(['member', 'ECS (ns)', 'cache hot-subset ns/op', 'churn ns/op'], rows)));
+            'ECS dense-iter + random has (SparseSet), cache hot-subset (SparseSet), churn insert/delete same keys (mutable members), query wide-range (SparseTable, the static-member workload). Inapplicable workloads read n/a.',
+            null, tableRows(['member', 'ECS (ns)', 'cache hot-subset ns/op', 'churn ns/op', 'query ns/op'], rows)));
     }
 
     const meta = payload.meta;
