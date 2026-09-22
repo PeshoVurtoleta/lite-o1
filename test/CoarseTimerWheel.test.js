@@ -148,7 +148,7 @@ test('APPROXIMATION drains at EXACTLY the reported fire tick (never early, fires
 // 3. No-cascade worst-case O(1) -- max-tick / median-tick ratio bounded
 // ---------------------------------------------------------------------------
 
-test('no-cascade worst-case O(1): NO tick-time spike (p99 / median batch time stays bounded), unlike a cascade', () => {
+test('no-cascade worst-case O(1): NO tick-time spike (p99 / median batch time stays bounded vs host jitter), unlike a cascade', () => {
     const N = 4000;
     const noop = () => {};
     function primed() {
@@ -161,30 +161,101 @@ test('no-cascade worst-case O(1): NO tick-time spike (p99 / median batch time st
         }
         return w;
     }
-    // Time BATCHES of ticks (batching averages out single-op wall-clock noise). A CASCADING wheel
-    // would make the batch that crosses a heavy wrap far slower than a typical batch; the
-    // non-cascading wheel keeps every batch within a small constant band. Warm up first so JIT /
-    // cache effects do not masquerade as a spike.
+    // We time BATCHES of ticks (batching averages out single-op wall-clock noise). A CASCADING
+    // wheel makes the batch that crosses a heavy wrap far slower than a typical batch (an O(bucket)
+    // spike); the non-cascading wheel keeps every batch in a small constant band. p99/median is the
+    // spike detector -- it is scale-invariant to a UNIFORM slowdown (sustained load slows every
+    // batch, cancelling in the ratio) and only rises when SOME batches are slower than others.
+    //
+    // But that NON-uniform jitter (a GC pause or scheduler preemption parking one batch) is exactly
+    // what a loaded CI host injects, and it inflates p99/median with no cascade present -- the
+    // historical false-fail (ratio 95.93 under parallel `npm run verify` load; ~5.7 in isolation).
+    // Two independent defenses, matching the witness harness's robustness pattern:
+    //   (a) MEDIAN-OF-RUNS: take the median p99/median over RUNS independent passes, so a single
+    //       load-induced outlier batch in one pass cannot move the verdict.
+    //   (d) RELATIVE-TO-HOST-JITTER: since this wheel is structurally FLAT, a same-sized flat
+    //       arithmetic kernel (NO data-dependent work, so it CANNOT cascade) rides the identical
+    //       host jitter. Its own p99/median is the pure-jitter baseline; the bound scales with it,
+    //       so under load both inflate together and only a REAL per-tick O(n) blowup -- which the
+    //       flat kernel does not have -- moves the coarse ratio above the baseline band.
     const BATCH = 256;
-    const BATCHES = 400;
-    let w = primed();
-    for (let warm = 0; warm < 20000; warm++) { w.drainDue(noop); w.advance(1); } // warm up
-    w = primed();
-    const batchMs = new Float64Array(BATCHES);
-    for (let b = 0; b < BATCHES; b++) {
-        const t0 = performance.now();
-        for (let i = 0; i < BATCH; i++) { w.drainDue(noop); w.advance(1); }
-        batchMs[b] = performance.now() - t0;
+    const BATCHES = 200;
+    const RUNS = 9; // odd -> exact median
+
+    const ratioOf = (batchMs) => {
+        const sorted = Float64Array.from(batchMs).sort();
+        const median = sorted[BATCHES >> 1] || 1e-6;
+        return sorted[Math.floor(BATCHES * 0.99)] / median;
+    };
+    const median9 = (a) => Float64Array.from(a).sort()[a.length >> 1];
+
+    // One batch-timing pass over a freshly primed wheel -> its p99/median ratio.
+    function coarsePass() {
+        const w = primed();
+        const batchMs = new Float64Array(BATCHES);
+        for (let b = 0; b < BATCHES; b++) {
+            const t0 = performance.now();
+            for (let i = 0; i < BATCH; i++) { w.drainDue(noop); w.advance(1); }
+            batchMs[b] = performance.now() - t0;
+        }
+        return ratioOf(batchMs);
     }
-    const sorted = Float64Array.from(batchMs).sort();
-    const median = sorted[BATCHES >> 1] || 1e-6;
-    const p99 = sorted[Math.floor(BATCHES * 0.99)];
-    const ratio = p99 / median;
-    // No cascade => no O(bucket) spike; p99 batch stays within a small band of the median. A
-    // cascading wheel (HierarchicalTimerWheel) shows a wrap spike here; a bounded ratio is the
-    // teaching contrast. Generous bound (<= 12) tolerates host jitter while still failing on a
-    // real per-tick O(n) blowup.
-    assert.ok(ratio <= 12, `p99/median batch-tick ratio ${ratio.toFixed(2)} must stay bounded (no cascade spike)`);
+
+    // Spike-free host-jitter reference: `iters` fixed arithmetic ops per batch, no branches on data,
+    // so every batch is the SAME work -- any variance is host jitter alone. `iters` is calibrated
+    // (below) so a reference batch costs about as much as a coarse batch, keeping both medians well
+    // above timer resolution and making the additive-jitter impact on each ratio comparable.
+    let sink = 1 >>> 0;
+    const kernel = (iters) => {
+        let acc = sink;
+        for (let i = 0; i < iters; i++) acc = (acc + Math.imul(acc | 1, 2654435761)) >>> 0;
+        sink = acc; // keep the result live (defeat dead-code elimination)
+    };
+    function jitterPass(iters) {
+        const batchMs = new Float64Array(BATCHES);
+        for (let b = 0; b < BATCHES; b++) {
+            const t0 = performance.now();
+            for (let i = 0; i < BATCH; i++) kernel(iters);
+            batchMs[b] = performance.now() - t0;
+        }
+        return ratioOf(batchMs);
+    }
+
+    // Warm up JIT / caches so first-touch costs do not masquerade as a spike.
+    { const w = primed(); for (let warm = 0; warm < 20000; warm++) { w.drainDue(noop); w.advance(1); } }
+    for (let warm = 0; warm < 200; warm++) kernel(256);
+
+    // Calibrate the flat kernel to ~ one coarse batch's cost.
+    const w0 = primed();
+    let probeMs = 0;
+    { const t0 = performance.now();
+      for (let i = 0; i < BATCH; i++) { w0.drainDue(noop); w0.advance(1); }
+      probeMs = performance.now() - t0; }
+    const CAL = 1 << 16;
+    const c0 = performance.now();
+    kernel(CAL);
+    const msPerKernelOp = (performance.now() - c0) / CAL || 1e-9;
+    // ops so that BATCH * iters kernel ops ~ probeMs; clamp to a sane band.
+    const iters = Math.min(1 << 16, Math.max(64, Math.round((probeMs / BATCH) / msPerKernelOp)));
+
+    const coarse = new Float64Array(RUNS);
+    const jitter = new Float64Array(RUNS);
+    for (let r = 0; r < RUNS; r++) { coarse[r] = coarsePass(); jitter[r] = jitterPass(iters); }
+    const coarseMed = median9(coarse);
+    const jitterMed = median9(jitter);
+
+    // No cascade => the coarse pass adds no O(bucket) spike beyond host jitter. The bound is the
+    // LARGER of a small absolute band (governs on a quiet host, where jitterMed ~ 1-3) and a
+    // multiple of the host's OWN measured jitter ratio (governs under load). A cascading wheel
+    // (HierarchicalTimerWheel) blows past both -- that contrast is the teaching intent.
+    const ABS_BOUND = 12;
+    const MARGIN = 4;
+    const bound = Math.max(ABS_BOUND, MARGIN * jitterMed);
+    assert.ok(Number.isFinite(sink)); // keep the kernel's result observed
+    assert.ok(coarseMed <= bound,
+        `coarse p99/median batch-tick ratio ${coarseMed.toFixed(2)} must stay bounded ` +
+        `(<= ${bound.toFixed(2)} = max(${ABS_BOUND}, ${MARGIN}x host-jitter ${jitterMed.toFixed(2)}); ` +
+        `no cascade spike)`);
 });
 
 // ---------------------------------------------------------------------------
