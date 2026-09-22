@@ -388,6 +388,51 @@ Routed elsewhere (from the same candidate list, for the record, so they are not 
   exotic -- research-shelf only, philosophically closer to lite-filter's approximate world than to lite-o1's
   exactness; not queued.
 
+### Deferred candidates beyond M18 (NEED A RESEARCH PASS before they earn a milestone)
+
+The Post-1.0 roster table (#1-#8) is scheduled through **M18 (Rank/Select, 1.8.0), the last NUMBERED
+milestone.** M18 is the end of the current plan, NOT a closed roster. Three candidates are recorded here as
+DEFERRED -- each is credible and zero-overlap, but none has a settled design, an ADR, or a milestone number
+yet. Each needs its own research pass (a full brief + the open questions below resolved with the user) before
+it is promoted to M19+. Listed newest-first by how load-bearing the open questions are.
+
+- **Elias-Fano encoded monotone sequence** -- a succinct representation of a NON-DECREASING integer
+  sequence in ~2 + ceil(log2(U/n)) bits/element (near the information-theoretic minimum), giving O(1)
+  random ACCESS to the i-th element and successor/predecessor queries, built ON TOP of the M18 Rank/Select
+  bitvector (upper bits as a unary-coded bitvector read via rank/select, lower bits bit-packed). Adopted by
+  SDSL, folly, FM-index / inverted-index compression. Already noted as a follow-on to M18 (Post-1.0 #8 row;
+  section 6). **Depends on M18 -- cannot start before Rank/Select ships.** RESEARCH NEEDED: (a) THE HOME CALL
+  -- lite-o1 STATIC member (frame access() as the worst-case-O(1) headline, successor as a disclosed
+  expected / O(log log U) co-headline) vs @zakkster/lite-loglogn, whose whole charter IS O(log log U) and
+  which already lists EliasFano as a Tier-2 substrate; (b) surface honesty -- expose only access() (clean
+  worst-case O(1)) or also nextGEQ / successor (which drags in the expected / O(log log U) bound, a
+  mixed-honesty surface lite-o1 usually avoids); (c) reuse M18's RankSelect as substrate, NEVER fork (the
+  suite reuse law). See also section 11's open Elias-Fano-home question.
+
+- **WindowFoldInt32** -- the int32-lane sibling of WindowFold (M17), carrying the BITWISE associative
+  operators (AND identity -1 / OR identity 0 / XOR identity 0 -- clean monoids) and any int-domain monoid
+  that a Float64 value lane CANNOT honestly hold. Same DABA-Lite worst-case-O(1) push/evict/query engine,
+  but over an Int32Array value + aggregate lane. User-named and DEFERRED at the M17 session (ADR 0023).
+  RESEARCH NEEDED: (a) a SEPARATE class (lean -- a frozen lane TYPE, not just a frozen op, keeps each variant
+  0 B/op and avoids a union lane) vs a re-parameterized WindowFold; (b) the exact operator set (AND/OR/XOR
+  certainly; whether int32 MIN/MAX belong here or stay on WindowFold's Float64 lane, which already covers
+  integer values to 2^53); (c) the value contract (int32 coercion vs a typeof-int guard; how |v| > 2^31
+  fails closed); (d) whether it shares the DABA-Lite six-cursor core with WindowFold via a private helper by
+  DESIGN-PARITY without a runtime cross-dep. Feeds bitmask-window / rolling-permission / windowed-flags
+  workloads.
+
+- **Reservoir sampler (Algorithm R)** -- exact UNIFORM sampling of k items from an unbounded STREAM of
+  unknown length in worst-case O(1) per item (for the i-th item, keep with probability k/i via a swap into a
+  fixed-size reservoir). Distinct from RandomSet (samples a LIVE bounded set) and AliasTable (static
+  weights): the reservoir samples a stream you CANNOT store. Surfaced by the 2026-09-22 sweep as a valid
+  candidate, not queued (see the REJECTED / re-routed list above -- this is the one entry there that is
+  DEFERRED, not rejected). RESEARCH NEEDED: (a) Algorithm R (per-item worst-case O(1) -- the honesty fit)
+  vs Algorithm L (skip-based, fewer RNG draws but an EXPECTED bound -- likely REJECT for the same reason the
+  hashed wheel was rejected); (b) fixed reservoir size k at construction, a Float64 value lane, a
+  per-instance NR-LCG seed (the RandomSet / AliasTable seed discipline); (c) the surface -- offer(v) /
+  sample() / forEach over the reservoir as a read snapshot; (d) whether a weighted reservoir (A-Res / A-ExpJ)
+  is a follow-on or out of scope.
+
 ---
 
 ## 5. The Amortized-Honesty Hook

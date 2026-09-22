@@ -697,4 +697,18 @@ independent of each other; suggested order WindowFold first (broadest reuse -- c
 audio / telemetry), then Rank/Select (which also unblocks a future Elias-Fano and is a
 substrate lite-loglogn re-adopts). Reorder freely.
 
+### Deferred beyond M18 (M19+ -- NEED A RESEARCH PASS, not yet scheduled)
+
+M18 (Rank/Select, 1.8.0) is the last NUMBERED milestone. The roster is not closed after
+it: three candidates are DEFERRED, each credible and zero-overlap but with no settled
+design, ADR, or milestone number yet. Each needs its own research brief + open-question
+resolution with the user before promotion to M19+. Full deferred entries (what is known +
+the open questions) are in `RESEARCH.md` section 4, "Deferred candidates beyond M18".
+
+| Candidate | One-line | Depends on | Status |
+|-----------|----------|------------|--------|
+| **Elias-Fano** (succinct monotone-sequence codec) | O(1) access to a monotone int sequence in ~2 + log2(U/n) bits/elem, built on the M18 rank/select layer | M18 (Rank/Select) | deferred -- HOME call open (lite-o1 static vs lite-loglogn) |
+| **WindowFoldInt32** (int32-lane WindowFold sibling) | the bitwise AND/OR/XOR sliding-window folds a Float64 lane cannot honestly carry (ADR 0023 deferral) | M17 (shares the DABA-Lite core by design-parity) | deferred -- separate-class vs re-param call open |
+| **Reservoir sampler** (Algorithm R) | exact uniform k-sample from an UNBOUNDED stream, worst-case O(1)/item; distinct from RandomSet/AliasTable | none | deferred -- Algorithm R vs L call open |
+
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
