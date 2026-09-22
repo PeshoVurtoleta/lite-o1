@@ -1,7 +1,7 @@
 # lite-o1 -- which structure to pick (GUIDE)
 
 A repo-only decision guide for the O(1) family: which member, reach-for / avoid,
-and how to measure the constant yourself. At v1.8.0 the family is STABLE at eighteen
+and how to measure the constant yourself. At v1.9.0 the family is STABLE at nineteen
 members and this guide is complete for them -- still open (a new section lands with
 each future member), but no longer a skeleton. It is NOT an API encyclopedia (that
 is the README + `O1.d.ts`); it answers "which member, and is my constant real?"
@@ -23,8 +23,9 @@ flatness floor for YOUR workload -- run `npm run witness` and read the shape.
 
 ## Which member? (decision flowchart)
 
-ASCII, routes on the discriminating questions. Every leaf is one of the eighteen
-members; `(wc)` = worst-case O(1), `(am)` = amortized O(1).
+ASCII, routes on the discriminating questions. Every leaf is one of the nineteen
+members; `(wc)` = worst-case O(1), `(am)` = amortized O(1), and EliasFano is the one
+DATA-DEPENDENT member (wc access, O(1)-typical / O(log n)-worst nextGEQ).
 
 ```
 START -- what is the SHAPE of your workload?
@@ -59,6 +60,9 @@ START -- what is the SHAPE of your workload?
 +-- rank1(i) (how many set bits BEFORE i) / select1(k) (position of the k-th set
 |   bit) over a FIXED bitvector you build ONCE (succinct positional index)? -> RankSelect (wc query)
 |
++-- The i-th value, or the successor (smallest value >= x), of a SORTED integer
+|   sequence you build ONCE, in near-optimal (succinct) space? -> EliasFano (wc access; O(1) typical / O(log n) worst nextGEQ)
+|
 +-- Draw a random outcome by WEIGHT (a discrete distribution: loot table,
 |   weighted load-balance), built ONCE from fixed weights? -> AliasTable (wc sample)
 |
@@ -86,6 +90,9 @@ line the witness prints, and the per-member "avoid it when" notes below. (Cuckoo
 lookup -- get / has / delete -- is worst-case O(1), a hard <= 8-slot probe; only its `set`
 is amortized, wearing the in-place re-seed spike. SparseTable's QUERY is worst-case O(1); its
 one-time O(n log n) BUILD is a disclosed co-headline paid at construction, not a per-op spike.)
+EliasFano is the one DATA-DEPENDENT member: its `access` is worst-case O(1), but `nextGEQ` is
+O(1) typical / O(log n) worst-case (an in-bucket binary search that only bites on clustered keys) --
+keep it off a strict-worst-case path if you call `nextGEQ` on adversarial data; `access` is always O(1).
 
 ## Which member? (picker table)
 
@@ -111,6 +118,7 @@ One row per member; pick by the left column, confirm with the discriminator.
 | timers over a NEAR-UNBOUNDED horizon, hard per-tick budget, approximate fire OK | CoarseTimerWheel  | worst-case  | Linux-4.8 NON-cascading coarse-bucket wheel; O(1) schedule/cancel/advance/drainDue, NO spike; APPROXIMATE bounded-late fire (< 12.5%, L0 exact) is the co-headline |
 | the SUM/MIN/MAX/PRODUCT aggregate of a SLIDING WINDOW, hard per-op budget | WindowFold             | worst-case  | GENERAL FIFO monoid aggregator (DABA-Lite); O(1) push/evict/query (<= 2 combines), NO flip spike; the general complement to MonoDeque's amortized min/max |
 | rank1(i) / select1(k) over a FIXED bitvector (succinct positional index)     | RankSelect             | worst-case  | STATIC build-once cs-poppy directory; O(1) rank/select/access over a frozen bitvector, ~3-6% index co-headline; the positional index BitSet stops short of |
+| the i-th value / successor of a SORTED integer set in near-optimal space     | EliasFano              | wc access / data-dep nextGEQ | STATIC build-once succinct codec (~2+log2(U/n) bits/elem) on a composed RankSelect; access O(1), nextGEQ O(1) typical / O(log n) worst; the compressed-monotone-sequence primitive |
 
 ---
 
@@ -747,7 +755,7 @@ cohort; the O(n) build + 2n typed-array space are the honest co-headline).
 
 ## Roadmap members (not yet shipped, planned)
 
-The public API is stable at v1.8.0's eighteen members; these are planned, not shipped.
+The public API is stable at v1.9.0's nineteen members; these are planned, not shipped.
 Placeholders so the decision axes are visible early; each fills in on release.
 
 - **SlotPool** -- free-list slot allocator with generational (ABA-safe) handles.

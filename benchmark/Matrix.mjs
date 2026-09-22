@@ -28,8 +28,8 @@
 /** Sentinel for a cell that does not apply. NEVER 0. */
 export const NA = 'n/a';
 
-/** The eighteen shipped members, in build order. */
-export const SUBJECTS = ['SparseSet', 'RingDeque', 'UnionFind', 'MonoDeque', 'MinStack', 'RandomSet', 'FreqO1', 'BucketQueue', 'TimerWheel', 'HierarchicalTimerWheel', 'RingLog', 'CuckooMap', 'SparseTable', 'BitSet', 'AliasTable', 'CoarseTimerWheel', 'WindowFold', 'RankSelect'];
+/** The nineteen shipped members, in build order. */
+export const SUBJECTS = ['SparseSet', 'RingDeque', 'UnionFind', 'MonoDeque', 'MinStack', 'RandomSet', 'FreqO1', 'BucketQueue', 'TimerWheel', 'HierarchicalTimerWheel', 'RingLog', 'CuckooMap', 'SparseTable', 'BitSet', 'AliasTable', 'CoarseTimerWheel', 'WindowFold', 'RankSelect', 'EliasFano'];
 
 /** The eight measurement dimensions (RESEARCH.md section 3). */
 export const DIMENSIONS = ['D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7', 'D8'];
@@ -66,6 +66,7 @@ export const BASELINE = {
     CoarseTimerWheel: '4-ary-heap', // an alloc-free 4-ary min-heap on the same tick trace (O(log n)/timer)
     WindowFold: 'naive-window',  // an alloc-free O(W) full-window refold recomputed each query
     RankSelect: 'scan-fold',     // an alloc-free O(words) popcount scan that recomputes rank each query
+    EliasFano: 'scan-fold',      // a plain sorted-array binary search (8 bytes/elem, O(log n) access)
 };
 
 /**
@@ -106,6 +107,7 @@ export const STRONG_BASELINE = {
     CoarseTimerWheel: NA,
     WindowFold: NA,
     RankSelect: NA,
+    EliasFano: NA,
 };
 
 /**
@@ -243,6 +245,13 @@ export const RATIONALE = {
             'a strawman; RankSelect answers rank/select in worst-case O(1) after a disclosed O(n) build ' +
             '(~3.2% index overhead).',
     },
+    EliasFano: {
+        verdict: 'FAIR-ALREADY', strong: NA,
+        why: 'the foil is a plain sorted Float64 array read by binary search (8 bytes/element, O(log n) ' +
+            'access) -- the honest thing a dev reaches for before a succinct codec, not a strawman; ' +
+            'EliasFano gives worst-case-O(1) access in ~2 + log2(U/n) bits/element after a disclosed O(n) ' +
+            'build (the succinct space is the disclosed co-headline).',
+    },
 };
 
 // ===========================================================================
@@ -283,6 +292,7 @@ export const MEMBER_TAGS = {
     CoarseTimerWheel: ['steady'], // NON-cascading: no periodic structural spike (unlike HTW's 'cascade')
     WindowFold: ['steady'], // de-amortized: the flip is spread <= 2 combines/op, no periodic spike
     RankSelect: ['steady'], // static build-once: rank/select are worst-case O(1), no periodic spike
+    EliasFano: ['steady'], // static build-once: access is worst-case O(1), no periodic spike
 };
 
 /**
@@ -295,7 +305,7 @@ export const RANDOM_LOOKUP = {
     RingDeque: false, MonoDeque: false, MinStack: false, RandomSet: false,
     FreqO1: false, BucketQueue: false, TimerWheel: false, HierarchicalTimerWheel: false,
     RingLog: false, CuckooMap: false, SparseTable: false, BitSet: false, AliasTable: false,
-    CoarseTimerWheel: false, WindowFold: false, RankSelect: false,
+    CoarseTimerWheel: false, WindowFold: false, RankSelect: false, EliasFano: false,
 };
 
 /**
@@ -314,6 +324,7 @@ export const CAPACITY_KNOB = {
     CoarseTimerWheel: true, // fixed capacity knob: ops/ms vs bytes/live on the Pareto (mutable wheel)
     WindowFold: true, // fixed capacity knob: ops/ms vs bytes/live on the Pareto (mutable window)
     RankSelect: false, // static build-once: cost is a build cost (like SparseTable / AliasTable), not on the Pareto axes
+    EliasFano: false, // static build-once: cost is a build cost (like SparseTable / AliasTable), not on the Pareto axes
 };
 
 /**
@@ -343,7 +354,7 @@ export function baselineFor(member, dim) {
  */
 export function supportsKeyType(member, keyType) {
     if (!SUBJECTS.includes(member)) return false;
-    return keyType === 'int'; // all eighteen members are integer/numeric substrates
+    return keyType === 'int'; // all nineteen members are integer/numeric substrates
 }
 
 /**
@@ -359,7 +370,7 @@ export function supportsKeyType(member, keyType) {
  */
 export function supportsWorkload(member, workload) {
     if (!SUBJECTS.includes(member)) return false;
-    if (workload === 'churn') return member !== 'SparseTable' && member !== 'AliasTable' && member !== 'RankSelect'; // static: no mutate churn
+    if (workload === 'churn') return member !== 'SparseTable' && member !== 'AliasTable' && member !== 'RankSelect' && member !== 'EliasFano'; // static: no mutate churn
     if (workload === 'ecs' || workload === 'cache') return member === 'SparseSet';
     return false;
 }
@@ -479,6 +490,7 @@ export const CLEAR_WITNESS_EXCLUDED = Object.freeze({
     CoarseTimerWheel: 'clear() also resets the clock (now) + the 18-word occupancy bitmap; specialized scheduler',
     WindowFold: 'sliding-window aggregator; reuse idiom is evict, clear() resets positions + flip state, incidental',
     RankSelect: 'static/immutable -- build-once succinct index, no clear() surface at all',
+    EliasFano: 'static/immutable -- build-once succinct codec, no clear() surface at all',
 });
 
 // ===========================================================================
@@ -525,4 +537,5 @@ export const OP_CLASS = Object.freeze({
     CoarseTimerWheel: { insert: 'worst-case-O(1)', delete: 'worst-case-O(1)', iterate: 'O(n)-per-call' },
     WindowFold: { insert: 'worst-case-O(1)', delete: 'worst-case-O(1)', iterate: 'O(n)-per-call' },
     RankSelect: { insert: NA, delete: NA, iterate: NA },
+    EliasFano: { insert: NA, delete: NA, iterate: NA },
 });

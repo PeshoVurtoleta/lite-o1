@@ -5,7 +5,7 @@
  * fails `npm run test:types`. Not executed; only type-checked.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, VERSION } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano, VERSION } from '../../O1.js';
 import type { WindowFoldOp } from '../../O1.js';
 
 // VERSION is a string.
@@ -710,3 +710,40 @@ new RankSelect(42, 40);
 rksel.rank1('10');
 // @ts-expect-error -- select1 k must be a number.
 rksel.select1('3');
+
+// --- EliasFano -------------------------------------------------------------
+const ef: EliasFano = new EliasFano([0, 3, 7, 42]);
+const efArr: EliasFano = new EliasFano(new Uint32Array([0, 3, 7, 42]));
+void efArr;
+
+const efLen: number = ef.length;
+const efSize: number = ef.size;
+const efU: number = ef.universe;
+const efBpe: number = ef.bitsPerElement;
+const efBytes: number = ef.sizeBytes;
+void efLen; void efSize; void efU; void efBpe; void efBytes;
+
+// @ts-expect-error -- length is readonly.
+ef.length = 5;
+
+// access -> number | undefined; nextGEQ -> number.
+const efAccess: number | undefined = ef.access(2);
+const efNext: number = ef.nextGEQ(5);
+void efAccess; void efNext;
+
+// forEach callback gets (value, eliasFano).
+ef.forEach((value, eliasFano) => {
+    const v: number = value;
+    const e: EliasFano = eliasFano;
+    void v; void e;
+});
+
+// iterable of the stored values (numbers).
+for (const v of ef) { const vv: number = v; void vv; }
+
+// @ts-expect-error -- source must be an Array or a numeric TypedArray, not a number.
+new EliasFano(42);
+// @ts-expect-error -- access index must be a number.
+ef.access('2');
+// @ts-expect-error -- nextGEQ x must be a number.
+ef.nextGEQ('5');

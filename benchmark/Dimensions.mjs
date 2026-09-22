@@ -17,7 +17,7 @@
 import {
     SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet,
     FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel,
-    RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect,
+    RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano,
 } from '../O1.js';
 import {
     prng, median, warm, gcNow, hasGc, percentile, collect, timeNsPerOp, foldHash,
@@ -245,6 +245,17 @@ export function makeSubject(member, n, rng) {
         const rs = new RankSelect(words, n);
         let key = 0;
         return { obj: rs, op: () => { key++; if (key >= n) key = 0; SINK = (SINK + rs.rank1(key)) | 0; } };
+    }
+    if (member === 'EliasFano') {
+        // A STATIC build-once Elias-Fano codec (built here, OUTSIDE the timed op -- the O(n) build +
+        // the succinct ~2+log2(U/n) bits/element are the disclosed co-headline, EXCLUDED from the
+        // per-op claim). The hot op is access over a walking index (worst-case O(1): one select1 + one
+        // bit-packed low read, independent of n). The decoded value folds into SINK.
+        const vals = new Float64Array(n);
+        for (let k = 0; k < n; k++) vals[k] = k * 2; // monotone, U = 2n -> L = 1 (dense)
+        const ef = new EliasFano(vals);
+        let key = 0;
+        return { obj: ef, op: () => { key++; if (key >= n) key = 0; SINK = (SINK + (ef.access(key) | 0)) | 0; } };
     }
     throw new Error('[bench] unhandled member: ' + member);
 }
@@ -774,6 +785,22 @@ export function makeBaseline(member, n) {
             },
         };
     }
+    if (member === 'EliasFano') {
+        // A plain sorted Float64 array read by a binary-search lower_bound -- the honest thing a dev
+        // reaches for before a succinct codec (8 bytes/element, O(log n) per lookup). Same monotone
+        // values as the subject; a walking target keeps the search exercised. O(log n) per op -> gentle.
+        const vals = new Float64Array(n);
+        for (let k = 0; k < n; k++) vals[k] = k * 2;
+        let key = 0;
+        return {
+            op: () => {
+                const x = key * 2; key++; if (key >= n) key = 0;
+                let lo = 0, hi = n;
+                while (lo < hi) { const mid = (lo + hi) >>> 1; if (vals[mid] < x) lo = mid + 1; else hi = mid; }
+                SINK += lo < n ? (vals[lo] | 0) : 0;
+            },
+        };
+    }
     throw new Error('[bench] unhandled member: ' + member);
 }
 
@@ -869,6 +896,7 @@ const LINEAR_BASELINE = {
     AliasTable: true,    // cumulative-scan foil is an O(n) linear prefix scan per draw
     CoarseTimerWheel: true, // 4-ary-heap foil is O(log n) per fired timer
     RankSelect: true,    // popcount-scan foil is an O(words) rank rescan per query
+    EliasFano: true,     // sorted-array binary-search foil is O(log n) per lookup (timed gently)
 };
 
 /** Exact backing-store byte footprint of a member instance (typed-array buffers). */
@@ -948,6 +976,11 @@ export function memberBytes(member, obj) {
         return obj._w.buffer.byteLength + obj._l0.buffer.byteLength + obj._l1.buffer.byteLength +
             obj._l2.buffer.byteLength + obj._sel1.buffer.byteLength + obj._sel0.buffer.byteLength;
     }
+    if (member === 'EliasFano') {
+        // The packed low store + the composed RankSelect over the upper bitvector (data words +
+        // the cs-poppy directory) -- the whole succinct footprint, surfaced by the sizeBytes getter.
+        return obj.sizeBytes;
+    }
     throw new Error('[bench] unhandled member: ' + member);
 }
 
@@ -995,6 +1028,9 @@ export function theoreticalMinPerLive(member) {
     if (member === 'RankSelect') return 0.125; // ONE BIT per live (indexed) element = 1/8 byte -- the
     // raw bit-storage floor a bitvector index is FOR (the BitSet convention). The cs-poppy directory
     // (~3.2%) is the DISCLOSED index overhead, NOT folded into the per-live floor (the FreqO1 discipline).
+    if (member === 'EliasFano') return 0.375; // ~3 bits per live element (2 + log2(U/n) with L = 1 for a
+    // dense sequence) / 8 = 0.375 byte -- the near-information-theoretic succinct floor Elias-Fano is FOR.
+    // The RankSelect directory over the upper bits is the DISCLOSED index overhead, NOT folded in here.
     throw new Error('[bench] unhandled member: ' + member);
 }
 
@@ -1003,6 +1039,7 @@ function liveCount(member, obj) {
     if (member === 'UnionFind') return obj.capacity;   // fixed universe (all elements live)
     if (member === 'SparseTable') return obj.length;   // static: source-element count (no `size`)
     if (member === 'RankSelect') return obj.length;    // static: bit count (nbits), the indexed universe
+    if (member === 'EliasFano') return obj.length;     // static: element count (n), the encoded sequence
     return obj.size;
 }
 
@@ -1361,6 +1398,17 @@ function makeMixed(member, cap, rng) {
         let key = 0;
         return () => { key++; if (key >= cap) key = 0; SINK = (SINK + rs.rank1(key)) | 0; };
     }
+    if (member === 'EliasFano') {
+        // STATIC / immutable: there is no mutation trace to amortize, so D2 reports drift as n/a
+        // (see D2). The trace here is a long stream of access queries over a codec built ONCE -- it
+        // proves the access cost is FLAT (constant by construction), which keeps the cell non-vacuous
+        // (real query nsPerOp points), never a mutation drift.
+        const vals = new Float64Array(cap);
+        for (let k = 0; k < cap; k++) vals[k] = k * 2;
+        const ef = new EliasFano(vals);
+        let key = 0;
+        return () => { key++; if (key >= cap) key = 0; SINK = (SINK + (ef.access(key) | 0)) | 0; };
+    }
     // Fail closed (mirrors every other dispatch helper): a member NOT handled above must
     // throw, so a future member cannot silently inherit MonoDeque's mixed trace.
     throw new Error('[bench] unhandled member: ' + member);
@@ -1390,7 +1438,7 @@ export function D2(member, opts = {}) {
     // amortized-DRIFT metric is n/a (the STRING, never a numeric 0 -- "not applicable", not
     // "measured zero"). The points above are a real WIDE-range QUERY trace, kept so the cell
     // stays non-vacuous and shows the query cost is flat by construction.
-    const isStatic = member === 'SparseTable' || member === 'AliasTable' || member === 'RankSelect';
+    const isStatic = member === 'SparseTable' || member === 'AliasTable' || member === 'RankSelect' || member === 'EliasFano';
     const drift = isStatic ? NA : (first > 0 ? last / first : 0);
     const reason = isStatic
         ? 'static/immutable: no mutation trace to amortize; points are the flat query/sample trace' : undefined;
@@ -1503,6 +1551,11 @@ function D3Static(member, opts) {
             for (let k = 0; k < W; k++) words[k] = (k * 2654435761) >>> 0; // ~half set
             return new RankSelect(words, len);
         }
+        if (member === 'EliasFano') {
+            const vals = new Float64Array(len);
+            for (let k = 0; k < len; k++) vals[k] = k * 2; // monotone, U = 2*len -> L = 1
+            return new EliasFano(vals);
+        }
         const src = new Float64Array(len);
         for (let k = 0; k < len; k++) src[k] = (k * 2654435761) & 0x7fffffff;
         return new SparseTable(src, 'min');
@@ -1550,7 +1603,7 @@ function D3Static(member, opts) {
 }
 
 export function D3(member, opts = {}) {
-    if (member === 'SparseTable' || member === 'AliasTable' || member === 'RankSelect') return D3Static(member, opts);
+    if (member === 'SparseTable' || member === 'AliasTable' || member === 'RankSelect' || member === 'EliasFano') return D3Static(member, opts);
     const n = opts.n ?? 65536;
     let obj;
     if (member === 'SparseSet') obj = new SparseSet(n, n);
@@ -1899,7 +1952,7 @@ export function D7(member, opts = {}) {
     // fraction and no near-full / just-resized state, so the load-factor sweep is n/a (the STRING,
     // never a numeric 0 -- "not applicable", not "measured zero"). The int-key QUERY / SAMPLE
     // throughput (keyTypes.int) + the scan-fold baseline keep the cell non-vacuous.
-    if (member === 'SparseTable' || member === 'AliasTable' || member === 'RankSelect') {
+    if (member === 'SparseTable' || member === 'AliasTable' || member === 'RankSelect' || member === 'EliasFano') {
         return {
             dim: 'D7', member, baseline: baselineFor(member, 'D7'), unit: 'ns/op',
             keyTypes, baselineIntNs: baseIntNs,
@@ -2100,8 +2153,8 @@ export function D8(member, opts = {}) {
     // (AliasTable) over a table built ONCE. This keeps the cell non-vacuous (a real nsPerOp) even
     // though ecs / cache / churn are all n/a for a static member.
     let query = NA;
-    if (member === 'SparseTable' || member === 'AliasTable' || member === 'RankSelect') {
-        const built = makeSubject(member, n, prng(seed)); // builds the table; op = a query / sample / rank
+    if (member === 'SparseTable' || member === 'AliasTable' || member === 'RankSelect' || member === 'EliasFano') {
+        const built = makeSubject(member, n, prng(seed)); // builds the table; op = a query / sample / rank / access
         query = { nsPerOp: median(collect(built.op, 5000, 60)) };
     }
 
@@ -2207,7 +2260,8 @@ export function traceHash(member, seed = DEFAULT_SEED, length = 100000) {
         member === 'FreqO1' || member === 'BucketQueue' || member === 'TimerWheel' ||
         member === 'HierarchicalTimerWheel' || member === 'RingLog' ||
         member === 'CuckooMap' || member === 'SparseTable' || member === 'BitSet' ||
-        member === 'AliasTable' || member === 'CoarseTimerWheel' || member === 'RankSelect') mode = 0;
+        member === 'AliasTable' || member === 'CoarseTimerWheel' || member === 'RankSelect' ||
+        member === 'EliasFano') mode = 0;
     else if (member === 'RingDeque' || member === 'MinStack') mode = 1;
     else if (member === 'MonoDeque' || member === 'WindowFold') mode = 2;
     else throw new Error('[bench] unhandled member: ' + member);

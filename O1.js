@@ -3,10 +3,10 @@
  * that doubles as a teachable textbook: each member solves a real problem AND
  * witnesses its constant on a host (the O(1) Witness -- see test/witness.mjs).
  *
- * v1.8.0 ships eighteen members -- SparseSet, RingDeque, UnionFind, MonoDeque,
+ * v1.9.0 ships nineteen members -- SparseSet, RingDeque, UnionFind, MonoDeque,
  * MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel,
- * RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, and RankSelect --
- * plus its `VERSION` const. The eighteen are independent (no shared mutable module state),
+ * RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, and EliasFano --
+ * plus its `VERSION` const. The nineteen are independent (no shared mutable module state),
  * so a bundler that imports one drops the others (`sideEffects: false`).
  *
  * The complexity class IS the product: every hot op below is O(1) worst-case and
@@ -19,7 +19,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.8.0';
+export const VERSION = '1.9.0';
 
 /** Largest universe the Uint32 substrate + the (k >>> 0) key check can honor. */
 const MAX_UNIVERSE = 0x100000000; // 2^32
@@ -5519,5 +5519,240 @@ export class RankSelect {
      */
     _rank0BB(block) {
         return (block << 9) - this._rankBB(block);
+    }
+}
+
+/** Largest element COUNT (n) an EliasFano may hold; keeps every index SMI-safe (the upper
+ * bitvector is n + numBuckets bits, guarded separately against RankSelect's 2^25 bit ceiling). */
+const EF_MAX_N = 0x2000000; // 2^25
+/** Largest universe (U, exclusive) an EliasFano may span; keeps every reconstructed value
+ * (hi * 2^L + lo) < 2^48, well inside the SMI-safe 2^53 float-integer range. */
+const EF_MAX_U = 0x1000000000000; // 2^48
+/** The low-bit width cap: L is bit-packed into 32-bit words and read with 32-bit ops, so it is
+ * capped at 31; a rare very-sparse sequence (natural L > 31) just widens the upper bitvector. */
+const EF_MAX_L = 31;
+
+/**
+ * EliasFano -- a zero-GC, WORST-CASE-O(1)-access, STATIC build-once SUCCINCT codec for a SORTED
+ * (monotone non-decreasing) integer sequence, the nineteenth member. It stores n values from
+ * [0, U) in ~2 + ceil(log2(U/n)) bits/element (near the information-theoretic minimum), built ON
+ * TOP of the M18 RankSelect (COMPOSED, never forked): the upper bits (value >> L) are a unary-gap
+ * bitvector indexed by a private RankSelect field; the lower L = max(0, floor(log2(U/n))) bits are
+ * bit-packed into a flat Uint32Array.
+ *
+ * THE HONESTY CONTRACT (rides SparseTable ADR 0018 / RankSelect ADR 0024; ADR 0025):
+ *   - `access(i)` is TRUE WORST-CASE O(1): one select1 (worst-case O(1)) + one bit-packed low read
+ *     -- (select1(i) - i) * 2^L | low(i), zero-alloc. The flat access line IS the worst-case claim,
+ *     so there is NO max-single-op line.
+ *   - `nextGEQ(x)` (successor-or-equal) is DATA-DEPENDENT: O(1) TYPICAL on well-distributed keys
+ *     (buckets average ~1 element at L), O(log n) WORST-CASE on clustered keys (a bounded in-bucket
+ *     binary search after an O(1) select0 seek). It is NOT a clean "expected O(1)" and NOT
+ *     "worst-case O(1)" -- a third honesty category, disclosed as such. Zero-alloc.
+ *   - The O(n) BUILD and the succinct SPACE are DISCLOSED CO-HEADLINES, paid ONCE at construction.
+ *
+ * Fail closed: `new EliasFano(source)` REQUIRES a SORTED numeric Array / TypedArray (U is inferred
+ * as max + 1). A zero-alloc validation pass (typeof FIRST, BEFORE any typed array is allocated)
+ * throws `[lite-o1]` on a decreasing pair, a negative / non-integer / NaN / BigInt value, or n / U
+ * past EF_MAX_N / EF_MAX_U. It does NOT sort internally (that would hide caller bugs and allocate).
+ * Build-once, query-only: there are NO mutators (rebuild to change). Queries NEVER throw: a bad i ->
+ * access undefined; a bad x or x > max -> nextGEQ -1 (the family "queries never throw" law).
+ */
+export class EliasFano {
+    /**
+     * @param {number[]|Uint32Array|Int32Array|Uint16Array|Int16Array|Uint8Array|Int8Array|Uint8ClampedArray|Float32Array|Float64Array}
+     *        source  a SORTED (monotone non-decreasing) sequence of n non-negative integers in
+     *                [0, U). U is inferred as (last value + 1). The values are ENCODED (not
+     *                referenced): a later mutation of the caller's array never changes the codec.
+     */
+    constructor(source) {
+        // Source shape FIRST (typeof-safe; String(x) is Symbol / BigInt-safe), BEFORE any alloc.
+        if (source === null || typeof source !== 'object' ||
+            !(Array.isArray(source) || ArrayBuffer.isView(source))) {
+            throw new TypeError(
+                '[lite-o1] EliasFano source must be an Array or a numeric TypedArray, got ' + String(source));
+        }
+        const n = source.length;
+        if (!Number.isInteger(n) || n < 0 || n > EF_MAX_N) {
+            throw new RangeError('[lite-o1] EliasFano length must be an integer in [0, 2^25], got ' + String(n));
+        }
+        // Zero-alloc validation pass: monotone, non-negative, integer, < EF_MAX_U. Runs BEFORE any
+        // typed array exists, so a bad source leaves nothing half-built (the BitSet / RankSelect idiom).
+        let prev = 0;
+        for (let i = 0; i < n; i++) {
+            const v = source[i];
+            // Number.isInteger never coerces (false on Symbol / BigInt / NaN / null); catches every bad shape.
+            if (!Number.isInteger(v) || v < 0 || v >= EF_MAX_U) {
+                throw new RangeError(
+                    '[lite-o1] EliasFano value at ' + i + ' must be an integer in [0, 2^48), got ' + String(v));
+            }
+            if (i > 0 && v < prev) {
+                throw new RangeError(
+                    '[lite-o1] EliasFano source must be monotone non-decreasing; value at ' + i +
+                    ' (' + v + ') < previous (' + prev + ')');
+            }
+            prev = v;
+        }
+        this._n = n;
+        if (n === 0) {
+            // Empty sequence: universe 0, no low store, a dummy 1-bit RankSelect (never queried --
+            // access / nextGEQ short-circuit on n === 0). Keeps every field non-null.
+            this._u = 0; this._l = 0; this._lowFactor = 1; this._lowMask = 0;
+            this._numBuckets = 0; this._upperNbits = 1;
+            this._low = new Uint32Array(0);
+            this._rs = new RankSelect(new Uint32Array(1), 1);
+            return;
+        }
+        const max = source[n - 1];            // sorted, so the last value is the maximum
+        const U = max + 1;                    // inferred universe (exclusive)
+        // L = max(0, floor(log2(U/n))), corrected for Math.log2 float error, capped at EF_MAX_L.
+        let L = 0;
+        if (U > n) {
+            L = Math.floor(Math.log2(U / n));
+            if (L < 0) L = 0;
+            while (Math.pow(2, L + 1) <= U / n) L++;
+            while (L > 0 && Math.pow(2, L) > U / n) L--;
+            if (L > EF_MAX_L) L = EF_MAX_L;
+        }
+        const lowFactor = Math.pow(2, L);     // 2^L; float, exact for L <= 48
+        const hiMax = Math.floor(max / lowFactor);
+        const numBuckets = hiMax + 1;
+        const upperNbits = n + numBuckets;    // n ones (one per element) + numBuckets zeros
+        if (upperNbits > RANKSELECT_MAX_BITS) {
+            throw new RangeError(
+                '[lite-o1] EliasFano index too large: upper bitvector ' + upperNbits +
+                ' bits exceeds the 2^25 ceiling (reduce n or the universe)');
+        }
+        this._u = U;
+        this._l = L;
+        this._lowFactor = lowFactor;
+        this._lowMask = L === 0 ? 0 : ((0xFFFFFFFF >>> (32 - L)) >>> 0);
+        this._numBuckets = numBuckets;
+        this._upperNbits = upperNbits;
+
+        // Low bits: n * L bits, bit-packed little-endian into a flat Uint32Array.
+        const lowWords = L === 0 ? 0 : ((n * L + 31) >>> 5);
+        const low = new Uint32Array(lowWords > 0 ? lowWords : 0);
+        // Upper bits: set bit (hi_i + i) for element i. Built in a scratch Uint32Array that
+        // RankSelect COPIES (the scratch is garbage after; the O(n) build is the disclosed co-headline).
+        const upWords = new Uint32Array((upperNbits + 31) >>> 5);
+        for (let i = 0; i < n; i++) {
+            const v = source[i];
+            const hi = Math.floor(v / lowFactor);
+            const pos = hi + i;
+            upWords[pos >>> 5] |= (1 << (pos & 31));
+            if (L !== 0) {
+                const lo = v - hi * lowFactor;    // in [0, 2^L)
+                const p = i * L;
+                const wi = p >>> 5, off = p & 31, rem = 32 - off;
+                low[wi] |= (lo << off);
+                if (L > rem) low[wi + 1] |= (lo >>> rem);
+            }
+        }
+        this._low = low;
+        this._rs = new RankSelect(upWords, upperNbits);
+    }
+
+    /** The number of stored values (n). O(1). */
+    get length() { return this._n; }
+
+    /** The number of stored values (n) -- alias of length (the static-member convention). O(1). */
+    get size() { return this._n; }
+
+    /** The inferred universe U (exclusive): every value is in [0, U); U = max + 1 (0 when empty). O(1). */
+    get universe() { return this._u; }
+
+    /** The average encoded bits per element ((upper bits + low bits) / n; 0 when empty). O(1). */
+    get bitsPerElement() { return this._n > 0 ? (this._upperNbits + this._n * this._l) / this._n : 0; }
+
+    /** The total backing byte footprint: the packed low store + the RankSelect (data words + directory). O(1). */
+    get sizeBytes() {
+        return this._low.buffer.byteLength + this._rs._w.buffer.byteLength + this._rs.indexBytes;
+    }
+
+    /**
+     * The i-th value (ascending). WORST-CASE O(1): one select1 (worst-case O(1)) + one bit-packed
+     * low read -- (select1(i) - i) * 2^L + low(i). Returns `undefined` for a bad i (non-number,
+     * non-uint32, or >= length) and NEVER throws (typeof FIRST so a Symbol / BigInt never coerces).
+     * @param {number} i
+     * @returns {number|undefined}
+     */
+    access(i) {
+        if (typeof i !== 'number' || (i >>> 0) !== i || i >= this._n) return undefined;
+        return this._valueAt(i);
+    }
+
+    /**
+     * The smallest stored value >= x (successor-or-equal). DATA-DEPENDENT: O(1) TYPICAL on
+     * well-distributed keys, O(log n) WORST-CASE on clustered keys -- an O(1) select0 bucket seek
+     * plus a BOUNDED in-bucket binary search over the low bits. Returns -1 when x > max (or the
+     * sequence is empty), and NEVER throws (typeof FIRST; a bad x -> -1).
+     * @param {number} x
+     * @returns {number} the smallest value >= x, or -1
+     */
+    nextGEQ(x) {
+        const n = this._n;
+        if (n === 0 || typeof x !== 'number' || Number.isNaN(x)) return -1;
+        const min = this._valueAt(0);
+        if (x <= min) return min;                 // x <= min (incl. negatives) -> the minimum
+        if (x > this._u - 1) return -1;           // x beyond the maximum
+        const L = this._l;
+        const lowFactor = this._lowFactor;
+        const hx = Math.floor(x / lowFactor);     // target bucket
+        const lx = x - hx * lowFactor;            // target low bits
+        const rs = this._rs;
+        // Elements with high < hx: rank1(select0(hx-1)) = select0(hx-1) - (hx-1). hx > min's high
+        // is guaranteed here (x > min), and hx <= hiMax (x <= max), so both select0 calls are in range.
+        const startIdx = hx === 0 ? 0 : (rs.select0(hx - 1) - (hx - 1));
+        // Elements with high <= hx: rank1(select0(hx)) = select0(hx) - hx.
+        const endIdx = rs.select0(hx) - hx;
+        // Bounded in-bucket binary search: first low >= lx in [startIdx, endIdx) (lows are sorted).
+        let lo = startIdx, hi = endIdx;
+        while (lo < hi) {
+            const mid = (lo + hi) >>> 1;
+            if (this._readLow(mid) < lx) lo = mid + 1; else hi = mid;
+        }
+        if (lo < endIdx) return hx * lowFactor + this._readLow(lo); // found in bucket hx
+        if (endIdx < n) return this._valueAt(endIdx);               // first element in a higher bucket
+        return -1;
+    }
+
+    /**
+     * Iterate the values in ASCENDING order, alloc-free. O(n) -- the documented scan exception,
+     * EXCLUDED from the zero-alloc-per-op claims. A HOISTED callback keeps it allocation-free.
+     * @param {(value:number, eliasFano:EliasFano)=>void} fn
+     */
+    forEach(fn) {
+        const n = this._n;
+        for (let i = 0; i < n; i++) fn(this._valueAt(i), this);
+    }
+
+    /**
+     * Iterate the values in ASCENDING order. O(n). The ONE documented per-protocol ALLOCATOR
+     * (a {value, done} per step) -- kept OUT of the zero-alloc claims (use forEach for the
+     * alloc-free scan).
+     */
+    *[Symbol.iterator]() {
+        const n = this._n;
+        for (let i = 0; i < n; i++) yield this._valueAt(i);
+    }
+
+    // ---- private (pure integer surgery, zero allocation) --------------------------------------
+
+    /** The i-th value WITHOUT bounds validation (the hot core of access / forEach). @private */
+    _valueAt(i) {
+        const hi = this._rs.select1(i) - i;      // high bits: the i-th one is at position hi + i
+        return hi * this._lowFactor + this._readLow(i);
+    }
+
+    /** The L bit-packed low bits of element i (0 when L === 0). Reads across at most two words. @private */
+    _readLow(i) {
+        const L = this._l;
+        if (L === 0) return 0;
+        const low = this._low;
+        const p = i * L;
+        const wi = p >>> 5, off = p & 31, got = 32 - off;
+        let lo = low[wi] >>> off;
+        if (got < L) lo |= (low[wi + 1] << got);
+        return lo & this._lowMask;
     }
 }

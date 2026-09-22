@@ -22,7 +22,7 @@
  */
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano } from '../../O1.js';
 
 const U = 1 << 16;      // universe 65536
 const CAP = 1 << 14;    // capacity 16384
@@ -2005,6 +2005,75 @@ const rsForEachDrain = {
     statsOf(s) { return { grows: rsGrows(s) }; },
 };
 
+// ===========================================================================
+// EliasFano scenarios -- a STATIC build-once succinct codec (a packed low store + a composed
+// RankSelect over the upper bits), BUILT ONCE OUTSIDE the window. access(i) is WORST-CASE O(1)
+// (one select1 + one packed low read); nextGEQ(x) is O(1)-typical / O(log n)-worst; both zero-alloc.
+// The O(n) build + succinct space are the disclosed co-headline. Static / immutable: re-queried, never rebuilt.
+// ===========================================================================
+
+const EF_PERF_N = 1 << 18;   // 262,144 sorted values; avg gap ~8 -> L = 3 (real low bits)
+
+/** Zero-alloc counter for EliasFano scenarios, KEYED ON sizeBytes (packed low store + composed RankSelect) -- fixed at build. */
+function efGrows(s) { return s.ef.sizeBytes; }
+
+/** An EliasFano built ONCE over a bounded, uniformly-spread sorted set (the O(n) build is out of the window). */
+function efBuild() {
+    const src = new Float64Array(EF_PERF_N);
+    let acc = 0;
+    for (let i = 0; i < EF_PERF_N; i++) { acc += ((i * 2654435761) >>> 28) + 1; src[i] = acc; } // strictly increasing
+    return { ef: new EliasFano(src), max: acc };
+}
+
+/** access: a prebuilt codec; every op one access over a walking index -- worst-case O(1), int32-wrapped acc. */
+const efAccess = {
+    name: 'EliasFano access (walking index)',
+    setup() { return { ef: efBuild().ef, key: 0, acc: 0 }; },
+    hot(s, n) {
+        const ef = s.ef;
+        let key = s.key | 0, acc = s.acc | 0;
+        for (let i = 0; i < n; i++) {
+            key = (key + 1) & (EF_PERF_N - 1);
+            acc = (acc + ef.access(key)) | 0;
+        }
+        s.key = key | 0; s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: efGrows(s) }; },
+};
+
+/** nextGEQ: a prebuilt codec; every op one nextGEQ over a walking x (O(1) typical on this uniform set), int32-wrapped acc. */
+const efNextGEQ = {
+    name: 'EliasFano nextGEQ (walking x)',
+    setup() { const b = efBuild(); return { ef: b.ef, max: b.max, stride: ((b.max / 997) | 0) || 1, x: 0, acc: 0 }; },
+    hot(s, n) {
+        const ef = s.ef;
+        const max = s.max, stride = s.stride;
+        let x = s.x | 0, acc = s.acc | 0;
+        for (let i = 0; i < n; i++) {
+            x = x + stride;
+            if (x >= max) x -= max; // single wrap, keeps x an SMI in [0, max)
+            acc = (acc + ef.nextGEQ(x)) | 0;
+        }
+        s.x = x | 0; s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: efGrows(s) }; },
+};
+
+/** EliasFano forEach-drain: a prebuilt SMALL codec decoded each op through a HOISTED module-scope callback. */
+let efDrainAcc = 0;
+function efForEachInto(v) { efDrainAcc = (efDrainAcc + v) | 0; }
+const efForEachDrain = {
+    name: 'EliasFano forEach-drain',
+    setup() {
+        const src = new Float64Array(256);
+        let acc = 0;
+        for (let i = 0; i < 256; i++) { acc += (i & 7) + 1; src[i] = acc; }
+        return { ef: new EliasFano(src) };
+    },
+    hot(s, n) { const ef = s.ef; for (let i = 0; i < n; i++) ef.forEach(efForEachInto); },
+    statsOf(s) { return { grows: efGrows(s) }; },
+};
+
 const scenarios = [
     addChurn, hasHit, deleteChurn, clearRefill, forEachDrain,
     ringFifo, ringLifo, ringInterleave,
@@ -2024,6 +2093,7 @@ const scenarios = [
     ctwScheduleChurn, ctwDrainAdvance, ctwCancelChurn, ctwAdvanceTick, ctwForEachDrain,
     wfPushEvictQuery, wfQueryRead, wfEvictRefill, wfForEachDrain,
     rsRank, rsSelect, rsForEachDrain,
+    efAccess, efNextGEQ, efForEachDrain,
 ];
 
 /**
@@ -2444,6 +2514,32 @@ const rsMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/**
+ * The EliasFano teeth: a per-op `[Symbol.iterator]` spread into a FRESH [] each op -- the generator +
+ * its per-step {value, done} wrappers + the array MUST trip the gate, proving the instrument has teeth
+ * on the EliasFano surface too (its iterator is the ONE documented per-protocol allocator; forEach is
+ * the alloc-free decode). statsOf returns a constant so the failure is the allocation lanes.
+ */
+const efMustFailAlloc = {
+    name: 'EliasFano [Symbol.iterator] spread into fresh array (MUST allocate)',
+    setup() {
+        const src = new Float64Array(256);
+        let acc = 0;
+        for (let i = 0; i < 256; i++) { acc += (i & 7) + 1; src[i] = acc; }
+        return { ef: new EliasFano(src) };
+    },
+    hot(s, n) {
+        const ef = s.ef;
+        let sink = 0;
+        for (let i = 0; i < n; i++) {
+            const arr = [...ef]; // fresh generator + array per op -> heap churn
+            sink += arr.length;
+        }
+        s.sink = sink;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -2453,5 +2549,5 @@ zgcSuite({
     counters: { grows: 0 },
     maxRetainedKB: 64,
     scenarios,
-    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc, twMustFailAlloc, htwMustFailAlloc, ringLogMustFailAlloc, cuckMustFailAlloc, stMustFailAlloc, bsMustFailAlloc, atMustFailAlloc, wfMustFailAlloc, rsMustFailAlloc],
+    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc, twMustFailAlloc, htwMustFailAlloc, ringLogMustFailAlloc, cuckMustFailAlloc, stMustFailAlloc, bsMustFailAlloc, atMustFailAlloc, wfMustFailAlloc, rsMustFailAlloc, efMustFailAlloc],
 });

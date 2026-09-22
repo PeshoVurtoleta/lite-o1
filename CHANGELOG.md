@@ -8,6 +8,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.9.0] - 2026-09-23
+
+### Added
+
+- **`EliasFano` -- the nineteenth member: a zero-GC, succinct STATIC encoding of a monotone
+  non-decreasing integer sequence (quasi-succinct, ~2 + ceil(log2(U/n)) bits/element).** Build once
+  from a SORTED numeric Array / TypedArray (U inferred as `max + 1`, the values ENCODED not
+  referenced); the low `L = floor(log2(U/n))` bits are bit-packed and the upper bits are a unary-gap
+  bitvector indexed by a COMPOSED `RankSelect` (reuse, never a fork). `access(i)` returns the i-th
+  value in WORST-CASE O(1) (`(select1(i) - i) << L | low(i)`) -- it joins the worst-case cohort with
+  NO max-single-op line. `nextGEQ(x)` (successor-or-equal) is the family's first DATA-DEPENDENT op:
+  **O(1) typical on well-distributed keys, O(log n) worst-case on clustered keys** (an in-bucket
+  binary search after an O(1) `select0` seek) -- labeled as such, never as a clean "expected O(1)"
+  nor as worst-case O(1) (ADR 0025). The O(n) build + the succinct space are DISCLOSED co-headlines
+  (the SparseTable / RankSelect static-member contract). Getters `length` / `size` (= n) / `universe`
+  (= U) / `bitsPerElement` / `sizeBytes`; `forEach` / iterator decode ascending. Build-once,
+  query-only: NO mutators. Fail closed at construction (an unsorted / negative / non-integer / NaN /
+  BigInt value, or n / U past the ceiling, throws `[lite-o1]` typeof-first BEFORE any allocation -- it
+  does NOT sort internally); queries never throw (`access` bad i -> undefined; `nextGEQ` x > max or
+  bad x -> -1). HOME: lite-o1 (static sub-family), NOT `@zakkster/lite-loglogn` (a DYNAMIC
+  predecessor family that does not fit a static codec); sub-logarithmic successor is that package's
+  domain, arbitrary-index range queries are `@zakkster/lite-logn`'s. See
+  [`decisions/0025`](./decisions/0025-eliasfano.md).
+- **`test/EliasFano.test.js`** -- full behavioral suite with O(n) oracles: `access(i)` equals the
+  source value for every i; `nextGEQ(x)` equals a naive lower-bound oracle over random x (incl.
+  below-min / above-max / exact hits); fail-closed construction (unsorted / out-of-range, before any
+  alloc); the queries-never-throw contract; the empty-sequence edge.
+- Gate coverage extended for the nineteenth member: `test/torture.mjs` (retention -> `size() = 0`
+  plus a `0 B/op` hot-path phase on `access` and `nextGEQ`), `test/witness.mjs` (a flat `access` line
+  vs a foil, NO max-single-op line; `nextGEQ` flat on uniform keys with the clustered-key degradation
+  disclosed), `test/perf/PerfGate.test.mjs`, and `benchmark/` (`SUBJECTS` -> 19; a STATIC member,
+  excluded from the churn workload alongside SparseTable / AliasTable / RankSelect).
+
+### Changed
+
+- Roster is now NINETEEN members; `O1.js` header member-count + roster list + `VERSION` bumped to
+  `1.9.0`, with `package.json` (version + description + keywords) and `llms.txt` in sync. `O1.js` is
+  a PURE APPEND -- the prior eighteen member classes are byte-identical (only the header comment and
+  the `VERSION` const changed). README + GUIDE document the succinct monotone-sequence codec leaf.
+
 ## [1.8.0] - 2026-09-22
 
 ### Added

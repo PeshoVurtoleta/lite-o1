@@ -401,13 +401,15 @@ it is promoted to M19+. Listed newest-first by how load-bearing the open questio
   random ACCESS to the i-th element and successor/predecessor queries, built ON TOP of the M18 Rank/Select
   bitvector (upper bits as a unary-coded bitvector read via rank/select, lower bits bit-packed). Adopted by
   SDSL, folly, FM-index / inverted-index compression. Already noted as a follow-on to M18 (Post-1.0 #8 row;
-  section 6). **Depends on M18 -- cannot start before Rank/Select ships.** RESEARCH NEEDED: (a) THE HOME CALL
-  -- lite-o1 STATIC member (frame access() as the worst-case-O(1) headline, successor as a disclosed
-  expected / O(log log U) co-headline) vs @zakkster/lite-loglogn, whose whole charter IS O(log log U) and
-  which already lists EliasFano as a Tier-2 substrate; (b) surface honesty -- expose only access() (clean
-  worst-case O(1)) or also nextGEQ / successor (which drags in the expected / O(log log U) bound, a
-  mixed-honesty surface lite-o1 usually avoids); (c) reuse M18's RankSelect as substrate, NEVER fork (the
-  suite reuse law). See also section 11's open Elias-Fano-home question.
+  section 6). **SHIPPED as M19 / v1.9.0 in lite-o1 (ADR 0025) -- no longer deferred.** THE HOME CALL was
+  RESOLVED to lite-o1 (not lite-loglogn): correcting a stale note, @zakkster/lite-loglogn is a DYNAMIC
+  add/delete predecessor family (StratifiedBitset / XFastTrie / YFastTrie / vEBTree) that does NOT plan
+  EliasFano and does not fit a STATIC build-once codec; EliasFano's substrate (RankSelect) is in lite-o1,
+  and access() is worst-case O(1) -- lite-o1's static sub-family. Framing A: access() worst-case O(1) is
+  the headline (+ succinct space); nextGEQ() ships LABELED DATA-DEPENDENT -- O(1) typical on well-distributed
+  keys, O(log n) worst-case on clustered keys (an in-bucket binary search after an O(1) select0 seek) --
+  the family's first data-dependent op, NOT a clean expected-O(1). It composes M18's RankSelect (reuse,
+  never fork). Sub-logarithmic (O(log log U)) predecessor remains lite-loglogn's separate domain.
 
 - **WindowFoldInt32** -- the int32-lane sibling of WindowFold (M17), carrying the BITWISE associative
   operators (AND identity -1 / OR identity 0 / XOR identity 0 -- clean monoids) and any int-domain monoid

@@ -510,14 +510,15 @@ test('D1 perOpTail: exactly the 5 amortized members carry a tail object; the oth
 
 const NEW_MEMBERS = ['RingLog', 'CuckooMap', 'SparseTable'];
 
-test('adoption: SUBJECTS is 18; cells() is 144; each new member has exactly 8 cells', () => {
-    assert.equal(SUBJECTS.length, 18, 'SUBJECTS must be the 18 shipped members');
+test('adoption: SUBJECTS is 19; cells() is 152; each new member has exactly 8 cells', () => {
+    assert.equal(SUBJECTS.length, 19, 'SUBJECTS must be the 19 shipped members');
     for (const m of NEW_MEMBERS) assert.ok(SUBJECTS.includes(m), m + ' must be registered');
     assert.ok(SUBJECTS.includes('CoarseTimerWheel'), 'CoarseTimerWheel must be registered');
     assert.ok(SUBJECTS.includes('WindowFold'), 'WindowFold must be registered');
     assert.ok(SUBJECTS.includes('RankSelect'), 'RankSelect must be registered');
+    assert.ok(SUBJECTS.includes('EliasFano'), 'EliasFano must be registered');
     const all = cells();
-    assert.equal(all.length, 144, 'grid must be 18 x 8 = 144 cells');
+    assert.equal(all.length, 152, 'grid must be 19 x 8 = 152 cells');
     assert.equal(all.length, SUBJECTS.length * DIMENSIONS.length);
     for (const m of NEW_MEMBERS) {
         assert.equal(all.filter((c) => c.member === m).length, 8, m + ' must have exactly 8 cells');
@@ -698,9 +699,9 @@ test('adoption: D3 memberBytes is stable across 5 fill/clear cycles (no backing-
         'SparseTable of equal length must have equal backing bytes');
 });
 
-test('shipping discipline -- package.json.version is the 1.8.0 bump; benchmark/ stays repo-only', () => {
+test('shipping discipline -- package.json.version is the 1.9.0 bump; benchmark/ stays repo-only', () => {
     const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
-    assert.equal(pkg.version, '1.8.0', '1.8.0 appends RankSelect (the eighteenth member)');
+    assert.equal(pkg.version, '1.9.0', '1.9.0 appends EliasFano (the nineteenth member)');
     // benchmark/ must NOT be shipped (it is repo-only infra) even in a shipping session.
     assert.ok(!pkg.files.includes('benchmark'), 'benchmark/ must not appear in package.json files[]');
 });
@@ -988,6 +989,7 @@ const ALLOC_SECTION_MARKER = Object.freeze({
     CoarseTimerWheel: '**CoarseTimerWheel** allocates',
     WindowFold: '**WindowFold** allocates',
     RankSelect: '**RankSelect** allocates',
+    EliasFano: '**EliasFano** allocates',
 });
 
 test('#3 doc gate hardened: EVERY one of the 15 members carries its OWN per-member alloc-"proven" ' +
@@ -1061,7 +1063,7 @@ test('#1 CLEAR_WITNESS is EXACTLY the four container members; each has a clear()
     }
     // The EXCLUDED table names the other nine, each with a reason (never silently dropped).
     const excl = Object.keys(CLEAR_WITNESS_EXCLUDED);
-    assert.equal(excl.length, 14, 'fourteen members excluded with reasons');
+    assert.equal(excl.length, 15, 'fifteen members excluded with reasons');
     assert.equal(excl.length + CLEAR_WITNESS.length, SUBJECTS.length, 'every member is either in or excluded');
     for (const m of excl) {
         assert.ok(SUBJECTS.includes(m), m + ' must be a real member');
@@ -1071,8 +1073,8 @@ test('#1 CLEAR_WITNESS is EXACTLY the four container members; each has a clear()
     }
 });
 
-test('#2 OP_CLASS: iterate is O(n)-per-call for the non-static members; the static rows (SparseTable, AliasTable, RankSelect) are all n/a', () => {
-    const STATIC = new Set(['SparseTable', 'AliasTable', 'RankSelect']);
+test('#2 OP_CLASS: iterate is O(n)-per-call for the non-static members; the static rows (SparseTable, AliasTable, RankSelect, EliasFano) are all n/a', () => {
+    const STATIC = new Set(['SparseTable', 'AliasTable', 'RankSelect', 'EliasFano']);
     for (const m of SUBJECTS) {
         const row = OP_CLASS[m];
         assert.ok(row, m + ' must have an OP_CLASS row');
@@ -1206,17 +1208,17 @@ test('#4 report: D6 + D8 render ADJACENT to the D2 witness plot; clear + per-op 
     assert.ok(html.includes('n/a'), 'inapplicable cells must render the n/a string');
 });
 
-test('#6 trinity + shipping surface: VERSION 1.8.0 across O1.js/package.json/llms.txt; benchmark/ not shipped', () => {
+test('#6 trinity + shipping surface: VERSION 1.9.0 across O1.js/package.json/llms.txt; benchmark/ not shipped', () => {
     const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
-    assert.equal(VERSION, '1.8.0', 'O1.js VERSION const');
-    assert.equal(pkg.version, '1.8.0', 'package.json version');
+    assert.equal(VERSION, '1.9.0', 'O1.js VERSION const');
+    assert.equal(pkg.version, '1.9.0', 'package.json version');
     const m = LLMS.match(/^Version:\s*(\S+)/m);
     assert.ok(m, 'llms.txt Version header present');
-    assert.equal(m[1], '1.8.0', 'llms.txt Version header');
+    assert.equal(m[1], '1.9.0', 'llms.txt Version header');
     assert.equal(VERSION, pkg.version, 'trinity string-equal (VERSION === package.json)');
     assert.equal(VERSION, m[1], 'trinity string-equal (VERSION === llms.txt)');
     // README + llms.txt are shipped; benchmark/ is repo-only.
     assert.ok(pkg.files.includes('README.md') && pkg.files.includes('llms.txt'), 'README + llms.txt ship');
     assert.ok(!pkg.files.includes('benchmark'), 'benchmark/ stays repo-only');
-    assert.equal(cells().length, 144, 'bench grid stays 18 x 8 = 144 cells');
+    assert.equal(cells().length, 152, 'bench grid stays 19 x 8 = 152 cells');
 });

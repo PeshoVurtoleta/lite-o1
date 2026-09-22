@@ -39,7 +39,7 @@ async function main() {
     const { GcProfiler, checkNoGc, measureAllocs } =
         await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect } = await import('../O1.js');
+    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano } = await import('../O1.js');
 
     const U = 1 << 16;      // universe 65536
     const CAP = 1 << 14;    // capacity 16384
@@ -274,6 +274,17 @@ async function main() {
             rsel.access(i & 1023);
             rsel.forEach(noop);
             tracker.track(rsel, noop, 'rankselect', { audit: true });
+            // EliasFano owns its packed low store + a COMPOSED RankSelect over the upper bits;
+            // nothing external to release. STATIC/immutable: build once from a SORTED array, then
+            // exercise access / nextGEQ / forEach (query-only) before tracking; reclaim proven by size()->0.
+            const efSrc = new Float64Array(256);
+            let efPrev = 0;
+            for (let k = 0; k < 256; k++) { efPrev += ((k ^ i) & 7) + 1; efSrc[k] = efPrev; } // strictly increasing
+            const ef1 = new EliasFano(efSrc);
+            ef1.access(i & 255);
+            ef1.nextGEQ(((i * 2654435761) >>> 8) % (efPrev + 1));
+            ef1.forEach(noop);
+            tracker.track(ef1, noop, 'eliasfano', { audit: true });
         }
         return tracker.size();
     }
@@ -745,6 +756,36 @@ async function main() {
     const rsSelAllocBytes = Math.max(0, Math.round(rsSelBpc));
     const rsSelAllocOk = rsSelAllocBytes === 0;
 
+    // EliasFano hot path: a STATIC build-once succinct codec, BUILT ONCE OUTSIDE the measured window
+    // (the O(n) build + succinct space are the disclosed co-headline). access(i) is worst-case O(1)
+    // (one select1 + one packed low read), zero-alloc; nextGEQ(x) is O(1)-typical / O(log n)-worst,
+    // zero-alloc. Both returns fold into int32 sinks so V8 cannot elide them.
+    const EF_N = 1 << 18;                   // 262,144 sorted values; avg gap ~8 -> L = 3 (real low bits)
+    const efHotSrc = new Float64Array(EF_N);
+    let efHotAcc = 0;
+    for (let k = 0; k < EF_N; k++) { efHotAcc += ((k * 2654435761) >>> 28) + 1; efHotSrc[k] = efHotAcc; } // strictly increasing
+    const efHot = new EliasFano(efHotSrc);  // built once, outside the measured loops
+    const efHotMax = efHotAcc;
+    let efAccKey = 0, efAccSink = 0;
+    const efAccStep = () => {
+        efAccKey = (efAccKey + 1) & (EF_N - 1);
+        efAccSink = (efAccSink + efHot.access(efAccKey)) | 0; // O(1) worst-case access
+    };
+    const efAccAllocRes = measureAllocs(efAccStep, { iterations: 100000, batches: 8 });
+    const efAccBpc = efAccAllocRes.bytesPerCall === null ? 0 : efAccAllocRes.bytesPerCall;
+    const efAccAllocBytes = Math.max(0, Math.round(efAccBpc));
+    const efAccAllocOk = efAccAllocBytes === 0;
+
+    let efNextKey = 0, efNextSink = 0;
+    const efNextStep = () => {
+        efNextKey = (efNextKey + 2654435761) % efHotMax;
+        efNextSink = (efNextSink + efHot.nextGEQ(efNextKey)) | 0; // O(1)-typical / O(log n)-worst, zero-alloc
+    };
+    const efNextAllocRes = measureAllocs(efNextStep, { iterations: 100000, batches: 8 });
+    const efNextBpc = efNextAllocRes.bytesPerCall === null ? 0 : efNextAllocRes.bytesPerCall;
+    const efNextAllocBytes = Math.max(0, Math.round(efNextBpc));
+    const efNextAllocOk = efNextAllocBytes === 0;
+
     // "0 B/op" resolved at the sampling floor: heapUsed deltas are quantized and
     // noisy, so a truly non-allocating op reads a sub-byte figure (a lone blip
     // in one batch / iterations). Round to the nearest byte -- any per-op
@@ -1000,7 +1041,7 @@ async function main() {
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
         findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && monoAllocOk &&
         minAllocOk && randAllocOk && freqAllocOk && buckAllocOk && twAllocOk && htwAllocOk &&
-        ringLogAllocOk && cuckAllocOk && stAllocOk && bitAllocOk && bitHighAllocOk && bitOrAllocOk && bitRetOk && aliasAllocOk && ctwAllocOk && wfAllocOk && rsRankAllocOk && rsSelAllocOk && abOk;
+        ringLogAllocOk && cuckAllocOk && stAllocOk && bitAllocOk && bitHighAllocOk && bitOrAllocOk && bitRetOk && aliasAllocOk && ctwAllocOk && wfAllocOk && rsRankAllocOk && rsSelAllocOk && efAccAllocOk && efNextAllocOk && abOk;
 
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
@@ -1023,10 +1064,12 @@ async function main() {
         ctwAllocBytes + ' B/op (CoarseTimerWheel) ' +
         wfAllocBytes + ' B/op (WindowFold) ' +
         rsRankAllocBytes + ' B/op (RankSelect rank1) ' +
-        rsSelAllocBytes + ' B/op (RankSelect select1)' +
+        rsSelAllocBytes + ' B/op (RankSelect select1) ' +
+        efAccAllocBytes + ' B/op (EliasFano access) ' +
+        efNextAllocBytes + ' B/op (EliasFano nextGEQ)' +
         ' | bitRetGrowth=' + bitRetGrowth + ' B' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
-        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' bsSink=' + bsSink + ' bhSink=' + bhSink + ' brSink=' + brSink + ' atSink=' + atSink + ' wfSink=' + wfSink + ' rsRankSink=' + rsRankSink + ' rsSelSink=' + rsSelSink + ' abGrowth=' + abDelta + ')');
+        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' bsSink=' + bsSink + ' bhSink=' + bhSink + ' brSink=' + brSink + ' atSink=' + atSink + ' wfSink=' + wfSink + ' rsRankSink=' + rsRankSink + ' rsSelSink=' + rsSelSink + ' efAccSink=' + efAccSink + ' efNextSink=' + efNextSink + ' abGrowth=' + abDelta + ')');
 
     if (!ok) {
         if (!trackedOk) console.error('  vacuous: tracker held ' + trackedMid + ' instances (expected > 0)');
@@ -1057,6 +1100,8 @@ async function main() {
         if (!wfAllocOk) console.error('  alloc ' + wfAllocBytes + ' B/op WindowFold (raw bytesPerCall ' + wfBpc + ')');
         if (!rsRankAllocOk) console.error('  alloc ' + rsRankAllocBytes + ' B/op RankSelect rank1 (raw bytesPerCall ' + rsRankBpc + ')');
         if (!rsSelAllocOk) console.error('  alloc ' + rsSelAllocBytes + ' B/op RankSelect select1 (raw bytesPerCall ' + rsSelBpc + ')');
+        if (!efAccAllocOk) console.error('  alloc ' + efAccAllocBytes + ' B/op EliasFano access (raw bytesPerCall ' + efAccBpc + ')');
+        if (!efNextAllocOk) console.error('  alloc ' + efNextAllocBytes + ' B/op EliasFano nextGEQ (raw bytesPerCall ' + efNextBpc + ')');
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;
     }

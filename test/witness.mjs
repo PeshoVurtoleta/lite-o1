@@ -48,7 +48,7 @@
  * metric are unchanged; only the measurement is made steadier.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano } from '../O1.js';
 
 const SIZES = [1e3, 1e4, 1e5, 1e6, 1e7];
 const BATCH = 1e6;
@@ -2131,5 +2131,108 @@ if (!rsAllOk) {
     if (!rsOk) console.error('  violation RankSelect flatness ' + fmt(rsw.flatness) + ' < 0.70');
     if (!rsFoilOk) console.error('  violation naive foil flatness ' + fmt(rsFoil.flatness) + ' > 0.55');
     if (!rsRatioOk) console.error('  violation min RankSelect ratio ' + fmt(rsRatio) + 'x < 1.50x');
+    process.exitCode = 1;
+}
+
+// ===========================================================================
+// EliasFano witness -- STATIC succinct nextGEQ (successor) vs a naive O(n)
+// linear-scan successor over the same sorted set.
+// ===========================================================================
+// EliasFano stores n sorted integers in ~2 + log2(U/n) bits each. access(i) is worst-case O(1) but is
+// NOT witnessed here -- a plain sorted array also accesses in O(1), so there is no collapsing foil for
+// it (access's flatness + 0-alloc are proven by the torture gate + decisions/0025). The witnessed op
+// is nextGEQ (successor-or-equal): DATA-DEPENDENT -- O(1) TYPICAL on well-distributed keys (buckets
+// average ~1 element at L, a select0 seek + a ~1-element in-bucket step), degrading to O(log n)
+// WORST-CASE only on clustered keys (disclosed, NOT gated -- decisions/0025). Here the keys are
+// UNIFORMLY spread, so nextGEQ is O(1) and FLAT, while the foil recomputes the successor by a naive
+// O(n) linear scan from the front, collapsing as n grows. Gated over n >= 1e4.
+const EF_SIZES = [1e3, 1e4, 1e5];
+const EF_BATCH = 5e5;         // large: stable timing for the O(1)-typical nextGEQ
+const EF_FOIL_BATCH = 2e3;    // small: an O(n) linear scan at n=1e5 must stay tractable
+const EF_GATE_MIN = 1e4;
+
+// A SORTED array of n uniformly-spread integers (gap in [1, 16]); reused by the member + the foil.
+function buildEliasFanoSorted(n) {
+    const src = new Float64Array(n);
+    let acc = 0;
+    for (let k = 0; k < n; k++) { acc += ((k * 2654435761) >>> 28) + 1; src[k] = acc; } // uniform gaps, strictly increasing
+    return { src, max: acc };
+}
+function buildEliasFanoWit(n) {
+    const built = buildEliasFanoSorted(n);
+    const ef = new EliasFano(built.src);     // the O(n) BUILD -- excluded from the timed op
+    const max = built.max;
+    const stride = ((max / 997) | 0) || 1;
+    let x = 0;
+    const op = () => {
+        x += stride;
+        if (x >= max) x = 0;
+        SINK += ef.nextGEQ(x); // O(1) typical on the uniform set
+    };
+    return { op };
+}
+// Foil: the same sorted values in a plain Float64Array; every op recomputes the successor by a naive
+// O(n) linear scan from the front -- O(n) per query, so ops/ms collapses as n grows.
+function buildNextGEQScanFoil(n) {
+    const built = buildEliasFanoSorted(n);
+    const src = built.src, max = built.max;
+    const stride = ((max / 997) | 0) || 1;
+    let x = 0;
+    const op = () => {
+        x += stride;
+        if (x >= max) x = 0;
+        let r = -1;
+        for (let k = 0; k < n; k++) { if (src[k] >= x) { r = src[k]; break; } } // O(n) linear scan
+        SINK += r;
+    };
+    return { op };
+}
+
+const efw = witness(buildEliasFanoWit, EF_SIZES, EF_BATCH, REPS, EF_GATE_MIN);
+const efFoil = witness(buildNextGEQScanFoil, EF_SIZES, EF_FOIL_BATCH, REPS, EF_GATE_MIN);
+
+console.log('');
+console.log('O(1) Witness -- EliasFano nextGEQ (successor, O(1) typical) vs a naive O(n) linear scan (rate ops/ms, median of ' +
+    REPS + ', gate n >= ' + nStr(EF_GATE_MIN) + ')');
+console.log('');
+console.log('  n         EliasFano ops/ms   naive ops/ms   ratio');
+console.log('  --------  ----------------   ------------   -----');
+let efRatio = Infinity;
+for (let i = 0; i < EF_SIZES.length; i++) {
+    const a = efw.rows[i].opsPerMs;
+    const b = efFoil.rows[i].opsPerMs;
+    const ratio = b > 0 ? a / b : Infinity;
+    const gated = EF_SIZES[i] >= EF_GATE_MIN;
+    if (gated && ratio < efRatio) efRatio = ratio;
+    const tag = EF_SIZES[i] < EF_GATE_MIN ? '   <- L1 micro-case (shown, not gated)' : '';
+    console.log('  ' + nStr(EF_SIZES[i]).padEnd(8) + '  ' +
+        fmt(a).padStart(16) + '   ' + fmt(b).padStart(12) + '   ' + fmt(ratio).padStart(5) + 'x' + tag);
+}
+
+console.log('');
+console.log('  EliasFano nextGEQ flatness (n >= ' + nStr(EF_GATE_MIN) + '): ' + fmt(efw.flatness) + '   (gate >= 0.70, UNIFORM keys)');
+console.log('  naive foil flatness (last/first): ' + fmt(efFoil.flatness) + '   (gate <= 0.55 -- true O(n) collapse)');
+console.log('  min EliasFano/naive ratio:        ' + fmt(efRatio) + 'x  (gate >= 1.50x)');
+// access(i) is WORST-CASE O(1) (one select1 + one packed low read) -- proven flat + 0-alloc by the
+// torture gate, not witnessed here (a plain sorted array also accesses in O(1), no collapsing foil).
+// nextGEQ is the family's DATA-DEPENDENT op: O(1) TYPICAL (witnessed flat here on uniform keys),
+// O(log n) WORST-CASE on clustered keys (disclosed, decisions/0025) -- NOT an amortized spike, so
+// there is NO max-single-op line; the flat typical line + the disclosed worst is the honest claim.
+
+const efOk = efw.flatness >= 0.70;
+const efFoilOk = efFoil.flatness <= 0.55;
+const efRatioOk = efRatio >= 1.5;
+const efAllOk = efOk && efFoilOk && efRatioOk;
+
+console.log('');
+console.log('WITNESS EliasFano ' + (efAllOk ? 'ok' : 'FAIL') +
+    ' ef.flatness=' + fmt(efw.flatness) +
+    ' naive.flatness=' + fmt(efFoil.flatness) +
+    ' minRatio=' + fmt(efRatio) + 'x');
+
+if (!efAllOk) {
+    if (!efOk) console.error('  violation EliasFano flatness ' + fmt(efw.flatness) + ' < 0.70');
+    if (!efFoilOk) console.error('  violation naive foil flatness ' + fmt(efFoil.flatness) + ' > 0.55');
+    if (!efRatioOk) console.error('  violation min EliasFano ratio ' + fmt(efRatio) + 'x < 1.50x');
     process.exitCode = 1;
 }

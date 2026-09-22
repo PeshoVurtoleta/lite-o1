@@ -1010,3 +1010,44 @@ export class RankSelect {
     /** Iterate set-bit indices in ascending order. O(nbits). */
     [Symbol.iterator](): IterableIterator<number>;
 }
+
+/**
+ * EliasFano -- a zero-GC, succinct STATIC encoding of a monotone non-decreasing integer sequence
+ * (quasi-succinct, ~2 + ceil(log2(U/n)) bits/element), built on a composed RankSelect over the upper
+ * bits. access(i) is WORST-CASE O(1); nextGEQ(x) is DATA-DEPENDENT -- O(1) TYPICAL on well-distributed
+ * keys, O(log n) WORST-CASE on clustered keys (an in-bucket binary search after an O(1) select0 seek) --
+ * a third honesty category, neither clean "expected O(1)" nor worst-case O(1). The O(n) build + the
+ * succinct space are a disclosed co-headline. Build-once, query-only: no mutators. Fail closed on an
+ * unsorted / out-of-range source; queries never throw.
+ */
+export class EliasFano {
+    /** @param source a SORTED (monotone non-decreasing) sequence of n non-negative integers in [0, U); U is inferred as (last value + 1). The values are ENCODED, not referenced. Throws [lite-o1] (before any alloc) on an unsorted / negative / non-integer / NaN / BigInt value, or n / U past the ceiling. */
+    constructor(source: RankSelectSource);
+
+    /** Number of stored values (n). O(1). */
+    readonly length: number;
+
+    /** Number of stored values (n) -- alias of length (the static-member convention). O(1). */
+    readonly size: number;
+
+    /** The inferred universe U (exclusive): every value is in [0, U); U = max + 1 (0 when empty). O(1). */
+    readonly universe: number;
+
+    /** The average encoded bits per element (0 when empty). O(1). */
+    readonly bitsPerElement: number;
+
+    /** The total backing byte footprint (the packed low store + the composed RankSelect). O(1). */
+    readonly sizeBytes: number;
+
+    /** The i-th value (ascending). WORST-CASE O(1). Returns undefined for a bad i. Never throws. */
+    access(i: number): number | undefined;
+
+    /** The smallest stored value >= x (successor-or-equal). DATA-DEPENDENT: O(1) typical, O(log n) worst-case. Returns -1 when x > max or on a bad x. Never throws. */
+    nextGEQ(x: number): number;
+
+    /** Iterate the stored values in ascending order, alloc-free. O(n). fn is (value, eliasFano). */
+    forEach(fn: (value: number, eliasFano: EliasFano) => void): void;
+
+    /** Iterate the stored values in ascending order. O(n). */
+    [Symbol.iterator](): IterableIterator<number>;
+}

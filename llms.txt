@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-Version: 1.8.0
+Version: 1.9.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -13,12 +13,13 @@ op is O(1) worst-case (or O(1)-amortized where stated) and allocates zero bytes
 after construction, and a shipped witness harness demonstrates the flat
 throughput curve against a built-in foil.
 
-v1.8.0 ships eighteen members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
+v1.9.0 ships nineteen members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
 RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap,
-SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, and RankSelect. They share no mutable
-module state, so a bundler that imports one drops the others (tree-shakeable). 1.8.0 adds RankSelect
-(the eighteenth member; 1.7.0 added WindowFold, 1.6.0 added CoarseTimerWheel, 1.5.0 added AliasTable,
-1.4.0 added BitSet, 1.3.0 added SparseTable, 1.2.0 added CuckooMap, 1.1.0 added RingLog).
+SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, and EliasFano. They share no
+mutable module state, so a bundler that imports one drops the others (tree-shakeable). 1.9.0 adds
+EliasFano (the nineteenth member; 1.8.0 added RankSelect, 1.7.0 added WindowFold, 1.6.0 added
+CoarseTimerWheel, 1.5.0 added AliasTable, 1.4.0 added BitSet, 1.3.0 added SparseTable, 1.2.0 added
+CuckooMap, 1.1.0 added RingLog).
 
 ## Exports (from the single main file O1.js)
 
@@ -120,7 +121,20 @@ module state, so a bundler that imports one drops the others (tree-shakeable). 1
   O(1) getters; forEach(fn) is the O(n) scan exception. Fail closed on nbits (typeof-safe, before any
   alloc); queries never throw (bad i -> rank 0 / access undefined; bad/overflow k -> select -1).
   @zakkster/lite-loglogn re-adopts it as its rank/select substrate.
-- `VERSION` -- string, '1.8.0'.
+- `EliasFano` -- class. A zero-GC, succinct STATIC encoding of a monotone non-decreasing integer
+  sequence (quasi-succinct, ~2 + ceil(log2(U/n)) bits/element), built on a COMPOSED RankSelect over
+  the upper bits. Build once from a SORTED numeric Array | TypedArray (U inferred as max + 1; the
+  values are ENCODED, not referenced). access(i) is the i-th value in WORST-CASE O(1) (one select1 +
+  one packed low read); nextGEQ(x) is the smallest value >= x and is DATA-DEPENDENT -- O(1) TYPICAL
+  on well-distributed keys, O(log n) WORST-CASE on clustered keys (an in-bucket binary search after an
+  O(1) select0 seek), a third honesty category (neither clean "expected O(1)" nor worst-case O(1)).
+  The O(n) build + the succinct space are a DISCLOSED co-headline; access joins the worst-case cohort
+  (NO max-single-op line). length / size (= n) / universe (= U) / bitsPerElement / sizeBytes are O(1)
+  getters; forEach(fn) is the O(n) decode exception. Build-once, query-only: NO mutators. Fail closed
+  on an unsorted / out-of-range source (typeof-first, before any alloc); queries never throw (bad i ->
+  access undefined; x > max or bad x -> nextGEQ -1). Elias-Fano's sub-log successor is a DEFERRED
+  follow-on's job (@zakkster/lite-loglogn); for arbitrary-index range queries use @zakkster/lite-logn.
+- `VERSION` -- string, '1.9.0'.
 
 ## SparseSet
 
@@ -1184,6 +1198,44 @@ the O(n) build + the ~3.2% index space are a DISCLOSED co-headline, EXCLUDED fro
 so there is NO max-single-op line (the flat rank line IS the worst-case claim; the witness foil is a
 naive O(words) popcount scan). Non-overlap: BitSet (ADR 0019) is the MUTABLE membership / flag
 structure with no rank/select; RankSelect is the IMMUTABLE succinct index over a frozen bit pattern.
+
+## EliasFano
+
+    new EliasFano(source)
+
+- source: a SORTED (monotone non-decreasing) sequence of n non-negative integers in [0, U) -- a
+  numeric Array or any numeric TypedArray. U is INFERRED as (last value + 1). The values are ENCODED
+  into a private store, not referenced (a later mutation of the caller's array never changes the codec).
+- Constructor fails closed (typeof-first, BEFORE any typed array is allocated) on a non-array source, a
+  non-integer / negative / NaN / BigInt value, a decreasing pair (it does NOT sort internally -- an
+  unsorted source is a caller bug), or n / U / the upper bitvector past the ceiling (n <= 2^25).
+- Encoding (quasi-succinct, Elias-Fano): L = max(0, floor(log2(U/n))) low bits per value, bit-packed
+  into a flat Uint32Array; the upper bits (value >> L) as a unary-gap bitvector indexed by a COMPOSED
+  RankSelect (reuse, never a fork). Total ~ n*(2 + L) bits, i.e. ~2 + ceil(log2(U/n)) bits/element --
+  near the information-theoretic minimum for a monotone sequence.
+
+Query surface:
+
+- access(i) -> number|undefined  The i-th value (ascending). WORST-CASE O(1): (select1(i) - i)*2^L +
+                                 low(i). A bad i is undefined, NEVER throws.
+- nextGEQ(x) -> number           The smallest stored value >= x (successor-or-equal). DATA-DEPENDENT:
+                                 O(1) TYPICAL on well-distributed keys, O(log n) WORST-CASE on clustered
+                                 keys (a select0 bucket seek in O(1) + a bounded in-bucket binary search
+                                 over the low bits). Returns -1 when x > max or on a bad x. NEVER throws.
+- forEach(fn) -> void            O(n) alloc-free ascending decode; fn is (value, eliasFano).
+- [Symbol.iterator]()            O(n) ascending values (ALLOCATES per protocol -- use forEach alloc-free).
+- length / size (getter)         The value count n.
+- universe (getter)              The inferred exclusive universe U (max + 1; 0 when empty).
+- bitsPerElement (getter)        The average encoded bits per element (the succinct co-headline).
+- sizeBytes (getter)             The total backing footprint (packed low store + the composed RankSelect).
+
+Honesty contract: access is WORST-CASE O(1) (joins the worst-case cohort, NO max-single-op line); the
+O(n) build + the succinct space are DISCLOSED co-headlines paid once (SparseTable ADR 0018 precedent).
+nextGEQ is the family's first DATA-DEPENDENT op: O(1) typical / O(log n) worst -- labeled as such, never
+sold as a clean expected-O(1) (ADR 0025). Build-once / immutable: NO mutators (rebuild to change).
+Non-overlap: RankSelect is the rank/select index over a raw bit pattern; EliasFano is the succinct codec
+for a monotone integer SEQUENCE built on it. Sub-logarithmic predecessor/successor (O(log log U)) is
+@zakkster/lite-loglogn's domain; arbitrary-index mutable range queries are @zakkster/lite-logn's Fenwick.
 
 ## Design bounds
 
