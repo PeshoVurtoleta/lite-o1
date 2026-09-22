@@ -16,8 +16,8 @@ import { EliasFano, VERSION } from '../O1.js';
 
 const litO1 = (e) => e instanceof Error && /^\[lite-o1]/.test(e.message);
 
-test('VERSION is the frozen 1.9.0 string', () => {
-    assert.equal(VERSION, '1.9.0');
+test('VERSION is the frozen 1.10.0 string', () => {
+    assert.equal(VERSION, '1.10.0');
 });
 
 // A deterministic Numerical-Recipes LCG (never Math.random -- reproducible vectors).

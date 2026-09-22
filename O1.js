@@ -3,10 +3,10 @@
  * that doubles as a teachable textbook: each member solves a real problem AND
  * witnesses its constant on a host (the O(1) Witness -- see test/witness.mjs).
  *
- * v1.9.0 ships nineteen members -- SparseSet, RingDeque, UnionFind, MonoDeque,
+ * v1.10.0 ships twenty members -- SparseSet, RingDeque, UnionFind, MonoDeque,
  * MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel,
- * RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, and EliasFano --
- * plus its `VERSION` const. The nineteen are independent (no shared mutable module state),
+ * RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano, and Reservoir --
+ * plus its `VERSION` const. The twenty are independent (no shared mutable module state),
  * so a bundler that imports one drops the others (`sideEffects: false`).
  *
  * The complexity class IS the product: every hot op below is O(1) worst-case and
@@ -19,7 +19,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.9.0';
+export const VERSION = '1.10.0';
 
 /** Largest universe the Uint32 substrate + the (k >>> 0) key check can honor. */
 const MAX_UNIVERSE = 0x100000000; // 2^32
@@ -5754,5 +5754,200 @@ export class EliasFano {
         let lo = low[wi] >>> off;
         if (got < L) lo |= (low[wi + 1] << got);
         return lo & this._lowMask;
+    }
+}
+
+/**
+ * Seen-count ceiling for Reservoir. `_n` counts items seen so far as a plain double; 2^53 is the
+ * last integer with no larger integer sharing its double, so once `_n` would reach 2^53 the
+ * reservoir THROWS rather than let the counter alias its neighbor (the MonoDeque / TimerWheel
+ * saturating-counter lesson). The guard is `>=` so `_n` stays strictly below 2^53 and the
+ * index draw `floor(s / 2^32 * (n + 1))` stays integer-exact.
+ */
+const RESERVOIR_MAX_SEEN = 2 ** 53; // 2^53 (Number.MAX_SAFE_INTEGER + 1)
+
+/** Largest reservoir size k the Float64 store + the integer-k check can honor (inclusive). */
+const RESERVOIR_MAX_K = 2 ** 31; // 2^31
+
+/**
+ * Reservoir -- a zero-GC, WORST-CASE O(1) EXACT uniform k-sampler over an UNBOUNDED stream
+ * (Vitter's Algorithm R). Feed items one at a time via add(); at every moment the reservoir holds
+ * a uniform random sample of size min(seen, k) drawn from ALL items seen so far, in FIXED memory k
+ * -- the stream itself is never stored. The suite's THIRD sampling member, and the non-overlap is
+ * exact: RandomSet draws uniformly from a MATERIALIZED set (every member is retained); AliasTable
+ * draws from a STATIC WEIGHTED vector (build-once, immutable); Reservoir draws uniformly from an
+ * UNBOUNDED stream and STORES NOTHING BUT THE SAMPLE. Streaming telemetry, log sampling,
+ * online A/B bucketing, and Monte-Carlo over a generator all reach for this and otherwise buffer
+ * the whole stream just to sample it.
+ *
+ * THE HONESTY CONTRACT: add() is the hot op and it is TRUE WORST-CASE O(1), zero-alloc -- one LCG
+ * advance + one compare + one conditional store + one increment, INDEPENDENT of the number of
+ * items seen. There is NO rejection sampling (it would break worst-case O(1)); the index is drawn
+ * once by a single multiply, so the residual multiply-bias on the retention draw is at most
+ * n / 2^32 (DISCLOSED, not coded around -- statistical, not cryptographic). Because add() is
+ * worst-case O(1) (not amortized), there is NO max-single-op line -- the flat add line IS the
+ * worst-case claim.
+ *
+ * Algorithm R: `_n` is the total items seen. On add(v), during the FILL phase (`_n < k`) the value
+ * is stored verbatim at `_store[_n]` and the RNG does NOT advance -- so two same-seed reservoirs
+ * fed the same stream stay bit-identical. Once full (`_n >= k`) the RNG advances once, draws a
+ * uniform index j in [0, n] inclusive by the HIGH bits `floor(s / 2^32 * (n + 1))` (NEVER
+ * s % (n + 1) -- the NR LCG's low bits are weak), and if `j < k` overwrites `_store[j]`; then
+ * `_n` increments. The keep-probability of the incoming item is exactly k / (n + 1) and every
+ * retained item's probability stays uniform -- the classic Algorithm R invariant.
+ *
+ * PRNG: a per-instance Numerical Recipes LCG advanced as `s = (s * 1664525 + 1013904223) >>> 0`,
+ * DUPLICATED inline (RandomSet's / AliasTable's idiom) so there is NO shared mutable module state
+ * and tree shaking stays intact. The seed is a 2nd ctor arg (default 0x9e3779b1) stored in
+ * `_seed`; reset() restores the generator to it (replaying the exact draw sequence), while
+ * clear() empties the reservoir WITHOUT reseeding (RandomSet's clear() policy). Statistical, not
+ * cryptographic.
+ *
+ * Fail closed: the seen counter is capped at 2^53 via a `>=` ceiling guard in add() (throwing
+ * rather than let `_n` alias its double neighbor -- a `>` would be off-by-one). Value contract
+ * (typeof FIRST, IDENTICAL to RingDeque / MonoDeque / MinStack): a value must be typeof 'number'
+ * AND not NaN (`v !== v`); +/-Infinity accepted; NaN / null / undefined / string / Symbol /
+ * BigInt / object (incl. numeric valueOf) / boxed Number reject via a byte-identical no-op throw.
+ * NEVER-throw QUERY: get(i) returns the reservoir slot at i (over the LIVE fill [0, size)) or
+ * undefined for any bad i, and never throws.
+ *
+ * The only per-op allocator is [Symbol.iterator] (a {value, done} per step) -- use forEach for the
+ * alloc-free scan; both walk only the LIVE reservoir [0, size), never the stream.
+ */
+export class Reservoir {
+    /**
+     * @param {number} k    reservoir size; an integer in [1, 2^31] (EXACT, NOT power-of-two rounded).
+     * @param {number} [seed=0x9e3779b1]  RNG seed; any integer (coerced to uint32).
+     */
+    constructor(k, seed = 0x9e3779b1) {
+        // typeof / integer / range guard FIRST so a Symbol / BigInt never reaches arithmetic
+        // (Number.isInteger never coerces -- false on a Symbol / BigInt). k is EXACT: there is no
+        // ring and no & MASK, so it is NOT rounded to a power of two (the MinStack precedent).
+        if (typeof k !== 'number' || !Number.isInteger(k) || k < 1 || k > RESERVOIR_MAX_K) {
+            this._badK(k);
+        }
+        // typeof guard BEFORE any coercion: String(seed) in the cold message is Symbol/BigInt-safe.
+        // Any integer is folded into the uint32 RNG domain via >>> 0. Thrown BEFORE _store is
+        // allocated so nothing half-built escapes.
+        if (typeof seed !== 'number' || !Number.isInteger(seed)) {
+            this._badSeed(seed);
+        }
+        this._k = k;
+        this._store = new Float64Array(k); // the reservoir; _store[0.._size) is the live sample
+        this._n = 0;                       // total items seen so far (a Number)
+        this._seed = seed >>> 0;           // the reset seed (reset() restores _s to this)
+        this._s = seed >>> 0;              // per-instance RNG word (never module state)
+    }
+
+    /** Live reservoir fill = min(seen, k). O(1). */
+    get size() { return this._n < this._k ? this._n : this._k; }
+
+    /** Total items seen so far. O(1). */
+    get seen() { return this._n; }
+
+    /** Reservoir size k this instance was constructed for. O(1). */
+    get capacity() { return this._k; }
+
+    /** The RNG seed reset() restores to (uint32). O(1). */
+    get seed() { return this._seed; }
+
+    /**
+     * Feed one item into the stream. WORST-CASE O(1), zero-alloc. During the FILL phase (n < k)
+     * v is stored verbatim and the RNG does NOT advance; once full the RNG advances once, draws a
+     * uniform index j in [0, n] by the HIGH bits (floor(s / 2^32 * (n + 1)), NOT s % (n + 1)), and
+     * if j < k overwrites that slot. Fails closed: a non-clean value throws via _badValue (a
+     * byte-identical no-op -- nothing is stored, `_n` unchanged); the seen counter reaching 2^53
+     * throws via _seenOverflow (a `>=` guard so `_n` stays integer-exact).
+     * @param {number} v  a number and not NaN (+/-Infinity accepted).
+     * @returns {Reservoir} this
+     */
+    add(v) {
+        if (typeof v !== 'number' || v !== v) return this._badValue(v); // v !== v -> NaN
+        const n = this._n;
+        if (n >= RESERVOIR_MAX_SEEN) return this._seenOverflow();
+        const k = this._k;
+        if (n < k) { this._store[n] = v; this._n = n + 1; return this; }
+        const s = (this._s * 1664525 + 1013904223) >>> 0;
+        this._s = s;
+        const j = Math.floor(s / 4294967296 * (n + 1));
+        if (j < k) this._store[j] = v;
+        this._n = n + 1;
+        return this;
+    }
+
+    /**
+     * The reservoir SAMPLE slot at index i (0-relative over the LIVE fill [0, size)). O(1). Returns
+     * undefined for a non-integer / out-of-range / bad i (Symbol / BigInt / -1 / 1.5 / >= size /
+     * NaN) and NEVER throws (the family "queries never throw" law -- typeof FIRST so a Symbol /
+     * BigInt never coerces). This reads the SAMPLE, not the stream.
+     * @param {number} i
+     * @returns {number|undefined}
+     */
+    get(i) {
+        if (typeof i !== 'number' || (i | 0) !== i || i < 0) return undefined;
+        const size = this._n < this._k ? this._n : this._k;
+        if (i >= size) return undefined;
+        return this._store[i];
+    }
+
+    /**
+     * Empty the reservoir in O(1): resets the seen counter only -- the store is left BYTE-IDENTICAL
+     * and the RNG word `_s` is NOT reset (clear empties the reservoir, it does not reseed the
+     * stream -- RandomSet's clear() policy). To restart the exact draw sequence use reset().
+     */
+    clear() { this._n = 0; }
+
+    /**
+     * Reset in O(1): empties the reservoir AND restores the RNG word `_s` to the construction seed,
+     * so the next add() sequence replays the EXACT original draws (the reproducibility door). The
+     * store is left BYTE-IDENTICAL; only `_n` and `_s` change.
+     */
+    reset() { this._n = 0; this._s = this._seed; }
+
+    /**
+     * Iterate the LIVE reservoir sample [0, size) in slot order, alloc-free. O(size) -- the
+     * documented scan exception, EXCLUDED from the zero-alloc-per-op claims. A HOISTED callback
+     * keeps it allocation-free.
+     * @param {(value:number, index:number, reservoir:Reservoir)=>void} fn
+     */
+    forEach(fn) {
+        const store = this._store;
+        const size = this._n < this._k ? this._n : this._k;
+        for (let i = 0; i < size; i++) fn(store[i], i, this);
+    }
+
+    /**
+     * Iterate the LIVE reservoir sample [0, size) in slot order, yielding values. O(size). The ONE
+     * documented per-protocol ALLOCATOR (a {value, done} per step) -- kept OUT of the zero-alloc
+     * claims (use forEach for the alloc-free scan).
+     */
+    *[Symbol.iterator]() {
+        const store = this._store;
+        const size = this._n < this._k ? this._n : this._k;
+        for (let i = 0; i < size; i++) yield store[i];
+    }
+
+    // ---- cold path only: throw builders (string concat lives here, off the hot body) ----
+
+    /** @private */
+    _badValue(v) {
+        // String(v) -- NOT '+ v' / a template literal: those THROW on a Symbol or BigInt,
+        // turning a fail-closed reject into a different crash.
+        throw new RangeError('[lite-o1] Reservoir value must be a number and not NaN, got ' + String(v));
+    }
+
+    /** @private */
+    _badK(k) {
+        throw new RangeError('[lite-o1] Reservoir k must be an integer in [1, 2^31], got ' + String(k));
+    }
+
+    /** @private */
+    _badSeed(s) {
+        throw new RangeError('[lite-o1] seed must be an integer, got ' + String(s));
+    }
+
+    /** @private */
+    _seenOverflow() {
+        throw new RangeError('[lite-o1] Reservoir seen count ceiling 2^53 reached; call clear() to reuse');
     }
 }

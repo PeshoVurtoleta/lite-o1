@@ -8,6 +8,49 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.10.0] - 2026-09-23
+
+### Added
+
+- **`Reservoir` -- the twentieth member: a zero-GC, WORST-CASE O(1)-per-item exact uniform k-sampler
+  over an UNBOUNDED stream (Vitter's Algorithm R).** Keep a uniform-random sample of `capacity` (k)
+  items drawn from a stream of unknown, unbounded length in FIXED memory over ONE `Float64Array` of k
+  slots. `add(v)` stores the first k items, then for the i-th item (1-indexed) retains it with
+  probability `k/i` by overwriting a uniformly chosen slot -- one per-instance NR-LCG advance + one
+  compare + a conditional store, never a run, so `add` is WORST-CASE O(1) and prints NO max-single-op
+  line (the MinStack / RandomSet / TimerWheel worst-case cohort). The reservoir IS the sample: read it
+  with `get(i)` / `forEach` / iterate (there is deliberately NO `sample()`). Getters `size`
+  (= min(seen, k)) / `seen` (the stream counter) / `capacity` (= k) / `seed`. `clear()` empties without
+  reseeding (the RNG stream continues); `reset()` empties AND restores the construction seed (the draw
+  sequence replays exactly). The high-bits multiply index (`floor(s / 2^32 * (n+1))`, not `s % (n+1)`)
+  carries a residual bias `<= n / 2^32` -- DISCLOSED, not coded around (rejection sampling would break
+  the worst-case O(1)); sampling is statistical, not cryptographic. `k` is fixed and EXACT (not
+  power-of-two rounded). Fail closed at construction (a bad `k` / seed throws `[lite-o1]` typeof-first
+  BEFORE any allocation), on a non-clean value (typeof-first, byte-identical no-op), and at the `2^53`
+  seen-count ceiling (a `>=` guard -- past it `k/i` and the index draw stop being integer-exact);
+  `get()` never throws (a bad `i` -> undefined). The STREAMING uniform sampler completing the trio:
+  RandomSet draws uniformly from a MATERIALIZED live set, AliasTable is the STATIC WEIGHTED draw,
+  Reservoir samples uniformly from an UNBOUNDED stream storing NOTHING but the sample. See
+  [`decisions/0026`](./decisions/0026-reservoir.md).
+- **`test/Reservoir.test.js`** -- full behavioral suite: the fill phase (first k stored verbatim) and
+  the sampling phase (retained iff the draw < k); determinism per seed (same-seed reservoirs fed the
+  same stream are `get()`-identical, distinct seeds decorrelate); `clear()` vs `reset()` divergence;
+  the value-contract matrix (NaN / null / string / Symbol / BigInt / object throw; +/-Infinity and -0
+  accepted); `get()` never throws on a bad index; fail-closed constructor; the `2^53` ceiling throw
+  primed at the boundary (proving `>=` not `>`); a seeded uniformity smoke test.
+- Gate coverage extended for the twentieth member: `test/torture.mjs` (retention -> `size() = 0` plus a
+  `0 B/op` hot-path phase on `add` and `get`), `test/witness.mjs` (a flat `add` line vs a naive
+  from-scratch-resample O(n) foil that collapses, NO max-single-op line), `test/perf/PerfGate.test.mjs`
+  (add-stream / get / clear-refill scenarios + an allocating-iterator teeth case), and `benchmark/`
+  (`SUBJECTS` -> 20; a MUTABLE streaming member, IN the churn workload).
+
+### Changed
+
+- Roster is now TWENTY members; `O1.js` header member-count + roster list + `VERSION` bumped to
+  `1.10.0`, with `package.json` (version + description + keywords) and `llms.txt` in sync. `O1.js` is a
+  PURE APPEND -- the prior nineteen member classes are byte-identical (only the header comment and the
+  `VERSION` const changed). README + GUIDE document the streaming-uniform-sampler leaf.
+
 ## [1.9.0] - 2026-09-23
 
 ### Added

@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-Version: 1.9.0
+Version: 1.10.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -13,13 +13,13 @@ op is O(1) worst-case (or O(1)-amortized where stated) and allocates zero bytes
 after construction, and a shipped witness harness demonstrates the flat
 throughput curve against a built-in foil.
 
-v1.9.0 ships nineteen members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
+v1.10.0 ships twenty members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
 RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap,
-SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, and EliasFano. They share no
-mutable module state, so a bundler that imports one drops the others (tree-shakeable). 1.9.0 adds
-EliasFano (the nineteenth member; 1.8.0 added RankSelect, 1.7.0 added WindowFold, 1.6.0 added
-CoarseTimerWheel, 1.5.0 added AliasTable, 1.4.0 added BitSet, 1.3.0 added SparseTable, 1.2.0 added
-CuckooMap, 1.1.0 added RingLog).
+SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano, and Reservoir.
+They share no mutable module state, so a bundler that imports one drops the others (tree-shakeable).
+1.10.0 adds Reservoir (the twentieth member; 1.9.0 added EliasFano, 1.8.0 added RankSelect, 1.7.0
+added WindowFold, 1.6.0 added CoarseTimerWheel, 1.5.0 added AliasTable, 1.4.0 added BitSet, 1.3.0
+added SparseTable, 1.2.0 added CuckooMap, 1.1.0 added RingLog).
 
 ## Exports (from the single main file O1.js)
 
@@ -134,7 +134,25 @@ CuckooMap, 1.1.0 added RingLog).
   on an unsorted / out-of-range source (typeof-first, before any alloc); queries never throw (bad i ->
   access undefined; x > max or bad x -> nextGEQ -1). Elias-Fano's sub-log successor is a DEFERRED
   follow-on's job (@zakkster/lite-loglogn); for arbitrary-index range queries use @zakkster/lite-logn.
-- `VERSION` -- string, '1.9.0'.
+- `Reservoir` -- class. A zero-GC, WORST-CASE O(1)-per-item exact uniform k-sampling reservoir over an
+  UNBOUNDED stream (Vitter's Algorithm R). Keep a uniform-random sample of `capacity` (k) items drawn
+  from a stream of unknown, unbounded length in FIXED memory k -- add(v) stores the first k items, then
+  for the i-th item (1-indexed) retains it with probability k/i by overwriting a uniformly chosen slot
+  (one per-instance NR-LCG advance + one compare + one conditional store). So add / get are WORST-CASE
+  O(1) 0 B/op and it prints NO max-single-op line (the MinStack / TimerWheel worst-case cohort). The
+  STREAMING uniform sampler completing the trio: RandomSet draws uniformly from a MATERIALIZED live set
+  (stores every member), AliasTable is the STATIC WEIGHTED draw, Reservoir samples uniformly from an
+  UNBOUNDED stream storing NOTHING but the sample. The reservoir IS the sample -- read it with get(i) /
+  forEach / iterate (there is deliberately NO sample()). size (= min(seen, k)) / seen (stream count) /
+  capacity (= k) / seed are O(1) getters; forEach(fn) is the O(size) scan exception. clear() empties
+  without reseeding (the RNG stream continues); reset() empties AND restores the seed (replays the exact
+  draws). The high-bits multiply index has a residual bias <= n / 2^32 (DISCLOSED, no rejection loop --
+  it would break worst-case O(1)); sampling is statistical, not cryptographic. Fixed k EXACT (not
+  power-of-two rounded). Fail closed at construction (a bad k / seed throws typeof-first, before any
+  alloc), on a non-clean value (typeof-first, byte-identical no-op), and at the 2^53 seen-count ceiling;
+  get() never throws (a bad i -> undefined). For a weighted stream sample (A-Res) or a sliding-window
+  sample, neither ships -- Reservoir is the exact uniform whole-stream sampler.
+- `VERSION` -- string, '1.10.0'.
 
 ## SparseSet
 
@@ -1236,6 +1254,59 @@ sold as a clean expected-O(1) (ADR 0025). Build-once / immutable: NO mutators (r
 Non-overlap: RankSelect is the rank/select index over a raw bit pattern; EliasFano is the succinct codec
 for a monotone integer SEQUENCE built on it. Sub-logarithmic predecessor/successor (O(log log U)) is
 @zakkster/lite-loglogn's domain; arbitrary-index mutable range queries are @zakkster/lite-logn's Fenwick.
+
+## Reservoir
+
+    new Reservoir(k, seed = 0x9e3779b1)
+
+- k: the reservoir size (sample capacity), an integer in [1, 2^31]. EXACT -- NOT rounded to a power of
+  two (there is no ring, no & MASK; the capacity getter reports the constructed integer verbatim).
+- seed: ANY integer, coerced to uint32 via >>> 0, default 0x9e3779b1. Per-instance -- NEVER module-level
+  RNG state (the NR-LCG is duplicated inline like RandomSet / AliasTable, so tree-shaking stays intact).
+- Constructor fails closed (typeof-guard FIRST so a Symbol / BigInt never reaches coercion, BEFORE the
+  Float64Array(k) is allocated) on a non-integer / out-of-range k or a bad seed.
+- Substrate: ONE Float64Array(k) reservoir + scalars for the seen count n, the live LCG state, and the
+  construction seed. Algorithm R (Vitter): the first k items are stored verbatim; for the i-th item
+  (1-indexed i = n+1) draw j = floor(s / 2^32 * (n+1)) over [0, n] and, iff j < k, overwrite slot j.
+  The RNG does NOT advance during the fill phase (n < k), so two same-seed reservoirs fed the same
+  stream are bit-identical.
+
+Hot surface (add / get WORST-CASE O(1), zero allocation):
+
+- add(v) -> this            Offer one stream item. Fail closed: a non-clean value throws [lite-o1]
+                            (typeof guard FIRST; a byte-identical no-op), and the 2^53 seen-count ceiling
+                            throws (a >= guard -- past it k/i and the index draw stop being integer-exact).
+                            Chainable. WORST-CASE O(1): one typeof check + one ceiling compare + (in the
+                            sampling phase) one LCG advance + one compare + one conditional store.
+- get(i) -> number|undefined  The sampled value at reservoir slot i (0-relative, over [0, size)). A
+                            non-int / out-of-range / bad i (Symbol / BigInt / -1 / 1.5 / >= size) is
+                            undefined, NEVER throws (typeof-first). Reads the SAMPLE, not the stream.
+- clear() -> void          O(1): resets the seen count, touches NO store. Does NOT reseed (the RNG stream
+                            continues -- the RandomSet policy).
+- reset() -> void          O(1): resets the seen count AND restores the RNG to the construction seed, so
+                            the draw sequence replays exactly (the reproducibility door).
+- forEach(fn) -> void      O(size) alloc-free scan over the live reservoir; fn is (value, index,
+                            reservoir). A documented exception to the zero-alloc-per-op claim.
+- [Symbol.iterator]()      O(size) scan; ALLOCATES per protocol -- use forEach for the alloc-free scan.
+- size (getter)            Live reservoir fill = min(seen, k).
+- seen (getter)            Total stream items seen so far (the n counter).
+- capacity (getter)        The reservoir size k (sample capacity).
+- seed (getter)            The uint32 seed reset() restores to.
+
+Value contract (LOCKED, IDENTICAL to RingDeque / MonoDeque / MinStack): a pushed value must be
+typeof 'number' AND not NaN. Rejected (throws [lite-o1]): null, undefined, string, Symbol, BigInt, object
+(incl. one with a numeric valueOf), NaN. Accepted: any finite number, and +/-Infinity. The typeof guard
+runs FIRST so a Symbol / BigInt never reaches arithmetic. -0 stored reads back as 0.
+
+Honesty contract: add / get are WORST-CASE O(1) (Algorithm R never scans a run -- so NO max-single-op
+line; it joins the MinStack / RandomSet / TimerWheel worst-case cohort, NOT the amortized one). The
+high-bits multiply index (floor(s / 2^32 * (n+1)), NOT s % (n+1) whose low bits are weak) carries a
+residual multiply-bias <= n / 2^32 -- DISCLOSED, not coded around (rejection sampling would break the
+worst-case O(1)); uniformity is STATISTICAL, not cryptographic (draw from crypto for adversarial use).
+Non-overlap: RandomSet draws uniformly from a MATERIALIZED live set (stores every member, supports
+delete); AliasTable is the STATIC WEIGHTED draw from a frozen distribution; Reservoir samples uniformly
+from an UNBOUNDED stream in FIXED memory, storing nothing but the sample (no delete, no re-draw). A
+weighted stream sample (A-Res) and a sliding-window sample are neither -- out of scope.
 
 ## Design bounds
 

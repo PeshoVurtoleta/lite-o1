@@ -39,7 +39,7 @@ async function main() {
     const { GcProfiler, checkNoGc, measureAllocs } =
         await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano } = await import('../O1.js');
+    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano, Reservoir } = await import('../O1.js');
 
     const U = 1 << 16;      // universe 65536
     const CAP = 1 << 14;    // capacity 16384
@@ -285,6 +285,17 @@ async function main() {
             ef1.nextGEQ(((i * 2654435761) >>> 8) % (efPrev + 1));
             ef1.forEach(noop);
             tracker.track(ef1, noop, 'eliasfano', { audit: true });
+            // Reservoir owns ONE fixed Float64 store; nothing external to release. Fill past capacity
+            // (into the Algorithm R sampling phase), exercise get / forEach / clear / reset, then track;
+            // reclaim proven by size()->0.
+            const rv1 = new Reservoir(64, (0x9e3779b1 ^ i) >>> 0);
+            for (let k = 0; k < 200; k++) rv1.add(((k * 2654435761) ^ i) & 0x7fffffff);
+            if (rv1.size > 0) rv1.get(i % rv1.size);
+            rv1.forEach(noop);
+            rv1.clear();
+            rv1.add(i);
+            rv1.reset();
+            tracker.track(rv1, noop, 'reservoir', { audit: true });
         }
         return tracker.size();
     }
@@ -786,6 +797,34 @@ async function main() {
     const efNextAllocBytes = Math.max(0, Math.round(efNextBpc));
     const efNextAllocOk = efNextAllocBytes === 0;
 
+    // Reservoir hot path: a fixed-k reservoir FILLED to capacity OUTSIDE the measured window, so every
+    // measured add() takes the Algorithm R sampling branch (one NR-LCG advance + one compare + a
+    // conditional store) -- worst-case O(1), zero-alloc. get(i) is one bounds check + one typed read.
+    // Both fold into int32 sinks so V8 cannot elide them.
+    const RV_K = 1 << 12;                   // 4096-slot reservoir
+    const rvHot = new Reservoir(RV_K, 0x9e3779b1);
+    for (let k = 0; k < RV_K; k++) rvHot.add(k); // fill -> steady sampling phase (built outside the window)
+    let rvVal = 0, rvAddSink = 0;
+    const rvAddStep = () => {
+        rvVal = (rvVal + 1) | 0;
+        rvHot.add(rvVal);
+        rvAddSink = (rvAddSink + rvHot.seen) | 0; // observe the sampling mutation
+    };
+    const rvAddAllocRes = measureAllocs(rvAddStep, { iterations: 100000, batches: 8 });
+    const rvAddBpc = rvAddAllocRes.bytesPerCall === null ? 0 : rvAddAllocRes.bytesPerCall;
+    const rvAddAllocBytes = Math.max(0, Math.round(rvAddBpc));
+    const rvAddAllocOk = rvAddAllocBytes === 0;
+
+    let rvGetKey = 0, rvGetSink = 0;
+    const rvGetStep = () => {
+        rvGetKey = (rvGetKey + 1) & (RV_K - 1);
+        rvGetSink = (rvGetSink + (rvHot.get(rvGetKey) | 0)) | 0; // O(1) positional read, zero-alloc
+    };
+    const rvGetAllocRes = measureAllocs(rvGetStep, { iterations: 100000, batches: 8 });
+    const rvGetBpc = rvGetAllocRes.bytesPerCall === null ? 0 : rvGetAllocRes.bytesPerCall;
+    const rvGetAllocBytes = Math.max(0, Math.round(rvGetBpc));
+    const rvGetAllocOk = rvGetAllocBytes === 0;
+
     // "0 B/op" resolved at the sampling floor: heapUsed deltas are quantized and
     // noisy, so a truly non-allocating op reads a sub-byte figure (a lone blip
     // in one batch / iterations). Round to the nearest byte -- any per-op
@@ -1031,6 +1070,9 @@ async function main() {
         cuck.clear();                                    // O(cap): the reused columns grow no store
         for (let k = 0; k < BS_BITS; k += 2) bitset.set(k); // fill the reused bitset (~half)
         bitset.clear();                                  // O(words): reused words + summary, no new store
+        rvHot.clear();
+        for (let k = 0; k < CAP; k++) rvHot.add(k);      // stream past capacity (sampling); fixed k-slot store
+        rvHot.clear();                                   // O(1): resets seen, the reused Float64 store grows nothing
     }
     globalThis.gc();
     const abAfter = process.memoryUsage().arrayBuffers;
@@ -1041,7 +1083,7 @@ async function main() {
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
         findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && monoAllocOk &&
         minAllocOk && randAllocOk && freqAllocOk && buckAllocOk && twAllocOk && htwAllocOk &&
-        ringLogAllocOk && cuckAllocOk && stAllocOk && bitAllocOk && bitHighAllocOk && bitOrAllocOk && bitRetOk && aliasAllocOk && ctwAllocOk && wfAllocOk && rsRankAllocOk && rsSelAllocOk && efAccAllocOk && efNextAllocOk && abOk;
+        ringLogAllocOk && cuckAllocOk && stAllocOk && bitAllocOk && bitHighAllocOk && bitOrAllocOk && bitRetOk && aliasAllocOk && ctwAllocOk && wfAllocOk && rsRankAllocOk && rsSelAllocOk && efAccAllocOk && efNextAllocOk && rvAddAllocOk && rvGetAllocOk && abOk;
 
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
@@ -1066,10 +1108,12 @@ async function main() {
         rsRankAllocBytes + ' B/op (RankSelect rank1) ' +
         rsSelAllocBytes + ' B/op (RankSelect select1) ' +
         efAccAllocBytes + ' B/op (EliasFano access) ' +
-        efNextAllocBytes + ' B/op (EliasFano nextGEQ)' +
+        efNextAllocBytes + ' B/op (EliasFano nextGEQ) ' +
+        rvAddAllocBytes + ' B/op (Reservoir add) ' +
+        rvGetAllocBytes + ' B/op (Reservoir get)' +
         ' | bitRetGrowth=' + bitRetGrowth + ' B' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
-        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' bsSink=' + bsSink + ' bhSink=' + bhSink + ' brSink=' + brSink + ' atSink=' + atSink + ' wfSink=' + wfSink + ' rsRankSink=' + rsRankSink + ' rsSelSink=' + rsSelSink + ' efAccSink=' + efAccSink + ' efNextSink=' + efNextSink + ' abGrowth=' + abDelta + ')');
+        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' bsSink=' + bsSink + ' bhSink=' + bhSink + ' brSink=' + brSink + ' atSink=' + atSink + ' wfSink=' + wfSink + ' rsRankSink=' + rsRankSink + ' rsSelSink=' + rsSelSink + ' efAccSink=' + efAccSink + ' efNextSink=' + efNextSink + ' rvAddSink=' + rvAddSink + ' rvGetSink=' + rvGetSink + ' abGrowth=' + abDelta + ')');
 
     if (!ok) {
         if (!trackedOk) console.error('  vacuous: tracker held ' + trackedMid + ' instances (expected > 0)');
@@ -1102,6 +1146,8 @@ async function main() {
         if (!rsSelAllocOk) console.error('  alloc ' + rsSelAllocBytes + ' B/op RankSelect select1 (raw bytesPerCall ' + rsSelBpc + ')');
         if (!efAccAllocOk) console.error('  alloc ' + efAccAllocBytes + ' B/op EliasFano access (raw bytesPerCall ' + efAccBpc + ')');
         if (!efNextAllocOk) console.error('  alloc ' + efNextAllocBytes + ' B/op EliasFano nextGEQ (raw bytesPerCall ' + efNextBpc + ')');
+        if (!rvAddAllocOk) console.error('  alloc ' + rvAddAllocBytes + ' B/op Reservoir add (raw bytesPerCall ' + rvAddBpc + ')');
+        if (!rvGetAllocOk) console.error('  alloc ' + rvGetAllocBytes + ' B/op Reservoir get (raw bytesPerCall ' + rvGetBpc + ')');
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;
     }

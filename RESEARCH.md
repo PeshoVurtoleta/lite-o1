@@ -423,17 +423,19 @@ it is promoted to M19+. Listed newest-first by how load-bearing the open questio
   DESIGN-PARITY without a runtime cross-dep. Feeds bitmask-window / rolling-permission / windowed-flags
   workloads.
 
-- **Reservoir sampler (Algorithm R)** -- exact UNIFORM sampling of k items from an unbounded STREAM of
-  unknown length in worst-case O(1) per item (for the i-th item, keep with probability k/i via a swap into a
-  fixed-size reservoir). Distinct from RandomSet (samples a LIVE bounded set) and AliasTable (static
-  weights): the reservoir samples a stream you CANNOT store. Surfaced by the 2026-09-22 sweep as a valid
-  candidate, not queued (see the REJECTED / re-routed list above -- this is the one entry there that is
-  DEFERRED, not rejected). RESEARCH NEEDED: (a) Algorithm R (per-item worst-case O(1) -- the honesty fit)
-  vs Algorithm L (skip-based, fewer RNG draws but an EXPECTED bound -- likely REJECT for the same reason the
-  hashed wheel was rejected); (b) fixed reservoir size k at construction, a Float64 value lane, a
-  per-instance NR-LCG seed (the RandomSet / AliasTable seed discipline); (c) the surface -- offer(v) /
-  sample() / forEach over the reservoir as a read snapshot; (d) whether a weighted reservoir (A-Res / A-ExpJ)
-  is a follow-on or out of scope.
+- **Reservoir sampler (Algorithm R)** -- **SHIPPED as `Reservoir` at v1.10.0 (M20, ADR 0026).** Exact
+  UNIFORM sampling of k items from an unbounded STREAM of unknown length in worst-case O(1) per item (for
+  the i-th item, keep with probability k/i via a swap into a fixed-size reservoir). Distinct from RandomSet
+  (samples a LIVE bounded set) and AliasTable (static weights): the reservoir samples a stream you CANNOT
+  store. RESOLVED research questions: (a) **Algorithm R chosen** (per-item worst-case O(1) -- the honesty
+  fit); **Algorithm L REJECTED** (skip-based EXPECTED bound -- a second data-dependent member, rejected for
+  the same reason the hashed wheel was); (b) fixed EXACT reservoir size k at construction, ONE Float64
+  store, a per-instance NR-LCG seed (the RandomSet / AliasTable discipline); (c) surface = **`add(v)` /
+  `get(i)` / `forEach` / iterate** + `size` / `seen` / `capacity` / `seed` + `clear()` (no reseed) /
+  `reset()` (reseed) -- **NO `sample()`** (the reservoir IS the sample; a second RNG surface was cut) and
+  the ROADMAP-sketched `offer()` renamed `add()` for verb parity; (d) a weighted reservoir (A-Res / A-ExpJ)
+  is **OUT of scope** (neither a weighted nor a sliding-window stream sample ships). The 2^53 seen-count
+  ceiling fails closed (a `>=` guard). The high-bits multiply index carries a disclosed `<= n/2^32` bias.
 
 ---
 

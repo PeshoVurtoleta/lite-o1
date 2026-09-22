@@ -17,7 +17,7 @@
 import {
     SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet,
     FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel,
-    RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano,
+    RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano, Reservoir,
 } from '../O1.js';
 import {
     prng, median, warm, gcNow, hasGc, percentile, collect, timeNsPerOp, foldHash,
@@ -256,6 +256,16 @@ export function makeSubject(member, n, rng) {
         const ef = new EliasFano(vals);
         let key = 0;
         return { obj: ef, op: () => { key++; if (key >= n) key = 0; SINK = (SINK + (ef.access(key) | 0)) | 0; } };
+    }
+    if (member === 'Reservoir') {
+        // A reservoir primed to STEADY FULL (seen >= k = n), so every hot add() takes the Algorithm R
+        // sampling branch: one NR-LCG advance + one compare + a (probability k/i) conditional store --
+        // WORST-CASE O(1), never a run. The O(1) fill phase runs OUTSIDE the timed op. The seen counter
+        // (mutated every add) folds into SINK so V8 cannot elide the sampling work.
+        const r = new Reservoir(n, 0x9e3779b1);
+        for (let k = 0; k < n; k++) r.add(k); // fill to capacity -> steady sampling phase
+        let v = 0;
+        return { obj: r, op: () => { r.add(v); v = (v + 1) | 0; SINK = (SINK + r.seen) | 0; } };
     }
     throw new Error('[bench] unhandled member: ' + member);
 }
@@ -801,6 +811,22 @@ export function makeBaseline(member, n) {
             },
         };
     }
+    if (member === 'Reservoir') {
+        // The naive uniform-sampler foil: keep the WHOLE stream in a growing Array (no fixed
+        // reservoir), because without Algorithm R you must retain every item to pick a uniform
+        // k-sample -- memory grows UNBOUNDED (O(n)) and the array reallocates as it grows, the exact
+        // cost the fixed-k reservoir removes. Bounded here to n for the bench run (a real naive impl
+        // never trims -- that unbounded-memory collapse is the D3 / witness story), folding length.
+        const arr = [];
+        let v = 0;
+        return {
+            op: () => {
+                arr.push(v); v = (v + 1) | 0;
+                if (arr.length >= n) { SINK = (SINK + arr.length) | 0; arr.length = 0; } // bound the bench; memory story is D3
+                else SINK = (SINK + arr.length) | 0;
+            },
+        };
+    }
     throw new Error('[bench] unhandled member: ' + member);
 }
 
@@ -897,6 +923,7 @@ const LINEAR_BASELINE = {
     CoarseTimerWheel: true, // 4-ary-heap foil is O(log n) per fired timer
     RankSelect: true,    // popcount-scan foil is an O(words) rank rescan per query
     EliasFano: true,     // sorted-array binary-search foil is O(log n) per lookup (timed gently)
+    Reservoir: false,    // growing-array foil is amortized-O(1) push (+ O(1) reset), a fast rival
 };
 
 /** Exact backing-store byte footprint of a member instance (typed-array buffers). */
@@ -981,6 +1008,7 @@ export function memberBytes(member, obj) {
         // the cs-poppy directory) -- the whole succinct footprint, surfaced by the sizeBytes getter.
         return obj.sizeBytes;
     }
+    if (member === 'Reservoir') return obj._store.buffer.byteLength; // ONE Float64 reservoir of k slots (fixed)
     throw new Error('[bench] unhandled member: ' + member);
 }
 
@@ -1031,6 +1059,9 @@ export function theoreticalMinPerLive(member) {
     if (member === 'EliasFano') return 0.375; // ~3 bits per live element (2 + log2(U/n) with L = 1 for a
     // dense sequence) / 8 = 0.375 byte -- the near-information-theoretic succinct floor Elias-Fano is FOR.
     // The RankSelect directory over the upper bits is the DISCLOSED index overhead, NOT folded in here.
+    if (member === 'Reservoir') return 8;    // one Float64 reservoir slot (8) per live sample element =
+    // the actual-column-width floor. `seen` grows unbounded but the STORE is fixed at k slots -- the
+    // sample is the live payload, so the per-live floor is the sample slot, not the stream length.
     throw new Error('[bench] unhandled member: ' + member);
 }
 
@@ -1409,6 +1440,16 @@ function makeMixed(member, cap, rng) {
         let key = 0;
         return () => { key++; if (key >= cap) key = 0; SINK = (SINK + (ef.access(key) | 0)) | 0; };
     }
+    if (member === 'Reservoir') {
+        // A long stream of add()s over a fixed-k reservoir: past the fill it is ALL Algorithm R
+        // sampling (worst-case O(1) per item, INDEPENDENT of how many items seen), so D2 proves add
+        // stays FLAT across the whole trace (constant by construction) with the reservoir memory fixed
+        // at k slots. The sample read folds into SINK. No mutation drift to amortize -> D2 reports n/a.
+        const r = new Reservoir(cap, 0x9e3779b1);
+        for (let k = 0; k < cap; k++) r.add(k); // fill once -> steady sampling phase
+        let v = 0;
+        return () => { r.add(v); v = (v + 1) | 0; if (r.size > 0) SINK = (SINK + (r.get(0) | 0)) | 0; };
+    }
     // Fail closed (mirrors every other dispatch helper): a member NOT handled above must
     // throw, so a future member cannot silently inherit MonoDeque's mixed trace.
     throw new Error('[bench] unhandled member: ' + member);
@@ -1517,6 +1558,7 @@ function fillMember(member, obj, count) {
     if (member === 'RingLog') { obj.clear(); for (let k = 0; k < count; k++) obj.push(k); return; }
     if (member === 'CuckooMap') { obj.clear(); for (let k = 0; k < count; k++) obj.set(k, k); return; }
     if (member === 'BitSet') { obj.clear(); for (let k = 0; k < count; k++) obj.set(k); return; }
+    if (member === 'Reservoir') { obj.clear(); for (let k = 0; k < count; k++) obj.add(k); return; }
     // SparseTable is STATIC (build-once, no clear / mutators): D3 handles it on a dedicated
     // path and NEVER calls fillMember for it, so it stays fail-closed here.
     throw new Error('[bench] unhandled member: ' + member);
@@ -1621,6 +1663,7 @@ export function D3(member, opts = {}) {
     else if (member === 'RingLog') obj = new RingLog(n);
     else if (member === 'CuckooMap') obj = new CuckooMap(n);
     else if (member === 'BitSet') obj = new BitSet(n);
+    else if (member === 'Reservoir') obj = new Reservoir(n, 0x9e3779b1); // fixed-k reservoir (mutable, capacity knob)
     else throw new Error('[bench] unhandled member: ' + member);
 
     gcNow();
@@ -2105,6 +2148,16 @@ export function churnNs(member, n, seed) {
         const op = () => { b.unset(k); b.set(k); k = (k + 1) % n; };
         return median(collect(op, 4000, 60));
     }
+    if (member === 'Reservoir') {
+        // Push-only churn (streaming: add offers items to the fixed-k reservoir -- there is no delete).
+        // At steady full, every add is the worst-case-O(1) Algorithm R sampling draw; memory stays fixed
+        // at k slots while seen grows. The seen counter folds into SINK so the sampling work is observed.
+        const r = new Reservoir(n, 0x9e3779b1);
+        for (let k = 0; k < n; k++) r.add(k); // fill to capacity -> steady sampling phase
+        let v = 0;
+        const op = () => { r.add(v); v = (v + 1) | 0; SINK = (SINK + r.seen) | 0; };
+        return median(collect(op, 4000, 60));
+    }
     // SparseTable is STATIC (no insert/delete): churn is inapplicable. D8 gates it via
     // supportsWorkload and never calls churnNs for it, so it stays fail-closed here.
     throw new Error('[bench] unhandled member: ' + member);
@@ -2261,7 +2314,7 @@ export function traceHash(member, seed = DEFAULT_SEED, length = 100000) {
         member === 'HierarchicalTimerWheel' || member === 'RingLog' ||
         member === 'CuckooMap' || member === 'SparseTable' || member === 'BitSet' ||
         member === 'AliasTable' || member === 'CoarseTimerWheel' || member === 'RankSelect' ||
-        member === 'EliasFano') mode = 0;
+        member === 'EliasFano' || member === 'Reservoir') mode = 0;
     else if (member === 'RingDeque' || member === 'MinStack') mode = 1;
     else if (member === 'MonoDeque' || member === 'WindowFold') mode = 2;
     else throw new Error('[bench] unhandled member: ' + member);

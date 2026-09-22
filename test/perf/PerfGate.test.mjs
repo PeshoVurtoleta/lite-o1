@@ -22,7 +22,7 @@
  */
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano, Reservoir } from '../../O1.js';
 
 const U = 1 << 16;      // universe 65536
 const CAP = 1 << 14;    // capacity 16384
@@ -2074,6 +2074,73 @@ const efForEachDrain = {
     statsOf(s) { return { grows: efGrows(s) }; },
 };
 
+// ===========================================================================
+// Reservoir scenarios -- a fixed-k uniform-sampling reservoir (Vitter's Algorithm R) over ONE
+// backing Float64Array of k slots. add(v) is WORST-CASE O(1) (one NR-LCG advance + one compare + a
+// probability-k/i conditional store); get(i) is O(1). The store is fixed at construction, so the
+// `grows` counter (its ArrayBuffer byte length) must show a 0 delta across the window.
+// ===========================================================================
+
+const RV_PERF_K = 1 << 12;   // 4096-slot reservoir
+
+/** Zero-alloc counter for Reservoir scenarios: the single backing Float64Array's byte length -- fixed at construction. */
+function rvGrows(s) { return s.rv._store.buffer.byteLength; }
+
+/** A Reservoir FILLED to capacity (into the steady Algorithm R sampling phase), built OUTSIDE the window. */
+function rvBuildFull() {
+    const rv = new Reservoir(RV_PERF_K, 0x9e3779b1);
+    for (let i = 0; i < RV_PERF_K; i++) rv.add(i);
+    return rv;
+}
+
+/** add-stream: every op offers one item to a steady-full reservoir -- the Algorithm R sampling branch, worst-case O(1). */
+const rvAddStream = {
+    name: 'Reservoir add-stream (steady sampling)',
+    setup() { return { rv: rvBuildFull(), v: 0, acc: 0 }; },
+    hot(s, n) {
+        const rv = s.rv;
+        let v = s.v | 0, acc = s.acc | 0;
+        for (let i = 0; i < n; i++) {
+            rv.add(v); v = (v + 1) | 0;
+            acc = (acc + rv.seen) | 0;
+        }
+        s.v = v | 0; s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: rvGrows(s) }; },
+};
+
+/** get-read: a prebuilt full reservoir; every op one positional read over a walking index -- O(1), int32-wrapped acc. */
+const rvGetRead = {
+    name: 'Reservoir get (walking index)',
+    setup() { return { rv: rvBuildFull(), key: 0, acc: 0 }; },
+    hot(s, n) {
+        const rv = s.rv;
+        let key = s.key | 0, acc = s.acc | 0;
+        for (let i = 0; i < n; i++) {
+            key = (key + 1) & (RV_PERF_K - 1);
+            acc = (acc + (rv.get(key) | 0)) | 0;
+        }
+        s.key = key | 0; s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: rvGrows(s) }; },
+};
+
+/** clear-refill: interleave O(1) clear() with add() churn -- the reused Float64 store grows nothing. */
+const rvClearRefill = {
+    name: 'Reservoir clear + add churn',
+    setup() { return { rv: rvBuildFull(), v: 0 }; },
+    hot(s, n) {
+        const rv = s.rv;
+        let v = s.v | 0;
+        for (let i = 0; i < n; i++) {
+            if ((i & 1023) === 0) rv.clear();  // O(1): resets seen, no store touched
+            rv.add(v); v = (v + 1) | 0;
+        }
+        s.v = v | 0;
+    },
+    statsOf(s) { return { grows: rvGrows(s) }; },
+};
+
 const scenarios = [
     addChurn, hasHit, deleteChurn, clearRefill, forEachDrain,
     ringFifo, ringLifo, ringInterleave,
@@ -2094,6 +2161,7 @@ const scenarios = [
     wfPushEvictQuery, wfQueryRead, wfEvictRefill, wfForEachDrain,
     rsRank, rsSelect, rsForEachDrain,
     efAccess, efNextGEQ, efForEachDrain,
+    rvAddStream, rvGetRead, rvClearRefill,
 ];
 
 /**
@@ -2540,6 +2608,31 @@ const efMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/**
+ * The Reservoir teeth: a per-op `[Symbol.iterator]` spread into a FRESH [] each op -- the generator +
+ * its per-step wrappers + the array MUST trip the gate, proving the instrument has teeth on the
+ * Reservoir surface too (its iterator is the ONE documented per-protocol allocator; forEach is the
+ * alloc-free scan). statsOf returns a constant so the failure is the allocation lanes.
+ */
+const rvMustFailAlloc = {
+    name: 'Reservoir [Symbol.iterator] spread into fresh array (MUST allocate)',
+    setup() {
+        const rv = new Reservoir(256, 0x9e3779b1);
+        for (let i = 0; i < 512; i++) rv.add(i); // fill past capacity -> full reservoir
+        return { rv };
+    },
+    hot(s, n) {
+        const rv = s.rv;
+        let sink = 0;
+        for (let i = 0; i < n; i++) {
+            const arr = [...rv]; // fresh generator + array per op -> heap churn
+            sink += arr.length;
+        }
+        s.sink = sink;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -2549,5 +2642,5 @@ zgcSuite({
     counters: { grows: 0 },
     maxRetainedKB: 64,
     scenarios,
-    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc, twMustFailAlloc, htwMustFailAlloc, ringLogMustFailAlloc, cuckMustFailAlloc, stMustFailAlloc, bsMustFailAlloc, atMustFailAlloc, wfMustFailAlloc, rsMustFailAlloc, efMustFailAlloc],
+    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc, twMustFailAlloc, htwMustFailAlloc, ringLogMustFailAlloc, cuckMustFailAlloc, stMustFailAlloc, bsMustFailAlloc, atMustFailAlloc, wfMustFailAlloc, rsMustFailAlloc, efMustFailAlloc, rvMustFailAlloc],
 });

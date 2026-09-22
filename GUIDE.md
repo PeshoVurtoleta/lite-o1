@@ -1,7 +1,7 @@
 # lite-o1 -- which structure to pick (GUIDE)
 
 A repo-only decision guide for the O(1) family: which member, reach-for / avoid,
-and how to measure the constant yourself. At v1.9.0 the family is STABLE at nineteen
+and how to measure the constant yourself. At v1.10.0 the family is STABLE at twenty
 members and this guide is complete for them -- still open (a new section lands with
 each future member), but no longer a skeleton. It is NOT an API encyclopedia (that
 is the README + `O1.d.ts`); it answers "which member, and is my constant real?"
@@ -23,7 +23,7 @@ flatness floor for YOUR workload -- run `npm run witness` and read the shape.
 
 ## Which member? (decision flowchart)
 
-ASCII, routes on the discriminating questions. Every leaf is one of the nineteen
+ASCII, routes on the discriminating questions. Every leaf is one of the twenty
 members; `(wc)` = worst-case O(1), `(am)` = amortized O(1), and EliasFano is the one
 DATA-DEPENDENT member (wc access, O(1)-typical / O(log n)-worst nextGEQ).
 
@@ -66,6 +66,9 @@ START -- what is the SHAPE of your workload?
 +-- Draw a random outcome by WEIGHT (a discrete distribution: loot table,
 |   weighted load-balance), built ONCE from fixed weights? -> AliasTable (wc sample)
 |
++-- Keep a UNIFORM random sample of k items from a STREAM of unknown / unbounded
+|   length, in FIXED memory (you cannot store the whole stream)? -> Reservoir (wc add)
+|
 +-- "Are these two in the SAME GROUP?" over a fixed integer set,
 |   merging groups incrementally (no un-merge)? -> UnionFind (am)
 |
@@ -83,7 +86,7 @@ START -- what is the SHAPE of your workload?
 ```
 
 Budget rule of thumb: if you cannot tolerate ANY per-op spike (hard-real-time on
-the WORST single op), stay on the thirteen `(wc)` members. The five `(am)` members
+the WORST single op), stay on the fourteen `(wc)` members. The five `(am)` members
 (UnionFind, MonoDeque, BucketQueue, HierarchicalTimerWheel, CuckooMap) buy their constant
 with an amortized average and wear an honest worst-single-op tail -- read the MAX-single-op
 line the witness prints, and the per-member "avoid it when" notes below. (CuckooMap's
@@ -119,6 +122,7 @@ One row per member; pick by the left column, confirm with the discriminator.
 | the SUM/MIN/MAX/PRODUCT aggregate of a SLIDING WINDOW, hard per-op budget | WindowFold             | worst-case  | GENERAL FIFO monoid aggregator (DABA-Lite); O(1) push/evict/query (<= 2 combines), NO flip spike; the general complement to MonoDeque's amortized min/max |
 | rank1(i) / select1(k) over a FIXED bitvector (succinct positional index)     | RankSelect             | worst-case  | STATIC build-once cs-poppy directory; O(1) rank/select/access over a frozen bitvector, ~3-6% index co-headline; the positional index BitSet stops short of |
 | the i-th value / successor of a SORTED integer set in near-optimal space     | EliasFano              | wc access / data-dep nextGEQ | STATIC build-once succinct codec (~2+log2(U/n) bits/elem) on a composed RankSelect; access O(1), nextGEQ O(1) typical / O(log n) worst; the compressed-monotone-sequence primitive |
+| a UNIFORM sample of k items from an UNBOUNDED stream, in FIXED memory        | Reservoir              | worst-case  | Vitter's Algorithm R; O(1)/item add keeps a uniform k-sample without storing the stream; the streaming complement to RandomSet (materialized) and AliasTable (weighted) |
 
 ---
 
@@ -755,7 +759,7 @@ cohort; the O(n) build + 2n typed-array space are the honest co-headline).
 
 ## Roadmap members (not yet shipped, planned)
 
-The public API is stable at v1.9.0's nineteen members; these are planned, not shipped.
+The public API is stable at v1.10.0's twenty members; these are planned, not shipped.
 Placeholders so the decision axes are visible early; each fills in on release.
 
 - **SlotPool** -- free-list slot allocator with generational (ABA-safe) handles.

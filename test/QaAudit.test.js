@@ -18,15 +18,15 @@ import * as O1Module from '../O1.js';
 
 const litO1 = (e) => e instanceof Error && /^\[lite-o1]/.test(e.message);
 
-// The nineteen shipped member class names (EliasFano added at v1.9.0). This list is the
+// The twenty shipped member class names (Reservoir added at v1.10.0). This list is the
 // regression guard itself: it does NOT read O1.js to discover members, so
 // adding/removing/renaming a member without touching this test -- or without
 // updating the docs below -- is exactly the drift this test exists to catch.
-const NINETEEN_MEMBERS = [
+const TWENTY_MEMBERS = [
     'SparseSet', 'RingDeque', 'UnionFind', 'MonoDeque', 'MinStack',
     'RandomSet', 'FreqO1', 'BucketQueue', 'TimerWheel', 'HierarchicalTimerWheel',
     'RingLog', 'CuckooMap', 'SparseTable', 'BitSet', 'AliasTable', 'CoarseTimerWheel',
-    'WindowFold', 'RankSelect', 'EliasFano',
+    'WindowFold', 'RankSelect', 'EliasFano', 'Reservoir',
 ];
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -1465,33 +1465,34 @@ test('SparseTable IMMUTABILITY: a post-build mutation of the caller source never
 });
 
 // ===========================================================================
-// Cross-file "nineteen members" regression guard. v1.9.0 grew the roster to
-// nineteen (EliasFano); this test fails if a future session adds/removes a member
+// Cross-file "twenty members" regression guard. v1.10.0 grew the roster to
+// twenty (Reservoir); this test fails if a future session adds/removes a member
 // from O1.js without also updating README.md / GUIDE.md / llms.txt, or vice
-// versa (docs claim eighteen but the module does not export eighteen).
+// versa (docs claim nineteen but the module does not export nineteen).
 // ===========================================================================
 
-test('O1.js exports exactly the nineteen frozen members plus VERSION -- no more, no fewer', () => {
-    for (const name of NINETEEN_MEMBERS) {
+test('O1.js exports exactly the twenty frozen members plus VERSION -- no more, no fewer', () => {
+    for (const name of TWENTY_MEMBERS) {
         assert.equal(typeof O1Module[name], 'function', name + ' must be an exported class/function');
     }
     const exportedNames = Object.keys(O1Module).sort();
-    const expected = [...NINETEEN_MEMBERS, 'VERSION'].sort();
-    assert.deepEqual(exportedNames, expected, 'O1.js export surface drifted from the frozen nineteen-member + VERSION list');
+    const expected = [...TWENTY_MEMBERS, 'VERSION'].sort();
+    assert.deepEqual(exportedNames, expected, 'O1.js export surface drifted from the frozen twenty-member + VERSION list');
 });
 
-test('README.md, GUIDE.md, and llms.txt all describe the roster as "nineteen members" (case-insensitive), never a stale count', () => {
+test('README.md, GUIDE.md, and llms.txt all describe the roster as "twenty members" (case-insensitive), never a stale count', () => {
     const files = ['README.md', 'GUIDE.md', 'llms.txt'];
     for (const f of files) {
         const text = readFileSync(join(ROOT, f), 'utf8');
-        assert.match(text, /nineteen members?/i, f + ' must describe the roster as "nineteen member(s)" somewhere');
+        assert.match(text, /twenty members?/i, f + ' must describe the roster as "twenty member(s)" somewhere');
         // Stale roster-size prose from earlier releases must not survive verbatim.
         // NOTE: "ten members" is NOT rejected here -- the repo-only benchmark suite
         // deliberately still profiles TEN members (RingLog + CuckooMap + SparseTable are
         // out of the bench, like FreqO1/BucketQueue/the wheels), so "ten members x 8
         // dimensions = 80 cells" is a CORRECT, current phrase. The stale roster counts are
         // nine (pre-HTW), eleven (pre-CuckooMap), twelve (pre-SparseTable), sixteen
-        // (pre-WindowFold), and seventeen (pre-RankSelect), plus the stale 72-cell benchmark size.
+        // (pre-WindowFold), seventeen (pre-RankSelect), eighteen (pre-EliasFano), and
+        // nineteen (pre-Reservoir), plus the stale 72-cell benchmark size.
         assert.doesNotMatch(text, /\bnine members\b/i, f + ' must not still say "nine members"');
         assert.doesNotMatch(text, /\beleven members\b/i, f + ' must not still say "eleven members"');
         assert.doesNotMatch(text, /\btwelve members\b/i, f + ' must not still say "twelve members"');
@@ -1501,13 +1502,14 @@ test('README.md, GUIDE.md, and llms.txt all describe the roster as "nineteen mem
         assert.doesNotMatch(text, /\bsixteen members\b/i, f + ' must not still say "sixteen members"');
         assert.doesNotMatch(text, /\bseventeen members\b/i, f + ' must not still say "seventeen members"');
         assert.doesNotMatch(text, /\beighteen members\b/i, f + ' must not still say "eighteen members"');
+        assert.doesNotMatch(text, /\bnineteen members\b/i, f + ' must not still say "nineteen members"');
         assert.doesNotMatch(text, /\b72 cells\b/, f + ' must not still say the stale 72-cell benchmark count');
     }
 });
 
-test('every NINETEEN_MEMBERS name appears in the GUIDE.md picker table and decision flowchart', () => {
+test('every TWENTY_MEMBERS name appears in the GUIDE.md picker table and decision flowchart', () => {
     const guide = readFileSync(join(ROOT, 'GUIDE.md'), 'utf8');
-    for (const name of NINETEEN_MEMBERS) {
+    for (const name of TWENTY_MEMBERS) {
         const count = (guide.match(new RegExp('\\b' + name + '\\b', 'g')) || []).length;
         assert.ok(count >= 2, name + ' must appear at least twice in GUIDE.md (flowchart leaf + picker table row), found ' + count);
     }

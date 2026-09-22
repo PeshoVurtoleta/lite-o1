@@ -1051,3 +1051,50 @@ export class EliasFano {
     /** Iterate the stored values in ascending order. O(n). */
     [Symbol.iterator](): IterableIterator<number>;
 }
+
+/**
+ * Reservoir -- a zero-GC, WORST-CASE O(1)-per-item exact uniform k-sampling reservoir over an
+ * unbounded stream (Vitter's Algorithm R). Keep a uniform random sample of `capacity` (k) items
+ * drawn from a stream of unknown, unbounded length in FIXED memory: `add(v)` stores the first k
+ * items, then for the i-th item retains it with probability k/i by overwriting a uniformly chosen
+ * slot -- one per-instance NR-LCG advance + one compare + one conditional store, so it never
+ * allocates and prints NO max-single-op line. The streaming uniform sampler complementing RandomSet
+ * (uniform from a MATERIALIZED set) and AliasTable (STATIC WEIGHTED). The reservoir IS the sample:
+ * read it with get / forEach / iterate (there is no separate sample()). The residual multiply-bias
+ * (<= n / 2^32) is disclosed; sampling is statistical, not cryptographic. Fails closed at the 2^53
+ * seen-count ceiling and on a non-clean value.
+ */
+export class Reservoir {
+    /** @param k the reservoir size (sample capacity), an integer in [1, 2^31]. EXACT, not power-of-two rounded. @param seed any integer, coerced to uint32 (default 0x9e3779b1), per-instance. Throws [lite-o1] (before any alloc) on a bad k or seed. */
+    constructor(k: number, seed?: number);
+
+    /** Offer one stream item to the reservoir. HOT, worst-case O(1), zero-alloc. Value must be typeof 'number' and not NaN (+/-Infinity ok); a non-clean value throws [lite-o1] (byte-identical no-op). Throws [lite-o1] at the 2^53 seen-count ceiling. Chainable. */
+    add(v: number): this;
+
+    /** The sampled value at reservoir slot i (0-relative, over [0, size)). HOT, O(1). Returns undefined for a bad / out-of-range i. Never throws. Reads the SAMPLE, not the stream. */
+    get(i: number): number | undefined;
+
+    /** Empty the reservoir in O(1): resets the seen count, touches no store. Does NOT reseed (the RNG stream continues). */
+    clear(): void;
+
+    /** Reset in O(1): empties the reservoir AND restores the RNG to the construction seed, so the draw sequence replays exactly. */
+    reset(): void;
+
+    /** Live reservoir fill = min(seen, capacity). O(1). */
+    readonly size: number;
+
+    /** Total stream items seen so far. O(1). */
+    readonly seen: number;
+
+    /** The reservoir size k (sample capacity). O(1). */
+    readonly capacity: number;
+
+    /** The uint32 seed reset() restores to. O(1). */
+    readonly seed: number;
+
+    /** Iterate the sampled values (reservoir order), alloc-free. O(size). fn is (value, index, reservoir). */
+    forEach(fn: (value: number, index: number, reservoir: Reservoir) => void): void;
+
+    /** Iterate the sampled values (reservoir order). O(size). */
+    [Symbol.iterator](): IterableIterator<number>;
+}

@@ -48,7 +48,7 @@
  * metric are unchanged; only the measurement is made steadier.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano, Reservoir } from '../O1.js';
 
 const SIZES = [1e3, 1e4, 1e5, 1e6, 1e7];
 const BATCH = 1e6;
@@ -2234,5 +2234,94 @@ if (!efAllOk) {
     if (!efOk) console.error('  violation EliasFano flatness ' + fmt(efw.flatness) + ' < 0.70');
     if (!efFoilOk) console.error('  violation naive foil flatness ' + fmt(efFoil.flatness) + ' > 0.55');
     if (!efRatioOk) console.error('  violation min EliasFano ratio ' + fmt(efRatio) + 'x < 1.50x');
+    process.exitCode = 1;
+}
+
+// ===========================================================================
+// Reservoir witness -- STREAMING uniform k-sampling add() (Algorithm R, worst-case
+// O(1)/item) vs a naive sampler that RE-DERIVES its uniform sample from scratch
+// on each item (a full O(n) pass over the whole retained stream).
+// ===========================================================================
+// Algorithm R MAINTAINS the uniform k-sample INCREMENTALLY: each add is worst-case O(1) (one NR-LCG
+// advance + one compare + a probability-k/i conditional store), INDEPENDENT of how many items seen, so
+// throughput stays FLAT as the stream grows. The naive foil keeps the whole stream and re-derives the
+// sample from scratch every item with a single O(n) pass (reservoir-from-scratch, k=1) -- O(n) per
+// item, so ops/ms collapses as n grows. (The foil also pays O(n) MEMORY vs Reservoir's fixed k slots --
+// the disclosed co-cost, not the timed axis here.) Gated over n >= 1e4.
+const RV_SIZES = [1e3, 1e4, 1e5];
+const RV_BATCH = 5e5;         // large: stable timing for the O(1) add
+const RV_FOIL_BATCH = 2e3;    // small: an O(n) from-scratch resample at n=1e5 must stay tractable
+const RV_GATE_MIN = 1e4;
+const RV_WIT_K = 64;          // fixed reservoir / sample size
+
+function buildReservoirWit(n) {
+    const r = new Reservoir(RV_WIT_K, 0x9e3779b1);
+    for (let k = 0; k < n; k++) r.add(k); // reach the steady sampling phase (n items seen); build excluded
+    let v = n;
+    const op = () => { r.add(v); v = (v + 1) | 0; SINK += r.seen | 0; }; // worst-case O(1), independent of n
+    return { op };
+}
+// Foil: the whole stream retained; each op re-derives a uniform pick by a full O(n) single pass over
+// every stored item (the wasteful from-scratch resample the incremental reservoir replaces).
+function buildReservoirScanFoil(n) {
+    const stored = new Float64Array(n);
+    for (let k = 0; k < n; k++) stored[k] = k;
+    const len = n;
+    let s = 0x9e3779b1 >>> 0;
+    const op = () => {
+        let pick = 0;
+        for (let k = 0; k < len; k++) {                 // O(n) pass: touch every retained item
+            s = (s * 1664525 + 1013904223) >>> 0;
+            if ((s % (k + 1)) === 0) pick = stored[k];  // running uniform pick (foil: uniformity not gated)
+        }
+        SINK += pick | 0;
+    };
+    return { op };
+}
+
+const rvw = witness(buildReservoirWit, RV_SIZES, RV_BATCH, REPS, RV_GATE_MIN);
+const rvFoil = witness(buildReservoirScanFoil, RV_SIZES, RV_FOIL_BATCH, REPS, RV_GATE_MIN);
+
+console.log('');
+console.log('O(1) Witness -- Reservoir add (Algorithm R, worst-case O(1)/item) vs a naive O(n) from-scratch resample (rate ops/ms, median of ' +
+    REPS + ', gate n >= ' + nStr(RV_GATE_MIN) + ')');
+console.log('');
+console.log('  n         Reservoir ops/ms   naive ops/ms   ratio');
+console.log('  --------  ----------------   ------------   -----');
+let rvRatio = Infinity;
+for (let i = 0; i < RV_SIZES.length; i++) {
+    const a = rvw.rows[i].opsPerMs;
+    const b = rvFoil.rows[i].opsPerMs;
+    const ratio = b > 0 ? a / b : Infinity;
+    const gated = RV_SIZES[i] >= RV_GATE_MIN;
+    if (gated && ratio < rvRatio) rvRatio = ratio;
+    const tag = RV_SIZES[i] < RV_GATE_MIN ? '   <- L1 micro-case (shown, not gated)' : '';
+    console.log('  ' + nStr(RV_SIZES[i]).padEnd(8) + '  ' +
+        fmt(a).padStart(16) + '   ' + fmt(b).padStart(12) + '   ' + fmt(ratio).padStart(5) + 'x' + tag);
+}
+
+console.log('');
+console.log('  Reservoir add flatness (n >= ' + nStr(RV_GATE_MIN) + '): ' + fmt(rvw.flatness) + '   (gate >= 0.70)');
+console.log('  naive foil flatness (last/first): ' + fmt(rvFoil.flatness) + '   (gate <= 0.55 -- true O(n) collapse)');
+console.log('  min Reservoir/naive ratio:        ' + fmt(rvRatio) + 'x  (gate >= 1.50x)');
+// add is WORST-CASE O(1) (Algorithm R never scans a run) -- so there is NO max-single-op line; the flat
+// add line + the disclosed <= n/2^32 multiply-bias is the honest claim. get(i) is O(1) too (proven flat
+// + 0-alloc by the torture gate). The foil's O(n) MEMORY is the other half of the story (decisions/0026).
+
+const rvOk = rvw.flatness >= 0.70;
+const rvFoilOk = rvFoil.flatness <= 0.55;
+const rvRatioOk = rvRatio >= 1.5;
+const rvAllOk = rvOk && rvFoilOk && rvRatioOk;
+
+console.log('');
+console.log('WITNESS Reservoir ' + (rvAllOk ? 'ok' : 'FAIL') +
+    ' rv.flatness=' + fmt(rvw.flatness) +
+    ' naive.flatness=' + fmt(rvFoil.flatness) +
+    ' minRatio=' + fmt(rvRatio) + 'x');
+
+if (!rvAllOk) {
+    if (!rvOk) console.error('  violation Reservoir flatness ' + fmt(rvw.flatness) + ' < 0.70');
+    if (!rvFoilOk) console.error('  violation naive foil flatness ' + fmt(rvFoil.flatness) + ' > 0.55');
+    if (!rvRatioOk) console.error('  violation min Reservoir ratio ' + fmt(rvRatio) + 'x < 1.50x');
     process.exitCode = 1;
 }

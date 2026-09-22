@@ -5,7 +5,7 @@
  * fails `npm run test:types`. Not executed; only type-checked.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano, VERSION } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano, Reservoir, VERSION } from '../../O1.js';
 import type { WindowFoldOp } from '../../O1.js';
 
 // VERSION is a string.
@@ -747,3 +747,49 @@ new EliasFano(42);
 ef.access('2');
 // @ts-expect-error -- nextGEQ x must be a number.
 ef.nextGEQ('5');
+
+// --- Reservoir -------------------------------------------------------------
+const resv: Reservoir = new Reservoir(16);
+const resvSeeded: Reservoir = new Reservoir(16, 12345);
+void resvSeeded;
+
+// add -> this (chainable); get -> number | undefined.
+const resvChain: Reservoir = resv.add(1).add(2).add(3);
+void resvChain;
+const resvVal: number | undefined = resv.get(0);
+void resvVal;
+
+// getters: size / seen / capacity / seed are readonly numbers.
+const resvSize: number = resv.size;
+const resvSeen: number = resv.seen;
+const resvCap: number = resv.capacity;
+const resvSeed: number = resv.seed;
+void resvSize; void resvSeen; void resvCap; void resvSeed;
+
+// @ts-expect-error -- size is readonly.
+resv.size = 5;
+// @ts-expect-error -- seen is readonly.
+resv.seen = 5;
+
+// clear / reset return void.
+const resvClear: void = resv.clear();
+const resvReset: void = resv.reset();
+void resvClear; void resvReset;
+
+// forEach callback gets (value, index, reservoir).
+resv.forEach((value, index, reservoir) => {
+    const v: number = value;
+    const i: number = index;
+    const r: Reservoir = reservoir;
+    void v; void i; void r;
+});
+
+// iterable of the sampled values (numbers).
+for (const v of resv) { const vv: number = v; void vv; }
+
+// @ts-expect-error -- k must be a number.
+new Reservoir('16');
+// @ts-expect-error -- add value must be a number.
+resv.add('1');
+// @ts-expect-error -- get index must be a number.
+resv.get('0');
