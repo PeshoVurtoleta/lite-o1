@@ -1,7 +1,7 @@
 # lite-o1 -- which structure to pick (GUIDE)
 
 A repo-only decision guide for the O(1) family: which member, reach-for / avoid,
-and how to measure the constant yourself. At v1.5.0 the family is STABLE at fifteen
+and how to measure the constant yourself. At v1.6.0 the family is STABLE at sixteen
 members and this guide is complete for them -- still open (a new section lands with
 each future member), but no longer a skeleton. It is NOT an API encyclopedia (that
 is the README + `O1.d.ts`); it answers "which member, and is my constant real?"
@@ -23,7 +23,7 @@ flatness floor for YOUR workload -- run `npm run witness` and read the shape.
 
 ## Which member? (decision flowchart)
 
-ASCII, routes on the discriminating questions. Every leaf is one of the fifteen
+ASCII, routes on the discriminating questions. Every leaf is one of the sixteen
 members; `(wc)` = worst-case O(1), `(am)` = amortized O(1).
 
 ```
@@ -66,11 +66,13 @@ START -- what is the SHAPE of your workload?
       +-- horizon fits ONE rotation (delay <= slots-1), want a hard
       |   per-tick budget (no spike)? -> TimerWheel (wc)
       +-- horizon WIDE but bounded (delay < 2^26), can tolerate a
-          periodic cascade spike? -> HierarchicalTimerWheel (am)
+      |   periodic cascade spike? -> HierarchicalTimerWheel (am)
+      +-- horizon NEAR-UNBOUNDED (delay < 62*2^24), want a hard per-tick
+          budget AND can tolerate an APPROXIMATE (bounded-late) fire time? -> CoarseTimerWheel (wc)
 ```
 
 Budget rule of thumb: if you cannot tolerate ANY per-op spike (hard-real-time on
-the WORST single op), stay on the eight `(wc)` members. The five `(am)` members
+the WORST single op), stay on the eleven `(wc)` members. The five `(am)` members
 (UnionFind, MonoDeque, BucketQueue, HierarchicalTimerWheel, CuckooMap) buy their constant
 with an amortized average and wear an honest worst-single-op tail -- read the MAX-single-op
 line the witness prints, and the per-member "avoid it when" notes below. (CuckooMap's
@@ -99,6 +101,7 @@ One row per member; pick by the left column, confirm with the discriminator.
 | the MIN or MAX over an ARBITRARY range of a FIXED numeric array | SparseTable            | worst-case  | STATIC build-once immutable range-min/max; O(1) query, O(n log n) build co-headline |
 | a DENSE bit/flag/dirty mask over MANY bits (N >> 32)         | BitSet                 | worst-case  | fixed multi-word bitset; O(1) test/set/clear/toggle + O(1) firstSet/nextSet via a popcount summary; O(words) bulk set-algebra |
 | a random outcome drawn by WEIGHT from a FIXED distribution   | AliasTable             | worst-case  | STATIC build-once Vose alias method; O(1) weighted sample() after an O(n) build co-headline; the weighted complement to RandomSet |
+| timers over a NEAR-UNBOUNDED horizon, hard per-tick budget, approximate fire OK | CoarseTimerWheel  | worst-case  | Linux-4.8 NON-cascading coarse-bucket wheel; O(1) schedule/cancel/advance/drainDue, NO spike; APPROXIMATE bounded-late fire (< 12.5%, L0 exact) is the co-headline |
 
 ---
 
@@ -696,7 +699,7 @@ cohort; the O(words) bulk ops are the honest co-headline).
 
 ---
 
-### AliasTable (v1.5.0)
+### AliasTable (v1.6.0)
 
 Static build-once Vose weighted sampler: build a table from a fixed weight vector ONCE (an
 O(n) precompute over two flat typed arrays `_prob` Float64 + `_alias` Uint32, plus an owned
@@ -735,7 +738,7 @@ cohort; the O(n) build + 2n typed-array space are the honest co-headline).
 
 ## Roadmap members (not yet shipped, planned)
 
-The public API is stable at v1.5.0's fifteen members; these are planned, not shipped.
+The public API is stable at v1.6.0's sixteen members; these are planned, not shipped.
 Placeholders so the decision axes are visible early; each fills in on release.
 
 - **SlotPool** -- free-list slot allocator with generational (ABA-safe) handles.

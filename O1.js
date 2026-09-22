@@ -3,11 +3,11 @@
  * that doubles as a teachable textbook: each member solves a real problem AND
  * witnesses its constant on a host (the O(1) Witness -- see test/witness.mjs).
  *
- * v1.5.0 ships fifteen members -- SparseSet, RingDeque, UnionFind, MonoDeque,
+ * v1.6.0 ships sixteen members -- SparseSet, RingDeque, UnionFind, MonoDeque,
  * MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel,
- * RingLog, CuckooMap, SparseTable, BitSet, and AliasTable -- plus its `VERSION` const. The
- * fifteen are independent (no shared mutable module state), so a bundler that imports one
- * drops the others (`sideEffects: false`).
+ * RingLog, CuckooMap, SparseTable, BitSet, AliasTable, and CoarseTimerWheel -- plus its
+ * `VERSION` const. The sixteen are independent (no shared mutable module state), so a
+ * bundler that imports one drops the others (`sideEffects: false`).
  *
  * The complexity class IS the product: every hot op below is O(1) worst-case and
  * allocates ZERO bytes after construction. The witness harness (never imported
@@ -19,7 +19,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.5.0';
+export const VERSION = '1.6.0';
 
 /** Largest universe the Uint32 substrate + the (k >>> 0) key check can honor. */
 const MAX_UNIVERSE = 0x100000000; // 2^32
@@ -4303,5 +4303,549 @@ export class AliasTable {
     _allZero() {
         throw new RangeError(
             '[lite-o1] AliasTable requires at least one strictly-positive weight (all weights were 0)');
+    }
+}
+
+/**
+ * NIL for CoarseTimerWheel's intrusive per-bucket pointers (`_next` / `_prev` / `_head` /
+ * `_tail`), which store DENSE indices in [0, capacity). Identical role to TimerWheel's
+ * TW_NIL: 0 is a valid dense index, so the sentinel is the top uint32 value -- never a legal
+ * index -- and it is always `>= _size`, so a NIL head reads as empty under the same guards.
+ */
+const COARSEWHEEL_NIL = 0xFFFFFFFF; // 2^32 - 1
+
+/**
+ * Largest tick a CoarseTimerWheel's monotone `now` may reach (identical to TW_MAX_TICK).
+ * `now` and the stored `_fireAt` are plain doubles; 2^53 is the last integer with no larger
+ * integer sharing its double, so once `now + delay` (or a rounded-up fire tick) would reach
+ * 2^53 the wheel THROWS rather than lose the integer precision the level/bucket math relies
+ * on (the `Math.floor(now / g)` / `Math.ceil(deadline / g)` selection is exact only while
+ * both operands are integer-exact -- division by a power of two never rounds below 2^53).
+ */
+const COARSEWHEEL_MAX_TICK = 2 ** 53; // 2^53 (Number.MAX_SAFE_INTEGER + 1)
+
+// ---- coarse geometry: 9 levels x 64 buckets, per-level clock shift 3n (gran 8^n) --------
+// Level n granularity g_n = 8^n = 2^(3n) (L0 = 1 EXACT, L8 = 2^24); each level's 64 buckets
+// span g_n x 64 = 2^(3n+6) ticks. All 576 (= 9 x 64) bucket heads live in ONE flat
+// `_head` / `_tail` array plus a reserved DRAINING identity at index 576 (drainDue's
+// snapshot list, exactly as TimerWheel). A per-bucket non-empty BITMAP of 18 x Uint32
+// (576 bits) makes "find the next level/bucket to service" a find-first-set (the BitSet
+// firstSet idiom, design-parity NOT a runtime dep), so no empty bucket is ever scanned.
+const COARSEWHEEL_LEVELS = 9;         // levels 0..8
+const COARSEWHEEL_BUCKETS = 64;       // buckets per level (6-bit index)
+const COARSEWHEEL_HEADS = 576;        // total bucket heads = 9 * 64
+const COARSEWHEEL_DRAINING = 576;     // reserved DRAINING list identity (index HEADS)
+// Horizon: MAX_DELAY = 62 x 2^24 = 0x3E000000 (~0.97 x 2^30), NOT the full 2^30 L8 span.
+// The never-early round-up-then-verify select places a top-level timer at bucket-delta
+// delta_8 = ceil((now + delay) / 2^24) - floor(now / 2^24), which must land in [0, 63]. At
+// the full 2^30 span a delay near 2^30 yields delta_8 = 64 (up to 65 at an unlucky clock
+// phase), which would alias the CURRENT top bucket and fire ~64 granules EARLY, and there is
+// no L9 to escalate into. Capping at 62 x 2^24 guarantees delta_8 <= 63 at EVERY phase
+// (ceil((g8 - 1 + MAX_DELAY - 1) / g8) = 63), so escalation never falls off L8 and drain /
+// peekNext / advance stay pure-bitmap worst-case O(1). This is exactly Linux 4.8's
+// WHEEL_TIMEOUT_MAX = CUTOFF - LVL_GRAN(top) phase margin (see decisions/0022, call 2).
+const COARSEWHEEL_MAX_DELAY = 0x3E000000; // 62 * 2^24 = 1,040,187,392 (delay in [0, this))
+
+/**
+ * Smallest set-bit position >= `start` within a level's 64-bit occupancy (lo = buckets
+ * 0..31, hi = buckets 32..63), or -1 if none at or above start. A FIXED two-word scan +
+ * one ctz32 -- worst-case O(1), no allocation. `0xFFFFFFFF << k` for k in [0, 31] is a clean
+ * mask (never a 32-shift; the start >= 32 branch subtracts 32 first). The BitSet firstSet
+ * idiom applied to one wheel level (design-parity, not a runtime dep).
+ * @private
+ */
+function _cwFirstSetGE(lo, hi, start) {
+    if (start < 32) {
+        const m = lo & (0xFFFFFFFF << start);
+        if (m !== 0) return _bitsetCtz32(m);
+        if (hi !== 0) return 32 + _bitsetCtz32(hi);
+        return -1;
+    }
+    const m = hi & (0xFFFFFFFF << (start - 32));
+    if (m !== 0) return 32 + _bitsetCtz32(m);
+    return -1;
+}
+
+/**
+ * CoarseTimerWheel -- a zero-GC, WORST-CASE O(1), NEAR-UNBOUNDED, APPROXIMATE-fire timing
+ * wheel: the NON-CASCADING Linux-4.8 coarse-bucket sibling of TimerWheel /
+ * HierarchicalTimerWheel, over PRIVATE `Uint32Array` columns + a per-bucket occupancy bitmap.
+ * The sixteenth member.
+ *
+ * The two shipped wheels are EXACT: TimerWheel is bounded worst-case O(1); HierarchicalTimer-
+ * Wheel is bounded 2^26 AMORTIZED O(1) and CASCADES (its co-headline is a max-single-op
+ * spike). CoarseTimerWheel is the third, genuinely distinct point in the design space --
+ * NEAR-UNBOUNDED (delay in [0, ~0.97 x 2^30)) and WORST-CASE O(1) with NO cascade and NO
+ * max-single-op line -- by trading PRECISION for range: a fire time is APPROXIMATE, bounded,
+ * and ONE-SIDED (LATE by at most gran(level) - 1, NEVER early; L0 is exact). That approximate
+ * fire is the disclosed co-headline (the way TimerWheel's is a bounded delay ceiling), the
+ * FIRST concession from exactness the suite has made -- so it is a HEADLINE, not a footnote.
+ * For EXACT far-future deadlines reach for a min-heap (`@zakkster/lite-logn`).
+ *
+ * MODEL (Linux 4.8 "Reinventing the timer wheel", Gleixner 2016): cascading is DELETED
+ * because ~93% of timers are cancelled / re-armed before they expire, so cascade work is
+ * wasted and its cost unpredictable. A far-future timer sits in a COARSE bucket and fires IN
+ * PLACE -- never cascaded, never re-filed. The classic hashed-with-rounds wheel (Netty
+ * `HashedWheelTimer`, Varghese-Lauck) is REJECTED: its per-tick drain scans a slot list
+ * decrementing a rounds counter, so it is EXPECTED O(1) but WORST-CASE O(n) -- it cannot wear
+ * the suite's witnessed-flat identity (see decisions/0022).
+ *
+ * GEOMETRY: 9 levels x 64 buckets, per-level clock shift 3n (granularity g_n = 8^n): L0 = 1
+ * (EXACT), L1 = 8, ..., L8 = 2^24. A level n is reached only by delays >= 8 x g_n, so the
+ * worst-case relative error is (g_n - 1) / (8 x g_n) < 1/8 = 12.5% -- one-sided (late),
+ * matching Linux; L0 is exact. Horizon MAX_DELAY = 62 x 2^24 (~0.97 x 2^30); the tick clock
+ * is capped at 2^53. The horizon is a phase margin below the full 2^30 L8 span so the top
+ * level never overflows its 64 buckets (see the COARSEWHEEL_MAX_DELAY note).
+ *
+ * FIRE-TIME BOUND (strict, one-sided, never-early -- round-up-then-verify select). schedule
+ * ROUNDS the deadline (now + delay) UP to the finest level granularity whose granule-delta
+ * `ceil(deadline / g_n) - floor(now / g_n)` lands in [0, 63], escalating to the next coarser
+ * level otherwise. The applied fire tick F = ceil(deadline / g_n) x g_n satisfies
+ * `now + delay <= F < now + delay + g_n` -- NEVER before the deadline, LATE by at most
+ * g_n - 1. (The naive Linux `(d + gran) >> shift` index can alias a bucket one rotation off,
+ * firing ~64 granules late; round-up-then-verify gives the tight [start, start + gran) bound.)
+ * Because every escalation keeps delta <= 63 < 64 (the horizon guarantees it even at L8), a
+ * bucket's FIRST visit after scheduling IS its fire tick -- no aliasing -- so drain / peekNext
+ * / advance never need to read `_fireAt` to disambiguate (they stay pure-bitmap O(1)).
+ *
+ * DRAIN-BEFORE-ADVANCE (TimerWheel's contract, MINUS the cascade). At tick `now` the DUE set
+ * is, FINEST-FIRST, each level n where `now % g_n === 0` at bucket `(now / g_n) % 64`.
+ *   - `drainDue(fn)` fires + removes EXACTLY the timers in those due buckets at ENTRY,
+ *     O(due + levels), with SNAPSHOT semantics (each due bucket is moved into the reserved
+ *     DRAINING identity + relabeled, so the REAL bucket goes empty and a (re)schedule during
+ *     fn DEFERS to a later drain), head-drained (robust to a re-entrant cancel; the list only
+ *     shrinks, so it terminates). fn is HOISTED user code -- the one documented alloc exception.
+ *     A cross-level tie fires FINEST-FIRST (L0 before L1 ...); within a bucket, FIFO.
+ *   - `advance(ticks)` is FAIL-CLOSED and WORST-CASE O(1) for ANY k: it validates via the
+ *     BITMAP (peekNext = the next due tick across all 9 levels by find-first-set) that no due
+ *     timer lies in [now, now + ticks) -- else it THROWS `[lite-o1]` as a byte-identical no-op
+ *     (the check precedes the `now` mutation). There is NO per-tick loop and NO cascade, so
+ *     there is NO O(levels + bucket) spike -- CoarseTimerWheel joins TimerWheel / SparseTable /
+ *     BitSet in the worst-case cohort and prints NO max-single-op line. A re-entrant advance
+ *     (nested, or from inside a drainDue callback via `_busy`) THROWS `[lite-o1]`.
+ *
+ * Layout (all PRIVATE, flat pointer-free SoA; mirrors TimerWheel's substrate):
+ *   - IDS ride SparseSet's dense + sparse cross-check (`_dense[i]` = the id at dense index i,
+ *     `_sparse[id]` maps back; the dense index i IS the node identity the intrusive lists use,
+ *     so `clear()` is O(1)).
+ *   - Per NODE (dense index i): `_bucketOf[i]` (which of the 576 buckets, or DRAINING, it sits
+ *     in), `_next[i]` / `_prev[i]` (an intrusive doubly-linked FIFO of dense indices within a
+ *     bucket; NIL = COARSEWHEEL_NIL), and `_fireAt[i]` (the rounded absolute fire tick, a
+ *     Float64 integer-exact to 2^53 -- WRITTEN by schedule, READ only by `fireTimeOf`; drain /
+ *     peekNext / advance never touch it).
+ *   - Per BUCKET (`_head` / `_tail`, length HEADS + 1): index 576 is the DRAINING identity; a
+ *     bucket b is non-empty iff its `_bits` bit is set (`_bits[b >>> 5] & (1 << (b & 31))`).
+ *   - `_bits` (Uint32Array(18)): the per-bucket occupancy bitmap; level n occupies words
+ *     [2n, 2n + 2). `clear()` is O(1): reset `_size` / `_now` + a fixed 18-word `_bits` fill.
+ *
+ * ID / DELAY / TICKS model: ids are integers [0, universe); delay is an integer
+ * [0, MAX_DELAY); ticks is an integer [0, 2^32-1]. Every guard is typeof-first
+ * (`typeof x !== 'number' || (x >>> 0) !== x || x >= bound`) so a Symbol / BigInt never
+ * reaches the coercing `>>>`; the cold builders name the offender with `String(x)`. `null` is
+ * not zero. Fail closed on the MUTATORS (schedule / advance throw a BYTE-IDENTICAL no-op --
+ * every guard precedes the first write); ABSENT / never-throw on the QUERIES (has / cancel /
+ * peekNext / fireTimeOf). NO payload storage (schedule ids; keep payloads in a parallel column).
+ */
+export class CoarseTimerWheel {
+    /**
+     * @param {number} universe            exclusive id ceiling; integer in [1, 2^32]. Ids are [0, universe).
+     * @param {number} [capacity=universe] max simultaneously-live timers; integer in [1, universe].
+     */
+    constructor(universe, capacity = universe) {
+        // typeof guard BEFORE any coercion (Number.isInteger never coerces; false on a
+        // Symbol / BigInt), and String(x) in the cold message is Symbol/BigInt-safe.
+        if (typeof universe !== 'number' || !Number.isInteger(universe) ||
+            universe < 1 || universe > MAX_UNIVERSE) {
+            throw new RangeError(
+                '[lite-o1] universe must be an integer in [1, 2^32], got ' + String(universe));
+        }
+        if (typeof capacity !== 'number' || !Number.isInteger(capacity) ||
+            capacity < 1 || capacity > universe) {
+            throw new RangeError(
+                '[lite-o1] capacity must be an integer in [1, ' + universe + '], got ' + String(capacity));
+        }
+        this._universe = universe;
+        this._cap = capacity;
+        // ---- id substrate (dense + sparse cross-check; dense index = node id) ----
+        this._dense = new Uint32Array(capacity);    // dense[i] = the i-th live timer id
+        this._sparse = new Uint32Array(universe);   // sparse[id] = dense index (valid iff cross-check)
+        this._bucketOf = new Uint32Array(capacity); // bucketOf[i] = flat bucket [0..575] or DRAINING
+        this._next = new Uint32Array(capacity);     // next[i]/prev[i] = next/prev dense index in the
+        this._prev = new Uint32Array(capacity);     //   bucket's FIFO order (NIL = COARSEWHEEL_NIL)
+        this._fireAt = new Float64Array(capacity);  // fireAt[i] = rounded absolute fire tick (<= 2^53)
+        this._size = 0;                             // live timer count
+        // ---- static buckets (0..575 = the 9 levels; index 576 = DRAINING) ----
+        this._head = new Uint32Array(COARSEWHEEL_HEADS + 1).fill(COARSEWHEEL_NIL); // FIFO oldest per bucket
+        this._tail = new Uint32Array(COARSEWHEEL_HEADS + 1).fill(COARSEWHEEL_NIL); // FIFO newest per bucket
+        this._bits = new Uint32Array(18);           // per-bucket occupancy bitmap (576 bits)
+        this._now = 0;                              // monotone tick counter
+        this._busy = false;                         // guards the drain region (re-entrant advance)
+    }
+
+    /** Number of live timers. O(1). */
+    get size() { return this._size; }
+
+    /** Max simultaneously-live timers this wheel was sized for. O(1). */
+    get capacity() { return this._cap; }
+
+    /** Exclusive id ceiling; ids are [0, universe). O(1). */
+    get universe() { return this._universe; }
+
+    /** The monotone tick counter. O(1). */
+    get now() { return this._now; }
+
+    /** Largest schedulable delay (MAX_DELAY - 1 = 62 x 2^24 - 1); delay is [0, maxDelay]. O(1). */
+    get maxDelay() { return COARSEWHEEL_MAX_DELAY - 1; }
+
+    /**
+     * True iff id is scheduled. O(1): the SparseSet cross-check. A bad id (negative,
+     * fractional, NaN, null, Symbol, BigInt, >= universe) is ABSENT, never a throw. The
+     * `typeof` short-circuits BEFORE `>>>` runs (which coerces + THROWS on a Symbol / BigInt);
+     * `(id >>> 0) !== id` then rejects every non-uint32 number.
+     */
+    has(id) {
+        if (typeof id !== 'number' || (id >>> 0) !== id || id >= this._universe) return false;
+        const i = this._sparse[id];
+        return i < this._size && this._dense[i] === id;
+    }
+
+    /**
+     * Schedule id to fire APPROXIMATELY `delay` ticks from now: place it at the finest level
+     * whose rounded-up granule-delta lands in [0, 63], firing at F = ceil((now + delay) / g_n)
+     * x g_n -- NEVER before now + delay, LATE by at most g_n - 1 (L0 exact). O(1) worst-case,
+     * zero-alloc. Fails closed, ALL guards preceding every write (a byte-identical no-op on any
+     * reject): a bad id throws via _oob; a bad delay (not a uint32 in [0, MAX_DELAY)) throws via
+     * _badDelay; a NEW id when full throws via _full; a deadline / fire tick that would reach
+     * 2^53 throws via _tickCeil. An already-present id is an IDEMPOTENT no-op (the delay arg is
+     * still validated) -- reschedule = cancel then schedule. Guard typeof FIRST on BOTH args.
+     * @param {number} id     a timer id integer in [0, universe)
+     * @param {number} delay  ticks from now, an integer in [0, MAX_DELAY)
+     * @returns {CoarseTimerWheel} this
+     */
+    schedule(id, delay) {
+        if (typeof id !== 'number' || (id >>> 0) !== id || id >= this._universe) return this._oob(id);
+        if (typeof delay !== 'number' || (delay >>> 0) !== delay || delay >= COARSEWHEEL_MAX_DELAY) return this._badDelay(delay);
+        const si = this._sparse[id];
+        if (si < this._size && this._dense[si] === id) return this; // present -> idempotent no-op
+        if (this._size === this._cap) return this._full();
+        const now = this._now;
+        if (now + delay >= COARSEWHEEL_MAX_TICK) return this._tickCeil();
+        const deadline = now + delay;
+        // Round-up-then-verify select: the finest level whose granule-delta is <= 63. Division
+        // by g_n = 2^(3n) never rounds below 2^53, so floor/ceil are integer-exact. Escalation
+        // (delta > 63 -> coarser) always finds a level by n = 8 (the horizon guarantees it).
+        let n = 0;
+        let g = 1;
+        let clockF = deadline;
+        for (; n < COARSEWHEEL_LEVELS; n++) {
+            g = 1 << (3 * n);
+            const cf = Math.ceil(deadline / g);
+            if (cf - Math.floor(now / g) <= 63) { clockF = cf; break; }
+        }
+        const fireAt = clockF * g;
+        if (fireAt >= COARSEWHEEL_MAX_TICK) return this._tickCeil();
+        const flat = n * COARSEWHEEL_BUCKETS + (clockF % 64);
+        const j = this._size;
+        this._dense[j] = id;
+        this._sparse[id] = j;
+        this._fireAt[j] = fireAt;
+        this._linkTail(j, flat);
+        this._size = j + 1;
+        return this;
+    }
+
+    /**
+     * Cancel id. O(1) worst-case, zero-alloc. Unlink it from its bucket FIFO (fixing the
+     * bucket head/tail + its occupancy bit) then swap the last dense node into its hole. Returns
+     * true iff id was scheduled; a bad / absent id returns false and NEVER throws (mirrors the
+     * query contract). Guard typeof FIRST.
+     * @param {number} id
+     * @returns {boolean} true iff id was scheduled and removed.
+     */
+    cancel(id) {
+        if (typeof id !== 'number' || (id >>> 0) !== id || id >= this._universe) return false;
+        const i = this._sparse[id];
+        if (i >= this._size || this._dense[i] !== id) return false;
+        this._removeNode(i);
+        return true;
+    }
+
+    /**
+     * The next tick at which any scheduled timer is due, or -1 when empty. O(1) via the bitmap:
+     * a find-first-set across the 9 levels (each a fixed two-word ctz scan). Useful for a
+     * NOHZ-style caller that sleeps to the next deadline. Never throws.
+     * @returns {number} the next due (rounded fire) tick, or -1
+     */
+    peekNext() {
+        return this._peekNextTick();
+    }
+
+    /**
+     * The applied (rounded) absolute fire tick for a scheduled id, or -1 for an absent / bad id.
+     * O(1), never throws. Lets a caller SEE the coarse rounding (fireTimeOf(id) - (now at
+     * schedule + delay) is the one-sided lateness, in [0, gran(level) - 1]).
+     * @param {number} id
+     * @returns {number} the rounded fire tick, or -1
+     */
+    fireTimeOf(id) {
+        if (typeof id !== 'number' || (id >>> 0) !== id || id >= this._universe) return -1;
+        const i = this._sparse[id];
+        if (i >= this._size || this._dense[i] !== id) return -1;
+        return this._fireAt[i];
+    }
+
+    /**
+     * Fire + remove EXACTLY the timers due at the current tick, FINEST-FIRST across levels
+     * (each level n with `now % g_n === 0`, bucket `(now / g_n) % 64`), calling fn(id, wheel)
+     * per timer in FIFO order. O(due + levels), zero-alloc. SNAPSHOT semantics identical to
+     * TimerWheel: each due bucket is MOVED into the reserved DRAINING identity and its nodes
+     * relabeled, so the REAL bucket goes empty (a re-entrant (re)schedule during fn lands there
+     * and DEFERS to a later drain), then head-drained (re-reading the head each step is robust
+     * to a re-entrant cancel; the list only shrinks so it terminates). `_busy` is set across the
+     * drain so a re-entrant advance() throws; a re-entrant clear() self-terminates via the
+     * `i >= _size || _bucketOf[i] !== DRAINING` guard. fn is user code -- the one documented
+     * alloc exception.
+     * @param {(id:number, wheel:CoarseTimerWheel)=>void} fn
+     */
+    drainDue(fn) {
+        const now = this._now;
+        const wasBusy = this._busy;
+        this._busy = true; // block a re-entrant advance() across the fired callbacks
+        try {
+            // Finest-first: once `now` is not a multiple of g_n, no coarser level is due either
+            // (g_{n+1} is a multiple of g_n), so break.
+            for (let n = 0; n < COARSEWHEEL_LEVELS; n++) {
+                const g = 1 << (3 * n);
+                if (now % g !== 0) break;
+                const bucket = Math.floor(now / g) % 64;
+                this._drainBucket(n * COARSEWHEEL_BUCKETS + bucket, fn);
+            }
+        } finally {
+            this._busy = wasBusy;
+        }
+    }
+
+    /**
+     * Advance the tick clock by `ticks` (default 1). WORST-CASE O(1) for ANY k (no per-tick
+     * loop, no cascade): it validates via the bitmap that no due timer lies in [now, now + ticks)
+     * -- i.e. peekNext() is empty or >= now + ticks -- else it THROWS `[lite-o1]` as a
+     * BYTE-IDENTICAL no-op (the check precedes the `now` mutation; drain-before-advance). Fails
+     * closed: a non-uint32 `ticks` throws via _badTicks; `now + ticks` reaching 2^53 throws via
+     * _tickCeil; a re-entrant advance (nested, or from inside a drainDue callback, seen via
+     * `_busy`) throws via _advancing.
+     * @param {number} [ticks=1]
+     * @returns {CoarseTimerWheel} this
+     */
+    advance(ticks = 1) {
+        if (typeof ticks !== 'number' || (ticks >>> 0) !== ticks) return this._badTicks(ticks);
+        if (this._busy) return this._advancing(); // nested / in-flight-drain advance is fail-closed
+        const now = this._now;
+        if (now + ticks >= COARSEWHEEL_MAX_TICK) return this._tickCeil();
+        const nx = this._peekNextTick();
+        if (nx !== -1 && nx < now + ticks) return this._undrained();
+        this._now = now + ticks;
+        return this;
+    }
+
+    /**
+     * Empty the wheel in O(1): reset the live count + the tick clock (two scalars) and clear the
+     * 18-word occupancy bitmap (a FIXED fill, NOT an O(horizon) sweep). Stale dense/sparse
+     * entries fail the has() cross-check and the zeroed bitmap voids every stale bucket head, so
+     * no per-bucket store is zeroed. After clear() the tick clock restarts at 0. Legal from
+     * inside a drainDue callback.
+     */
+    clear() {
+        this._size = 0;
+        this._now = 0;
+        this._bits.fill(0);
+    }
+
+    /**
+     * Iterate live timers in DENSE STORAGE order (insertion order, permuted by a cancel / drain
+     * swap-remove) -- NOT time order. O(size). Re-reads `_size` each step, so a re-entrant cancel
+     * from inside fn self-terminates. A HOISTED callback keeps it allocation-free (the documented
+     * O(k) exception). fn is (id, fireAt, wheel).
+     * @param {(id:number, fireAt:number, wheel:CoarseTimerWheel)=>void} fn
+     */
+    forEach(fn) {
+        const d = this._dense;
+        const f = this._fireAt;
+        for (let i = 0; i < this._size; i++) fn(d[i], f[i], this);
+    }
+
+    /**
+     * Iterate live timer ids in dense storage order (same order as forEach). O(size). The ONE
+     * per-protocol ALLOCATOR (a {value, done} per step) -- kept OUT of the zero-alloc claims;
+     * use forEach for the alloc-free scan.
+     */
+    *[Symbol.iterator]() {
+        const d = this._dense;
+        for (let i = 0; i < this._size; i++) yield d[i];
+    }
+
+    // ---- private helpers (hot: bucket surgery + bitmap; cold: throw builders) -------------
+
+    /**
+     * The next due (rounded fire) tick across all 9 levels, or -1 when no timer is in a REAL
+     * bucket. For each non-empty level the soonest occupied bucket at or after the level's
+     * current clock position is found by find-first-set (cyclic over the level's 64 bits); its
+     * fire tick is (clockNow + offset) x g_n. WORST-CASE O(1) (a fixed <= 9-level scan). Because
+     * every timer's granule-delta is <= 63, a bucket's first visit IS its fire tick, so the
+     * bitmap alone is exact -- no `_fireAt` read.
+     * @private
+     */
+    _peekNextTick() {
+        if (this._size === 0) return -1;
+        const now = this._now;
+        const bits = this._bits;
+        let best = -1;
+        for (let n = 0; n < COARSEWHEEL_LEVELS; n++) {
+            const wi = n << 1;                 // two words per level
+            const lo = bits[wi];
+            const hi = bits[wi + 1];
+            if (lo === 0 && hi === 0) continue;
+            const g = 1 << (3 * n);
+            const clockNow = Math.floor(now / g);
+            const curPos = clockNow % 64;
+            let p = _cwFirstSetGE(lo, hi, curPos);
+            let offset;
+            if (p !== -1) {
+                offset = p - curPos;
+            } else {
+                p = _cwFirstSetGE(lo, hi, 0);  // wrap: level non-empty, so p >= 0
+                offset = p - curPos + 64;
+            }
+            const fire = (clockNow + offset) * g;
+            if (best === -1 || fire < best) best = fire;
+        }
+        return best;
+    }
+
+    /**
+     * Append node j to the FIFO tail of REAL bucket `flat` (in [0, 575]), setting the occupancy
+     * bit + creating the list if the bucket was empty (decided by the bit, so a stale post-clear
+     * head is naturally voided). O(1).
+     * @private
+     */
+    _linkTail(j, flat) {
+        this._bucketOf[j] = flat;
+        const wi = flat >>> 5;
+        const mask = 1 << (flat & 31);
+        if ((this._bits[wi] & mask) === 0) {
+            // empty bucket: j is the sole node.
+            this._bits[wi] |= mask;
+            this._head[flat] = j;
+            this._tail[flat] = j;
+            this._prev[j] = COARSEWHEEL_NIL;
+            this._next[j] = COARSEWHEEL_NIL;
+        } else {
+            // non-empty: append j at the tail (FIFO newest in this bucket).
+            const t = this._tail[flat];
+            this._prev[j] = t;
+            this._next[j] = COARSEWHEEL_NIL;
+            this._next[t] = j;
+            this._tail[flat] = j;
+        }
+    }
+
+    /**
+     * Drain REAL bucket `flat` (in [0, 575]): move its whole FIFO into the DRAINING identity +
+     * relabel each node, clear the real bucket's occupancy bit, then HEAD-DRAIN firing fn(id,
+     * this) per timer (fired AFTER removal so a re-entrant cancel(id) is inert; a (re)schedule
+     * during fn lands in the now-empty real bucket and DEFERS). Empty buckets (bit clear) are a
+     * no-op. O(due). @private
+     */
+    _drainBucket(flat, fn) {
+        const wi = flat >>> 5;
+        const mask = 1 << (flat & 31);
+        if ((this._bits[wi] & mask) === 0) return; // empty -> no-op
+        const draining = COARSEWHEEL_DRAINING;
+        const h = this._head[flat];
+        for (let n = h; n !== COARSEWHEEL_NIL; n = this._next[n]) this._bucketOf[n] = draining;
+        this._head[draining] = h;
+        this._tail[draining] = this._tail[flat];
+        this._bits[wi] &= ~mask;               // real bucket goes empty
+        this._head[flat] = COARSEWHEEL_NIL;
+        this._tail[flat] = COARSEWHEEL_NIL;
+        for (;;) {
+            const i = this._head[draining];
+            if (i === COARSEWHEEL_NIL || i >= this._size || this._bucketOf[i] !== draining) break;
+            const id = this._dense[i];
+            this._removeNode(i);   // unlink from the DRAINING list + swap-remove dense
+            fn(id, this);          // fired AFTER removal -> a re-entrant cancel(id) is inert
+        }
+    }
+
+    /**
+     * Remove the node at dense index i: unlink it from its bucket (`_bucketOf[i]`, a real bucket
+     * OR the DRAINING identity), fixing that bucket's head/tail (and clearing its occupancy bit
+     * if it went empty AND it is a real bucket), then swap the last live node into index i
+     * (fixing the moved node's intrusive pointers + head/tail + fireAt). O(1). Because the moved
+     * node's bucket is read from `_bucketOf[last]`, it repairs the DRAINING list too, so a swap
+     * during a head-drain leaves the DRAINING head/tail correct (mirrors TimerWheel._removeNode).
+     * @private
+     */
+    _removeNode(i) {
+        const flat = this._bucketOf[i];
+        const p = this._prev[i];
+        const nx = this._next[i];
+        if (p === COARSEWHEEL_NIL) this._head[flat] = nx; else this._next[p] = nx;
+        if (nx === COARSEWHEEL_NIL) this._tail[flat] = p; else this._prev[nx] = p;
+        // A real bucket that just lost its only node clears its occupancy bit (DRAINING has none).
+        if (p === COARSEWHEEL_NIL && nx === COARSEWHEEL_NIL && flat < COARSEWHEEL_HEADS) {
+            this._bits[flat >>> 5] &= ~(1 << (flat & 31));
+        }
+        const last = --this._size;
+        if (i === last) return;
+        const mk = this._dense[last];
+        const mb = this._bucketOf[last];
+        this._dense[i] = mk;
+        this._sparse[mk] = i;
+        this._bucketOf[i] = mb;
+        this._fireAt[i] = this._fireAt[last];
+        const mp = this._prev[last];
+        const mn = this._next[last];
+        this._prev[i] = mp;
+        this._next[i] = mn;
+        if (mp === COARSEWHEEL_NIL) this._head[mb] = i; else this._next[mp] = i;
+        if (mn === COARSEWHEEL_NIL) this._tail[mb] = i; else this._prev[mn] = i;
+    }
+
+    /** @private */
+    _oob(id) {
+        // String(id) -- NOT '+ id' / a template literal: those THROW on a Symbol.
+        throw new RangeError('[lite-o1] id out of universe [0, ' + this._universe + '): ' + String(id));
+    }
+
+    /** @private */
+    _badDelay(delay) {
+        throw new RangeError('[lite-o1] delay out of range [0, ' + (COARSEWHEEL_MAX_DELAY - 1) + ']: ' + String(delay));
+    }
+
+    /** @private */
+    _full() {
+        throw new RangeError('[lite-o1] CoarseTimerWheel full (capacity ' + this._cap + ')');
+    }
+
+    /** @private */
+    _badTicks(ticks) {
+        throw new RangeError('[lite-o1] ticks must be an integer in [0, 2^32-1], got ' + String(ticks));
+    }
+
+    /** @private */
+    _tickCeil() {
+        throw new RangeError('[lite-o1] CoarseTimerWheel tick ceiling 2^53 reached; call clear() to reuse');
+    }
+
+    /** @private */
+    _undrained() {
+        throw new RangeError('[lite-o1] CoarseTimerWheel advance would skip an undrained due bucket; ' +
+            'drainDue() before advance() (drain-before-advance)');
+    }
+
+    /** @private */
+    _advancing() {
+        throw new RangeError('[lite-o1] CoarseTimerWheel advance() during an in-flight drain/advance; ' +
+            'advance only between drains (would strand the un-fired due timers)');
     }
 }

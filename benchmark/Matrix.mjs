@@ -29,7 +29,7 @@
 export const NA = 'n/a';
 
 /** The fifteen shipped members, in build order. */
-export const SUBJECTS = ['SparseSet', 'RingDeque', 'UnionFind', 'MonoDeque', 'MinStack', 'RandomSet', 'FreqO1', 'BucketQueue', 'TimerWheel', 'HierarchicalTimerWheel', 'RingLog', 'CuckooMap', 'SparseTable', 'BitSet', 'AliasTable'];
+export const SUBJECTS = ['SparseSet', 'RingDeque', 'UnionFind', 'MonoDeque', 'MinStack', 'RandomSet', 'FreqO1', 'BucketQueue', 'TimerWheel', 'HierarchicalTimerWheel', 'RingLog', 'CuckooMap', 'SparseTable', 'BitSet', 'AliasTable', 'CoarseTimerWheel'];
 
 /** The eight measurement dimensions (RESEARCH.md section 3). */
 export const DIMENSIONS = ['D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7', 'D8'];
@@ -63,6 +63,7 @@ export const BASELINE = {
     SparseTable: 'scan-fold',   // an alloc-free O(len) range-scan that recomputes each query
     BitSet: 'Set',              // the native Set<number>, the familiar sparse-membership default
     AliasTable: 'scan-fold',    // an alloc-free O(n) cumulative-scan sampler (linear scan per draw)
+    CoarseTimerWheel: '4-ary-heap', // an alloc-free 4-ary min-heap on the same tick trace (O(log n)/timer)
 };
 
 /**
@@ -100,6 +101,7 @@ export const STRONG_BASELINE = {
     SparseTable: NA,
     BitSet: NA,
     AliasTable: NA,
+    CoarseTimerWheel: NA,
 };
 
 /**
@@ -217,6 +219,13 @@ export const RATIONALE = {
             'array for each draw -- the obvious approach before Vose\'s alias method, the honest rival, ' +
             'not a strawman; AliasTable draws by weight in worst-case O(1) after a disclosed O(n) build.',
     },
+    CoarseTimerWheel: {
+        verdict: 'FAIR-ALREADY', strong: NA,
+        why: 'the primary foil is a STRONG one -- an alloc-free 4-ary min-heap (O(log n) per tick), ' +
+            'the real structure a careful dev reaches for when delays are far-future / unbounded, not ' +
+            'a strawman; the non-cascading coarse wheel wins by a WORST-CASE-O(1) constant with NO ' +
+            'cascade spike, trading an approximate (bounded, one-sided-late) fire for the flat line.',
+    },
 };
 
 // ===========================================================================
@@ -254,6 +263,7 @@ export const MEMBER_TAGS = {
     SparseTable: ['steady'],
     BitSet: ['steady'],
     AliasTable: ['steady'],
+    CoarseTimerWheel: ['steady'], // NON-cascading: no periodic structural spike (unlike HTW's 'cascade')
 };
 
 /**
@@ -266,6 +276,7 @@ export const RANDOM_LOOKUP = {
     RingDeque: false, MonoDeque: false, MinStack: false, RandomSet: false,
     FreqO1: false, BucketQueue: false, TimerWheel: false, HierarchicalTimerWheel: false,
     RingLog: false, CuckooMap: false, SparseTable: false, BitSet: false, AliasTable: false,
+    CoarseTimerWheel: false,
 };
 
 /**
@@ -281,6 +292,7 @@ export const CAPACITY_KNOB = {
     SparseTable: false, // static build-once: cost is a build cost, not on the Pareto axes
     BitSet: true,       // fixed bit-capacity knob (nbits): ops/ms vs bytes/live on the Pareto
     AliasTable: false,  // static build-once: cost is a build cost (like SparseTable), not on the Pareto axes
+    CoarseTimerWheel: true, // fixed capacity knob: ops/ms vs bytes/live on the Pareto (mutable wheel)
 };
 
 /**
@@ -443,6 +455,7 @@ export const CLEAR_WITNESS_EXCLUDED = Object.freeze({
     SparseTable: 'static/no-mutators -- build-once, no clear() surface at all',
     BitSet: 'clear() is an O(words) data + summary zero-fill, not a pure O(1) counter reset',
     AliasTable: 'static/immutable -- clear() resets the PRNG seed, not a container empty/reuse cycle',
+    CoarseTimerWheel: 'clear() also resets the clock (now) + the 18-word occupancy bitmap; specialized scheduler',
 });
 
 // ===========================================================================
@@ -486,4 +499,5 @@ export const OP_CLASS = Object.freeze({
     SparseTable: { insert: NA, delete: NA, iterate: NA },
     BitSet: { insert: 'worst-case-O(1)', delete: 'worst-case-O(1)', iterate: 'O(n)-per-call' },
     AliasTable: { insert: NA, delete: NA, iterate: NA },
+    CoarseTimerWheel: { insert: 'worst-case-O(1)', delete: 'worst-case-O(1)', iterate: 'O(n)-per-call' },
 });

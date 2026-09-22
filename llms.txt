@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-Version: 1.5.0
+Version: 1.6.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -13,11 +13,12 @@ op is O(1) worst-case (or O(1)-amortized where stated) and allocates zero bytes
 after construction, and a shipped witness harness demonstrates the flat
 throughput curve against a built-in foil.
 
-v1.5.0 ships fifteen members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
+v1.6.0 ships sixteen members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
 RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap,
-SparseTable, BitSet, and AliasTable. They share no mutable module state, so a bundler that imports
-one drops the others (tree-shakeable). 1.5.0 adds AliasTable (the fifteenth member; 1.4.0 added
-BitSet, 1.3.0 added SparseTable, 1.2.0 added CuckooMap, 1.1.0 added RingLog).
+SparseTable, BitSet, AliasTable, and CoarseTimerWheel. They share no mutable module state, so a
+bundler that imports one drops the others (tree-shakeable). 1.6.0 adds CoarseTimerWheel (the
+sixteenth member; 1.5.0 added AliasTable, 1.4.0 added BitSet, 1.3.0 added SparseTable, 1.2.0 added
+CuckooMap, 1.1.0 added RingLog).
 
 ## Exports (from the single main file O1.js)
 
@@ -82,7 +83,19 @@ BitSet, 1.3.0 added SparseTable, 1.2.0 added CuckooMap, 1.1.0 added RingLog).
   reads the original input weight; the caller's weights are COPIED in (immutable); a per-instance
   seeded LCG makes it reproducible (clear() resets to the seed). Build-once, sample-only (NO
   mutators / reweight); fail closed at construction, sample()/weightOf() never throw.
-- `VERSION` -- string, '1.5.0'.
+- `CoarseTimerWheel` -- class. A zero-GC, WORST-CASE O(1), NON-CASCADING, near-unbounded
+  timing wheel with an APPROXIMATE (bounded, one-sided-LATE) fire time -- the Linux-4.8
+  coarse-bucket model (9 levels x 64 buckets, per-level clock shift 3n, granularity 8^n).
+  schedule() / cancel() / drainDue() / advance() are worst-case O(1) with NO cascade and NO
+  max-single-op line (it touches <= 9 levels/buckets, independent of live count and delay
+  magnitude), via a per-bucket occupancy BITMAP (18 x Uint32) find-first-set. A far-future
+  timer sits in a coarse bucket and fires IN PLACE. The trade is PRECISION for range: a timer
+  fires LATE by at most gran(level) - 1 (<= 12.5% relative, ONE-SIDED never early; L0 EXACT) --
+  the disclosed co-headline. Near-unbounded delay in [0, 62 x 2^24) (~0.97 x 2^30; the Linux
+  phase margin below the full 2^30 span). peekNext() (next due tick, NOHZ) + fireTimeOf(id)
+  (the rounded fire tick) are O(1) queries. For EXACT far-future deadlines use a min-heap
+  (@zakkster/lite-logn). NO payload storage. Fail closed on schedule/advance; queries never throw.
+- `VERSION` -- string, '1.6.0'.
 
 ## SparseSet
 
@@ -661,6 +674,84 @@ Id / delay / ticks model: ids integer [0, universe); delay integer [0, 2^26); ti
 advance throw), ABSENT on the QUERIES (has / cancel never throw). Re-entrant advance is the
 one drainDue-callback exception -- it throws [lite-o1] (schedule / cancel / clear stay legal).
 
+## CoarseTimerWheel
+
+    new CoarseTimerWheel(universe, capacity = universe)
+
+- A WORST-CASE O(1), NON-CASCADING, near-unbounded timing wheel with an APPROXIMATE (bounded,
+  one-sided-LATE) fire time -- the Linux-4.8 coarse-bucket model. The third wheel: TimerWheel
+  is bounded + EXACT + worst-case; HierarchicalTimerWheel is bounded 2^26 + EXACT + AMORTIZED
+  (cascade spike); CoarseTimerWheel is near-unbounded + APPROXIMATE + worst-case with NO
+  cascade and NO max-single-op line. A far-future timer sits in a COARSE bucket and fires IN
+  PLACE -- never cascaded, never re-filed. HEADLINE TRADE: precision for range -- a timer fires
+  LATE by at most gran(level) - 1 (<= 12.5% relative error, ONE-SIDED never early; L0 EXACT).
+  For EXACT far-future deadlines use a min-heap (@zakkster/lite-logn); the classic
+  hashed-with-rounds wheel is REJECTED (expected-O(1) / worst-case-O(n), see ADR 0022).
+- universe: exclusive id ceiling; integer in [1, 2^32]. Ids are integers in [0, universe).
+- capacity: max simultaneously-live timers; integer in [1, universe], default universe.
+- Constructor throws a [lite-o1] RangeError on a bad universe / capacity (typeof-guarded FIRST
+  so a Symbol / BigInt never reaches coercion; String(x) message).
+- GEOMETRY: 9 levels x 64 buckets, per-level clock shift 3n, granularity g_n = 8^n (L0 = 1
+  EXACT, L1 = 8, ..., L8 = 2^24). Horizon MAX_DELAY = 62 x 2^24 = 0x3E000000 = 1,040,187,392
+  (~0.97 x 2^30); delay in [0, MAX_DELAY). The horizon is a Linux WHEEL_TIMEOUT_MAX phase
+  margin below the full 2^30 L8 span so the top level's 64 buckets never overflow (delta_8 <= 63
+  at every clock phase). The monotone tick clock is capped at 2^53.
+- FIRE-TIME BOUND (round-up-then-verify select): schedule rounds the deadline (now + delay) UP
+  to the finest level granularity whose granule-delta ceil(deadline/g_n) - floor(now/g_n) lands
+  in [0, 63], escalating to the next coarser level otherwise. The applied fire tick
+  F = ceil(deadline/g_n) x g_n obeys now+delay <= F < now+delay + g_n. Because escalation keeps
+  delta <= 63 < 64, a bucket's FIRST visit IS its fire tick (no aliasing) -- so drain / peekNext
+  / advance stay pure-BITMAP O(1), never reading _fireAt.
+- Substrate (all PRIVATE): IDS ride SparseSet's dense + sparse cross-check (dense index = node
+  id). Per NODE: bucketOf (flat bucket 0..575 or the DRAINING identity 576), next/prev intrusive
+  FIFO, and fireAt (a Float64, integer-exact to 2^53 -- WRITTEN by schedule, READ only by
+  fireTimeOf). Per BUCKET: a STATIC head/tail array of length 577; a bucket is non-empty iff its
+  _bits bit is set. _bits is a per-bucket occupancy BITMAP (18 x Uint32 = 576 bits; level n in
+  words [2n, 2n+2)) driving find-first-set for advance / drainDue / peekNext.
+
+Hot surface (schedule / cancel / advance(k) worst-case O(1); drainDue O(due + levels); all zero
+allocation):
+
+- schedule(id, delay) -> this  Place id at the level/bucket for `delay` (fire >= now + delay,
+                            late by <= gran(level) - 1). IDEMPOTENT no-op if present. Fail
+                            closed: a bad id / a delay >= MAX_DELAY / a NEW id past capacity /
+                            a deadline or fire tick reaching 2^53 throw [lite-o1] as a
+                            byte-identical no-op.
+- cancel(id) -> boolean     Unlink id + swap-remove (clearing the bucket bit if it empties).
+                            True iff scheduled; a bad / absent id returns false, NEVER throws.
+- drainDue(fn) -> void      Fire + remove every timer DUE at the current tick, FINEST-FIRST
+                            across levels (each level n with now % g_n === 0, bucket
+                            (now / g_n) % 64), fn(id, wheel) in FIFO order. O(due + levels).
+                            SNAPSHOT semantics (each due bucket is moved into the reserved
+                            DRAINING identity then head-drained; a re-entrant (re)schedule
+                            DEFERS to a later drain; re-entrant cancel/clear supported; a
+                            re-entrant advance throws). fn is user code -- the one alloc exception.
+- advance(ticks = 1) -> this  DRAIN-BEFORE-ADVANCE, worst-case O(1) for ANY k (no per-tick
+                            loop, no cascade): validates via the bitmap that no due timer lies
+                            in [now, now+ticks) (peekNext empty or >= now+ticks) else throws
+                            [lite-o1] as a byte-identical no-op. Also throws on `now` reaching
+                            2^53, or a re-entrant advance (nested / in-flight drain, via _busy).
+                            NO max-single-op line (worst-case cohort).
+- peekNext() -> number      The next tick any timer is due (bitmap find-first-set across the 9
+                            levels), or -1 when empty. O(1), never throws.
+- fireTimeOf(id) -> number  The applied (rounded) fire tick for a scheduled id, or -1 for an
+                            absent / bad id. O(1), never throws. fireTimeOf(id) - (schedule-time
+                            now + delay) is the one-sided lateness, in [0, gran(level) - 1].
+- has(id) -> boolean        True iff scheduled. A bad id is ABSENT, never throws.
+- size / capacity / universe / now / maxDelay (getters). maxDelay is MAX_DELAY - 1.
+- clear() -> void           O(1): resets the live count + tick clock to 0 and clears the 18-word
+                            occupancy bitmap (a FIXED fill, NOT an O(horizon) sweep).
+- forEach(fn) -> void       O(size) alloc-free scan in DENSE STORAGE order (NOT time order);
+                            fn is (id, fireAt, wheel). Re-reads size each step, so a re-entrant
+                            cancel self-terminates.
+- [Symbol.iterator]()       O(size) scan, same order; ALLOCATES per protocol -- use forEach.
+
+Id / delay / ticks model: ids integer [0, universe); delay integer [0, MAX_DELAY); ticks integer
+[0, 2^32-1]. Every guard is typeof-first so a Symbol / BigInt never reaches the coercing `>>>`;
+messages via String(x). null is not zero. Fail closed on the MUTATORS (schedule / advance throw),
+ABSENT on the QUERIES (has / cancel / peekNext / fireTimeOf never throw). Re-entrant advance is
+the one drainDue-callback exception -- it throws [lite-o1] (schedule / cancel / clear stay legal).
+
 ## RingLog
 
     new RingLog(capacity)
@@ -1098,6 +1189,26 @@ co-headline (paid once at construction, EXCLUDED from the per-op claim, the Spar
   duplicated inline, no module state); clear() resets to the seed for reproducibility. The O(n)
   BUILD + 2n Float64/Uint32 SPACE are the disclosed co-headline (paid once, EXCLUDED from the per-op
   claim). NO max-single-op line (worst-case cohort). forEach is the O(n) alloc-free scan exception.
+- CoarseTimerWheel valid id: integer in [0, universe); valid delay: integer in [0, MAX_DELAY)
+  where MAX_DELAY = 62 x 2^24 = 0x3E000000 = 1,040,187,392 (~0.97 x 2^30); valid ticks: integer in
+  [0, 2^32-1]; fixed capacity, no growth. NON-CASCADING Linux-4.8 coarse-bucket wheel (9 levels x
+  64 buckets, shift 3n, gran 8^n): schedule rounds the deadline UP to the finest level whose
+  granule-delta is <= 63 and files it there; the timer fires IN PLACE (never cascaded). APPROXIMATE
+  fire -- the disclosed co-headline: fire >= now + delay ALWAYS (never early), LATE by at most
+  gran(level) - 1 (<= 12.5% relative error, ONE-SIDED; L0 EXACT). DRAIN-BEFORE-ADVANCE -- advance()
+  refuses to skip a due bucket (throws fail-closed), validated by the per-bucket occupancy BITMAP
+  (18 x Uint32), so advance is WORST-CASE O(1) for ANY k with NO cascade and NO max-single-op line.
+  Space O(capacity + 577 + 18). Fail closed on the mutators schedule / advance (throws [lite-o1]; a
+  delay >= MAX_DELAY or a NEW id past capacity throws a byte-identical no-op; null never coerced to
+  id 0), absent on the queries has / cancel / peekNext / fireTimeOf (never throw; cancel/absent
+  false, peekNext/fireTimeOf -1). schedule / cancel / advance(k) are WORST-CASE O(1); drainDue is
+  O(due + levels). `now` ceiling 2^53. Re-entrant advance throws [lite-o1] (schedule / cancel /
+  clear stay legal in a callback). Finest-first across levels, FIFO within a bucket; drainDue
+  SNAPSHOT (a reschedule inside a callback defers). Static 577 buckets, no free-list; the 18-word
+  bitmap makes clear() O(1). forEach (id, fireAt, wheel) / [Symbol.iterator] scan in dense storage
+  order (iterator allocates). schedule of a present id is an idempotent no-op. NO payload storage;
+  for EXACT far-future deadlines use a min-heap (@zakkster/lite-logn). The foil is a FAIR 4-ary
+  min-heap (O(log n)), not a strawman.
 
 ## Scripts
 
@@ -1219,13 +1330,27 @@ co-headline (paid once at construction, EXCLUDED from the per-op claim, the Spar
   the summary, so its flatness holds >= 0.70; a scanning firstSet would be O(words) and MISS the
   floor (the T9 fail-path). NO MAX-single-op line: BitSet is worst-case cohort (the O(words) bulk
   ops are the honest co-headline, not a per-op spike).
+- CoarseTimerWheel: size-sweep [1e3, 1e4, 1e5], WORST-CASE-O(1) NON-CASCADING TICK (a steady-state
+  drainDue + advance, with the delay horizon scaled to n so ~1 timer is due per tick and drained
+  timers re-arm far ahead into a coarse level, firing IN PLACE) vs an ALLOC-FREE 4-ary MIN-HEAP
+  driven by the SAME tick trace (O(log n) per fired timer -- the same fair foil
+  HierarchicalTimerWheel uses). ops/ms is a rate (both batch 5e5). Gated over the steady window
+  size >= 1e4 (the 1e3 point is a pure-L1 micro-case shown but not gated). CoarseTimerWheel flatness
+  >= 0.70; CoarseWheel/heap ratio >= 1.5x; the 4-ary heap foil flatness is REPORTED and asserted
+  merely to be LESS flat than the wheel (an O(log n) foil decays gently, per ADR 0022 + 0013). NO
+  MAX-single-op line: schedule / cancel / advance(k) are WORST-CASE O(1) with NO cascade (a
+  bitmap-validated advance touches <= 9 levels), so there is no amortized spike -- UNLIKE
+  HierarchicalTimerWheel. A scanning-drain control (no bitmap) MISSES the flatness floor (fail-path).
 
 ## Not yet shipped
 
-The public API grows one member per release. 1.5.0 adds AliasTable (the fifteenth member; 1.4.0
-added BitSet, 1.3.0 added SparseTable, 1.2.0 added CuckooMap, 1.1.0 added RingLog). Not in this
-release, planned for later: SlotPool (a free-list slot allocator with generational ABA-safe
-handles) and a fully unbounded / hashed timer wheel.
+The public API grows one member per release. 1.6.0 adds CoarseTimerWheel (the sixteenth member;
+1.5.0 added AliasTable, 1.4.0 added BitSet, 1.3.0 added SparseTable, 1.2.0 added CuckooMap, 1.1.0
+added RingLog). The long-standing "fully unbounded / hashed timer wheel" roadmap item is now
+ANSWERED: CoarseTimerWheel is the honest near-unbounded wheel (approximate-fire, worst-case O(1),
+no cascade), and for EXACT far-future deadlines the right tool is a min-heap (@zakkster/lite-logn);
+the classic hashed-with-rounds wheel is REJECTED (expected-O(1) / worst-case-O(n), ADR 0022).
+SlotPool (a free-list slot allocator with generational handles) is CLOSED (ADR 0021).
 SparseSet holds membership, not payloads (store values in a parallel SoA
 column or @zakkster/lite-arena); RingDeque holds numbers only; UnionFind holds
 disjoint-set connectivity over [0, n), not payloads; MonoDeque holds numeric
@@ -1236,11 +1361,13 @@ extreme only, RandomSet holds integer membership + uniform sampling over
 keys + their integer PRIORITY over [0, universe) x [0, ceiling] -- a monotone priority
 queue, not a general heap (queue integer handles for object payloads) -- TimerWheel
 holds integer timer IDS over [0, universe) filed against a delay in [0, slots-1] -- a
-BOUNDED simple wheel, one rotation deep -- and HierarchicalTimerWheel holds integer timer
+BOUNDED simple wheel, one rotation deep -- HierarchicalTimerWheel holds integer timer
 IDS over [0, universe) filed against a delay in [0, 2^26) -- a BOUNDED CASCADING four-level
-wheel, not an UNbounded one (a fully unbounded / hashed wheel remains a deferred future
-member; both wheels schedule integer handles for object payloads, not payloads directly);
-and RingLog holds numbers only, a LOSSY rolling window you READ (keep the last N,
+wheel; and CoarseTimerWheel holds integer timer IDS over [0, universe) filed against a delay in
+[0, 62 x 2^24) -- a NON-CASCADING near-unbounded wheel with an APPROXIMATE (bounded, one-sided-
+late) fire time, NOT an exact one (for EXACT far-future deadlines reach for a min-heap in
+@zakkster/lite-logn; all three wheels schedule integer handles for object payloads, not payloads
+directly); and RingLog holds numbers only, a LOSSY rolling window you READ (keep the last N,
 overwrite-oldest) -- NOT a consumable queue (reach for RingDeque to drain / fail closed) --
 CuckooMap holds an exact integer-key -> number MAP over sparse / large safe-integer keys
 (|k| <= 2^53), O(capacity) space (NOT SparseSet's O(universe) dense set, NOT lite-filter's

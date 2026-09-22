@@ -1,8 +1,11 @@
-# lite-o1 -- post-1.0 roster roadmap (BitSet + AliasTable)
+# lite-o1 -- post-1.0 roster roadmap (BitSet + AliasTable, then M16-M18)
 
-Two BRIEF sessions extending `@zakkster/lite-o1` from thirteen members to fifteen.
-Modeled on `../BLUEPRINT_ROADMAP.md` (the ecosystem's session-brief blueprint).
-Sourced from the 2026-09-22 RESEARCH.md audit that REOPENED the post-1.0 queue.
+Two BRIEF sessions extending `@zakkster/lite-o1` from thirteen members to fifteen
+(BitSet 1.4.0, AliasTable 1.5.0 -- **both SHIPPED**), then a post-1.5 continuation
+(M16-M18) from a second research sweep -- see **section 7** and the companion briefs
+`ROADMAP-M16.md` (CoarseTimerWheel, in progress). Modeled on `../BLUEPRINT_ROADMAP.md`
+(the ecosystem's session-brief blueprint). Sourced from the 2026-09-22 RESEARCH.md
+audits that REOPENED the post-1.0 queue.
 
 **Why it exists.** The first three post-1.0 sessions SHIPPED (RingLog 1.1.0,
 CuckooMap 1.2.0, SparseTable/StaticRMQ 1.3.0), and that backlog is exhausted.
@@ -21,8 +24,11 @@ verbatim from RESEARCH.md so they are not a surprise at planning time.
 
 | Session | Member | Version | Bound | State |
 | --- | --- | --- | --- | --- |
-| **M14** | **BitSet** (multi-word dense bitset) | 1.4.0 | O(1) worst-case per-bit; O(1) firstSet/nextSet via summary; bulk ops O(words) disclosed | planned |
-| **M15** | **AliasTable** (Vose weighted sampling) | 1.5.0 | O(1) worst-case sample (after O(n) build) | planned |
+| **M14** | **BitSet** (multi-word dense bitset) | 1.4.0 | O(1) worst-case per-bit; O(1) firstSet/nextSet via summary; bulk ops O(words) disclosed | SHIPPED |
+| **M15** | **AliasTable** (Vose weighted sampling) | 1.5.0 | O(1) worst-case sample (after O(n) build) | SHIPPED |
+| **M16** | **CoarseTimerWheel** (near-unbounded approximate wheel) | 1.6.0 | O(1) worst-case, no cascade/no spike; approximate fire time < 12.5% disclosed | in progress (ROADMAP-M16.md, ADR 0022) |
+| **M17** | **WindowFold / DABA-Lite** (general sliding-window aggregation) | 1.7.0 | O(1) worst-case push/evict/query (DABA-Lite) | planned (section 7) |
+| **M18** | **Rank/Select bitvector** (cs-poppy class) | 1.8.0 | O(1) worst-case rank + O(1) select (after O(n) build) | planned (section 7) |
 
 M14 is the 14th member, M15 the 15th. Suggested order (RESEARCH.md): **BitSet
 first** (broadest reuse, easy win, mutable worst-case cohort), then **AliasTable**
@@ -508,5 +514,187 @@ worst-case cohort, and the easier win -- its only real boundary (the
 fastbit32/scheduler non-overlap) was already resolved by the 2026-09-22 audit.
 AliasTable is the more specialized draw and it depends on BitSet only for version
 ordering, so it can follow whenever the weighted-sampling niche is wanted.
+
+---
+
+## 7. Post-1.5 continuation (M16-M18) -- the second research sweep
+
+BitSet (1.4.0) and AliasTable (1.5.0) SHIPPED, exhausting sections 1-6. A SECOND
+research sweep (2026-09-22, vs the whole @zakkster O-notation shelf and Linux/IBM/
+adopted implementations) queued three more members and CLOSED two roadmap items.
+Same cadence: one concept per release, ADR + design-calls settled with the user
+BEFORE code, `/release` gate + card sync after. Each is a full pipeline session.
+
+### Closed by the sweep (NOT lite-o1 members -- recorded so they are not re-proposed)
+
+- **SlotPool -- REJECTED (ADR 0021).** The generational-handle free-list is owned by
+  `@zakkster/lite-arena` (a component-free `Arena` IS a slot pool); a lite-o1 SlotPool
+  would fork it, which the family LAW forbids. Members needing pooling keep private
+  purpose-fit pools (FreqO1, TimerWheel). Closes ADR 0003's open deferral.
+- **The "unbounded / hashed wheel" roadmap item -- ANSWERED by M16.** The classic
+  hashed-with-rounds wheel (Netty) is expected-O(1)/worst-case-O(n) on drain -- rejected
+  as dishonest for a proven-flat suite. M16 ships the honest Linux-4.8 non-cascading
+  design instead; unbounded + EXACT deadlines route to a `lite-logn` heap.
+- **LRU / SIEVE / cache eviction -> `@zakkster/lite-lru`** (a 13-policy `LiteCache<K,V>`
+  family already owns these). **Frequency/cardinality sketches (HLL/Count-Min/...) ->
+  the proposed `@zakkster/lite-sketch` sibling.** Neither is lite-o1's niche.
+
+### M16 -- CoarseTimerWheel (1.6.0) -- IN PROGRESS
+
+Full brief in `ROADMAP-M16.md`; settled calls in `decisions/0022-coarsetimerwheel.md`.
+The near-unbounded THIRD timing wheel: Linux-4.8-style non-cascading coarse-bucket
+wheel, worst-case O(1) with NO cascade spike (NO max-single-op line -- the honest
+difference from HierarchicalTimerWheel). Trade is PRECISION not complexity: approximate
+fire time, bounded one-sided-late (< 12.5%, L0 exact) -- the disclosed co-headline. 9
+levels x 64 buckets, MAX_DELAY = 62 x 2^24 (~0.97 x 2^30, the Linux WHEEL_TIMEOUT_MAX
+phase margin), strict never-early round-up-then-verify select, 18-word non-empty-bucket
+bitmap, exposes `peekNext()` + `fireTimeOf()`.
+
+===============================================================================
+# M17 -- lite-o1 v1.7.0 -- WindowFold / DABA-Lite (general sliding-window aggregation)
+===============================================================================
+
+PURPOSE
+  The suite tracks a sliding-window MIN or MAX (MonoDeque, one frozen extreme) and a
+  stack-lifetime min/max (MinStack), but has NO general FIFO-window aggregator for an
+  ARBITRARY associative operator (sum, product, mean/variance, min+max together,
+  bitwise-or, gcd). SWAG (sliding-window aggregation) needs only associativity; the
+  monotonic-deque discard trick is specific to idempotent order-dominating operators
+  and does not generalize. DABA-Lite (De-Amortized Banker's Aggregator; Tangwongsan,
+  Hirzel, Schneider -- IBM Research, arXiv:2009.13768; IBM/sliding-window-aggregators)
+  is WORST-CASE O(1) push/evict/query for any monoid in n+2 space -- the more
+  distinctive claim (lite-o1 already ships an amortized MonoDeque). Feeds lite-charts
+  rolling stats / min-max bands / rolling stddev, lite-audio RMS + peak-lookahead
+  envelopes, and telemetry windowed counters.
+
+SETTLE FIRST (write decisions/0023-windowfold.md BEFORE coding)
+  - DABA-Lite (worst-case O(1), n+2 space) vs two-stacks (amortized O(1), simpler to
+    render zero-GC) -- lean DABA-Lite (worst-case is the rarer, more defensible claim
+    beside the amortized MonoDeque; ship two-stacks only if the de-amortization proves
+    not worth the bookkeeping in a numeric SoA). Whichever ships, LABEL it honestly.
+  - Operator = a FROZEN NUMERIC ENUM chosen at construction (the MonoDeque frozen-kind
+    pattern): SUM, PRODUCT, MIN, MAX, MINMAX (pair, two lanes), COUNT, SUMSQ (+ SUM ->
+    mean/variance), AND, OR, XOR, GCD. Each an inlined branch-free combine over
+    TypedArray lanes with a compile-time identity constant. NO JS-callback combine (it
+    allocates / deopts and breaks 0 B/op). Decide the exact operator set.
+  - Empty-window query returns the operator identity or a sentinel (fail closed).
+  - Capacity FIXED, fail closed (the whole worst-case cohort). typeof-first guards.
+
+TASKS (all registration sites, per section 0 accounting)
+  - Append `export class WindowFold` to O1.js after CoarseTimerWheel + any operator-enum
+    const. Bump header "sixteen" -> "seventeen" + roster + VERSION 1.7.0; package.json
+    version + description + keywords; llms.txt (Version + surface + design bounds).
+  - O1.d.ts + test/types/o1.test-d.ts; test/WindowFold.test.js (see ASSERTIONS).
+  - Extend torture, witness, perf gate, benchmark Matrix (it is MUTABLE -- churn workload
+    applies, unlike the static members). README (blueprint spine) + GUIDE + CHANGELOG + ADR.
+
+HOT PATH
+  push / evict / query are a bounded number of `combine` calls (DABA-Lite: <= 2 per op)
+  over fixed TypedArray lanes -- no branch on window size, no allocation, no closure.
+  Prove 0 B/op in the perf gate; witness `query` flat vs an O(W) rescan foil.
+
+ASSERTIONS
+  - Correctness vs a naive O(W) recompute over random push/evict traces, for EVERY
+    shipped operator (SUM/MIN/MAX/MINMAX/SUMSQ/AND/OR/XOR/GCD/PRODUCT).
+  - DABA-Lite: push/evict/query do a BOUNDED number of combines independent of window
+    size -- max-op/median-op ratio stays bounded (a two-stacks build discloses the O(W)
+    flip spike instead; the label must match the build).
+  - Empty-window query returns the operator identity; a non-associative misuse is not
+    silently accepted (typeof-first numeric guards).
+  - torture "ok": tracker.size() -> 0; 0 B/op on push/evict/query; arrayBuffers delta 0.
+  - witness: `query` flatness >= 0.70; the O(W)-rescan foil decays; ratio >= 1.5x.
+  - The prior sixteen members diff BYTE-IDENTICAL (a pure-append diff).
+  - npm pack --dry-run excludes test/ benchmark/ demo/ decisions/.
+
+NON-GOALS
+  No JS-callback operator (breaks 0 B/op). No arbitrary-index / out-of-order window
+  (that is FiBA, O(log d), or lite-logn Fenwick/segment tree -- O(log n) mutable range).
+  No non-associative "operators". No growable capacity. No payload storage.
+
+DONE WHEN
+  WindowFold appended + exported; push/evict/query O(1) (labeled worst-case for
+  DABA-Lite) and 0 B/op; the frozen operator enum correct vs a naive recompute; witness
+  flat with an O(W)-rescan foil; torture "ok"; ADR 0023 records the DABA-Lite-vs-two-stacks
+  call + the operator set + the MonoDeque/MinStack/SparseTable/Fenwick non-overlap; prior
+  members byte-identical; /release 1.7.0 clean.
+
+===============================================================================
+# M18 -- lite-o1 v1.8.0 -- Rank/Select bitvector (cs-poppy class)
+===============================================================================
+
+PURPOSE
+  BitSet has popcount O(words) and firstSet/nextSet, but NOT O(1) `rank1(i)` (count of
+  set bits in [0, i)) nor O(1) `select1(k)` (position of the k-th set bit). A static
+  build-once popcount-directory index over an immutable bitvector delivers both:
+  worst-case O(1) rank and O(1) select (with a sampling layer), at ~3-6% index overhead
+  (cs-poppy; Zhou-Andersen-Kaminsky). The canonical succinct primitive under FM-indexes,
+  Elias-Fano, and compressed posting lists -- adopted by SDSL, Facebook folly, and
+  bioinformatics tooling. Fits lite-o1's STATIC-member honesty contract (decisions/0018):
+  query worst-case O(1) zero-alloc; the O(n) build + index space a disclosed co-headline;
+  NO max-single-op line.
+
+SETTLE FIRST (write decisions/0024-rankselect.md BEFORE coding)
+  - THE ROUTING CALL (confirm with the user): build Rank/Select in lite-o1 (pure
+    worst-case O(1) -- lite-o1's flat-line identity) and have `lite-loglogn` RE-ADOPT it
+    as substrate (never fork -- lite-loglogn's RESEARCH lists RankSelectBits Tier-3 +
+    EliasFano Tier-2). Confirm before code so lite-loglogn does not duplicate it.
+  - Index geometry: cs-poppy 4-level popcount directory (512-bit basic blocks) vs SDSL
+    rank_support_v (~25%) / v5 (~6.25%) -- lean cs-poppy (~3-6%, near-succinct). Record it.
+  - `select` ships a GENUINE O(1) sampling layer vs rank + binary-search (lean: ship the
+    sampling layer -- true O(1) select is the differentiator; rank+bsearch is O(log n)).
+  - Immutable build-once: source bits COPIED in; NO mutators; rebuild to change. Queries
+    (rank/select/access) never throw on a bad index (return 0 / -1 / undefined); the
+    constructor fails closed on bad length / non-integer capacity.
+  - Elias-Fano is a FOLLOW-ON (O(1) access on top of this select), home TBD -- NOT M18.
+
+TASKS (all registration sites, per section 0 accounting)
+  - Append `export class RankSelect` (name TBD -- RankSelect / BitRankSelect) to O1.js
+    after WindowFold + any BITVEC_MAX const. Bump header "seventeen" -> "eighteen" +
+    roster + VERSION 1.8.0; package.json; llms.txt.
+  - O1.d.ts + test/types/o1.test-d.ts; test/RankSelect.test.js (see ASSERTIONS).
+  - Extend torture, witness, perf gate, benchmark Matrix (STATIC -- like SparseTable /
+    AliasTable, NOT in the churn workload set). README + GUIDE + CHANGELOG + ADR.
+
+HOT PATH
+  rank(i) = directory reads + one masked popcount of the target word (Math.clz32 /
+  popcount machinery shared with BitSet) -- worst-case O(1), zero-alloc. select(k) =
+  a sample-table lookup + a bounded in-block scan -- worst-case O(1). Prove 0 B/op in
+  the perf gate; witness `rank` flat vs an O(words) popcount-scan foil.
+
+ASSERTIONS
+  - rank1(i) matches a naive prefix-popcount for all i over random bitvectors; rank1(0)=0;
+    rank1(length)=popcount. select1(k) returns the k-th set bit for all valid k, and -1
+    past popcount; rank(select(k)) round-trips.
+  - Worst-case O(1): rank/select touch a bounded number of words independent of i / of
+    the bitvector length (a rank-by-scan control misses the witness flatness floor).
+  - Construction fails closed (bad length / non-integer / oversize throws before alloc);
+    queries never throw (bad index -> 0 / -1 / undefined).
+  - torture "ok": tracker.size() -> 0; 0 B/op on rank/select; arrayBuffers delta 0.
+  - witness: `rank` flatness >= 0.70; the O(words)-scan foil decays; ratio >= 1.5x. NO
+    max-single-op line (static member; the O(n) build is the disclosed co-headline).
+  - The prior seventeen members diff BYTE-IDENTICAL (a pure-append diff).
+  - npm pack --dry-run excludes test/ benchmark/ demo/ decisions/.
+
+NON-GOALS
+  No mutable bitvector (that is BitSet -- reach for it to set/clear/toggle; RankSelect is
+  the static rank/select INDEX over a frozen bitvector). No O(log n) rank-by-bsearch
+  masquerading as O(1) select. No Elias-Fano in M18 (a follow-on). No compressed-bitvector
+  (RRR) unless a later session wants the space/time trade.
+
+DONE WHEN
+  RankSelect appended + exported; rank + select worst-case O(1) and 0 B/op; build-once
+  immutable with the O(n) build + index space disclosed; witness flat with an O(words)-scan
+  foil, NO max-single-op line; torture "ok"; ADR 0024 records the lite-o1-vs-lite-loglogn
+  routing, the cs-poppy geometry, and the true-O(1)-select call; prior members
+  byte-identical; /release 1.8.0 clean.
+
+---
+
+### Order (M16 -> M17 -> M18)
+
+M16 (CoarseTimerWheel) is in flight. M17 (WindowFold) and M18 (Rank/Select) are
+independent of each other; suggested order WindowFold first (broadest reuse -- charts /
+audio / telemetry), then Rank/Select (which also unblocks a future Elias-Fano and is a
+substrate lite-loglogn re-adopts). Reorder freely.
 
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>

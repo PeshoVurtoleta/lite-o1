@@ -39,7 +39,7 @@ async function main() {
     const { GcProfiler, checkNoGc, measureAllocs } =
         await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable } = await import('../O1.js');
+    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel } = await import('../O1.js');
 
     const U = 1 << 16;      // universe 65536
     const CAP = 1 << 14;    // capacity 16384
@@ -236,6 +236,19 @@ async function main() {
             at.weightOf(i & 63);
             at.clear();
             tracker.track(at, noop, 'aliastable', { audit: true });
+            // CoarseTimerWheel owns only its private Uint32Array id columns + Float64Array fireAt
+            // column + static per-bucket arrays + the 18-word bitmap; nothing external to release.
+            // Its arrays hold numbers, so a reclaimed instance is the desired outcome, proven by
+            // size()->0. Exercise schedule (a fine + a coarse delay) / has / cancel / drainDue /
+            // advance before tracking.
+            const ctw = new CoarseTimerWheel(1024, 256);
+            ctw.schedule(i & 1023, i & 63);                  // fine (L0)
+            ctw.schedule((i + 1) & 1023, 300 + (i & 63));    // coarse (L1)
+            ctw.has(i & 1023);
+            ctw.cancel(i & 1023);
+            ctw.drainDue(noop);
+            ctw.advance(1);
+            tracker.track(ctw, noop, 'coarsetimerwheel', { audit: true });
         }
         return tracker.size();
     }
@@ -632,6 +645,29 @@ async function main() {
     const aliasAllocBytes = Math.max(0, Math.round(aliasBpc));
     const aliasAllocOk = aliasAllocBytes === 0;
 
+    // CoarseTimerWheel hot path: a bounded resident NON-CASCADING coarse wheel churned in a rolling
+    // drain. CTW_W timers are primed spread across fine (L0) + coarse (L1+) buckets; each step drains
+    // the due bucket(s) (fire + swap-remove per timer) re-arming every drained timer far ahead
+    // through a HOISTED callback (it lands in a coarse level and fires IN PLACE -- never cascaded),
+    // then advance(1) over the now-drained tick (drain-before-advance holds, so no throw; the
+    // bitmap-validated advance is worst-case O(1), no cascade spike). Every op is zero-alloc (id
+    // columns + fireAt column + static bucket arrays + the 18-word bitmap recycle typed slots only;
+    // no JS allocation). drainDue's fn is user code (the documented exception).
+    const CTW_W = 1 << 12;                // 4096 resident timers, < CAP so never full
+    const CTW_REARM = 4095;              // re-arm delay -> a coarse level (fires in place, no cascade)
+    const ctw = new CoarseTimerWheel(U, CAP);
+    for (let k = 0; k < CTW_W; k++) ctw.schedule(k, k & 4095); // spread across fine + coarse buckets
+    const ctwRearm = (id, wheel) => { wheel.schedule(id, CTW_REARM); }; // re-arm far ahead
+    const ctwStep = () => {
+        ctw.drainDue(ctwRearm); // fire+remove the due bucket(s), re-arm each drained timer far ahead
+        ctw.advance(1);         // the current tick is drained -> legal worst-case-O(1) advance
+    };
+    const ctwAllocRes = measureAllocs(ctwStep, { iterations: 100000, batches: 8 });
+    const ctwBpc = ctwAllocRes.bytesPerCall === null ? 0 : ctwAllocRes.bytesPerCall;
+    const ctwAllocBytes = Math.max(0, Math.round(ctwBpc));
+    const ctwAllocOk = ctwAllocBytes === 0;
+    const ctwNoop = () => {};
+
     // "0 B/op" resolved at the sampling floor: heapUsed deltas are quantized and
     // noisy, so a truly non-allocating op reads a sub-byte figure (a lone blip
     // in one batch / iterations). Round to the nearest byte -- any per-op
@@ -660,6 +696,7 @@ async function main() {
         stStep();
         bitStep();
         aliasStep();
+        ctwStep();
         if ((i & 8191) === 0) {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
         }
@@ -753,6 +790,18 @@ async function main() {
         // drain 1024 ticks: crosses 4 level-0 wraps (cascades) and fires every timer
         for (let t = 0; t < 1024; t++) { htw.drainDue(htwNoop); htw.advance(1); }
     }
+    // CoarseTimerWheel fill (spread across fine + coarse buckets) + forEach (dense scan) + a
+    // drain-and-advance sweep that fires timers IN PLACE (no cascade) + O(1) clear cycles --
+    // exercises schedule across levels, the FIFO head-walk + swap-remove drain, the bitmap
+    // maintenance, the alloc-free scan, and clear (which fixed-fills the 18-word bitmap). clear()
+    // first resets `now` so each cycle re-enters at tick 0; the sweep fires every scheduled timer.
+    for (let f = 0; f < 256; f++) {
+        ctw.clear();
+        for (let k = 0; k < 512; k++) ctw.schedule(k, k & 1023); // spread across fine + coarse buckets
+        ctw.forEach(cb);
+        // drain 1024 ticks: fires every timer at its rounded fire tick (never early, no cascade)
+        for (let t = 0; t < 1024; t++) { ctw.drainDue(ctwNoop); ctw.advance(1); }
+    }
     // RingLog fill (past capacity -> real overwrite churn) + forEach scan + O(1) clear
     // cycles -- exercises the push-overwrite hot body, the alloc-free oldest->newest
     // scan, and clear. The 2*RL_CAP fill overwrites the whole buffer each cycle, so the
@@ -836,6 +885,10 @@ async function main() {
         for (let k = 0; k < CAP; k++) htw.schedule(k, 0); // all due at tick 0 (level-0 slot 0)
         htw.drainDue(htwNoop);                            // drain slot 0 -> size 0
         htw.clear();
+        ctw.clear();
+        for (let k = 0; k < CAP; k++) ctw.schedule(k, 0); // all due at tick 0 (L0 bucket 0)
+        ctw.drainDue(ctwNoop);                            // drain bucket 0 -> size 0
+        ctw.clear();                                      // O(1): resets scalars + the 18-word bitmap
         for (let k = 0; k < CAP; k++) ringLog.push(k); // fill to capacity (overwrites once full)
         ringLog.clear();                               // O(1): the reused buffer grows no store
         for (let k = 0; k < CUCK_W; k++) cuck.set(k, k); // fill under the ceiling (no re-seed)
@@ -852,7 +905,7 @@ async function main() {
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
         findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && monoAllocOk &&
         minAllocOk && randAllocOk && freqAllocOk && buckAllocOk && twAllocOk && htwAllocOk &&
-        ringLogAllocOk && cuckAllocOk && stAllocOk && bitAllocOk && bitHighAllocOk && bitOrAllocOk && bitRetOk && aliasAllocOk && abOk;
+        ringLogAllocOk && cuckAllocOk && stAllocOk && bitAllocOk && bitHighAllocOk && bitOrAllocOk && bitRetOk && aliasAllocOk && ctwAllocOk && abOk;
 
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
@@ -871,7 +924,8 @@ async function main() {
         bitAllocBytes + ' B/op (BitSet per-bit) ' +
         bitHighAllocBytes + ' B/op (BitSet firstSet/nextSet >=2^31 word) ' +
         bitOrAllocBytes + ' B/op (BitSet or) ' +
-        aliasAllocBytes + ' B/op (AliasTable sample)' +
+        aliasAllocBytes + ' B/op (AliasTable sample) ' +
+        ctwAllocBytes + ' B/op (CoarseTimerWheel)' +
         ' | bitRetGrowth=' + bitRetGrowth + ' B' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
         ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' bsSink=' + bsSink + ' bhSink=' + bhSink + ' brSink=' + brSink + ' atSink=' + atSink + ' abGrowth=' + abDelta + ')');
@@ -901,6 +955,7 @@ async function main() {
         if (!bitOrAllocOk) console.error('  alloc ' + bitOrAllocBytes + ' B/op BitSet or (raw bytesPerCall ' + bitOrBpc + ')');
         if (!bitRetOk) console.error('  retain ' + bitRetGrowth + ' B heap growth over 2e6 BitSet firstSet calls (>= 2^31 word); limit ' + (1 << 20) + ' B -- a firstSet must retain nothing');
         if (!aliasAllocOk) console.error('  alloc ' + aliasAllocBytes + ' B/op AliasTable sample (raw bytesPerCall ' + aliasBpc + ')');
+        if (!ctwAllocOk) console.error('  alloc ' + ctwAllocBytes + ' B/op CoarseTimerWheel (raw bytesPerCall ' + ctwBpc + ')');
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;
     }

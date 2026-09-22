@@ -8,6 +8,53 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.6.0] - 2026-09-22
+
+### Added
+
+- **`CoarseTimerWheel` -- the sixteenth member: a zero-GC, WORST-CASE O(1), NON-CASCADING,
+  near-unbounded timing wheel.** The suite's THIRD timing wheel, modeled on the Linux 4.8
+  timer-wheel rework (Gleixner, 2016): a far-future timer sits in a COARSE bucket and fires IN
+  PLACE -- never cascaded, never re-filed -- so `schedule` / `cancel` / `advance` / `drainDue` /
+  `peekNext` / `fireTimeOf` are worst-case O(1) with NO max-single-op line (the honest difference
+  from `HierarchicalTimerWheel`'s cascade spike). The trade is PRECISION, not complexity: a fire
+  time is APPROXIMATE, bounded ONE-SIDED-LATE (`now + delay <= fire < now + delay + granularity`,
+  never early; worst-case relative error `< 12.5%`, level 0 exact) -- the disclosed co-headline.
+  Geometry: 9 levels x 64 buckets, per-level clock shift `3n` (granularity `8^n`), an 18-word
+  `Uint32Array` non-empty-bucket bitmap driving find-first-set for `advance` / `drainDue` /
+  `peekNext`. Horizon `COARSEWHEEL_MAX_DELAY = 62 x 2^24 = 0x3E000000` (~0.97 x 2^30) -- the Linux
+  `WHEEL_TIMEOUT_MAX` phase margin: a full top-level rotation cannot be placed never-early (the
+  coarsest level has nowhere to escalate), so the horizon subtracts a coarse granule. The classic
+  hashed-with-rounds wheel (Netty) was REJECTED -- its per-tick drain scans a slot decrementing a
+  rounds counter, so it is EXPECTED O(1) but WORST-CASE O(n); unbounded + EXACT deadlines route to
+  a `@zakkster/lite-logn` heap instead. ids ride SparseSet's dense/sparse cross-check (O(1)
+  `clear()`); the DRAIN-BEFORE-ADVANCE + SNAPSHOT-drain contracts carry over from `TimerWheel`.
+  Fail closed at construction and on `schedule` (bad id/delay, delay `>= MAX_DELAY`, or a new id
+  past capacity throws `[lite-o1]` typeof-first, byte-identical no-op); queries never throw. Strict
+  never-early via a round-up-then-verify level select. See
+  [`decisions/0022`](./decisions/0022-coarsetimerwheel.md).
+- **`test/CoarseTimerWheel.test.js`** -- full behavioral suite: the approximation bound (a swept
+  `now` x many delays fires in `[now+delay, now+delay + 8^level)`, never early, `delay < 64` fires
+  EXACT, worst-case relative error `<= 12.5%`, with a tolerance-0 control that MUST fail), the
+  no-cascade worst-case-O(1) bound, the family contract (bad id / `delay >= MAX_DELAY` / full /
+  undrained-advance / mid-drain throw; `cancel` / `has` / `drainDue` / `peekNext` / `fireTimeOf`
+  on an absent id are safe), FIFO within a bucket, finest-first across levels, and `clear()`.
+- Gate coverage extended for the sixteenth member: `test/torture.mjs` (retention -> `size() = 0`
+  plus a `0 B/op` hot-path phase on `schedule` / `cancel` / `advance` / `drainDue`),
+  `test/witness.mjs` (a flat `CoarseTimerWheel` tick line vs a 4-ary min-heap timer-queue foil --
+  flatness `1.00`, ratio `>= 1.71x`, NO max-single-op line), `test/perf/PerfGate.test.mjs` (five
+  zero-alloc scenarios), and `benchmark/` (`SUBJECTS` -> 16, a churn workload, `16 x 8 = 128` cells).
+
+### Changed
+
+- Roster is now SIXTEEN members; `O1.js` header member-count + roster list + `VERSION` bumped to
+  `1.6.0`, with `package.json` (version + description + keywords) and `llms.txt` in sync. `O1.js` is
+  a PURE APPEND -- the prior fifteen member classes are byte-identical (only the header comment and
+  the `VERSION` const changed). README + GUIDE document the approximate-fire bound as a headline.
+- **`SlotPool` is REJECTED as a member** (see [`decisions/0021`](./decisions/0021-slotpool-rejected.md)):
+  the generational-handle free-list is owned by `@zakkster/lite-arena` (a component-free `Arena`
+  is exactly that pool); a lite-o1 SlotPool would fork it. Closes ADR 0003's open deferral.
+
 ## [1.5.0] - 2026-09-22
 
 ### Added

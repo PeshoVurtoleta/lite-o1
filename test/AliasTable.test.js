@@ -25,8 +25,8 @@ const ALIASTABLE_MAX_N = 0x4000000; // 2^26 (mirrors the module const)
 
 // --- version + surface -----------------------------------------------------
 
-test('VERSION is the frozen 1.5.0 string', () => {
-    assert.equal(VERSION, '1.5.0');
+test('VERSION is the frozen 1.6.0 string', () => {
+    assert.equal(VERSION, '1.6.0');
 });
 
 test('size / seed getters reflect construction', () => {

@@ -22,7 +22,7 @@
  */
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel } from '../../O1.js';
 
 const U = 1 << 16;      // universe 65536
 const CAP = 1 << 14;    // capacity 16384
@@ -1657,6 +1657,148 @@ const atForEachDrain = {
     statsOf(s) { return { grows: atGrows(s) }; },
 };
 
+// ===========================================================================
+// CoarseTimerWheel scenarios -- private Uint32Array id columns + a Float64Array fireAt column
+// + static per-bucket FIFO arrays + the 18-word occupancy bitmap, all WORST-CASE O(1)
+// zero-alloc (schedule / cancel / advance(k)) plus the O(due + levels) drainDue. NON-CASCADING:
+// a far-future timer sits in a coarse bucket and fires IN PLACE, so there is NO O(bucket) cascade
+// re-file -- every op is pure pointer / bitmap arithmetic over recycled typed slots, no coercion,
+// no heap double, no allocation.
+// ===========================================================================
+
+const CTW_U = 1 << 16;    // universe 65536
+const CTW_CAP = 1 << 14;  // capacity 16384
+const CTW_W = 1 << 12;    // 4096 resident timers -> steady state, never full/empty
+const CTW_SPREAD = 4096;  // delay spread (fine [0,64) + coarse buckets)
+const CTW_REARM = 4095;   // re-arm delay -> a coarse level (fires in place, no cascade)
+
+/**
+ * The zero-alloc counter for CoarseTimerWheel scenarios: the byte lengths of EVERY backing
+ * buffer (the id substrate + node columns + the Float64 fireAt column + the static per-bucket
+ * head/tail arrays + the 18-word bitmap). Capacity + universe are fixed at construction, so this
+ * NEVER grows -- the delta across the window must be 0 (the `ctwGrows` 0-delta canary; mirrors
+ * grows / ringGrows / ... / htwGrows).
+ */
+function ctwGrows(s) {
+    const w = s.ctw;
+    return w._dense.buffer.byteLength + w._sparse.buffer.byteLength +
+        w._bucketOf.buffer.byteLength + w._next.buffer.byteLength + w._prev.buffer.byteLength +
+        w._fireAt.buffer.byteLength + w._head.buffer.byteLength + w._tail.buffer.byteLength +
+        w._bits.buffer.byteLength;
+}
+
+/**
+ * schedule-churn: fresh timers at capacity, all at delay 0 (the fine L0 due bucket). schedule is
+ * fail-closed past capacity, so clear() (O(1), zero-alloc, resets now to 0 + fixed-fills the
+ * bitmap) the instant the wheel is full and keep refilling -- the wheel never exceeds CTW_CAP and
+ * every op is a real schedule (the id substrate write + the bucket file at the tail + a bit set).
+ */
+const ctwScheduleChurn = {
+    name: 'CoarseTimerWheel schedule-churn',
+    setup() { return { ctw: new CoarseTimerWheel(CTW_U, CTW_CAP), n: 0 }; },
+    hot(s, n) {
+        const w = s.ctw;
+        let live = s.n | 0;
+        for (let i = 0; i < n; i++) {
+            if (live === CTW_CAP) { w.clear(); live = 0; }
+            w.schedule(live, 0);
+            live = (live + 1) | 0;
+        }
+        s.n = live | 0;
+    },
+    statsOf(s) { return { grows: ctwGrows(s) }; },
+};
+
+/**
+ * drainDue-advance: prime a bounded resident window spread across fine + coarse buckets, then each
+ * op drains the current due bucket(s) (re-arming every fired timer FAR AHEAD into a coarse level,
+ * where it fires IN PLACE -- never cascaded) + advance(1) -- so the measured window is dominated by
+ * REAL drains (FIFO head-walk, per-timer swap-remove, bitmap maintenance) and the bitmap-validated
+ * O(1) advance. clear() resets now to 0 the instant the wheel empties, so the wheel oscillates
+ * 0 -> CTW_W (< CTW_CAP), never full, every op zero-alloc.
+ */
+const ctwRearm = (id, wheel) => { wheel.schedule(id, CTW_REARM); };
+const ctwDrainAdvance = {
+    name: 'CoarseTimerWheel drainDue-advance (spread fill then drain + advance)',
+    setup() {
+        const ctw = new CoarseTimerWheel(CTW_U, CTW_CAP);
+        for (let k = 0; k < CTW_W; k++) ctw.schedule(k, k & (CTW_SPREAD - 1));
+        return { ctw };
+    },
+    hot(s, n) {
+        const w = s.ctw;
+        for (let i = 0; i < n; i++) {
+            if (w.size === 0) { w.clear(); for (let k = 0; k < CTW_W; k++) w.schedule(k, k & (CTW_SPREAD - 1)); }
+            w.drainDue(ctwRearm);  // fire the due bucket(s), re-arm each drained timer far ahead
+            w.advance(1);          // step the clock (bitmap-validated O(1), no cascade)
+        }
+    },
+    statsOf(s) { return { grows: ctwGrows(s) }; },
+};
+
+/**
+ * cancel-churn: prime CTW_W resident timers spread across buckets, then each op cancels one (a real
+ * unlink from its bucket + swap-remove + a bit clear if it empties) and re-schedules it at the same
+ * delay -- so size returns to CTW_W every op and no op touches full/empty. No advance, so now stays
+ * 0. Every op is zero-alloc.
+ */
+const ctwCancelChurn = {
+    name: 'CoarseTimerWheel cancel-churn',
+    setup() {
+        const ctw = new CoarseTimerWheel(CTW_U, CTW_CAP);
+        for (let k = 0; k < CTW_W; k++) ctw.schedule(k, k & (CTW_SPREAD - 1));
+        return { ctw, i: 0 };
+    },
+    hot(s, n) {
+        const w = s.ctw;
+        let idx = s.i | 0;
+        for (let i = 0; i < n; i++) {
+            const key = idx & (CTW_W - 1);
+            w.cancel(key);                              // real unlink + swap-remove
+            w.schedule(key, key & (CTW_SPREAD - 1));    // re-add -> size returns to CTW_W
+            idx = (idx + 1) | 0;
+        }
+        s.i = idx | 0;
+    },
+    statsOf(s) { return { grows: ctwGrows(s) }; },
+};
+
+/**
+ * advance-tick: an EMPTY wheel advanced one tick per op -- exercises the advance hot body (the
+ * bitmap-validated emptiness check + counter add). The bitmap is empty, so every advance is legal
+ * and worst-case O(1); now climbs but never nears 2^53.
+ */
+const ctwAdvanceTick = {
+    name: 'CoarseTimerWheel advance-tick (empty wheel)',
+    setup() { return { ctw: new CoarseTimerWheel(CTW_U, CTW_CAP) }; },
+    hot(s, n) {
+        const w = s.ctw;
+        for (let i = 0; i < n; i++) w.advance(1);
+    },
+    statsOf(s) { return { grows: ctwGrows(s) }; },
+};
+
+/**
+ * CoarseTimerWheel forEach-drain: a primed wheel scanned each op through a HOISTED module-scope
+ * callback (never re-created per op). Proves forEach itself (the alloc-free dense-order scan; the
+ * ONE per-protocol allocator is [Symbol.iterator], gated separately) allocates nothing.
+ */
+let ctwForEachAcc = 0;
+function ctwForEachInto(id, fireAt) { ctwForEachAcc = (ctwForEachAcc + id + (fireAt | 0)) | 0; }
+const ctwForEachDrain = {
+    name: 'CoarseTimerWheel forEach-drain',
+    setup() {
+        const ctw = new CoarseTimerWheel(CTW_U, CTW_CAP);
+        for (let i = 0; i < 256; i++) ctw.schedule(i, i & (CTW_SPREAD - 1)); // bounded resident set to scan
+        return { ctw };
+    },
+    hot(s, n) {
+        const w = s.ctw;
+        for (let i = 0; i < n; i++) w.forEach(ctwForEachInto);
+    },
+    statsOf(s) { return { grows: ctwGrows(s) }; },
+};
+
 const scenarios = [
     addChurn, hasHit, deleteChurn, clearRefill, forEachDrain,
     ringFifo, ringLifo, ringInterleave,
@@ -1673,6 +1815,7 @@ const scenarios = [
     stQuery, stAtRead, stForEachDrain,
     bsTestHit, bsSetChurn, bsUnsetChurn, bsFirstSet, bsNextSet, bsOrBulk,
     atSample, atForEachDrain,
+    ctwScheduleChurn, ctwDrainAdvance, ctwCancelChurn, ctwAdvanceTick, ctwForEachDrain,
 ];
 
 /**

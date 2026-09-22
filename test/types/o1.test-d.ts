@@ -5,7 +5,7 @@
  * fails `npm run test:types`. Not executed; only type-checked.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, BitSet, AliasTable, VERSION } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, BitSet, AliasTable, CoarseTimerWheel, VERSION } from '../../O1.js';
 
 // VERSION is a string.
 const v: string = VERSION;
@@ -568,3 +568,55 @@ new AliasTable(1000);
 new AliasTable([1, 2, 3], 'seed');
 // @ts-expect-error -- weightOf takes a number.
 at.weightOf('3');
+
+// --- CoarseTimerWheel ------------------------------------------------------
+
+// Constructor: universe required; capacity optional.
+const ctw: CoarseTimerWheel = new CoarseTimerWheel(1000);
+const ctwCap: CoarseTimerWheel = new CoarseTimerWheel(1000, 256);
+void ctwCap;
+
+// Getters: size / capacity / universe / now / maxDelay are readonly numbers.
+const ctwsize: number = ctw.size;
+const ctwcap: number = ctw.capacity;
+const ctwuni: number = ctw.universe;
+const ctwnow: number = ctw.now;
+const ctwmax: number = ctw.maxDelay;
+void ctwsize; void ctwcap; void ctwuni; void ctwnow; void ctwmax;
+
+// @ts-expect-error -- size is readonly.
+ctw.size = 5;
+// @ts-expect-error -- now is readonly.
+ctw.now = 5;
+
+// schedule -> this (chainable); cancel/has -> boolean; peekNext/fireTimeOf -> number.
+const ctwsched: CoarseTimerWheel = ctw.schedule(1, 100);
+const ctwadv: CoarseTimerWheel = ctw.advance();
+const ctwadv2: CoarseTimerWheel = ctw.advance(4);
+const ctwhas: boolean = ctw.has(1);
+const ctwcancel: boolean = ctw.cancel(1);
+const ctwpeek: number = ctw.peekNext();
+const ctwfire: number = ctw.fireTimeOf(1);
+void ctwsched; void ctwadv; void ctwadv2; void ctwhas; void ctwcancel; void ctwpeek; void ctwfire;
+
+// drainDue callback gets (id, wheel); forEach gets (id, fireAt, wheel).
+ctw.drainDue((id, wheel) => {
+    const idn: number = id;
+    const wt: CoarseTimerWheel = wheel;
+    void idn; void wt;
+});
+ctw.forEach((id, fireAt, wheel) => {
+    const idn: number = id;
+    const fa: number = fireAt;
+    const wt: CoarseTimerWheel = wheel;
+    void idn; void fa; void wt;
+});
+
+// clear -> void; iterable of numbers.
+ctw.clear();
+for (const id of ctw) { const idn: number = id; void idn; }
+
+// @ts-expect-error -- universe must be a number.
+new CoarseTimerWheel('1000');
+// @ts-expect-error -- schedule id/delay must be numbers.
+ctw.schedule('1', 100);

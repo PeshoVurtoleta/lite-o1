@@ -234,7 +234,7 @@ simplest and most broadly useful first, novel/attention members later.
 |-----------------|----------------------------------------|------------------|---------------------|
 | **SparseSet**   | add / has / delete / clear / iterate   | O(1) worst-case  | THE textbook O(1) integer set: dense+sparse array pair. `clear()` in O(1) (reset the count, never zero the store) is the teachable gem. Iterable in insertion order. The headline member. |
 | RingDeque       | pushFront / pushBack / popFront / popBack | O(1) worst-case | Fixed-capacity double-ended queue over a circular typed array. Kills the `Array.prototype.shift` O(n) trap. FIFO, LIFO, and sliding-window all fall out of it. |
-| SlotPool        | alloc / free                           | O(1) worst-case  | Free-list slot allocator with generational (ABA-safe) handles -- the SoA substrate the other members and the wider suite reuse. Delineated from lite-arena (see section 6). |
+| ~~SlotPool~~ REJECTED | alloc / free                     | O(1) worst-case  | ~~Free-list slot allocator with generational (ABA-safe) handles.~~ REJECTED as a member (ADR 0021): OWNED by @zakkster/lite-arena (a component-free `Arena` IS this pool); a lite-o1 SlotPool would fork it (forbidden). Members needing pooling keep private purpose-fit pools (FreqO1, TimerWheel). See section 6. |
 | UnionFind       | find / union                           | O(alpha(n)) ~ O(1) amortized | Disjoint-set with path compression + union by rank. The near-O(1) inverse-Ackermann story is the family's best amortized-honesty teaching case. |
 | MonoDeque       | push / evictOlderThan / min or max     | O(1) amortized   | Monotonic deque = sliding-window minimum/maximum in O(1) amortized per element. The interview classic, made zero-GC and practical (streaming telemetry, rate limiting). |
 
@@ -255,7 +255,7 @@ simplest and most broadly useful first, novel/attention members later.
 | IntMap          | get / set / delete                     | O(1) amortized   | Open-addressing (Robin Hood / linear probe) int->int map on typed arrays. The zero-GC index substrate under several members; ship it only if it earns a standalone slot beyond being a substrate. |
 | Interner        | intern (string -> id) / resolve        | O(1) amortized   | String interning table: dedup strings to dense integer ids so the rest of the family stays on the `keys:'int'` fast path. Practical glue. |
 | RingLog         | push (overwrite-oldest) / iterate      | O(1) worst-case  | Fixed-capacity overwrite ring for telemetry/time-series (a RingDeque specialization). May be a RingDeque preset rather than a member. |
-| CountMin / HLL  | update / estimate                      | O(1) worst-case  | Probabilistic O(1)-update sketches (frequency / cardinality). Thematically adjacent to lite-filter's approximate membership; likely belongs THERE, noted here for the boundary. |
+| CountMin / HLL  | update / estimate                      | O(1) worst-case  | Probabilistic O(1)-update sketches (frequency / cardinality). ROUTED OUT to the proposed @zakkster/lite-sketch sibling (the gap between lite-filter's approximate MEMBERSHIP and lite-o1's EXACT O(1)) -- NOT a lite-o1 member. Noted here for the boundary; see section 6. |
 
 ### The boundary -- explicitly NOT O(1) (out of scope, and why)
 
@@ -290,18 +290,39 @@ entries from that list were routed elsewhere (see below).
 | Post-1.0 #3 | **SparseTable / StaticRMQ** | build / query (range min/max) | O(1) query (after O(n log n) build) | Legit O(1) range-min/max query over flat typed arrays, zero-GC. The O(1)-query answer to lite-logn's O(log n) Fenwick/SegmentTree -- a perfect cross-package teaching contrast. Carries ONE boundary decision to settle first (see open question below). | 1.3.0 |
 | Post-1.0 #4 | **BitSet** (multi-word dense bitset) | test / set / clear / toggle / firstSet / nextSet | O(1) worst-case per-bit; O(1) firstSet via a summary layer; bulk popcount/and/or/xor O(n/32) DISCLOSED | The general ARBITRARY-CAPACITY dense bitset over MANY Uint32 words (N >> 32) -- the canonical worst-case-O(1) structure the roster still lacks: visited sets, dirty masks, replay windows, permission bitmaps at scale. NOT lite-fastbit32 (that is the SINGLE-word 32-flag manager) and NOT a bit-bucket scheduler (lite-scheduler's FastBitScheduler / lite-o1's own BucketQueue own that) -- a distinct structure at a different scale, design-parity with fastbit32's branchless word ops but NOT a runtime dep (zero-deps law). Its differentiator over a raw Uint32Array is the O(1) firstSet/nextSet via a two-level popcount summary; bulk word ops are honestly O(words). | 1.4.0 |
 | Post-1.0 #5 | **AliasTable** (Vose weighted sampling) | build / sample | O(1) worst-case sample (after O(n) build) | O(1) WEIGHTED random sampling (one PRNG draw + one compare + one read over two typed arrays: `_prob` Float64, `_alias` Uint32). The weighted complement to RandomSet (uniform-only). Fits the SparseTable static build-once/immutable member contract (query worst-case O(1) zero-alloc; O(n) build a disclosed co-headline; NO max-single-op line). Instance-local seeded PRNG (deterministic, clear() resets seed). Loot tables, weighted load-balancing, Monte-Carlo, procedural gen. | 1.5.0 |
+| Post-1.0 #6 | **CoarseTimerWheel** (near-unbounded approximate wheel) | schedule / cancel / advance / drainDue / peekNext / fireTimeOf | O(1) worst-case (NO cascade, NO spike) | The near-unbounded THIRD timing wheel, modeled on the Linux 4.8 timer-wheel rework (Gleixner 2016): far-future timers sit in COARSE buckets and fire IN PLACE -- NEVER cascaded -- so schedule/cancel/advance/drainDue are worst-case O(1) with NO max-single-op line (the honest difference from HierarchicalTimerWheel's cascade spike). The trade is PRECISION, not complexity: fire time is APPROXIMATE, bounded one-sided-late (< 12.5%, L0 exact) -- the disclosed co-headline. 9 levels x 64 buckets, MAX_DELAY = 62 x 2^24 (~0.97 x 2^30, the Linux WHEEL_TIMEOUT_MAX phase margin), 18-word non-empty-bucket bitmap. The classic hashed-with-rounds wheel (Netty) was REJECTED (expected-O(1)/worst-case-O(n) drain -- dishonest for a proven-flat suite); unbounded+EXACT deadlines route to a lite-logn heap. ADR 0022. | 1.6.0 |
+| Post-1.0 #7 | **WindowFold / DABA-Lite** (general sliding-window aggregation) | push / evict / query | O(1) worst-case (DABA-Lite) | A GENERAL sliding-window aggregator for ANY associative operator -- the generalization MonoDeque (min/max only) and MinStack (stack lifetime, no eviction) leave open. DABA-Lite (De-Amortized Banker's Aggregator, Tangwongsan/Hirzel/Schneider, IBM Research; arXiv:2009.13768) is worst-case O(1) push/evict/query in n+2 space for any monoid -- the more distinctive claim vs the amortized two-stacks. A JS-callback combine breaks 0 B/op, so the operator is a frozen NUMERIC enum at construction (SUM/PRODUCT/MIN/MAX/MINMAX/SUMSQ/AND/OR/XOR/GCD), the MonoDeque frozen-kind pattern. Witness foil = a naive O(W) window rescan. Non-overlap: MonoDeque, MinStack, SparseTable (static), lite-logn Fenwick (arbitrary-index mutable). Feeds lite-charts rolling stats / min-max bands / stddev, lite-audio RMS+peak envelopes, telemetry counters. | 1.7.0 (proposed) |
+| Post-1.0 #8 | **Rank/Select bitvector** (cs-poppy class) | rank(i) / select(k) | O(1) worst-case (after O(n) build) | Static build-once popcount-directory index over an immutable bitvector: rank1(i) (set bits in [0,i)) worst-case O(1) and select1(k) (position of the k-th set bit) O(1), the ops BitSet stops short of (BitSet has popcount O(words) + firstSet/nextSet, NOT O(1) rank/select). ~3-6% index overhead (cs-poppy, Zhou-Andersen-Kaminsky). Fits the SparseTable static-member honesty contract (flat witness, O(n) build a disclosed co-headline). Adopted by SDSL, folly, FM-index. ROUTING: build in lite-o1 (pure worst-case O(1)); lite-loglogn RE-ADOPTS it as substrate (never fork -- it lists RankSelectBits Tier-3 + EliasFano Tier-2), and Elias-Fano (O(1) access, expected/O(log log U) successor) follows on top, home TBD. | 1.8.0 (proposed) |
 
-The first three post-1.0 sessions SHIPPED (RingLog 1.1.0, CuckooMap 1.2.0, SparseTable/StaticRMQ 1.3.0 --
-the static build-once/immutable boundary was SETTLED YES at the SparseTable session, so it is now the template
-for a static sub-family). That backlog is EXHAUSTED; #4 BitSet and #5 AliasTable REOPEN the queue (sourced from
-the 2026-09-22 research audit vs the whole @zakkster O-notation shelf). Both are small, canonical, zero-GC,
-and zero-overlap with any sibling (the audit confirmed lite-fastbit32/lite-scheduler own the single-word and
-scheduler bit niches; see section 6). AliasTable rides the SparseTable static-member precedent already settled.
+Sessions #1-#5 SHIPPED (RingLog 1.1.0, CuckooMap 1.2.0, SparseTable/StaticRMQ 1.3.0, BitSet 1.4.0,
+AliasTable 1.5.0 -- the static build-once/immutable boundary was SETTLED YES at the SparseTable session, so
+it is now the template for a static sub-family; AliasTable and the Rank/Select bitvector both ride it). A
+SECOND research sweep (2026-09-22, vs the whole @zakkster O-notation shelf, Linux/IBM/adopted implementations)
+reopened the queue with #6-#8: **CoarseTimerWheel** (in progress, 1.6.0), **WindowFold/DABA-Lite**, and a
+**Rank/Select bitvector**. All three are canonical, zero-GC, and zero-overlap with any sibling (the sweep
+confirmed the routing in section 6).
 
-Suggested order (adjustable): RingLog -> CuckooMap -> SparseTable (all shipped) -> BitSet (broadest reuse,
-easy win) -> AliasTable (leans on the settled static-member contract). Each is a full pipeline session
+Suggested order (adjustable): RingLog -> CuckooMap -> SparseTable -> BitSet -> AliasTable (all shipped) ->
+CoarseTimerWheel (in progress) -> WindowFold/DABA-Lite (M17, the general-SWAG generalization of MonoDeque)
+-> Rank/Select bitvector (M18, the O(1) rank/select BitSet stops short of). Each is a full pipeline session
 (planner -> discuss/settle -> coder -> reviewer -> qa), user commits/publishes, /release gate + card sync
 after, same as members 1-10.
+
+REJECTED / re-routed by the 2026-09-22 sweep (recorded so they are not re-proposed as lite-o1 members):
+- **SlotPool** -- REJECTED as a member (ADR 0021). The generational-handle free-list is OWNED by
+  @zakkster/lite-arena (a component-free `Arena` IS a slot pool); a lite-o1 SlotPool would fork it, which
+  the family LAW forbids. Members needing pooling keep private purpose-fit pools (FreqO1, TimerWheel). This
+  closes ADR 0003's open deferral -- SlotPool is NO LONGER a Tier-1 core member (see section 4 / section 6).
+- **LRU / SIEVE / ARC and the cache-eviction family** -> @zakkster/lite-lru (a 13-policy `LiteCache<K,V>`
+  family already owns these). Not lite-o1.
+- **HyperLogLog / Count-Min / CountSketch / DDSketch / Space-Saving** -> the proposed @zakkster/lite-sketch
+  sibling (probabilistic frequency/cardinality/heavy-hitters; see section 6). NOT lite-o1's exact-O(1) niche.
+- **Classic hashed-with-rounds timing wheel** (Netty-style) -- REJECTED (expected-O(1)/worst-case-O(n) drain);
+  CoarseTimerWheel ships the honest Linux-4.8 non-cascading design instead, unbounded+exact -> lite-logn heap.
+- **Robin Hood / Swiss tables / Hopscotch** -- expected-O(1) only, or (Swiss) SIMD-dependent so the advantage
+  evaporates in scalar JS, or (Hopscotch) redundant with CuckooMap's existing worst-case-O(1) contract.
+- Reservoir sampler (Algorithm R, exact worst-case O(1) streaming sample) -- a VALID future lite-o1 candidate
+  surfaced by the sweep, distinct from RandomSet (live set) / AliasTable (static weights); not queued this round.
 
 Design calls to settle at each session's start (surfaced now so they are not a surprise):
 - **RingLog:** does overwrite return/expose the evicted entry (a drain hook) or silently drop it? clear()
@@ -334,7 +355,31 @@ Design calls to settle at each session's start (surfaced now so they are not a s
   seed -- the SkipList/Treap seed discipline). Guard: weights finite and >= 0, at least one positive, typeof
   FIRST. Witness op = sample (flat O(1) line); foil = a naive O(n) cumulative-scan sampler whose per-sample
   throughput falls as n grows. WORST-CASE member -> no max-single-op line (the O(n) build is the disclosed
-  co-headline, like SparseTable).
+  co-headline, like SparseTable). (SETTLED + SHIPPED 1.5.0, ADR 0020.)
+- **CoarseTimerWheel:** the MODEL -- Linux 4.8 non-cascading coarse-bucket wheel (lean/settled) vs a classic
+  hashed-with-rounds wheel (REJECTED: expected-O(1)/worst-case-O(n) drain). Approximate fire time is the
+  HEADLINE co-headline: bounded, one-sided-LATE, < 12.5% (L0 exact). Geometry 9 levels x 64 buckets,
+  MAX_DELAY = 62 x 2^24 (the Linux WHEEL_TIMEOUT_MAX phase margin, NOT a full 2^30 -- the coarsest level can't
+  escalate the top ~3% never-early). Strict never-early via round-up-then-verify select. 18-word non-empty
+  bitmap (BitSet firstSet idiom, design-parity). Exposes peekNext() + fireTimeOf(). Worst-case O(1), NO
+  cascade -> NO max-single-op line. Witness foil = a 4-ary min-heap timer queue (exact, O(log n)). (SETTLED,
+  ADR 0022; in progress 1.6.0.)
+- **WindowFold / DABA-Lite:** DABA-Lite (worst-case O(1), n+2 space -- IBM Research) vs two-stacks (amortized
+  O(1), simpler) -- lean DABA-Lite (the rarer, more defensible claim; MonoDeque already ships amortized). The
+  operator is a FROZEN NUMERIC ENUM chosen at construction (SUM/PRODUCT/MIN/MAX/MINMAX/SUMSQ/AND/OR/XOR/GCD),
+  each an inlined branch-free combine over TypedArray lanes with a compile-time identity -- a JS callback would
+  break 0 B/op. Empty-window query returns the operator identity or a sentinel (fail-closed). Witness foil = a
+  naive O(W) window rescan. Non-overlap: MonoDeque (min/max only), MinStack (stack lifetime), SparseTable
+  (static), lite-logn Fenwick (arbitrary-index mutable). Worst-case member (DABA-Lite) -> no max-single-op
+  line; two-stacks would disclose an O(W) flip spike.
+- **Rank/Select bitvector:** index geometry (cs-poppy 4-level directory, ~3-6% overhead) and whether select
+  ships a genuine O(1) sampling layer vs rank+binary-search (lean: SHIP the sampling layer -- true O(1) select
+  is the differentiator). STATIC build-once/immutable (the SparseTable/AliasTable contract): O(n) build +
+  index space the disclosed co-headline; rank/select worst-case O(1) zero-alloc; NO max-single-op line.
+  ROUTING call to settle with the user: build in lite-o1 and have lite-loglogn RE-ADOPT it as substrate (never
+  fork); Elias-Fano (O(1) access, expected/O(log log U) successor) is a follow-on whose home (lite-o1 static
+  vs lite-loglogn) is a separate later call. Witness op = rank (flat O(1) line); foil = a naive O(words)
+  popcount-scan whose per-query cost climbs with i.
 
 Routed elsewhere (from the same candidate list, for the record, so they are not re-proposed as lite-o1):
 - **van Emde Boas / y-fast trie** -> lite-loglogn (O(log log U); already drafted RESEARCH.md/ROADMAP.md there).
@@ -368,9 +413,12 @@ constant is stated with its caveats, and the bench proves both the promise and i
 
 The suite ships one clear niche per package. lite-o1 must not re-implement what a sibling already owns:
 
-- **lite-arena** (zero-GC ECS allocator): already a SoA allocator. lite-o1's `SlotPool` is the GENERAL,
-  standalone free-list-with-generational-handles primitive; if lite-arena's allocator is exactly this,
-  `SlotPool` should re-export or depend on it rather than fork it. Resolve at planning time.
+- **lite-arena** (zero-GC ECS allocator): already the generational-handle SoA allocator. RESOLVED (ADR 0021,
+  2026-09-22): a lite-o1 `SlotPool` is REJECTED -- lite-arena's `Arena.spawn/despawn/isAlive` IS exactly the
+  free-list-with-generational-ABA-safe-handles primitive (a component-free `Arena` is a bare slot pool), so a
+  lite-o1 SlotPool would FORK it, which the family LAW forbids. lite-o1 members that need pooling keep private
+  purpose-fit pools (FreqO1's node+bucket pool, the timing wheels' slot rings); users wanting standalone
+  generational handles are pointed at lite-arena.
 - **lite-fastbit32** (branchless 32-bit flag manager): the SINGLE-WORD 32-flag primitive (ECS masks/pools).
   lite-o1's `BitSet` (post-1.0 #4) is a DIFFERENT structure -- the multi-word, arbitrary-capacity dense bitset
   (N >> 32) with an O(1) firstSet/nextSet summary layer and bulk set-algebra. Zero-deps law forbids a runtime
@@ -379,8 +427,16 @@ The suite ships one clear niche per package. lite-o1 must not re-implement what 
 - **lite-scheduler** (`FastBitScheduler`, an O(1) 32-tier Int32 bucket queue): owns the bitmask-AS-scheduler
   niche. lite-o1's own `BucketQueue` (Dial's monotone queue) is the priority-queue cousin; neither is a general
   bitset. BitSet must not drift into scheduling -- it is a membership/flag structure only.
-- **lite-lru** already ships a constant-time `Lfu`. lite-o1's `FreqO1` is the standalone frequency
-  primitive (inc/dec/getMax/getMin), not a cache; the doc must cross-link the two and state the difference.
+- **lite-lru** already ships the full cache-eviction family (a 13-policy `LiteCache<K,V>`: LRU, SIEVE, ARC,
+  S3-FIFO, W-TinyLFU, LIRS, ClockPro, LRU-K, Multi-Queue, CAR, and a constant-time `Lfu`). lite-o1 does NOT
+  add caches or eviction policies (an LRU/SIEVE member is routed OUT here). lite-o1's `FreqO1` is the
+  standalone frequency PRIMITIVE (inc/dec/getMax/getMin), not a cache; the doc cross-links the two.
+- **lite-loglogn** (PROPOSED, O(log log U) predecessor/successor family): owns vEB / x-fast / y-fast. Its
+  RESEARCH lists a Rank/Select bitvector (Tier-3 substrate) and Elias-Fano (Tier-2). RESOLVED direction: the
+  Rank/Select bitvector is built in lite-o1 (pure worst-case O(1) rank/select -- lite-o1's flat-line identity),
+  and lite-loglogn RE-ADOPTS it as substrate rather than forking (the SlotPool/NodePool reuse discipline).
+  Elias-Fano (O(1) access, expected/O(log log U) successor) is a follow-on; its home (lite-o1 static member vs
+  lite-loglogn) is a separate later call, decided when it is scheduled.
 - **lite-filter** owns approximate MEMBERSHIP (Bloom -> Cuckoo -> Quotient -> Xor -> BinaryFuse, complete at
   1.0.0). It is frozen at membership -- it is NOT the home for frequency/cardinality sketches.
 - **lite-sketch** (PROPOSED, user-approved 2026-09-22): the probabilistic frequency/cardinality family --
@@ -590,17 +646,24 @@ demo shows steady-state ops + the throughput witness.
   which argues for per-structure entries; confirm against the suite's single-PascalCase-main-file law.
 - **The shared spine's honest reach:** how much of `add`/`has`/`delete`/`size`/`clear`/iterate can be a
   common interface before it starts lying about structures that do not fit it (UnionFind, RingDeque)?
-- **`SlotPool` vs lite-arena:** re-export, depend, or a deliberately separate general primitive?
+- **`SlotPool` vs lite-arena:** RESOLVED (ADR 0021, 2026-09-22) -- REJECTED as a member; lite-arena owns the
+  generational-handle pool, and a lite-o1 SlotPool would fork it. See section 6.
 - **Flatness floors:** what per-member flatness threshold is a fair, non-flaky gate across machines and
   CI noise (the witness must fail a real regression without failing on a busy runner)?
 - **What does the user's existing research add or reorder?** (The candidate roster here is a first pass
   from the O(1) literature; fold the user's notes in as the authoritative input at planning time.)
-- **Does lite-o1 admit STATIC members?** (Raised by the post-1.0 SparseTable/StaticRMQ candidate.) Every
-  member to date is a mutable structure whose HOT OP is O(1). A build-once/immutable structure with an
-  O(1) QUERY but an O(n log n) build is a different flavor of the same "the constant is the product"
-  promise. Decide before SparseTable: admit a labeled "static/immutable, O(1)-query" sub-family (with
-  SparseTable as its template), or hold the line at mutable-O(1)-op only and route it out. Load-bearing --
-  it decides a whole potential sub-family, not just one member.
+- **Does lite-o1 admit STATIC members?** RESOLVED YES (2026-09-16): a labeled "static/immutable, O(1)-query"
+  sub-family is admitted under an honesty contract (query worst-case O(1) zero-alloc; the O(n)/O(n log n)
+  build + space a disclosed co-headline; NO max-single-op line). SparseTable is its template; AliasTable and
+  the planned Rank/Select bitvector both ride it. Load-bearing call, settled -- see decisions/0018.
+- **Rank/Select bitvector: lite-o1 or lite-loglogn?** LEANING lite-o1 (it is pure worst-case O(1) rank +
+  O(1) select -- lite-o1's flat-line identity -- with an O(n) build as the disclosed co-headline), with
+  lite-loglogn RE-ADOPTING it as substrate rather than forking. Confirm with the user at M18 planning, and
+  decide Elias-Fano's home (lite-o1 static member vs lite-loglogn, whose successor op is O(log log U)) then.
+- **WindowFold operator surface:** ship the frozen NUMERIC enum only (SUM/MIN/MAX/MINMAX/SUMSQ/AND/OR/XOR/
+  GCD/PRODUCT), or also a guarded callback path? Lean enum-only (a JS callback breaks 0 B/op and deopts the
+  hot combine). Decide the exact operator set + whether DABA-Lite (worst-case O(1)) or two-stacks (amortized)
+  is the shipped build at M17 planning.
 
 ---
 

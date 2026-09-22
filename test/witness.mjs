@@ -48,7 +48,7 @@
  * metric are unchanged; only the measurement is made steadier.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel } from '../O1.js';
 
 const SIZES = [1e3, 1e4, 1e5, 1e6, 1e7];
 const BATCH = 1e6;
@@ -1823,5 +1823,89 @@ if (!atAllOk) {
     if (!atOk) console.error('  violation AliasTable flatness ' + fmt(at.flatness) + ' < 0.70');
     if (!naiveCumOk) console.error('  violation naive foil flatness ' + fmt(naiveCum.flatness) + ' > 0.55');
     if (!atRatioOk) console.error('  violation min AliasTable ratio ' + fmt(atRatio) + 'x < 1.50x');
+    process.exitCode = 1;
+}
+
+// ===========================================================================
+// CoarseTimerWheel witness -- WORST-CASE-O(1) NON-CASCADING tick vs an O(log n)
+// 4-ary min-heap foil (the SAME fair foil HierarchicalTimerWheel uses). NO cascade
+// -> NO max-single-op line (unlike HierarchicalTimerWheel).
+// ===========================================================================
+// A NON-cascading coarse wheel of n live timers over a delay horizon of WIDTH n, so ~1
+// timer is due per tick regardless of n and each drained timer re-arms ~n ticks ahead --
+// landing in a COARSE bucket and firing IN PLACE (never cascaded). Each op drains the due
+// bucket(s) (re-arming every fired timer) and advances one tick -- WORST-CASE O(1) (a
+// bitmap-validated advance touches <= 9 levels, no cascade spike). It streams FLAT.
+function buildCoarseTimerWheel(n) {
+    const w = new CoarseTimerWheel(n, n);
+    const spread = Math.min(n, w.maxDelay);            // horizon width n -> ~1 due per tick
+    for (let k = 0; k < n; k++) w.schedule(k, k % spread);
+    const rearm = (id, wheel) => { wheel.schedule(id, spread - 1); SINK += id; }; // re-arm ~n ahead
+    const op = () => {
+        w.drainDue(rearm); // fire the ~1 timer due at the current tick (worst-case O(1))
+        w.advance(1);      // step the clock (bitmap-validated, no cascade)
+    };
+    return { op };
+}
+
+const CTW_SIZES = [1e4, 1e5, 1e6];
+const CTW_BATCH = 5e5;      // large: stable timing for the worst-case-O(1) tick
+const CTW_HEAP_BATCH = 5e5; // the O(log n) 4-ary heap stays tractable at n=1e6
+// The CTW tick (drainDue + advance) carries a per-tick constant (a <=9-level bitmap validate);
+// at n=1e4 the whole working set is L2-resident and the O(log n) heap depth is still shallow
+// (~log_4 1e4), so ops/ms measures cache turbo, not the constant, and the wheel/heap ratio is
+// compressed. Gated over the DRAM-resident STEADY window size >= 1e5 (the BitSet / CuckooMap
+// precedent -- ADR 0004 / 0019); the 1e4 point is DISPLAYED, tagged, not gated. The 1.5x ratio
+// and 0.70 flatness floors are UNCHANGED -- only the gate DOMAIN is pinned to where ops/ms
+// isolates the constant.
+const CTW_GATE_MIN = 1e5;
+const cw = witness(buildCoarseTimerWheel, CTW_SIZES, CTW_BATCH, REPS, CTW_GATE_MIN);
+const cwHeap = witness(buildFourAryHeapFoil, CTW_SIZES, CTW_HEAP_BATCH, REPS, CTW_GATE_MIN);
+
+console.log('');
+console.log('O(1) Witness -- CoarseTimerWheel tick (drainDue + advance, non-cascading) vs a 4-ary min-heap (rate ops/ms, median of ' +
+    REPS + ', gate size >= ' + nStr(CTW_GATE_MIN) + ')');
+console.log('');
+console.log('  size      CoarseWheel ops/ms  heap ops/ms    ratio');
+console.log('  --------  ----------------   ------------   -----');
+let cwRatio = Infinity;
+for (let i = 0; i < CTW_SIZES.length; i++) {
+    const a = cw.rows[i].opsPerMs;
+    const b = cwHeap.rows[i].opsPerMs;
+    const ratio = b > 0 ? a / b : Infinity;
+    const gated = CTW_SIZES[i] >= CTW_GATE_MIN;
+    if (gated && ratio < cwRatio) cwRatio = ratio; // ratio gate: steady window only
+    const tag = CTW_SIZES[i] < CTW_GATE_MIN ? '   <- L2 turbo micro-case (shown, not gated)' : '';
+    console.log('  ' + nStr(CTW_SIZES[i]).padEnd(8) + '  ' +
+        fmt(a).padStart(16) + '   ' + fmt(b).padStart(12) + '   ' + fmt(ratio).padStart(5) + 'x' + tag);
+}
+
+console.log('');
+console.log('  CoarseWheel flatness (size >= ' + nStr(CTW_GATE_MIN) + '): ' + fmt(cw.flatness) + '   (gate >= 0.70)');
+console.log('  4-ary heap foil flatness (last/first): ' + fmt(cwHeap.flatness) +
+    '   (O(log n): decays gently, gate < CoarseWheel flatness -- see note)');
+console.log('  min CoarseWheel/heap ratio:        ' + fmt(cwRatio) + 'x  (gate >= 1.50x)');
+// NO MAX-single-op line: schedule / cancel / advance(k) / drainDue are WORST-CASE O(1) with NO
+// cascade (a bitmap-validated advance touches <= 9 levels, independent of n and delay magnitude),
+// so there is no amortized spike to expose -- UNLIKE HierarchicalTimerWheel. The disclosed
+// co-headline is the APPROXIMATE fire (bounded, one-sided-late, <= 12.5%; L0 exact), not a per-op
+// spike. The flat tick line IS the worst-case claim (the O(log n) 4-ary heap is the fair rival).
+
+const cwOk = cw.flatness >= 0.70;
+const cwHeapOk = cwHeap.flatness < cw.flatness;
+const cwRatioOk = cwRatio >= 1.5;
+const cwAllOk = cwOk && cwHeapOk && cwRatioOk;
+
+console.log('');
+console.log('WITNESS CoarseTimerWheel ' + (cwAllOk ? 'ok' : 'FAIL') +
+    ' cw.flatness=' + fmt(cw.flatness) +
+    ' heap.flatness=' + fmt(cwHeap.flatness) +
+    ' minRatio=' + fmt(cwRatio) + 'x');
+
+if (!cwAllOk) {
+    if (!cwOk) console.error('  violation CoarseTimerWheel flatness ' + fmt(cw.flatness) + ' < 0.70');
+    if (!cwHeapOk) console.error('  violation 4-ary heap foil flatness ' + fmt(cwHeap.flatness) +
+        ' not < CoarseWheel flatness ' + fmt(cw.flatness));
+    if (!cwRatioOk) console.error('  violation min CoarseWheel ratio ' + fmt(cwRatio) + 'x < 1.50x');
     process.exitCode = 1;
 }

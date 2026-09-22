@@ -849,3 +849,68 @@ export class AliasTable {
     /** Iterate the original input weights in outcome order, alloc-free. fn is (weight, index, table). */
     forEach(fn: (weight: number, index: number, table: AliasTable) => void): void;
 }
+
+/**
+ * CoarseTimerWheel -- a zero-GC, WORST-CASE O(1), NON-CASCADING, near-unbounded timing wheel
+ * with an APPROXIMATE (bounded, one-sided-LATE) fire time -- the Linux-4.8 coarse-bucket model
+ * (9 levels x 64 buckets, per-level clock shift 3n, granularity 8^n). A far-future timer sits
+ * in a coarse bucket and fires IN PLACE (never cascaded). The trade is PRECISION for range: a
+ * timer fires LATE by at most gran(level) - 1 (<= 12.5% relative error, ONE-SIDED never early;
+ * L0 is EXACT). Delay range [0, 62 x 2^24) (~0.97 x 2^30; the Linux phase margin below the full
+ * 2^30 span). schedule / cancel / advance(k) are worst-case O(1) (a per-bucket occupancy bitmap
+ * find-first-set) with NO cascade and NO max-single-op line; drainDue is O(due + levels),
+ * finest-first, SNAPSHOT. For EXACT far-future deadlines use a min-heap (@zakkster/lite-logn).
+ * Fail closed on the mutators; queries never throw.
+ */
+export class CoarseTimerWheel {
+    /**
+     * @param universe  exclusive id ceiling; an integer in [1, 2^32]. Ids are [0, universe).
+     * @param capacity  max simultaneously-live timers; an integer in [1, universe]. Defaults to universe.
+     */
+    constructor(universe: number, capacity?: number);
+
+    /** Number of live timers. */
+    readonly size: number;
+
+    /** Max simultaneously-live timers this wheel was sized for. */
+    readonly capacity: number;
+
+    /** Exclusive id ceiling; ids are [0, universe). */
+    readonly universe: number;
+
+    /** The monotone tick counter. */
+    readonly now: number;
+
+    /** Largest schedulable delay (62 x 2^24 - 1); delay is [0, maxDelay]. */
+    readonly maxDelay: number;
+
+    /** True iff id is scheduled. Never throws; a bad id is absent. */
+    has(id: number): boolean;
+
+    /** Schedule id to fire APPROXIMATELY `delay` ticks from now (fire >= now + delay, late by <= gran(level) - 1). Idempotent no-op if present. Throws [lite-o1] on a bad id / a delay >= MAX_DELAY / when full / on the 2^53 tick ceiling. */
+    schedule(id: number, delay: number): this;
+
+    /** Cancel id. Returns true iff it was scheduled; a bad / absent id returns false. Never throws. */
+    cancel(id: number): boolean;
+
+    /** The next tick any timer is due, or -1 when empty. O(1). Never throws. */
+    peekNext(): number;
+
+    /** The applied (rounded) fire tick for a scheduled id, or -1 for an absent / bad id. O(1). Never throws. */
+    fireTimeOf(id: number): number;
+
+    /** Fire + remove every timer due at the current tick, finest-first across levels, calling fn(id, wheel) per timer in FIFO order. */
+    drainDue(fn: (id: number, wheel: CoarseTimerWheel) => void): void;
+
+    /** Advance the tick clock by `ticks` (default 1). Worst-case O(1) for any k. Throws [lite-o1] if a due bucket in [now, now+ticks) is undrained (drain-before-advance), the 2^53 tick ceiling is reached, or it is called re-entrantly (nested / in-flight drain). */
+    advance(ticks?: number): this;
+
+    /** Empty the wheel in O(1) (resets the count + tick clock, clears the occupancy bitmap; zeroes no per-bucket store). */
+    clear(): void;
+
+    /** Iterate live timers in dense storage order, alloc-free. fn is (id, fireAt, wheel). */
+    forEach(fn: (id: number, fireAt: number, wheel: CoarseTimerWheel) => void): void;
+
+    /** Iterate live timer ids in dense storage order. */
+    [Symbol.iterator](): IterableIterator<number>;
+}
