@@ -48,7 +48,7 @@
  * metric are unchanged; only the measurement is made steadier.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable } from '../O1.js';
 
 const SIZES = [1e3, 1e4, 1e5, 1e6, 1e7];
 const BATCH = 1e6;
@@ -1730,5 +1730,98 @@ if (!bsAllOk) {
     if (!bsFoilLessFlat) console.error('  violation Set foil flatness ' + fmt(bsFoil.flatness) + ' must be < BitSet flatness ' + fmt(bs.flatness));
     if (!bsRatioOk) console.error('  violation min BitSet/Set ratio ' + fmt(bsRatio) + 'x < 1.50x');
     if (!bsFirstOk) console.error('  violation firstSet O(1) control flatness ' + fmt(bsFirst.flatness) + ' < 0.70 (a scanning firstSet)');
+    process.exitCode = 1;
+}
+
+// ===========================================================================
+// AliasTable witness -- WORST-CASE-O(1) Vose weighted `sample` vs a naive O(n)
+// cumulative-scan sampler, the suite's SECOND static build-once member.
+// ===========================================================================
+// AliasTable.sample() is worst-case O(1) (two LCG advances + one Float64 compare + one Uint32
+// read, INDEPENDENT of n and of the weight distribution). The foil is the default a working
+// programmer reaches for: a cumulative-weight array scanned LINEARLY per draw -- O(n) per sample,
+// so ops/ms collapses as n grows (a TRUE O(n) foil, the <= 0.55 bar, like the SparseTable /
+// RingLog scan foils). The O(n) BUILD is excluded from the timed op (built once, outside the
+// closure -- the SparseTable precedent). Gated over the steady window n >= 1e4 (1e3 is a pure-L1
+// micro-case, shown not gated). NO max-single-op line: sample is WORST-CASE O(1), no amortized spike.
+const AT_SIZES = [1e3, 1e4, 1e5];
+const AT_BATCH = 5e5;        // large: stable timing for the O(1) sample
+const AT_FOIL_BATCH = 2e3;   // small: an O(n) scan at n=1e5 must stay tractable
+const AT_GATE_MIN = 1e4;
+
+// AliasTable: build a table of `n` varied positive weights ONCE (outside the timed op), then each
+// op is a single sample() -- worst-case O(1), independent of n.
+function buildAliasTable(n) {
+    const w = new Float64Array(n);
+    for (let k = 0; k < n; k++) w[k] = 1 + (((k * 2654435761) >>> 8) % 997); // varied positive weights
+    const t = new AliasTable(w, 0x9e3779b1); // the O(n) BUILD -- excluded from the timed op
+    const op = () => { SINK += t.sample(); };
+    return { op };
+}
+
+// Foil: an alloc-free naive cumulative-scan sampler. A Float64Array holds the running cumulative
+// weight; every draw picks a uniform in [0, total) and LINEARLY scans the cumulative array for the
+// landing outcome -- O(n) per sample, so ops/ms collapses as n grows, the exact trap the alias
+// method's O(1) two-array lookup kills.
+function buildNaiveCumScanFoil(n) {
+    const cum = new Float64Array(n);
+    let total = 0;
+    for (let k = 0; k < n; k++) { total += 1 + (((k * 2654435761) >>> 8) % 997); cum[k] = total; }
+    let s = 0x9e3779b1 >>> 0;
+    const op = () => {
+        s = (s * 1664525 + 1013904223) >>> 0;
+        const u = (s / 4294967296) * total;
+        let lo = 0;
+        while (lo < n && cum[lo] < u) lo++; // O(n) linear scan (the naive default)
+        SINK += lo;
+    };
+    return { op };
+}
+
+const at = witness(buildAliasTable, AT_SIZES, AT_BATCH, REPS, AT_GATE_MIN);
+const naiveCum = witness(buildNaiveCumScanFoil, AT_SIZES, AT_FOIL_BATCH, REPS, AT_GATE_MIN);
+
+console.log('');
+console.log('O(1) Witness -- AliasTable weighted sample vs a naive O(n) cumulative scan (rate ops/ms, median of ' +
+    REPS + ', gate n >= ' + nStr(AT_GATE_MIN) + ')');
+console.log('');
+console.log('  n         AliasTable ops/ms  naive ops/ms   ratio');
+console.log('  --------  ----------------   ------------   -----');
+let atRatio = Infinity;
+for (let i = 0; i < AT_SIZES.length; i++) {
+    const a = at.rows[i].opsPerMs;
+    const b = naiveCum.rows[i].opsPerMs;
+    const ratio = b > 0 ? a / b : Infinity;
+    const gated = AT_SIZES[i] >= AT_GATE_MIN;
+    if (gated && ratio < atRatio) atRatio = ratio; // ratio gate: steady window only
+    const tag = AT_SIZES[i] < AT_GATE_MIN ? '   <- L1 micro-case (shown, not gated)' : '';
+    console.log('  ' + nStr(AT_SIZES[i]).padEnd(8) + '  ' +
+        fmt(a).padStart(16) + '   ' + fmt(b).padStart(12) + '   ' + fmt(ratio).padStart(5) + 'x' + tag);
+}
+
+console.log('');
+console.log('  AliasTable flatness (n >= ' + nStr(AT_GATE_MIN) + '): ' + fmt(at.flatness) + '   (gate >= 0.70)');
+console.log('  naive foil flatness (last/first): ' + fmt(naiveCum.flatness) + '   (gate <= 0.55 -- true O(n) collapse)');
+console.log('  min AliasTable/naive ratio:       ' + fmt(atRatio) + 'x  (gate >= 1.50x)');
+// NO MAX-single-op line: sample is WORST-CASE O(1) (two LCG advances + one compare + one read,
+// independent of n and the weight skew), never a run. The O(n) BUILD + 2n Float64/Uint32 SPACE
+// are the disclosed co-headline (paid once at construction, outside the timed op), not a per-op
+// spike. The flat sample line IS the worst-case claim (the O(n) cumulative scan is the 0.55 rival).
+
+const atOk = at.flatness >= 0.70;
+const naiveCumOk = naiveCum.flatness <= 0.55;
+const atRatioOk = atRatio >= 1.5;
+const atAllOk = atOk && naiveCumOk && atRatioOk;
+
+console.log('');
+console.log('WITNESS AliasTable ' + (atAllOk ? 'ok' : 'FAIL') +
+    ' at.flatness=' + fmt(at.flatness) +
+    ' naive.flatness=' + fmt(naiveCum.flatness) +
+    ' minRatio=' + fmt(atRatio) + 'x');
+
+if (!atAllOk) {
+    if (!atOk) console.error('  violation AliasTable flatness ' + fmt(at.flatness) + ' < 0.70');
+    if (!naiveCumOk) console.error('  violation naive foil flatness ' + fmt(naiveCum.flatness) + ' > 0.55');
+    if (!atRatioOk) console.error('  violation min AliasTable ratio ' + fmt(atRatio) + 'x < 1.50x');
     process.exitCode = 1;
 }

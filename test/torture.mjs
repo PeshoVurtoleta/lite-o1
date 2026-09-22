@@ -39,7 +39,7 @@ async function main() {
     const { GcProfiler, checkNoGc, measureAllocs } =
         await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet } = await import('../O1.js');
+    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable } = await import('../O1.js');
 
     const U = 1 << 16;      // universe 65536
     const CAP = 1 << 14;    // capacity 16384
@@ -223,6 +223,19 @@ async function main() {
             bs.or(bs2);
             bs.unset(i & 1023);
             tracker.track(bs, noop, 'bitset', { audit: true });
+            // AliasTable owns only its three typed arrays (_prob + _alias + _w); nothing external
+            // to release. Its arrays hold numbers, so a reclaimed instance is the desired outcome,
+            // proven by size()->0. STATIC/immutable: build once, then exercise the sample + weightOf
+            // + clear (seed reset) surface before tracking.
+            const atW = new Float64Array(64);
+            for (let k = 0; k < 64; k++) atW[k] = (k ^ i) & 63;
+            atW[i & 63] = (atW[i & 63] || 0) + 1; // guarantee at least one strictly-positive weight
+            const at = new AliasTable(atW, i | 1);
+            at.sample();
+            at.sample();
+            at.weightOf(i & 63);
+            at.clear();
+            tracker.track(at, noop, 'aliastable', { audit: true });
         }
         return tracker.size();
     }
@@ -602,6 +615,23 @@ async function main() {
     const bitRetOk = bitRetGrowth < (1 << 20); // < 1 MiB retained across 2e6 firstSet calls
     if (brSink === 0x7fffffff) process.stderr.write(''); // keep brSink live (defeat dead-code elimination)
 
+    // AliasTable hot path: a STATIC build-once Vose sampler, BUILT ONCE OUTSIDE the measured window
+    // (the O(n) build is the disclosed co-headline, EXCLUDED from the per-op claim). The measured
+    // hot loop is repeated sample() calls -- worst-case O(1), zero-alloc (two LCG advances on
+    // instance-local state + one Float64 compare + one Uint32 read; the immutable typed columns are
+    // slots, never a JS allocation). The returned index folds into an int32 sink so V8 cannot elide
+    // it and no heap double is promoted.
+    const AT_N = 1 << 12;                 // 4096 outcomes
+    const atW = new Float64Array(AT_N);
+    for (let k = 0; k < AT_N; k++) atW[k] = (k & 63) + 1; // all positive, a spread of weights
+    const aliasTable = new AliasTable(atW, 0x9e3779b1); // built once, outside the measured loop
+    let atSink = 0;
+    const aliasStep = () => { atSink = (atSink + aliasTable.sample()) | 0; };
+    const aliasAllocRes = measureAllocs(aliasStep, { iterations: 100000, batches: 8 });
+    const aliasBpc = aliasAllocRes.bytesPerCall === null ? 0 : aliasAllocRes.bytesPerCall;
+    const aliasAllocBytes = Math.max(0, Math.round(aliasBpc));
+    const aliasAllocOk = aliasAllocBytes === 0;
+
     // "0 B/op" resolved at the sampling floor: heapUsed deltas are quantized and
     // noisy, so a truly non-allocating op reads a sub-byte figure (a lone blip
     // in one batch / iterations). Round to the nearest byte -- any per-op
@@ -629,6 +659,7 @@ async function main() {
         cuckStep();
         stStep();
         bitStep();
+        aliasStep();
         if ((i & 8191) === 0) {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
         }
@@ -821,7 +852,7 @@ async function main() {
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
         findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && monoAllocOk &&
         minAllocOk && randAllocOk && freqAllocOk && buckAllocOk && twAllocOk && htwAllocOk &&
-        ringLogAllocOk && cuckAllocOk && stAllocOk && bitAllocOk && bitHighAllocOk && bitOrAllocOk && bitRetOk && abOk;
+        ringLogAllocOk && cuckAllocOk && stAllocOk && bitAllocOk && bitHighAllocOk && bitOrAllocOk && bitRetOk && aliasAllocOk && abOk;
 
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
@@ -839,10 +870,11 @@ async function main() {
         stAllocBytes + ' B/op (SparseTable) ' +
         bitAllocBytes + ' B/op (BitSet per-bit) ' +
         bitHighAllocBytes + ' B/op (BitSet firstSet/nextSet >=2^31 word) ' +
-        bitOrAllocBytes + ' B/op (BitSet or)' +
+        bitOrAllocBytes + ' B/op (BitSet or) ' +
+        aliasAllocBytes + ' B/op (AliasTable sample)' +
         ' | bitRetGrowth=' + bitRetGrowth + ' B' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
-        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' bsSink=' + bsSink + ' bhSink=' + bhSink + ' brSink=' + brSink + ' abGrowth=' + abDelta + ')');
+        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' bsSink=' + bsSink + ' bhSink=' + bhSink + ' brSink=' + brSink + ' atSink=' + atSink + ' abGrowth=' + abDelta + ')');
 
     if (!ok) {
         if (!trackedOk) console.error('  vacuous: tracker held ' + trackedMid + ' instances (expected > 0)');
@@ -868,6 +900,7 @@ async function main() {
         if (!bitHighAllocOk) console.error('  alloc ' + bitHighAllocBytes + ' B/op BitSet firstSet/nextSet >=2^31 word (raw bytesPerCall ' + bitHighBpc + ')');
         if (!bitOrAllocOk) console.error('  alloc ' + bitOrAllocBytes + ' B/op BitSet or (raw bytesPerCall ' + bitOrBpc + ')');
         if (!bitRetOk) console.error('  retain ' + bitRetGrowth + ' B heap growth over 2e6 BitSet firstSet calls (>= 2^31 word); limit ' + (1 << 20) + ' B -- a firstSet must retain nothing');
+        if (!aliasAllocOk) console.error('  alloc ' + aliasAllocBytes + ' B/op AliasTable sample (raw bytesPerCall ' + aliasBpc + ')');
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;
     }

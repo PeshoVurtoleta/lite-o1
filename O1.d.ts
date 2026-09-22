@@ -799,3 +799,53 @@ export class BitSet {
     /** Iterate the set-bit indices in ascending order. Allocates a {value, done} per step by protocol. */
     [Symbol.iterator](): IterableIterator<number>;
 }
+
+/**
+ * AliasTable -- a zero-GC, WORST-CASE O(1) STATIC Vose weighted sampler; the complement to
+ * RandomSet (which draws uniformly) and the suite's second static build-once / immutable member.
+ * Build a table from a fixed weight vector ONCE (an O(n) precompute), then `sample()` draws an
+ * outcome index in [0, n) by WEIGHT in worst-case O(1): two per-instance LCG advances + one
+ * Float64 compare + one Uint32 read, independent of n and of the weight distribution. The O(n)
+ * BUILD and the 2n Float64/Uint32 SPACE are a DISCLOSED co-headline paid once at construction,
+ * EXCLUDED from the per-op claim. The caller's weights are COPIED into an owned Float64Array, so
+ * a later mutation cannot invalidate a built table. The PRNG is a per-instance Numerical Recipes
+ * LCG mapped to a column by the HIGH bits (`floor(s/2^32 * n)`, never `s % n`); the seed is a 2nd
+ * ctor arg with a fixed default, and `clear()` resets the generator to the seed (the table is
+ * immutable -- nothing else to reset). Build-once, sample-only: NO mutators, NO reweight path
+ * (a reweight is an O(n) rebuild, disclosed future work). Fail closed at construction (a non-array
+ * / empty / bad-length weights, a non-numeric / NaN / +/-Infinity / negative weight, or an
+ * all-zero vector throws [lite-o1]); queries never throw (sample() returns only an index in
+ * [0, n); weightOf returns 0 on a bad index). Because sample is worst-case O(1), there is NO
+ * max-single-op line.
+ */
+export class AliasTable {
+    /**
+     * @param weights  the outcome weights; a real Array of numbers or a numeric TypedArray,
+     *                 length in [1, 2^26]. COPIED into an owned Float64Array (immutable). Every
+     *                 weight must be a finite number >= 0, with at least one strictly > 0.
+     * @param seed     RNG seed; any integer, coerced to uint32. Defaults to 0x9e3779b1.
+     */
+    constructor(
+        weights: number[] | Float64Array | Float32Array | Int8Array | Uint8Array |
+            Uint8ClampedArray | Int16Array | Uint16Array | Int32Array | Uint32Array,
+        seed?: number,
+    );
+
+    /** Number of outcomes; sample() returns an index in [0, size). */
+    readonly size: number;
+
+    /** The RNG seed clear() resets to (uint32). */
+    readonly seed: number;
+
+    /** Draw an outcome index in [0, size) by weight. Worst-case O(1). Never throws. */
+    sample(): number;
+
+    /** The original input weight of outcome i, or 0 for a bad / out-of-range index. O(1). Never throws. */
+    weightOf(i: number): number;
+
+    /** Reset the PRNG to the construction seed (the table is immutable). O(1). */
+    clear(): this;
+
+    /** Iterate the original input weights in outcome order, alloc-free. fn is (weight, index, table). */
+    forEach(fn: (weight: number, index: number, table: AliasTable) => void): void;
+}

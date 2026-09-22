@@ -22,13 +22,14 @@
  *   - CuckooMap vs a native Map (the fair, already-strong general-key exact dict)
  *   - SparseTable vs an alloc-free O(len) range-scan fold (recompute per query)
  *   - BitSet vs a native Set<number> (the fair, familiar sparse-membership default)
+ *   - AliasTable vs an alloc-free O(n) cumulative-scan sampler (linear scan per draw)
  */
 
 /** Sentinel for a cell that does not apply. NEVER 0. */
 export const NA = 'n/a';
 
-/** The fourteen shipped members, in build order. */
-export const SUBJECTS = ['SparseSet', 'RingDeque', 'UnionFind', 'MonoDeque', 'MinStack', 'RandomSet', 'FreqO1', 'BucketQueue', 'TimerWheel', 'HierarchicalTimerWheel', 'RingLog', 'CuckooMap', 'SparseTable', 'BitSet'];
+/** The fifteen shipped members, in build order. */
+export const SUBJECTS = ['SparseSet', 'RingDeque', 'UnionFind', 'MonoDeque', 'MinStack', 'RandomSet', 'FreqO1', 'BucketQueue', 'TimerWheel', 'HierarchicalTimerWheel', 'RingLog', 'CuckooMap', 'SparseTable', 'BitSet', 'AliasTable'];
 
 /** The eight measurement dimensions (RESEARCH.md section 3). */
 export const DIMENSIONS = ['D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7', 'D8'];
@@ -61,6 +62,7 @@ export const BASELINE = {
     CuckooMap: 'Map',           // the native built-in general-key exact map (fair-already)
     SparseTable: 'scan-fold',   // an alloc-free O(len) range-scan that recomputes each query
     BitSet: 'Set',              // the native Set<number>, the familiar sparse-membership default
+    AliasTable: 'scan-fold',    // an alloc-free O(n) cumulative-scan sampler (linear scan per draw)
 };
 
 /**
@@ -97,6 +99,7 @@ export const STRONG_BASELINE = {
     CuckooMap: NA,
     SparseTable: NA,
     BitSet: NA,
+    AliasTable: NA,
 };
 
 /**
@@ -208,6 +211,12 @@ export const RATIONALE = {
             'a 3-level popcount summary + zero GC. The Set degrades on cache + boxing (not big-O), so ' +
             'the evidence is the sustained throughput lead, not a foil collapse.',
     },
+    AliasTable: {
+        verdict: 'FAIR-ALREADY', strong: NA,
+        why: 'the foil is an alloc-free O(n) cumulative-scan sampler that linearly scans a prefix-sum ' +
+            'array for each draw -- the obvious approach before Vose\'s alias method, the honest rival, ' +
+            'not a strawman; AliasTable draws by weight in worst-case O(1) after a disclosed O(n) build.',
+    },
 };
 
 // ===========================================================================
@@ -244,6 +253,7 @@ export const MEMBER_TAGS = {
     CuckooMap: ['steady', 'reseed'],
     SparseTable: ['steady'],
     BitSet: ['steady'],
+    AliasTable: ['steady'],
 };
 
 /**
@@ -255,7 +265,7 @@ export const RANDOM_LOOKUP = {
     SparseSet: true, UnionFind: true,
     RingDeque: false, MonoDeque: false, MinStack: false, RandomSet: false,
     FreqO1: false, BucketQueue: false, TimerWheel: false, HierarchicalTimerWheel: false,
-    RingLog: false, CuckooMap: false, SparseTable: false, BitSet: false,
+    RingLog: false, CuckooMap: false, SparseTable: false, BitSet: false, AliasTable: false,
 };
 
 /**
@@ -270,6 +280,7 @@ export const CAPACITY_KNOB = {
     HierarchicalTimerWheel: true, RingLog: true, CuckooMap: true,
     SparseTable: false, // static build-once: cost is a build cost, not on the Pareto axes
     BitSet: true,       // fixed bit-capacity knob (nbits): ops/ms vs bytes/live on the Pareto
+    AliasTable: false,  // static build-once: cost is a build cost (like SparseTable), not on the Pareto axes
 };
 
 /**
@@ -299,23 +310,23 @@ export function baselineFor(member, dim) {
  */
 export function supportsKeyType(member, keyType) {
     if (!SUBJECTS.includes(member)) return false;
-    return keyType === 'int'; // all thirteen members are integer/numeric substrates
+    return keyType === 'int'; // all fifteen members are integer/numeric substrates
 }
 
 /**
  * D8 workload applicability per member. ECS dense-iter + random has/get is a
  * SparseSet workload; cache hot-subset is a membership workload (SparseSet);
  * churn (insert/delete the same keys) applies to every MUTABLE member.
- * SparseTable is STATIC / immutable -- it has no insert/delete, so churn is
- * inapplicable and reads NA (its D8 story is the query workload instead).
- * Inapplicable workloads read NA in the result, never 0.
+ * SparseTable and AliasTable are STATIC / immutable -- they have no insert/delete,
+ * so churn is inapplicable and reads NA (their D8 story is the query/sample workload
+ * instead). Inapplicable workloads read NA in the result, never 0.
  * @param {string} member
  * @param {'ecs'|'cache'|'churn'} workload
  * @returns {boolean}
  */
 export function supportsWorkload(member, workload) {
     if (!SUBJECTS.includes(member)) return false;
-    if (workload === 'churn') return member !== 'SparseTable'; // static member: no mutate churn
+    if (workload === 'churn') return member !== 'SparseTable' && member !== 'AliasTable'; // static: no mutate churn
     if (workload === 'ecs' || workload === 'cache') return member === 'SparseSet';
     return false;
 }
@@ -327,7 +338,7 @@ export function supportsWorkload(member, workload) {
  * The strong baseline is an EXTRA COMPARISON INSIDE an existing cell (it is timed
  * within D1 and carried on the D1 result as strongBaselineDist), NOT a new dimension
  * column and NOT a separate cell -- so the matrix stays exactly SUBJECTS x DIMENSIONS
- * (13 x 8 = 104) cells. Each descriptor carries `strongBaseline` (NA for the 10
+ * (15 x 8 = 120) cells. Each descriptor carries `strongBaseline` (NA for the 12
  * FAIR-ALREADY members) purely as metadata; it never multiplies the cell count.
  * @returns {{member:string, dim:string, baseline:string, strongBaseline:string}[]}
  */
@@ -400,8 +411,9 @@ export function classifyClaim(line) {
 // HEADLINE guarantee: clear() returns the structure to its pristine EMPTY invariant
 // (size 0), allocates ZERO bytes, retains the backing store, and leaves it reusable.
 //
-// Member-scoped ON PURPOSE. 12 of 13 members expose a reset surface (only SparseTable
-// has none), so the witness is NOT "everything with a clear()". The EXCLUDED table
+// Member-scoped ON PURPOSE. 14 of 15 members expose a reset surface (only SparseTable
+// has none; AliasTable's clear() resets the PRNG seed, not a container), so the witness
+// is NOT "everything with a clear()". The EXCLUDED table
 // below records, per member, WHY it is out of the witness scope -- so the narrow set
 // reads deliberate, not arbitrary (an excluded member is NAMED with a reason, never
 // silently dropped -- the same honesty discipline as the NA-never-0 rule).
@@ -411,7 +423,7 @@ export function classifyClaim(line) {
 export const CLEAR_WITNESS = ['SparseSet', 'RingDeque', 'RandomSet', 'RingLog'];
 
 /**
- * The nine members EXCLUDED from CLEAR_WITNESS, each with a short honest reason.
+ * The eleven members EXCLUDED from CLEAR_WITNESS, each with a short honest reason.
  * SparseTable is static (no mutators at all); UnionFind's reset surface is reset()
  * (an O(n) bulk primitive, not an O(1) clear()); CuckooMap's clear() fills an
  * occupancy map (O(capacity), touches a store) rather than a pure counter reset; the
@@ -430,6 +442,7 @@ export const CLEAR_WITNESS_EXCLUDED = Object.freeze({
     CuckooMap: 'clear() is an O(capacity) occupancy fill, not a pure counter reset',
     SparseTable: 'static/no-mutators -- build-once, no clear() surface at all',
     BitSet: 'clear() is an O(words) data + summary zero-fill, not a pure O(1) counter reset',
+    AliasTable: 'static/immutable -- clear() resets the PRNG seed, not a container empty/reuse cycle',
 });
 
 // ===========================================================================
@@ -472,4 +485,5 @@ export const OP_CLASS = Object.freeze({
     CuckooMap: { insert: 'amortized-O(1)', delete: 'worst-case-O(1)', iterate: 'O(n)-per-call' },
     SparseTable: { insert: NA, delete: NA, iterate: NA },
     BitSet: { insert: 'worst-case-O(1)', delete: 'worst-case-O(1)', iterate: 'O(n)-per-call' },
+    AliasTable: { insert: NA, delete: NA, iterate: NA },
 });

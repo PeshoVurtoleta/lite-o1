@@ -22,7 +22,7 @@
  */
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable } from '../../O1.js';
 
 const U = 1 << 16;      // universe 65536
 const CAP = 1 << 14;    // capacity 16384
@@ -1593,6 +1593,70 @@ const bsOrBulk = {
     statsOf(s) { return { grows: bitsetGrows(s) }; },
 };
 
+// ===========================================================================
+// AliasTable scenarios -- a STATIC build-once Vose table over three immutable typed arrays
+// (_prob Float64 + _alias Uint32 + _w Float64 owned weight copy). sample() is WORST-CASE O(1)
+// zero-alloc (two LCG advances + one compare + one read). The O(n) BUILD is done in setup()
+// (OUTSIDE the measured window) -- the disclosed co-headline. Static / immutable: the single
+// reused table is re-sampled, never rebuilt (clear() only resets the PRNG).
+// ===========================================================================
+
+const AT_CAP = 1 << 12;   // 4096 outcomes
+
+/**
+ * The zero-alloc counter for AliasTable scenarios: the three immutable backing arrays' byte
+ * lengths (_prob + _alias + _w). All fixed at construction, so this NEVER grows -- the delta
+ * across the window must be 0 (mirrors stGrows / bitsetGrows).
+ */
+function atGrows(s) {
+    return s.at._prob.buffer.byteLength + s.at._alias.buffer.byteLength + s.at._w.buffer.byteLength;
+}
+
+/** An AliasTable built ONCE over a bounded positive weight vector (the O(n) build is out of the window). */
+function atFill() {
+    const w = new Float64Array(AT_CAP);
+    for (let i = 0; i < AT_CAP; i++) w[i] = 1 + (((i * 2654435761) >>> 8) % 997); // varied positive weights
+    return new AliasTable(w, 0x9e3779b1);
+}
+
+/**
+ * sample: a prebuilt table; every op one weighted draw (the worst-case-O(1) hot body -- two LCG
+ * advances + one Float64 compare + one Uint32 read, independent of n), int32-wrapped acc so the
+ * returned index is never dead-code-eliminated / promoted to a heap double.
+ */
+const atSample = {
+    name: 'AliasTable sample',
+    setup() { return { at: atFill(), acc: 0 }; },
+    hot(s, n) {
+        const at = s.at;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) acc = (acc + (at.sample() | 0)) | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: atGrows(s) }; },
+};
+
+/**
+ * AliasTable forEach-drain: a prebuilt table scanned each op through a HOISTED module-scope
+ * callback (never re-created per op). Proves forEach itself (the alloc-free weight scan) allocates
+ * nothing over its own dedicated window.
+ */
+let atDrainAcc = 0;
+function atForEachInto(v, i) { atDrainAcc = (atDrainAcc + v + i) | 0; }
+const atForEachDrain = {
+    name: 'AliasTable forEach-drain',
+    setup() {
+        const w = new Float64Array(256);
+        for (let i = 0; i < 256; i++) w[i] = 1 + (((i * 2654435761) >>> 8) % 997);
+        return { at: new AliasTable(w, 1) };
+    },
+    hot(s, n) {
+        const at = s.at;
+        for (let i = 0; i < n; i++) at.forEach(atForEachInto);
+    },
+    statsOf(s) { return { grows: atGrows(s) }; },
+};
+
 const scenarios = [
     addChurn, hasHit, deleteChurn, clearRefill, forEachDrain,
     ringFifo, ringLifo, ringInterleave,
@@ -1608,6 +1672,7 @@ const scenarios = [
     cuckGetHit, cuckHasHit, cuckSetChurn, cuckUpdateChurn, cuckForEachDrain,
     stQuery, stAtRead, stForEachDrain,
     bsTestHit, bsSetChurn, bsUnsetChurn, bsFirstSet, bsNextSet, bsOrBulk,
+    atSample, atForEachDrain,
 ];
 
 /**
@@ -1953,6 +2018,29 @@ const bsMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/**
+ * The AliasTable teeth: a per-op forEach that pushes every weight into a FRESH [] each op (fresh
+ * array + fresh closure) -- it MUST trip the gate (scavenges scale with n), proving the instrument
+ * has teeth on the AliasTable surface too (AliasTable exposes NO iterator; forEach is the alloc-free
+ * scan). statsOf returns a constant so the failure is the allocation lanes, not a missing counter.
+ */
+const atMustFailAlloc = {
+    name: 'AliasTable forEach into fresh array (MUST allocate)',
+    setup() {
+        const w = new Float64Array(256);
+        for (let i = 0; i < 256; i++) w[i] = 1 + (((i * 2654435761) >>> 8) % 997);
+        return { at: new AliasTable(w, 7) };
+    },
+    hot(s, n) {
+        const at = s.at;
+        for (let i = 0; i < n; i++) {
+            const arr = []; // fresh array per op -> heap churn
+            at.forEach((v) => arr.push(v)); // fresh closure per op too
+        }
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -1962,5 +2050,5 @@ zgcSuite({
     counters: { grows: 0 },
     maxRetainedKB: 64,
     scenarios,
-    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc, twMustFailAlloc, htwMustFailAlloc, ringLogMustFailAlloc, cuckMustFailAlloc, stMustFailAlloc, bsMustFailAlloc],
+    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc, twMustFailAlloc, htwMustFailAlloc, ringLogMustFailAlloc, cuckMustFailAlloc, stMustFailAlloc, bsMustFailAlloc, atMustFailAlloc],
 });

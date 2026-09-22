@@ -1,7 +1,7 @@
 # lite-o1 -- which structure to pick (GUIDE)
 
 A repo-only decision guide for the O(1) family: which member, reach-for / avoid,
-and how to measure the constant yourself. At v1.4.0 the family is STABLE at fourteen
+and how to measure the constant yourself. At v1.5.0 the family is STABLE at fifteen
 members and this guide is complete for them -- still open (a new section lands with
 each future member), but no longer a skeleton. It is NOT an API encyclopedia (that
 is the README + `O1.d.ts`); it answers "which member, and is my constant real?"
@@ -23,7 +23,7 @@ flatness floor for YOUR workload -- run `npm run witness` and read the shape.
 
 ## Which member? (decision flowchart)
 
-ASCII, routes on the discriminating questions. Every leaf is one of the fourteen
+ASCII, routes on the discriminating questions. Every leaf is one of the fifteen
 members; `(wc)` = worst-case O(1), `(am)` = amortized O(1).
 
 ```
@@ -51,6 +51,9 @@ START -- what is the SHAPE of your workload?
 |
 +-- The MIN or MAX over an ARBITRARY range [l, r] of a FIXED numeric array you
 |   build ONCE and never mutate (static range-min/max query)? -> SparseTable (wc query)
+|
++-- Draw a random outcome by WEIGHT (a discrete distribution: loot table,
+|   weighted load-balance), built ONCE from fixed weights? -> AliasTable (wc sample)
 |
 +-- "Are these two in the SAME GROUP?" over a fixed integer set,
 |   merging groups incrementally (no un-merge)? -> UnionFind (am)
@@ -95,6 +98,7 @@ One row per member; pick by the left column, confirm with the discriminator.
 | an exact key -> number MAP over sparse / large INTEGER keys   | CuckooMap              | amortized*  | bucketized cuckoo, <= 8-slot probe; *lookup wc, set amortized (re-seed spike) |
 | the MIN or MAX over an ARBITRARY range of a FIXED numeric array | SparseTable            | worst-case  | STATIC build-once immutable range-min/max; O(1) query, O(n log n) build co-headline |
 | a DENSE bit/flag/dirty mask over MANY bits (N >> 32)         | BitSet                 | worst-case  | fixed multi-word bitset; O(1) test/set/clear/toggle + O(1) firstSet/nextSet via a popcount summary; O(words) bulk set-algebra |
+| a random outcome drawn by WEIGHT from a FIXED distribution   | AliasTable             | worst-case  | STATIC build-once Vose alias method; O(1) weighted sample() after an O(n) build co-headline; the weighted complement to RandomSet |
 
 ---
 
@@ -692,13 +696,48 @@ cohort; the O(words) bulk ops are the honest co-headline).
 
 ---
 
+### AliasTable (v1.5.0)
+
+Static build-once Vose weighted sampler: build a table from a fixed weight vector ONCE (an
+O(n) precompute over two flat typed arrays `_prob` Float64 + `_alias` Uint32, plus an owned
+`_w` weight copy), then `sample()` draws an outcome index in `[0, n)` by WEIGHT in worst-case
+O(1) (two per-instance LCG advances + one Float64 compare + one Uint32 read, independent of n
+and of the weight distribution). The WEIGHTED complement to RandomSet's UNIFORM draw, and the
+suite's SECOND static build-once / immutable member (after SparseTable). `weightOf(i)` reads
+the original weight; `clear()` resets the seeded PRNG for reproducibility.
+
+**Reach for it when:**
+
+- You draw from a fixed DISCRETE DISTRIBUTION repeatedly -- a loot / drop table, weighted
+  load-balancing, weighted Monte-Carlo, procedural generation -- and want O(1) per draw
+  instead of hand-rolling an O(n) cumulative scan.
+- The weights are KNOWN up front and do not change between draws (build once, sample forever).
+- You want a reproducible stream: a per-instance seed makes two same-seed tables draw the
+  identical sequence; `clear()` restarts it.
+
+**Avoid it when:**
+
+- The weights CHANGE between draws -- AliasTable is immutable, and a reweight is an O(n)
+  rebuild (disclosed future work); rebuild a new table, or reach for a Fenwick / segment tree
+  over cumulative weights if updates dominate.
+- You want UNIFORM sampling from a live membership set (add / remove members and sample) --
+  that is RandomSet (`sample` / `removeRandom`), not a static weighted table.
+- You need the drawn PAYLOAD, not an index -- `sample()` returns an outcome index in `[0, n)`;
+  keep payloads in a parallel column keyed by the index (the zero-GC discipline).
+
+**Measure it:** `npm run witness` -- AliasTable `sample` flatness `>= 0.70` across the n-sweep
+`[1e4..1e5]` (the 1e3 point is an L1 micro-case, shown but not gated) while a naive O(n)
+cumulative-scan sampler collapses (flatness `<= 0.55`), ratio `>= 1.5x`. The O(n) build is
+measured OUTSIDE the timed op (the SparseTable precedent). NO MAX-single-op line (worst-case
+cohort; the O(n) build + 2n typed-array space are the honest co-headline).
+
+---
+
 ## Roadmap members (not yet shipped, planned)
 
-The public API is stable at v1.4.0's fourteen members; these are planned, not shipped.
+The public API is stable at v1.5.0's fifteen members; these are planned, not shipped.
 Placeholders so the decision axes are visible early; each fills in on release.
 
-- **AliasTable** -- Vose weighted sampling (the fifteenth member, v1.5.0): O(1) weighted
-  `sample()` after an O(n) build, the weighted complement to RandomSet's uniform draw.
 - **SlotPool** -- free-list slot allocator with generational (ABA-safe) handles.
   Reach for it as the SoA substrate; reconcile against `@zakkster/lite-arena`
   before picking one.

@@ -5,7 +5,7 @@
  * fails `npm run test:types`. Not executed; only type-checked.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, BitSet, VERSION } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, BitSet, AliasTable, VERSION } from '../../O1.js';
 
 // VERSION is a string.
 const v: string = VERSION;
@@ -529,3 +529,42 @@ new BitSet('1000');
 bs.set('3');
 // @ts-expect-error -- and takes a BitSet.
 bs.and(5);
+
+// --- AliasTable ------------------------------------------------------------
+
+// Constructor: weights required (Array or numeric TypedArray); seed optional.
+const at: AliasTable = new AliasTable([1, 2, 3]);
+const atTyped: AliasTable = new AliasTable(new Float64Array([1, 2, 3]));
+const atSeed: AliasTable = new AliasTable([1, 2, 3], 0x12345678);
+void atTyped; void atSeed;
+
+// Getters: size / seed are readonly numbers.
+const atsize: number = at.size;
+const atseed: number = at.seed;
+void atsize; void atseed;
+
+// @ts-expect-error -- size is readonly.
+at.size = 5;
+// @ts-expect-error -- seed is readonly.
+at.seed = 5;
+
+// sample -> number; weightOf -> number; clear -> this (chainable).
+const atsample: number = at.sample();
+const atweight: number = at.weightOf(0);
+const atcleared: AliasTable = at.clear();
+void atsample; void atweight; void atcleared;
+
+// forEach callback gets (weight, index, table).
+at.forEach((w, i, table) => {
+    const ww: number = w;
+    const ii: number = i;
+    const tt: AliasTable = table;
+    void ww; void ii; void tt;
+});
+
+// @ts-expect-error -- weights must be an array / typed array of numbers.
+new AliasTable(1000);
+// @ts-expect-error -- seed must be a number.
+new AliasTable([1, 2, 3], 'seed');
+// @ts-expect-error -- weightOf takes a number.
+at.weightOf('3');

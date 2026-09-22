@@ -17,7 +17,7 @@
 import {
     SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet,
     FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel,
-    RingLog, CuckooMap, SparseTable, BitSet,
+    RingLog, CuckooMap, SparseTable, BitSet, AliasTable,
 } from '../O1.js';
 import {
     prng, median, warm, gcNow, hasGc, percentile, collect, timeNsPerOp, foldHash,
@@ -197,6 +197,16 @@ export function makeSubject(member, n, rng) {
         for (let k = 0; k < n; k += 2) b.set(k);
         let key = 0;
         return { obj: b, op: () => { key++; if (key >= n) key = 0; if (b.test(key)) SINK++; } };
+    }
+    if (member === 'AliasTable') {
+        // A STATIC build-once Vose sampler (built here, OUTSIDE the timed op -- the O(n) build is
+        // the disclosed co-headline, EXCLUDED from the per-op claim). The hot op is sample() --
+        // worst-case O(1): two LCG advances + one Float64 compare + one Uint32 read, INDEPENDENT
+        // of n and the weight distribution. The returned index folds into SINK.
+        const w = new Float64Array(n);
+        for (let k = 0; k < n; k++) w[k] = (k & 63) + 1; // all positive, a spread of weights
+        const t = new AliasTable(w, 0x9e3779b1);
+        return { obj: t, op: () => { if (t.sample() >= 0) SINK++; } };
     }
     throw new Error('[bench] unhandled member: ' + member);
 }
@@ -614,6 +624,25 @@ export function makeBaseline(member, n) {
         let key = 0;
         return { op: () => { key++; if (key >= n) key = 0; if (set.has(key)) SINK++; } };
     }
+    if (member === 'AliasTable') {
+        // An alloc-free O(n) cumulative-scan sampler: a Float64 prefix-sum array of the SAME
+        // weights, drawn by picking a uniform in [0, total) and LINEARLY SCANNING for the first
+        // prefix >= it -- the obvious approach before Vose's alias method. A full factor of n
+        // lost per draw, so it collapses as n grows -> O(n), timed gently. Uses the same LCG.
+        const cum = new Float64Array(n);
+        let total = 0;
+        for (let k = 0; k < n; k++) { total += (k & 63) + 1; cum[k] = total; }
+        let s = 0x9e3779b1 >>> 0;
+        return {
+            op: () => {
+                s = (s * 1664525 + 1013904223) >>> 0;
+                const u = (s / 4294967296) * total;
+                let i = 0;
+                while (i < n - 1 && cum[i] < u) i++; // O(n) linear scan for the outcome
+                SINK += i;
+            },
+        };
+    }
     throw new Error('[bench] unhandled member: ' + member);
 }
 
@@ -705,6 +734,7 @@ const LINEAR_BASELINE = {
     CuckooMap: false,    // native Map foil is O(1) per op (a fair-already, fast rival)
     SparseTable: true,   // scan-fold foil is an O(len) range rescan per query
     BitSet: false,       // native Set foil is O(1) per op (fair-already; degrades on cache, not big-O)
+    AliasTable: true,    // cumulative-scan foil is an O(n) linear prefix scan per draw
 };
 
 /** Exact backing-store byte footprint of a member instance (typed-array buffers). */
@@ -763,6 +793,11 @@ export function memberBytes(member, obj) {
         return obj._w.buffer.byteLength + obj._s1.buffer.byteLength +
             obj._s2.buffer.byteLength + obj._s3.buffer.byteLength;
     }
+    if (member === 'AliasTable') {
+        // prob (Float64, n) + alias (Uint32, n) -- the sampler proper -- plus the owned weights
+        // copy (Float64, n) that weightOf reads and immutability depends on. All fixed at build.
+        return obj._prob.buffer.byteLength + obj._alias.buffer.byteLength + obj._w.buffer.byteLength;
+    }
     throw new Error('[bench] unhandled member: ' + member);
 }
 
@@ -798,6 +833,9 @@ export function theoreticalMinPerLive(member) {
     if (member === 'BitSet') return 0.125;   // ONE BIT per live (set) element = 1/8 byte -- the
     // dense floor a bitset is FOR (bytes cheaper than a per-element slot). The ~nbits/1024-word
     // popcount summary is fixed overhead, NOT folded into the per-live floor (the FreqO1 discipline).
+    if (member === 'AliasTable') return 12;  // prob (Float64, 8) + alias (Uint32, 4) per outcome =
+    // the actual-column-width floor of the sampler proper. The owned weights copy (Float64, 8) that
+    // weightOf reads is the disclosed extra, NOT folded into the per-live floor (the SparseTable discipline).
     throw new Error('[bench] unhandled member: ' + member);
 }
 
@@ -1121,6 +1159,16 @@ function makeMixed(member, cap, rng) {
             key++; if (key >= cap) key = 0;
         };
     }
+    if (member === 'AliasTable') {
+        // STATIC / immutable: there is no mutation trace to amortize, so D2 reports drift as n/a
+        // (see D2). The trace here is a long stream of weighted samples over a table built ONCE --
+        // it proves the sample cost is FLAT (constant by construction), which keeps the cell
+        // non-vacuous (real sample nsPerOp points), never a mutation drift.
+        const w = new Float64Array(cap);
+        for (let k = 0; k < cap; k++) w[k] = (k & 63) + 1;
+        const t = new AliasTable(w, 0x9e3779b1);
+        return () => { if (t.sample() >= 0) SINK++; };
+    }
     // Fail closed (mirrors every other dispatch helper): a member NOT handled above must
     // throw, so a future member cannot silently inherit MonoDeque's mixed trace.
     throw new Error('[bench] unhandled member: ' + member);
@@ -1150,9 +1198,10 @@ export function D2(member, opts = {}) {
     // amortized-DRIFT metric is n/a (the STRING, never a numeric 0 -- "not applicable", not
     // "measured zero"). The points above are a real WIDE-range QUERY trace, kept so the cell
     // stays non-vacuous and shows the query cost is flat by construction.
-    const drift = member === 'SparseTable' ? NA : (first > 0 ? last / first : 0);
-    const reason = member === 'SparseTable'
-        ? 'static/immutable: no mutation trace to amortize; points are the flat query trace' : undefined;
+    const isStatic = member === 'SparseTable' || member === 'AliasTable';
+    const drift = isStatic ? NA : (first > 0 ? last / first : 0);
+    const reason = isStatic
+        ? 'static/immutable: no mutation trace to amortize; points are the flat query/sample trace' : undefined;
 
     // Bench v3 -- BOUNDARY-CROSSING trace: replay the member's steady op stream into an
     // UNTIMED tag lane and record the op indices where a STRUCTURAL boundary is crossed
@@ -1239,6 +1288,11 @@ function D3Static(member, opts) {
     const n = opts.n ?? 65536;
     const theoMin = theoreticalMinPerLive(member);
     const buildOne = (len) => {
+        if (member === 'AliasTable') {
+            const w = new Float64Array(len);
+            for (let k = 0; k < len; k++) w[k] = (k & 63) + 1; // all positive
+            return new AliasTable(w, 0x9e3779b1);
+        }
         const src = new Float64Array(len);
         for (let k = 0; k < len; k++) src[k] = (k * 2654435761) & 0x7fffffff;
         return new SparseTable(src, 'min');
@@ -1286,7 +1340,7 @@ function D3Static(member, opts) {
 }
 
 export function D3(member, opts = {}) {
-    if (member === 'SparseTable') return D3Static(member, opts);
+    if (member === 'SparseTable' || member === 'AliasTable') return D3Static(member, opts);
     const n = opts.n ?? 65536;
     let obj;
     if (member === 'SparseSet') obj = new SparseSet(n, n);
@@ -1629,11 +1683,11 @@ export function D7(member, opts = {}) {
     const baseIntNs = median(collect(makeBaseline(member, Math.min(n, LINEAR_BASELINE[member] ? 4096 : n)).op,
         LINEAR_BASELINE[member] ? 400 : 4000, 60));
 
-    // SparseTable is STATIC / immutable: it is ALWAYS fully built -- there is no fill fraction
-    // and no near-full / just-resized state, so the load-factor sweep is n/a (the STRING, never
-    // a numeric 0 -- "not applicable", not "measured zero"). The int-key QUERY throughput
-    // (keyTypes.int) + the scan-fold baseline keep the cell non-vacuous.
-    if (member === 'SparseTable') {
+    // SparseTable / AliasTable are STATIC / immutable: ALWAYS fully built -- there is no fill
+    // fraction and no near-full / just-resized state, so the load-factor sweep is n/a (the STRING,
+    // never a numeric 0 -- "not applicable", not "measured zero"). The int-key QUERY / SAMPLE
+    // throughput (keyTypes.int) + the scan-fold baseline keep the cell non-vacuous.
+    if (member === 'SparseTable' || member === 'AliasTable') {
         return {
             dim: 'D7', member, baseline: baselineFor(member, 'D7'), unit: 'ns/op',
             keyTypes, baselineIntNs: baseIntNs,
@@ -1811,12 +1865,13 @@ export function D8(member, opts = {}) {
     // (no insert/delete), so churn is n/a for it -- the STRING, never a numeric 0.
     const churn = supportsWorkload(member, 'churn') ? { nsPerOp: churnNs(member, n, seed) } : NA;
 
-    // SparseTable's D8 workload is the QUERY (its only op), the static-member analogue of churn:
-    // a stream of WIDE-range queries over a table built ONCE. This keeps the cell non-vacuous
-    // (a real query nsPerOp) even though ecs / cache / churn are all n/a for a static member.
+    // SparseTable's / AliasTable's D8 workload is the QUERY / SAMPLE (their only op), the static-
+    // member analogue of churn: a stream of wide-range queries (SparseTable) or weighted samples
+    // (AliasTable) over a table built ONCE. This keeps the cell non-vacuous (a real nsPerOp) even
+    // though ecs / cache / churn are all n/a for a static member.
     let query = NA;
-    if (member === 'SparseTable') {
-        const built = makeSubject(member, n, prng(seed)); // builds the table; op = a wide query
+    if (member === 'SparseTable' || member === 'AliasTable') {
+        const built = makeSubject(member, n, prng(seed)); // builds the table; op = a query / sample
         query = { nsPerOp: median(collect(built.op, 5000, 60)) };
     }
 
@@ -1921,7 +1976,8 @@ export function traceHash(member, seed = DEFAULT_SEED, length = 100000) {
     if (member === 'SparseSet' || member === 'UnionFind' || member === 'RandomSet' ||
         member === 'FreqO1' || member === 'BucketQueue' || member === 'TimerWheel' ||
         member === 'HierarchicalTimerWheel' || member === 'RingLog' ||
-        member === 'CuckooMap' || member === 'SparseTable' || member === 'BitSet') mode = 0;
+        member === 'CuckooMap' || member === 'SparseTable' || member === 'BitSet' ||
+        member === 'AliasTable') mode = 0;
     else if (member === 'RingDeque' || member === 'MinStack') mode = 1;
     else if (member === 'MonoDeque') mode = 2;
     else throw new Error('[bench] unhandled member: ' + member);

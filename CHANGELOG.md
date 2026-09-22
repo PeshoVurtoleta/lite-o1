@@ -8,6 +8,52 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.5.0] - 2026-09-22
+
+### Added
+
+- **`AliasTable` -- the fifteenth member: a zero-GC, WORST-CASE O(1) STATIC Vose weighted sampler.**
+  Build a table from a fixed weight vector ONCE (an O(n) precompute), then `sample()` draws an
+  outcome index in `[0, n)` by WEIGHT in worst-case O(1) -- two per-instance LCG advances + one
+  `Float64` compare + one `Uint32` read, INDEPENDENT of n and of the weight distribution. The
+  WEIGHTED complement to RandomSet's uniform draw (loot tables, weighted load-balancing,
+  Monte-Carlo, procedural generation), and the suite's SECOND static build-once / immutable member
+  (after `SparseTable`, riding the ADR 0018 static-member precedent). `weightOf(i)` returns the
+  original input weight (0 for a bad index, never throws); `clear()` resets the seeded PRNG so the
+  stream restarts exactly (reproducibility); `forEach(fn)` scans the weights alloc-free; `size` /
+  `seed` getters. The O(n) Vose build (small/large worklists over one pre-allocated `Int32Array`
+  scratch) and the `2n` `Float64`/`Uint32` table space are a DISCLOSED co-headline, paid once at
+  construction and excluded from the per-op claim -- so, like `SparseTable` / `BitSet`, there is NO
+  max-single-op line. Layout is a flat pointer-free SoA: `_prob` (per-column accept probability),
+  `_alias` (per-column fallback outcome), and `_w` (an owned copy of the caller's weights, so a
+  later mutation of the caller's array can never change an already-built table -- copy-not-reference).
+  The PRNG is a Numerical-Recipes LCG DUPLICATED inline (RandomSet's idiom) so there is no shared
+  mutable module state and tree-shaking stays intact. `ALIASTABLE_MAX_N = 2^26` (SMI-safe index
+  ceiling). Fail closed at construction: a non-array / empty / bad-length weights, a NaN /
+  `+/-Infinity` / negative / non-numeric weight, or an all-zero vector throws `[lite-o1]`
+  typeof-first, before any table is allocated. `sample()` / `weightOf()` never throw. Build-once,
+  sample-only: NO mutators (no reweight -- an O(n) rebuild, disclosed future work) and NO
+  `[Symbol.iterator]`. See [`decisions/0020`](./decisions/0020-aliastable.md).
+- **`test/AliasTable.test.js`** -- full behavioral suite: constructor validation (a non-array /
+  empty / bad-length weights, a NaN / Infinity / negative / non-numeric weight, and an all-zero
+  vector all throw before allocation), the Vose distribution (a large seeded sample converges to
+  each normalized weight within tolerance; a degenerate all-on-one control samples only that
+  outcome), determinism (same seed + weights reproduce the sequence; `clear()` restarts it),
+  copy-not-reference (mutating the caller's weights array after build changes nothing), and the
+  `sample()`-only-returns-`[0, n)` / `weightOf` never-throw contracts.
+- **Gate extensions for `AliasTable`:** the torture gate (retention + a `sample` 0-B/op hot-path
+  phase), the witness (`sample` flatness vs a naive O(n) cumulative-scan foil that collapses), the
+  perf gate (a zero-alloc `sample` scenario + a `forEach`-into-fresh-array MUST-allocate control),
+  and the benchmark matrix.
+
+### Changed
+
+- **Pure append.** The prior fourteen member classes are byte-identical; `AliasTable` is a new
+  `export class` appended to `O1.js`, plus the header member-count word (`fourteen` -> `fifteen`),
+  the roster comment, and the three-place version sync (`package.json` / the `VERSION` const /
+  `llms.txt`) to 1.5.0. README / GUIDE / llms.txt gain the `AliasTable` section and now describe the
+  roster as "fifteen members"; the benchmark grid is `15 x 8 = 120` cells.
+
 ## [1.4.1] - 2026-09-22
 
 ### Fixed

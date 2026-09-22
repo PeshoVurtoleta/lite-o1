@@ -3,11 +3,11 @@
  * that doubles as a teachable textbook: each member solves a real problem AND
  * witnesses its constant on a host (the O(1) Witness -- see test/witness.mjs).
  *
- * v1.4.1 ships fourteen members -- SparseSet, RingDeque, UnionFind, MonoDeque,
+ * v1.5.0 ships fifteen members -- SparseSet, RingDeque, UnionFind, MonoDeque,
  * MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel,
- * RingLog, CuckooMap, SparseTable, and BitSet -- plus its `VERSION` const. The fourteen
- * are independent (no shared mutable module state), so a bundler that imports one drops
- * the others (`sideEffects: false`).
+ * RingLog, CuckooMap, SparseTable, BitSet, and AliasTable -- plus its `VERSION` const. The
+ * fifteen are independent (no shared mutable module state), so a bundler that imports one
+ * drops the others (`sideEffects: false`).
  *
  * The complexity class IS the product: every hot op below is O(1) worst-case and
  * allocates ZERO bytes after construction. The witness harness (never imported
@@ -19,7 +19,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.4.1';
+export const VERSION = '1.5.0';
 
 /** Largest universe the Uint32 substrate + the (k >>> 0) key check can honor. */
 const MAX_UNIVERSE = 0x100000000; // 2^32
@@ -4094,5 +4094,214 @@ export class BitSet {
         const got = other instanceof BitSet ? other._nbits : String(other);
         throw new RangeError(
             '[lite-o1] BitSet bulk op requires a same-capacity BitSet (' + this._nbits + '), got ' + got);
+    }
+}
+
+// ---- AliasTable internals (module-level, cold-shared, no mutable module state) ----
+
+/**
+ * Largest outcome count AliasTable admits. 2^26 = 67,108,864 outcomes. The ceiling keeps
+ * every column index (`_prob` / `_alias` slot, the `_scratch` worklist index) inside the SMI /
+ * uint32 range (so no boxing on the hot path -- the SPARSETABLE_MAX_LEN 2^26 precedent). A TYPE
+ * bound (a fail-closed guard thrown BEFORE any table is built), not a size any host materializes
+ * (a 2^26-outcome table is already ~1.3 GB of typed arrays -- mirrors MinStack's 2^31 note).
+ */
+const ALIASTABLE_MAX_N = 0x4000000; // 2^26
+
+/**
+ * AliasTable -- a zero-GC, WORST-CASE O(1) STATIC Vose weighted sampler: build a table from a
+ * fixed weight vector ONCE (an O(n) precompute), then draw an outcome index in [0, n) by WEIGHT
+ * in worst-case O(1). The complement to RandomSet (which draws UNIFORMLY): loot tables, weighted
+ * load-balancing, Monte-Carlo, and procedural generation all reach for this and otherwise
+ * hand-roll an O(n) cumulative scan. The suite's SECOND static build-once / immutable member.
+ *
+ * THE HONESTY CONTRACT (rides the SparseTable static-member precedent -- see decisions/0018 +
+ * decisions/0020): `sample()` is the hot op and it is TRUE WORST-CASE O(1), zero-alloc -- two
+ * LCG advances + one Float64 compare + one Uint32 read, INDEPENDENT of n and of the weight
+ * distribution. The O(n) BUILD and the 2n Float64/Uint32 SPACE are a DISCLOSED CO-HEADLINE (the
+ * same shape as SparseTable's O(n log n) build, BucketQueue's O(ceiling) space): paid ONCE at
+ * construction and EXCLUDED from the per-op claim. Because the sample is worst-case O(1) (not
+ * amortized), there is NO max-single-op line -- the flat sample line IS the worst-case claim.
+ *
+ * Layout (flat SoA, pointer-free): `_prob` (Float64Array(n)) holds each column's accept
+ * probability n*p_i clamped into [0, 1); `_alias` (Uint32Array(n)) holds each column's fallback
+ * outcome; `_w` (Float64Array(n)) is an OWNED COPY of the caller's input weights (so a later
+ * caller mutation can NEVER change an already-built table -- the SparseTable copy-not-reference
+ * discipline, and the store `weightOf` reads). The Vose build partitions the scaled weights into
+ * small (<1) / large (>=1) worklists over ONE PRE-ALLOCATED Int32Array scratch (a small stack
+ * growing from the front, a large stack from the back -- no per-step allocation); the scratch +
+ * the scaled-weight temporary are discarded build locals, never instance fields.
+ *
+ * PRNG: a per-instance Numerical Recipes LCG advanced as `s = (s * 1664525 + 1013904223) >>> 0`,
+ * DUPLICATED inline (RandomSet's idiom) so there is NO shared mutable module state and tree
+ * shaking stays intact. Each sample() runs TWO advances: the FIRST word's HIGH bits pick a column
+ * (`floor(s / 2^32 * n)`, NOT `s % n` -- the NR LCG's low bits are weak), the SECOND word's high
+ * bits give a uniform in [0, 1) compared against `_prob[col]`. The seed is a 2nd ctor arg with a
+ * fixed default stored in `_seed`; `clear()` resets the generator to the seed. Two default-seeded
+ * tables therefore produce IDENTICAL sample sequences -- pass distinct seeds to decorrelate.
+ *
+ * Build-once, sample-only: there are NO mutators (no reweight / update -- a reweight is an O(n)
+ * rebuild, disclosed as future work; see the ADR) and no per-outcome writes. Fail closed at
+ * CONSTRUCTION (a non-array weights, an empty vector, a bad length, a non-numeric / NaN /
+ * +/-Infinity / negative weight, or an all-zero vector throw [lite-o1] -- nothing half-built
+ * escapes, thrown BEFORE any table is allocated). NEVER-throw QUERY: sample() returns only an
+ * integer in [0, n) for any PRNG state and never throws; weightOf(i) returns the original input
+ * weight (0 for a bad / out-of-range index) and never throws (the family "queries never throw"
+ * law). The only allocator is the constructor; sample / weightOf / forEach allocate ZERO bytes.
+ *
+ * Value contract (typeof FIRST, IDENTICAL to SparseTable): every weight must be typeof 'number'
+ * AND finite AND >= 0, with at least one strictly > 0; NaN / +/-Infinity / negative / null /
+ * string / object (incl. numeric valueOf) / Symbol / BigInt reject. The typeof guard runs FIRST
+ * so a Symbol / BigInt never reaches coercion; messages via String(x).
+ */
+export class AliasTable {
+    /**
+     * @param {number[]|Float64Array|Float32Array|Int8Array|Uint8Array|Uint8ClampedArray|Int16Array|Uint16Array|Int32Array|Uint32Array}
+     *        weights  the outcome weights; a real Array or a numeric TypedArray, length in
+     *                 [1, 2^26]. COPIED into an owned Float64Array (the table is immutable).
+     * @param {number} [seed=0x9e3779b1]  RNG seed; any integer (coerced to uint32).
+     */
+    constructor(weights, seed = 0x9e3779b1) {
+        // Shape guard FIRST: a real Array or an ArrayBuffer view (numeric TypedArray). A
+        // DataView / BigInt typed array is admitted here but fails the per-element number check
+        // below; null / a primitive is rejected outright. String(x) is Symbol/BigInt-safe.
+        if (weights === null || typeof weights !== 'object' ||
+            !(Array.isArray(weights) || ArrayBuffer.isView(weights))) {
+            throw new TypeError(
+                '[lite-o1] AliasTable weights must be an Array or a numeric TypedArray, got ' + String(weights));
+        }
+        const n = weights.length;
+        if (!Number.isInteger(n) || n < 1 || n > ALIASTABLE_MAX_N) {
+            throw new RangeError(
+                '[lite-o1] AliasTable weights length must be an integer in [1, 2^26], got ' + String(n));
+        }
+        // typeof guard BEFORE any coercion: Number.isInteger never coerces (false on a Symbol /
+        // BigInt), and String(seed) in the cold message is Symbol-safe. Any integer is folded
+        // into the uint32 RNG domain via >>> 0.
+        if (typeof seed !== 'number' || !Number.isInteger(seed)) {
+            throw new RangeError('[lite-o1] seed must be an integer, got ' + String(seed));
+        }
+        // Copy + validate every weight (typeof FIRST so a Symbol / BigInt element never reaches
+        // coercion; NaN / +/-Infinity / negative reject). Sum + require at least one > 0.
+        // Nothing half-built escapes -- validation throws before _prob / _alias are allocated or
+        // any this.* is assigned; the weights copy is a local until the build succeeds.
+        const w = new Float64Array(n);
+        let sum = 0;
+        let anyPositive = false;
+        for (let i = 0; i < n; i++) {
+            const v = weights[i];
+            if (typeof v !== 'number' || v !== v || v === Infinity || v === -Infinity || v < 0) {
+                this._badWeight(v, i); // v !== v -> NaN
+            }
+            w[i] = v;
+            sum += v;
+            if (v > 0) anyPositive = true;
+        }
+        if (!anyPositive) this._allZero();
+        // Vose build: scaled[i] = n * p_i = w[i] * n / sum. Partition into small (<1) / large
+        // (>=1) over ONE pre-allocated Int32Array scratch -- a small stack from the front (sp), a
+        // large stack from the back (lp); sp + lp only ever decreases, so they never overlap.
+        const prob = new Float64Array(n);
+        const alias = new Uint32Array(n);
+        const scaled = new Float64Array(n); // discarded build local
+        const scratch = new Int32Array(n);  // discarded build local (the two worklists)
+        const inv = n / sum;
+        let sp = 0; // small-stack size (indices [0, sp))
+        let lp = 0; // large-stack size (indices [n-lp, n))
+        for (let i = 0; i < n; i++) {
+            const s = w[i] * inv;
+            scaled[i] = s;
+            if (s < 1) scratch[sp++] = i;
+            else scratch[n - 1 - lp++] = i;
+        }
+        while (sp > 0 && lp > 0) {
+            const l = scratch[--sp];
+            const g = scratch[n - 1 - --lp];
+            prob[l] = scaled[l];
+            alias[l] = g;
+            const rem = (scaled[g] + scaled[l]) - 1; // g donates (1 - scaled[l]) to fill column l
+            scaled[g] = rem;
+            if (rem < 1) scratch[sp++] = g;
+            else scratch[n - 1 - lp++] = g;
+        }
+        // Whatever remains (float residue on either stack) is a full column: accept always.
+        while (lp > 0) prob[scratch[n - 1 - --lp]] = 1;
+        while (sp > 0) prob[scratch[--sp]] = 1;
+        this._n = n;              // outcome count (the size getter)
+        this._prob = prob;        // per-column accept probability in [0, 1] (Float64)
+        this._alias = alias;      // per-column fallback outcome (Uint32)
+        this._w = w;              // owned copy of the input weights (weightOf reads this)
+        this._seed = seed >>> 0;  // the reset seed (clear() restores _s to this)
+        this._s = seed >>> 0;     // per-instance RNG word (never module state)
+    }
+
+    /** Number of outcomes; sample() returns an index in [0, size). O(1). */
+    get size() { return this._n; }
+
+    /** The RNG seed clear() resets to (uint32). O(1). */
+    get seed() { return this._seed; }
+
+    /**
+     * Draw an outcome index in [0, n) by WEIGHT. WORST-CASE O(1), zero-alloc, NEVER throws for
+     * any PRNG state. Two LCG advances: the FIRST word's HIGH bits pick a column
+     * (floor(s / 2^32 * n), NOT s % n -- the NR LCG's low bits are weak), the SECOND word's high
+     * bits give a uniform in [0, 1) compared against _prob[col]; below it accept the column,
+     * else fall through to its alias. Advances the per-instance RNG word `_s` (that IS the state).
+     * @returns {number} an integer in [0, n)
+     */
+    sample() {
+        const n = this._n;
+        let s = (this._s * 1664525 + 1013904223) >>> 0; // advance 1: column pick
+        const col = Math.floor(s / 4294967296 * n);
+        s = (s * 1664525 + 1013904223) >>> 0;           // advance 2: accept uniform
+        this._s = s;
+        return (s / 4294967296) < this._prob[col] ? col : this._alias[col];
+    }
+
+    /**
+     * The ORIGINAL input weight of outcome i (from the owned Float64 copy). O(1). Returns 0 for a
+     * non-integer / out-of-range i and NEVER throws (the family "queries never throw" law -- a
+     * zero-weight outcome is never sampled anyway; typeof FIRST so a Symbol / BigInt never coerces).
+     * @param {number} i
+     * @returns {number}
+     */
+    weightOf(i) {
+        if (typeof i !== 'number' || (i | 0) !== i || i < 0 || i >= this._n) return 0;
+        return this._w[i];
+    }
+
+    /**
+     * Reset the PRNG to the construction seed. O(1). The table is IMMUTABLE, so there is nothing
+     * else to reset; after clear() the sample() sequence restarts exactly (reproducibility).
+     * @returns {AliasTable} this
+     */
+    clear() { this._s = this._seed; return this; }
+
+    /**
+     * Iterate the ORIGINAL input weights in outcome order, alloc-free. O(n) -- the documented
+     * scan exception, EXCLUDED from the zero-alloc-per-op claims. A HOISTED callback keeps it
+     * allocation-free.
+     * @param {(weight:number, index:number, table:AliasTable)=>void} fn
+     */
+    forEach(fn) {
+        const w = this._w;
+        const n = this._n;
+        for (let i = 0; i < n; i++) fn(w[i], i, this);
+    }
+
+    // ---- cold path only: throw builders (string concat lives here, off the hot body) ----
+
+    /** @private */
+    _badWeight(v, i) {
+        // String(v) -- NOT '+ v' / a template literal: those THROW on a Symbol or BigInt,
+        // turning a fail-closed reject into a different crash.
+        throw new TypeError(
+            '[lite-o1] AliasTable weight[' + i + '] must be a finite number >= 0, got ' + String(v));
+    }
+
+    /** @private */
+    _allZero() {
+        throw new RangeError(
+            '[lite-o1] AliasTable requires at least one strictly-positive weight (all weights were 0)');
     }
 }

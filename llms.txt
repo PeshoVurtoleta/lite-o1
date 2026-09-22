@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-Version: 1.4.1
+Version: 1.5.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -13,11 +13,11 @@ op is O(1) worst-case (or O(1)-amortized where stated) and allocates zero bytes
 after construction, and a shipped witness harness demonstrates the flat
 throughput curve against a built-in foil.
 
-v1.4.1 ships fourteen members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
+v1.5.0 ships fifteen members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
 RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap,
-SparseTable, and BitSet. They share no mutable module state, so a bundler that imports one drops
-the others (tree-shakeable). 1.4.0 adds BitSet (the fourteenth member; 1.3.0 added SparseTable,
-1.2.0 added CuckooMap, 1.1.0 added RingLog).
+SparseTable, BitSet, and AliasTable. They share no mutable module state, so a bundler that imports
+one drops the others (tree-shakeable). 1.5.0 adds AliasTable (the fifteenth member; 1.4.0 added
+BitSet, 1.3.0 added SparseTable, 1.2.0 added CuckooMap, 1.1.0 added RingLog).
 
 ## Exports (from the single main file O1.js)
 
@@ -72,7 +72,17 @@ the others (tree-shakeable). 1.4.0 adds BitSet (the fourteenth member; 1.3.0 add
   MULTI-WORD structure; @zakkster/lite-fastbit32 stays the single 32-flag word and
   @zakkster/lite-scheduler's FastBitScheduler the bit-bucket scheduler (design-parity only, ZERO
   runtime dep). Fixed capacity, fail closed at construction; test/firstSet/nextSet never throw.
-- `VERSION` -- string, '1.4.1'.
+- `AliasTable` -- class. A zero-GC, WORST-CASE O(1) STATIC Vose weighted sampler -- the suite's
+  SECOND static build-once / immutable member and the WEIGHTED complement to RandomSet's uniform
+  draw. Build a table from a fixed weight vector ONCE (an O(n) precompute), then sample() draws an
+  outcome index in [0, n) by WEIGHT in worst-case O(1) (two LCG advances + one Float64 compare +
+  one Uint32 read, independent of n and of the weight distribution). Loot tables, weighted
+  load-balancing, Monte-Carlo, procedural generation. The O(n) BUILD and 2n Float64/Uint32 SPACE
+  are a DISCLOSED co-headline paid once at construction (the SparseTable precedent). weightOf(i)
+  reads the original input weight; the caller's weights are COPIED in (immutable); a per-instance
+  seeded LCG makes it reproducible (clear() resets to the seed). Build-once, sample-only (NO
+  mutators / reweight); fail closed at construction, sample()/weightOf() never throw.
+- `VERSION` -- string, '1.5.0'.
 
 ## SparseSet
 
@@ -907,6 +917,59 @@ WORST-CASE O(1) (a fixed word load + mask op, never a run), and firstSet / nextS
 WORST-CASE O(1) via the summary -- so the witness prints NO MAX-single-op line; the flat per-bit
 line IS the claim. The O(words) bulk ops are the honest co-headline (like SparseTable's build).
 
+## AliasTable
+
+    new AliasTable(weights, seed = 0x9e3779b1)
+
+- A WORST-CASE O(1) STATIC Vose weighted sampler: build a table from a fixed weight vector ONCE
+  (an O(n) precompute), then draw an outcome index in [0, n) by WEIGHT in worst-case O(1). The
+  WEIGHTED complement to RandomSet (which draws UNIFORMLY): loot tables, weighted load-balancing,
+  Monte-Carlo, procedural generation -- all otherwise hand-roll an O(n) cumulative scan. The
+  suite's SECOND static build-once / immutable member, the fifteenth member.
+- weights: the outcome weights; a real Array or a numeric TypedArray, length n in [1, 2^26].
+  COPIED into an owned Float64Array (the table is immutable -- a later caller mutation can never
+  change an already-built table). Every weight must be typeof 'number' AND finite AND >= 0, with
+  at least one strictly > 0; a non-array / empty / bad-length weights, or a NaN / +/-Infinity /
+  negative / non-numeric element, or an all-zero vector, throws [lite-o1] (typeof guard FIRST so a
+  Symbol / BigInt never coerces), thrown BEFORE any table is allocated so nothing half-built escapes.
+- seed: optional RNG seed; any integer (coerced to uint32), default 0x9e3779b1, per-instance.
+- Substrate (flat SoA, pointer-free): `_prob` (Float64Array(n)) per-column accept probability in
+  [0, 1]; `_alias` (Uint32Array(n)) per-column fallback outcome; `_w` (Float64Array(n)) the owned
+  copy of the input weights (weightOf reads it). The Vose build partitions the scaled weights into
+  small (<1) / large (>=1) worklists over ONE pre-allocated Int32Array scratch (a small stack from
+  the front, a large stack from the back -- no per-step allocation); scratch + scaled temporaries
+  are discarded build locals, never instance fields. PRNG: a per-instance Numerical-Recipes LCG
+  (s = (s*1664525 + 1013904223) >>> 0), DUPLICATED inline (RandomSet's idiom) so there is no shared
+  mutable module state and tree-shaking stays intact.
+
+Hot surface (sample is WORST-CASE O(1), zero allocation):
+
+- sample() -> index          Draw an outcome index in [0, n) by weight. WORST-CASE O(1), zero-alloc,
+                             NEVER throws for any PRNG state. Two LCG advances: the first word's
+                             HIGH bits pick a column (floor(s / 2^32 * n), NOT s % n -- the LCG's
+                             low bits are weak), the second word's high bits give a uniform in
+                             [0, 1) compared against _prob[col]; below it accept the column, else
+                             fall through to its alias. Advances the per-instance RNG word.
+- weightOf(i) -> number      The ORIGINAL input weight of outcome i (from the owned copy). O(1).
+                             A non-integer / out-of-range i returns 0 and NEVER throws (a
+                             zero-weight outcome is never sampled anyway; typeof guard FIRST).
+- clear() -> this            Reset the PRNG to the construction seed. O(1). The table is IMMUTABLE
+                             (nothing else to reset), so the sample() sequence restarts exactly.
+- forEach(fn) -> void        Invoke fn(weight, index, table) over the original weights in outcome
+                             order, alloc-free. O(n) -- the documented scan exception. A HOISTED
+                             callback keeps it allocation-free.
+- size (getter)              Number of outcomes n (sample() returns an index in [0, size)).
+- seed (getter)             The RNG seed clear() resets to (uint32).
+
+Build-once, sample-only: there are NO mutators (no reweight / update-weight -- a reweight is an
+O(n) rebuild, disclosed as future work) and no [Symbol.iterator]. The only allocator is the
+constructor; sample / weightOf / forEach allocate ZERO bytes.
+
+Worst-case honesty: sample() is WORST-CASE O(1) (two LCG advances + one compare + one read,
+independent of n and the weight skew), so like SparseTable / BitSet it prints NO MAX-single-op
+line -- the flat sample line IS the claim. The O(n) BUILD + 2n Float64/Uint32 SPACE are the honest
+co-headline (paid once at construction, EXCLUDED from the per-op claim, the SparseTable precedent).
+
 ## Design bounds
 
 - SparseSet valid key: integer in [0, universe).
@@ -1024,6 +1087,17 @@ line IS the claim. The O(words) bulk ops are the honest co-headline (like Sparse
   [Symbol.iterator] yield set-bit indices in ascending order (iterator allocates). NO max-single-op
   line (worst-case cohort). NON-OVERLAP: the MULTI-WORD structure vs lite-fastbit32's single 32-flag
   word + lite-scheduler's FastBitScheduler (design-parity only, ZERO runtime dep).
+- AliasTable valid weights: a real Array or numeric TypedArray, length n in [1, 2^26]; every weight
+  typeof 'number' && finite && >= 0, at least one > 0. STATIC build-once / immutable: the weights
+  are COPIED in, there are NO mutators (no reweight -- an O(n) rebuild, disclosed future work) and
+  NO [Symbol.iterator]. Fail closed at CONSTRUCTION (a non-array / empty / bad-length weights, a
+  NaN / +/-Infinity / negative / non-numeric element, or an all-zero vector throw [lite-o1]
+  typeof-first, before any table is allocated). sample() is WORST-CASE O(1) (two LCG advances +
+  one compare + one read, independent of n), returns an index in [0, n), NEVER throws; weightOf(i)
+  returns the original weight (0 for a bad index), NEVER throws. PRNG per-instance seeded (LCG
+  duplicated inline, no module state); clear() resets to the seed for reproducibility. The O(n)
+  BUILD + 2n Float64/Uint32 SPACE are the disclosed co-headline (paid once, EXCLUDED from the per-op
+  claim). NO max-single-op line (worst-case cohort). forEach is the O(n) alloc-free scan exception.
 
 ## Scripts
 
@@ -1148,10 +1222,10 @@ line IS the claim. The O(words) bulk ops are the honest co-headline (like Sparse
 
 ## Not yet shipped
 
-The public API grows one member per release. 1.4.0 adds BitSet (the fourteenth member; 1.3.0 added
-SparseTable, 1.2.0 added CuckooMap, 1.1.0 added RingLog). Not in this release, planned for later:
-AliasTable (Vose weighted sampling -- the fifteenth member, 1.5.0) and SlotPool (a free-list slot
-allocator with generational ABA-safe handles).
+The public API grows one member per release. 1.5.0 adds AliasTable (the fifteenth member; 1.4.0
+added BitSet, 1.3.0 added SparseTable, 1.2.0 added CuckooMap, 1.1.0 added RingLog). Not in this
+release, planned for later: SlotPool (a free-list slot allocator with generational ABA-safe
+handles) and a fully unbounded / hashed timer wheel.
 SparseSet holds membership, not payloads (store values in a parallel SoA
 column or @zakkster/lite-arena); RingDeque holds numbers only; UnionFind holds
 disjoint-set connectivity over [0, n), not payloads; MonoDeque holds numeric
