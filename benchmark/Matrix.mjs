@@ -21,13 +21,14 @@
  *   - RingLog vs a never-evicting growing Array (the foil pays unbounded memory)
  *   - CuckooMap vs a native Map (the fair, already-strong general-key exact dict)
  *   - SparseTable vs an alloc-free O(len) range-scan fold (recompute per query)
+ *   - BitSet vs a native Set<number> (the fair, familiar sparse-membership default)
  */
 
 /** Sentinel for a cell that does not apply. NEVER 0. */
 export const NA = 'n/a';
 
-/** The thirteen shipped members, in build order. */
-export const SUBJECTS = ['SparseSet', 'RingDeque', 'UnionFind', 'MonoDeque', 'MinStack', 'RandomSet', 'FreqO1', 'BucketQueue', 'TimerWheel', 'HierarchicalTimerWheel', 'RingLog', 'CuckooMap', 'SparseTable'];
+/** The fourteen shipped members, in build order. */
+export const SUBJECTS = ['SparseSet', 'RingDeque', 'UnionFind', 'MonoDeque', 'MinStack', 'RandomSet', 'FreqO1', 'BucketQueue', 'TimerWheel', 'HierarchicalTimerWheel', 'RingLog', 'CuckooMap', 'SparseTable', 'BitSet'];
 
 /** The eight measurement dimensions (RESEARCH.md section 3). */
 export const DIMENSIONS = ['D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7', 'D8'];
@@ -59,6 +60,7 @@ export const BASELINE = {
     RingLog: 'growing-array',   // a plain Array-backed log that grows / trims via O(n) shift
     CuckooMap: 'Map',           // the native built-in general-key exact map (fair-already)
     SparseTable: 'scan-fold',   // an alloc-free O(len) range-scan that recomputes each query
+    BitSet: 'Set',              // the native Set<number>, the familiar sparse-membership default
 };
 
 /**
@@ -94,6 +96,7 @@ export const STRONG_BASELINE = {
     RingLog: NA,
     CuckooMap: NA,
     SparseTable: NA,
+    BitSet: NA,
 };
 
 /**
@@ -197,6 +200,14 @@ export const RATIONALE = {
             '-- the obvious approach before the sparse-table precompute, the honest rival, not a ' +
             'strawman; SparseTable answers in worst-case O(1) after a disclosed O(n log n) build.',
     },
+    BitSet: {
+        verdict: 'FAIR-ALREADY', strong: NA,
+        why: 'the foil is a native Set<number> -- the familiar sparse-membership default a working ' +
+            'dev reaches for, already fair (not a strawman); BitSet trades Set object-key generality ' +
+            'for a dense word-indexed test/set/clear/toggle with worst-case-O(1) firstSet/nextSet via ' +
+            'a 3-level popcount summary + zero GC. The Set degrades on cache + boxing (not big-O), so ' +
+            'the evidence is the sustained throughput lead, not a foil collapse.',
+    },
 };
 
 // ===========================================================================
@@ -232,6 +243,7 @@ export const MEMBER_TAGS = {
     RingLog: ['steady', 'wrap'],
     CuckooMap: ['steady', 'reseed'],
     SparseTable: ['steady'],
+    BitSet: ['steady'],
 };
 
 /**
@@ -243,7 +255,7 @@ export const RANDOM_LOOKUP = {
     SparseSet: true, UnionFind: true,
     RingDeque: false, MonoDeque: false, MinStack: false, RandomSet: false,
     FreqO1: false, BucketQueue: false, TimerWheel: false, HierarchicalTimerWheel: false,
-    RingLog: false, CuckooMap: false, SparseTable: false,
+    RingLog: false, CuckooMap: false, SparseTable: false, BitSet: false,
 };
 
 /**
@@ -257,6 +269,7 @@ export const CAPACITY_KNOB = {
     RandomSet: true, FreqO1: true, BucketQueue: true, TimerWheel: true,
     HierarchicalTimerWheel: true, RingLog: true, CuckooMap: true,
     SparseTable: false, // static build-once: cost is a build cost, not on the Pareto axes
+    BitSet: true,       // fixed bit-capacity knob (nbits): ops/ms vs bytes/live on the Pareto
 };
 
 /**
@@ -416,6 +429,7 @@ export const CLEAR_WITNESS_EXCLUDED = Object.freeze({
     HierarchicalTimerWheel: 'clear() also resets the clock (now) + cascade levels',
     CuckooMap: 'clear() is an O(capacity) occupancy fill, not a pure counter reset',
     SparseTable: 'static/no-mutators -- build-once, no clear() surface at all',
+    BitSet: 'clear() is an O(words) data + summary zero-fill, not a pure O(1) counter reset',
 });
 
 // ===========================================================================
@@ -457,4 +471,5 @@ export const OP_CLASS = Object.freeze({
     RingLog: { insert: 'worst-case-O(1)', delete: NA, iterate: 'O(n)-per-call' },
     CuckooMap: { insert: 'amortized-O(1)', delete: 'worst-case-O(1)', iterate: 'O(n)-per-call' },
     SparseTable: { insert: NA, delete: NA, iterate: NA },
+    BitSet: { insert: 'worst-case-O(1)', delete: 'worst-case-O(1)', iterate: 'O(n)-per-call' },
 });

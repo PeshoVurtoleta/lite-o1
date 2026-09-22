@@ -288,11 +288,20 @@ entries from that list were routed elsewhere (see below).
 | Post-1.0 #1 | **RingLog** (lossy overwrite ring) | push (overwrite-oldest) / iterate / drain | O(1) worst-case | The real-time/telemetry/audio idiom: a fixed-capacity ring that OVERWRITES the oldest entry on full, rather than failing closed like RingDeque. Distinct SEMANTIC, not a RingDeque preset (supersedes the Tier-3 "may be a preset" hedge). Cleanest win: low complexity, pure O(1), naturally zero-GC. Teaching pair with RingDeque (lossy-overwrite vs fail-closed-at-capacity). | 1.1.0 |
 | Post-1.0 #2 | **CuckooMap / HopscotchMap** (name TBD) | get / set / delete | O(1) worst-case lookup; O(1) amortized insert | The first GENERAL-KEY exact dictionary with worst-case-O(1) lookup in the suite (SparseSet/RandomSet are integer-keyed; lite-lru is caches; lite-filter is APPROXIMATE membership -- none is an exact worst-case-O(1) map). Its rehash spike WEARS THE MAX-SINGLE-OP LINE, the same honesty headline as HierarchicalTimerWheel's cascade -- a thematic sibling. The meatiest of the three (eviction-loop bound + zero-GC rehash to design). | 1.2.0 |
 | Post-1.0 #3 | **SparseTable / StaticRMQ** | build / query (range min/max) | O(1) query (after O(n log n) build) | Legit O(1) range-min/max query over flat typed arrays, zero-GC. The O(1)-query answer to lite-logn's O(log n) Fenwick/SegmentTree -- a perfect cross-package teaching contrast. Carries ONE boundary decision to settle first (see open question below). | 1.3.0 |
+| Post-1.0 #4 | **BitSet** (multi-word dense bitset) | test / set / clear / toggle / firstSet / nextSet | O(1) worst-case per-bit; O(1) firstSet via a summary layer; bulk popcount/and/or/xor O(n/32) DISCLOSED | The general ARBITRARY-CAPACITY dense bitset over MANY Uint32 words (N >> 32) -- the canonical worst-case-O(1) structure the roster still lacks: visited sets, dirty masks, replay windows, permission bitmaps at scale. NOT lite-fastbit32 (that is the SINGLE-word 32-flag manager) and NOT a bit-bucket scheduler (lite-scheduler's FastBitScheduler / lite-o1's own BucketQueue own that) -- a distinct structure at a different scale, design-parity with fastbit32's branchless word ops but NOT a runtime dep (zero-deps law). Its differentiator over a raw Uint32Array is the O(1) firstSet/nextSet via a two-level popcount summary; bulk word ops are honestly O(words). | 1.4.0 |
+| Post-1.0 #5 | **AliasTable** (Vose weighted sampling) | build / sample | O(1) worst-case sample (after O(n) build) | O(1) WEIGHTED random sampling (one PRNG draw + one compare + one read over two typed arrays: `_prob` Float64, `_alias` Uint32). The weighted complement to RandomSet (uniform-only). Fits the SparseTable static build-once/immutable member contract (query worst-case O(1) zero-alloc; O(n) build a disclosed co-headline; NO max-single-op line). Instance-local seeded PRNG (deterministic, clear() resets seed). Loot tables, weighted load-balancing, Monte-Carlo, procedural gen. | 1.5.0 |
 
-Suggested order (adjustable): RingLog first (easy win, warms the post-1.0 cadence) -> CuckooMap (fills the
-real exact-dictionary gap) -> SparseTable (settle the static-member boundary, then ship). Each is a full
-pipeline session (planner -> discuss/settle -> coder -> reviewer -> qa), user commits/publishes, /release
-gate + card sync after, same as members 1-10.
+The first three post-1.0 sessions SHIPPED (RingLog 1.1.0, CuckooMap 1.2.0, SparseTable/StaticRMQ 1.3.0 --
+the static build-once/immutable boundary was SETTLED YES at the SparseTable session, so it is now the template
+for a static sub-family). That backlog is EXHAUSTED; #4 BitSet and #5 AliasTable REOPEN the queue (sourced from
+the 2026-09-22 research audit vs the whole @zakkster O-notation shelf). Both are small, canonical, zero-GC,
+and zero-overlap with any sibling (the audit confirmed lite-fastbit32/lite-scheduler own the single-word and
+scheduler bit niches; see section 6). AliasTable rides the SparseTable static-member precedent already settled.
+
+Suggested order (adjustable): RingLog -> CuckooMap -> SparseTable (all shipped) -> BitSet (broadest reuse,
+easy win) -> AliasTable (leans on the settled static-member contract). Each is a full pipeline session
+(planner -> discuss/settle -> coder -> reviewer -> qa), user commits/publishes, /release gate + card sync
+after, same as members 1-10.
 
 Design calls to settle at each session's start (surfaced now so they are not a surprise):
 - **RingLog:** does overwrite return/expose the evicted entry (a drain hook) or silently drop it? clear()
@@ -306,7 +315,26 @@ Design calls to settle at each session's start (surfaced now so they are not a s
   but not a mutable O(1)-op structure)? If yes, SparseTable is the template for that sub-family; if no, it is
   routed out. Also: min/max only vs an idempotent-monoid generalization (gcd, bitwise-or) -- lean: ship RMQ
   min/max, note the monoid generalization. Bench foil = lite-logn SegmentTree (O(log n) query) if available,
-  else a naive O(n) scan.
+  else a naive O(n) scan. (SETTLED YES: static members admitted under an honesty contract -- SparseTable shipped.)
+- **BitSet:** fixed-capacity fail-closed vs growable (lean: FIXED, matching every worst-case-O(1) member --
+  growth would pay an amortized realloc). Does it ship the O(1) firstSet/nextSet SUMMARY layer (a two-level
+  popcount hierarchy, ~n/1024 extra words) or stay flat with an O(n/32) scan (lean: SHIP the summary -- it is
+  the differentiator over a raw Uint32Array + lite-fastbit32, and keeps find-first worst-case O(1))? Bulk
+  set-algebra between two same-capacity bitsets (and/or/xor/andNot, in place, O(words)) -- include or defer
+  (lean: include, they are the point of a bitset). Iteration = ascending set-bit indices. NON-OVERLAP: this is
+  the multi-word arbitrary-N structure; lite-fastbit32 stays the single-word 32-flag primitive and
+  lite-scheduler's FastBitScheduler stays the bit-bucket scheduler -- BitSet reuses fastbit32's branchless
+  word-op idiom by DESIGN-PARITY, never as a runtime dep (zero-deps law), exactly as SlotPool/NodePool do.
+  Witness op = test (or set) as a flat ops/ms line; foil = a `Set<number>` or boolean `Array` whose per-op
+  throughput degrades with n (cache/box pressure) while BitSet stays flat.
+- **AliasTable:** build-once immutable (no reweight) vs a rebuild/update-weight path (lean: IMMUTABLE, the
+  SparseTable static-member precedent -- reweight is an O(n) rebuild, disclosed/future). `sample()` returns an
+  integer outcome index in [0, n); the caller maps index -> payload (keeps it zero-GC, numeric-only). PRNG =
+  instance-local deterministic (mulberry32/splitmix idiom, seed arg with a fixed default, clear() resets the
+  seed -- the SkipList/Treap seed discipline). Guard: weights finite and >= 0, at least one positive, typeof
+  FIRST. Witness op = sample (flat O(1) line); foil = a naive O(n) cumulative-scan sampler whose per-sample
+  throughput falls as n grows. WORST-CASE member -> no max-single-op line (the O(n) build is the disclosed
+  co-headline, like SparseTable).
 
 Routed elsewhere (from the same candidate list, for the record, so they are not re-proposed as lite-o1):
 - **van Emde Boas / y-fast trie** -> lite-loglogn (O(log log U); already drafted RESEARCH.md/ROADMAP.md there).
@@ -343,12 +371,30 @@ The suite ships one clear niche per package. lite-o1 must not re-implement what 
 - **lite-arena** (zero-GC ECS allocator): already a SoA allocator. lite-o1's `SlotPool` is the GENERAL,
   standalone free-list-with-generational-handles primitive; if lite-arena's allocator is exactly this,
   `SlotPool` should re-export or depend on it rather than fork it. Resolve at planning time.
-- **lite-fastbit32** (branchless 32-bit flag manager): the bitset primitive. Any lite-o1 member needing
-  a bitmap uses it as a policy-local dependency, exactly as lite-lru's SIEVE does -- never a reimplementation.
+- **lite-fastbit32** (branchless 32-bit flag manager): the SINGLE-WORD 32-flag primitive (ECS masks/pools).
+  lite-o1's `BitSet` (post-1.0 #4) is a DIFFERENT structure -- the multi-word, arbitrary-capacity dense bitset
+  (N >> 32) with an O(1) firstSet/nextSet summary layer and bulk set-algebra. Zero-deps law forbids a runtime
+  dependency, so BitSet reuses fastbit32's branchless word-op idiom by DESIGN-PARITY only (the SlotPool/NodePool
+  precedent), and the two cross-link: reach for fastbit32 for a fixed 32-flag word, BitSet for an N-bit set.
+- **lite-scheduler** (`FastBitScheduler`, an O(1) 32-tier Int32 bucket queue): owns the bitmask-AS-scheduler
+  niche. lite-o1's own `BucketQueue` (Dial's monotone queue) is the priority-queue cousin; neither is a general
+  bitset. BitSet must not drift into scheduling -- it is a membership/flag structure only.
 - **lite-lru** already ships a constant-time `Lfu`. lite-o1's `FreqO1` is the standalone frequency
   primitive (inc/dec/getMax/getMin), not a cache; the doc must cross-link the two and state the difference.
-- **lite-filter** owns approximate membership. Probabilistic O(1)-update sketches (Count-Min, HyperLogLog)
-  likely belong there; lite-o1 lists them only to mark the boundary.
+- **lite-filter** owns approximate MEMBERSHIP (Bloom -> Cuckoo -> Quotient -> Xor -> BinaryFuse, complete at
+  1.0.0). It is frozen at membership -- it is NOT the home for frequency/cardinality sketches.
+- **lite-sketch** (PROPOSED, user-approved 2026-09-22): the probabilistic frequency/cardinality family --
+  HyperLogLog (distinct count), CountMinSketch / CountSketch (frequency), HeavyKeeper / SpaceSaving (top-k /
+  heavy hitters). These are NEITHER membership (lite-filter) NOR exact-O(1) (lite-o1), so they route to their
+  own sibling with a shared "bounded error, zero-GC register arrays, measured-vs-theory honesty" contract.
+  lite-o1 lists them ONLY to mark the boundary; the deterministic-approximate SpaceSaving/Misra-Gries may land
+  here instead if the family prefers to keep all approximate-streaming together.
+- **lite-adaptive** (PROPOSED, user-approved): the future home for HYBRID structures that are O(1)
+  common-case but resolve to O(log n)/O(log log U) worst-case (interpolation search, fusion trees,
+  splay-augmented caches). Such a member routes to the library of its PROVABLE WORST-CASE bound and discloses
+  the O(1) fast path; a dedicated lite-adaptive is warranted only when BOTH bounds are load-bearing. Build
+  after lite-logn / lite-loglogn. lite-o1 keeps ONLY structures whose worst/amortized/expected bound is truly
+  O(1).
 
 ---
 

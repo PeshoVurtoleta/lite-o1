@@ -17,7 +17,7 @@
 import {
     SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet,
     FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel,
-    RingLog, CuckooMap, SparseTable,
+    RingLog, CuckooMap, SparseTable, BitSet,
 } from '../O1.js';
 import {
     prng, median, warm, gcNow, hasGc, percentile, collect, timeNsPerOp, foldHash,
@@ -188,6 +188,15 @@ export function makeSubject(member, n, rng) {
             obj: t,
             op: () => { const r = l + half; SINK += (t.query(l, r < n ? r : n - 1) | 0); l++; if (l >= half) l = 0; },
         };
+    }
+    if (member === 'BitSet') {
+        // A dense bitset of n bits with the EVEN bits set (~half the domain), then a walking
+        // membership probe (test) over [0, n) -- worst-case O(1): one word load + one mask test,
+        // INDEPENDENT of n. ~half the probes hit, half miss, so the branch is exercised both ways.
+        const b = new BitSet(n);
+        for (let k = 0; k < n; k += 2) b.set(k);
+        let key = 0;
+        return { obj: b, op: () => { key++; if (key >= n) key = 0; if (b.test(key)) SINK++; } };
     }
     throw new Error('[bench] unhandled member: ' + member);
 }
@@ -595,6 +604,16 @@ export function makeBaseline(member, n) {
             },
         };
     }
+    if (member === 'BitSet') {
+        // The fair-already foil: a native Set<number> holding the SAME even-bit members, probed
+        // with the IDENTICAL walking key. Set.has is O(1) amortized but its hash table + boxed
+        // number keys degrade as the working set outgrows the caches, while BitSet's word index
+        // streams flat -- the cache / boxing gap the dense bitset exists to close.
+        const set = new Set();
+        for (let k = 0; k < n; k += 2) set.add(k);
+        let key = 0;
+        return { op: () => { key++; if (key >= n) key = 0; if (set.has(key)) SINK++; } };
+    }
     throw new Error('[bench] unhandled member: ' + member);
 }
 
@@ -685,6 +704,7 @@ const LINEAR_BASELINE = {
     RingLog: true,       // growing-array foil pays an O(n) shift to bound (RingLog's O(1) job)
     CuckooMap: false,    // native Map foil is O(1) per op (a fair-already, fast rival)
     SparseTable: true,   // scan-fold foil is an O(len) range rescan per query
+    BitSet: false,       // native Set foil is O(1) per op (fair-already; degrades on cache, not big-O)
 };
 
 /** Exact backing-store byte footprint of a member instance (typed-array buffers). */
@@ -737,6 +757,12 @@ export function memberBytes(member, obj) {
         // n*(floor(log2 n)+1) cells -- the DISCLOSED O(n log n) space co-headline).
         return obj._src.buffer.byteLength + obj._table.buffer.byteLength;
     }
+    if (member === 'BitSet') {
+        // ONE data-word column (Uint32, ceil(nbits/32) words) + the 3-level popcount summary
+        // (Uint32; ~ nbits/1024 words total). All fixed at construction (no growth).
+        return obj._w.buffer.byteLength + obj._s1.buffer.byteLength +
+            obj._s2.buffer.byteLength + obj._s3.buffer.byteLength;
+    }
     throw new Error('[bench] unhandled member: ' + member);
 }
 
@@ -769,6 +795,9 @@ export function theoreticalMinPerLive(member) {
     if (member === 'SparseTable') return 8;  // one Float64 source cell (8) per live element =
     // the actual-column-width floor (the source is copied into a Float64Array). The O(n log n)
     // sparse table is the DISCLOSED space co-headline, NOT folded into the per-live floor.
+    if (member === 'BitSet') return 0.125;   // ONE BIT per live (set) element = 1/8 byte -- the
+    // dense floor a bitset is FOR (bytes cheaper than a per-element slot). The ~nbits/1024-word
+    // popcount summary is fixed overhead, NOT folded into the per-live floor (the FreqO1 discipline).
     throw new Error('[bench] unhandled member: ' + member);
 }
 
@@ -1078,6 +1107,20 @@ function makeMixed(member, cap, rng) {
             l++; if (l >= half) l = 0;
         };
     }
+    if (member === 'BitSet') {
+        // A bounded mixed trace: toggle a walking bit (set/clear via the summary-maintaining
+        // transition path), probe membership (test), and read the running frontier (firstSet) --
+        // every op worst-case O(1). The toggle keeps the set churning without unbounded growth.
+        const b = new BitSet(cap);
+        for (let k = 0; k < cap; k += 2) b.set(k);
+        let key = 0;
+        return () => {
+            b.toggle(key);
+            if (b.test(key)) SINK++;
+            if (b.firstSet() >= 0) SINK++;
+            key++; if (key >= cap) key = 0;
+        };
+    }
     // Fail closed (mirrors every other dispatch helper): a member NOT handled above must
     // throw, so a future member cannot silently inherit MonoDeque's mixed trace.
     throw new Error('[bench] unhandled member: ' + member);
@@ -1172,6 +1215,7 @@ function fillMember(member, obj, count) {
     }
     if (member === 'RingLog') { obj.clear(); for (let k = 0; k < count; k++) obj.push(k); return; }
     if (member === 'CuckooMap') { obj.clear(); for (let k = 0; k < count; k++) obj.set(k, k); return; }
+    if (member === 'BitSet') { obj.clear(); for (let k = 0; k < count; k++) obj.set(k); return; }
     // SparseTable is STATIC (build-once, no clear / mutators): D3 handles it on a dedicated
     // path and NEVER calls fillMember for it, so it stays fail-closed here.
     throw new Error('[bench] unhandled member: ' + member);
@@ -1257,6 +1301,7 @@ export function D3(member, opts = {}) {
     else if (member === 'HierarchicalTimerWheel') obj = new HierarchicalTimerWheel(n, n);
     else if (member === 'RingLog') obj = new RingLog(n);
     else if (member === 'CuckooMap') obj = new CuckooMap(n);
+    else if (member === 'BitSet') obj = new BitSet(n);
     else throw new Error('[bench] unhandled member: ' + member);
 
     gcNow();
@@ -1714,6 +1759,15 @@ export function churnNs(member, n, seed) {
         const op = () => { m.delete(key); m.set(key, key); key++; if (key >= live) key = 0; };
         return median(collect(op, 4000, 60));
     }
+    if (member === 'BitSet') {
+        // Insert/delete the SAME walking bit: clear then re-set keeps the set churning through
+        // the summary empty<->non-empty transition path (real per-bit mutation, worst-case O(1)).
+        const b = new BitSet(n);
+        for (let k = 0; k < n; k += 2) b.set(k);
+        let k = 0;
+        const op = () => { b.unset(k); b.set(k); k = (k + 1) % n; };
+        return median(collect(op, 4000, 60));
+    }
     // SparseTable is STATIC (no insert/delete): churn is inapplicable. D8 gates it via
     // supportsWorkload and never calls churnNs for it, so it stays fail-closed here.
     throw new Error('[bench] unhandled member: ' + member);
@@ -1867,7 +1921,7 @@ export function traceHash(member, seed = DEFAULT_SEED, length = 100000) {
     if (member === 'SparseSet' || member === 'UnionFind' || member === 'RandomSet' ||
         member === 'FreqO1' || member === 'BucketQueue' || member === 'TimerWheel' ||
         member === 'HierarchicalTimerWheel' || member === 'RingLog' ||
-        member === 'CuckooMap' || member === 'SparseTable') mode = 0;
+        member === 'CuckooMap' || member === 'SparseTable' || member === 'BitSet') mode = 0;
     else if (member === 'RingDeque' || member === 'MinStack') mode = 1;
     else if (member === 'MonoDeque') mode = 2;
     else throw new Error('[bench] unhandled member: ' + member);

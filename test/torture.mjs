@@ -39,7 +39,7 @@ async function main() {
     const { GcProfiler, checkNoGc, measureAllocs } =
         await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable } = await import('../O1.js');
+    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet } = await import('../O1.js');
 
     const U = 1 << 16;      // universe 65536
     const CAP = 1 << 14;    // capacity 16384
@@ -207,6 +207,22 @@ async function main() {
             stbl.query(0, 127);
             stbl.at(i & 127);
             tracker.track(stbl, noop, 'sparsetable', { audit: true });
+            // BitSet owns only its Uint32Array data word column + the three summary levels;
+            // nothing external to release. Its words hold numbers, so a reclaimed instance is
+            // the desired outcome, proven by size()->0. Exercise the per-bit + firstSet + bulk
+            // surface (a same-capacity or) before tracking.
+            const bs = new BitSet(1024);
+            bs.set(i & 1023);
+            bs.set((i + 1) & 1023);
+            bs.toggle((i + 2) & 1023);
+            bs.test(i & 1023);
+            bs.firstSet();
+            bs.nextSet((i & 1023) + 1);
+            const bs2 = new BitSet(1024);
+            bs2.set((i + 3) & 1023);
+            bs.or(bs2);
+            bs.unset(i & 1023);
+            tracker.track(bs, noop, 'bitset', { audit: true });
         }
         return tracker.size();
     }
@@ -507,6 +523,63 @@ async function main() {
     const stAllocBytes = Math.max(0, Math.round(stBpc));
     const stAllocOk = stAllocBytes === 0;
 
+    // BitSet PER-BIT hot path: a walking bit toggled (set/clear via the summary-maintaining
+    // transition path) + a membership probe + the O(1) frontier read (firstSet). Every op is
+    // worst-case O(1), zero-alloc (one word load + one mask op past the guard; the summary
+    // surgery is pure integer writes over the existing typed slots). The reads fold into a sink.
+    const BS_BITS = 1 << 16;             // 65536-bit dense bitset
+    const bitset = new BitSet(BS_BITS);
+    for (let k = 0; k < BS_BITS; k += 2) bitset.set(k); // prime ~half the domain
+    let bsk = 0;
+    let bsSink = 0;
+    const bitStep = () => {
+        bsk = (bsk + 1) & (BS_BITS - 1);
+        bitset.set(bsk);
+        bsSink = (bsSink + (bitset.test(bsk) ? 1 : 0)) | 0;
+        bitset.unset(bsk);
+        bsSink = (bsSink + (bitset.firstSet() | 0)) | 0;
+    };
+    const bitAllocRes = measureAllocs(bitStep, { iterations: 100000, batches: 8 });
+    const bitBpc = bitAllocRes.bytesPerCall === null ? 0 : bitAllocRes.bytesPerCall;
+    const bitAllocBytes = Math.max(0, Math.round(bitBpc));
+    const bitAllocOk = bitAllocBytes === 0;
+
+    // BitSet HIGH-BIT hot path (closes the reviewer nit on the per-bit gate above): a DEDICATED
+    // bitset primed with bit 31 of word 0 set, PLUS the top bit of the LAST word set -- the raw
+    // Uint32Array read >= 2^31, the ONE boxing risk named in the BITSET_MAX_BITS design note.
+    // Kept SEPARATE from `bitset` above: that walking-bit gate SETS then immediately UNSETS the
+    // same index every step, so after one full 65536-step cycle its `0x55555555` prime is wiped
+    // to all-zero and firstSet/nextSet never again observe a >= 2^31 word inside the measured
+    // window -- and even mid-cycle, bit 31 (odd) was never primed in the first place, so a raw
+    // word >= 2^31 was NEVER read by firstSet/nextSet inside the shipped 0-B/op gate. This bit is
+    // never toggled by the measured step, so every call here reads a >= 2^31 raw word value, both
+    // directly (word 0) and via the 3-level popcount-summary descent (the last word, index 2047).
+    const bitHigh = new BitSet(BS_BITS);
+    bitHigh.set(31);            // word 0 becomes 0x80000000: an odd, high (>= 2^31) raw word value
+    bitHigh.set(BS_BITS - 1);   // the LAST word's top bit too: the summary-descent path also reads >= 2^31
+    let bhSink = 0;
+    const bitHighStep = () => {
+        bhSink = (bhSink + (bitHigh.firstSet() | 0)) | 0;   // reads word 0 directly: value >= 2^31
+        bhSink = (bhSink + (bitHigh.nextSet(32) | 0)) | 0;  // summary descent to the LAST word: also >= 2^31
+    };
+    const bitHighAllocRes = measureAllocs(bitHighStep, { iterations: 100000, batches: 8 });
+    const bitHighBpc = bitHighAllocRes.bytesPerCall === null ? 0 : bitHighAllocRes.bytesPerCall;
+    const bitHighAllocBytes = Math.max(0, Math.round(bitHighBpc));
+    const bitHighAllocOk = bitHighAllocBytes === 0;
+
+    // BitSet BULK hot path: an in-place `or` between two SAME-capacity bitsets. This is O(words)
+    // (a disclosed co-headline, NOT the per-bit O(1) claim) but STILL 0 B/op -- it writes into the
+    // existing words + rebuilds the summary in place, allocating nothing. The torture gate proves
+    // that allocation claim SEPARATELY from the O(words) time claim.
+    const bitA = new BitSet(BS_BITS);
+    const bitB = new BitSet(BS_BITS);
+    for (let k = 0; k < BS_BITS; k += 3) bitB.set(k); // a fixed operand mask
+    const bitOrStep = () => { bitA.or(bitB); };
+    const bitOrAllocRes = measureAllocs(bitOrStep, { iterations: 2000, batches: 8 });
+    const bitOrBpc = bitOrAllocRes.bytesPerCall === null ? 0 : bitOrAllocRes.bytesPerCall;
+    const bitOrAllocBytes = Math.max(0, Math.round(bitOrBpc));
+    const bitOrAllocOk = bitOrAllocBytes === 0;
+
     // "0 B/op" resolved at the sampling floor: heapUsed deltas are quantized and
     // noisy, so a truly non-allocating op reads a sub-byte figure (a lone blip
     // in one batch / iterations). Round to the nearest byte -- any per-op
@@ -533,6 +606,7 @@ async function main() {
         ringLogStep();
         cuckStep();
         stStep();
+        bitStep();
         if ((i & 8191) === 0) {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
         }
@@ -656,6 +730,17 @@ async function main() {
             SINK += (sparseTable.query(l, r < ST_LEN ? r : ST_LEN - 1) | 0);
         }
     }
+    // BitSet fill + forEach scan + bulk set-algebra + O(words) clear() cycles -- exercises the
+    // per-bit set (summary-maintaining), the alloc-free ascending scan, the in-place or/and, and
+    // the whole-set reset. clear() zeroes the data + summary in place, growing no store.
+    const bitCb = (idx) => { SINK += idx | 0; };
+    for (let f = 0; f < 512; f++) {
+        for (let k = 0; k < 512; k++) bitset.set((k * 37) & (BS_BITS - 1));
+        bitset.forEach(bitCb);
+        bitA.and(bitB);
+        bitA.or(bitB);
+        bitset.clear();
+    }
     await new Promise((r) => setTimeout(r, 50));
     const s2 = gc.summary();
     const report = checkNoGc(s2, { maxMajor: 0, maxPauseMs: 2 });
@@ -702,6 +787,8 @@ async function main() {
         ringLog.clear();                               // O(1): the reused buffer grows no store
         for (let k = 0; k < CUCK_W; k++) cuck.set(k, k); // fill under the ceiling (no re-seed)
         cuck.clear();                                    // O(cap): the reused columns grow no store
+        for (let k = 0; k < BS_BITS; k += 2) bitset.set(k); // fill the reused bitset (~half)
+        bitset.clear();                                  // O(words): reused words + summary, no new store
     }
     globalThis.gc();
     const abAfter = process.memoryUsage().arrayBuffers;
@@ -712,7 +799,7 @@ async function main() {
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
         findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && monoAllocOk &&
         minAllocOk && randAllocOk && freqAllocOk && buckAllocOk && twAllocOk && htwAllocOk &&
-        ringLogAllocOk && cuckAllocOk && stAllocOk && abOk;
+        ringLogAllocOk && cuckAllocOk && stAllocOk && bitAllocOk && bitHighAllocOk && bitOrAllocOk && abOk;
 
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
@@ -727,9 +814,12 @@ async function main() {
         htwAllocBytes + ' B/op (HierarchicalTimerWheel) ' +
         ringLogAllocBytes + ' B/op (RingLog) ' +
         cuckAllocBytes + ' B/op (CuckooMap) ' +
-        stAllocBytes + ' B/op (SparseTable)' +
+        stAllocBytes + ' B/op (SparseTable) ' +
+        bitAllocBytes + ' B/op (BitSet per-bit) ' +
+        bitHighAllocBytes + ' B/op (BitSet firstSet/nextSet >=2^31 word) ' +
+        bitOrAllocBytes + ' B/op (BitSet or)' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
-        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' abGrowth=' + abDelta + ')');
+        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' bsSink=' + bsSink + ' bhSink=' + bhSink + ' abGrowth=' + abDelta + ')');
 
     if (!ok) {
         if (!trackedOk) console.error('  vacuous: tracker held ' + trackedMid + ' instances (expected > 0)');
@@ -751,6 +841,9 @@ async function main() {
         if (!ringLogAllocOk) console.error('  alloc ' + ringLogAllocBytes + ' B/op RingLog (raw bytesPerCall ' + ringLogBpc + ')');
         if (!cuckAllocOk) console.error('  alloc ' + cuckAllocBytes + ' B/op CuckooMap (raw bytesPerCall ' + cuckBpc + ')');
         if (!stAllocOk) console.error('  alloc ' + stAllocBytes + ' B/op SparseTable (raw bytesPerCall ' + stBpc + ')');
+        if (!bitAllocOk) console.error('  alloc ' + bitAllocBytes + ' B/op BitSet per-bit (raw bytesPerCall ' + bitBpc + ')');
+        if (!bitHighAllocOk) console.error('  alloc ' + bitHighAllocBytes + ' B/op BitSet firstSet/nextSet >=2^31 word (raw bytesPerCall ' + bitHighBpc + ')');
+        if (!bitOrAllocOk) console.error('  alloc ' + bitOrAllocBytes + ' B/op BitSet or (raw bytesPerCall ' + bitOrBpc + ')');
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;
     }

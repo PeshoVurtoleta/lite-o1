@@ -5,7 +5,7 @@
  * fails `npm run test:types`. Not executed; only type-checked.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, VERSION } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, BitSet, VERSION } from '../../O1.js';
 
 // VERSION is a string.
 const v: string = VERSION;
@@ -474,3 +474,58 @@ new TimerWheel('1000', 64);
 new TimerWheel(1000, 'x');
 // @ts-expect-error -- schedule takes numbers.
 tw.schedule('3', 0);
+
+// --- BitSet ----------------------------------------------------------------
+
+// Constructor: nbits required.
+const bs: BitSet = new BitSet(1000);
+
+// Getters: capacity / size are readonly numbers.
+const bscap: number = bs.capacity;
+const bssize: number = bs.size;
+void bscap; void bssize;
+
+// @ts-expect-error -- capacity is readonly.
+bs.capacity = 5;
+// @ts-expect-error -- size is readonly.
+bs.size = 5;
+
+// set / unset / toggle / and / or / xor / andNot / setAll -> this (chainable); test -> boolean.
+const chainedBs: BitSet = bs.set(3).unset(3).toggle(4).setAll();
+const bstest: boolean = bs.test(3);
+const bsfirst: number = bs.firstSet();
+const bsnext: number = bs.nextSet(4);
+const bspop: number = bs.popcount();
+void chainedBs; void bstest; void bsfirst; void bsnext; void bspop;
+
+// unset(i) clears a single bit; clear() (no arg) resets the whole set; both -> this.
+const bsClearedBit: BitSet = bs.unset(2);
+const bsCleared: BitSet = bs.clear();
+void bsClearedBit; void bsCleared;
+
+// bulk ops take another BitSet and return this.
+const other: BitSet = new BitSet(1000);
+const bsAnd: BitSet = bs.and(other).or(other).xor(other).andNot(other);
+void bsAnd;
+
+// forEach callback gets (index, bitset).
+bs.forEach((i, self) => {
+    const ii: number = i;
+    const ss: BitSet = self;
+    void ii; void ss;
+});
+
+// Iterable of number.
+for (const i of bs) {
+    const ii: number = i;
+    void ii;
+}
+const bsspread: number[] = [...bs];
+void bsspread;
+
+// @ts-expect-error -- nbits must be a number.
+new BitSet('1000');
+// @ts-expect-error -- set takes a number.
+bs.set('3');
+// @ts-expect-error -- and takes a BitSet.
+bs.and(5);

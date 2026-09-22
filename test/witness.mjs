@@ -48,7 +48,7 @@
  * metric are unchanged; only the measurement is made steadier.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet } from '../O1.js';
 
 const SIZES = [1e3, 1e4, 1e5, 1e6, 1e7];
 const BATCH = 1e6;
@@ -1619,5 +1619,116 @@ if (!stAllOk) {
     if (!stOk) console.error('  violation SparseTable flatness ' + fmt(st.flatness) + ' < 0.70');
     if (!naiveScanOk) console.error('  violation naive foil flatness ' + fmt(naiveScan.flatness) + ' > 0.55');
     if (!stRatioOk) console.error('  violation min SparseTable ratio ' + fmt(stRatio) + 'x < 1.50x');
+    process.exitCode = 1;
+}
+
+// ===========================================================================
+// BitSet witness -- WORST-CASE-O(1) dense-membership `test` vs a native Set<number>,
+// PLUS the firstSet O(1) CONTROL (a single high bit -> the summary descent stays flat).
+// ===========================================================================
+// n is the bit-capacity. The op is a walking membership probe (test) over [0, n) against a
+// bitset with the EVEN bits set -- one word load + one mask test, O(1) INDEPENDENT of n. The
+// foil is a native Set<number> holding the SAME even members, probed with the IDENTICAL key:
+// Set.has is O(1) amortized but its hash table + boxed number keys DEGRADE as the working set
+// outgrows the caches (cache + boxing, NOT asymptotics). So -- like BucketQueue's O(log n) heap
+// -- the Set foil decays GENTLY and CANNOT reach the O(n) foils' 0.55 collapse; its flatness is
+// REPORTED and asserted merely to be LESS flat than BitSet, and the gate is BitSet's own flatness
+// (>= 0.70) plus a sustained BitSet/Set throughput ratio (>= 1.5x). ops/ms is a RATE (both batch
+// 5e5). The gate window is DRAM-resident [1e5, 1e6]: below it (n=1e4) the ~8 KB bitset fits L1/L2
+// and the CPU turbo-spikes, so ops/ms turbo-spikes as the flatness DENOMINATOR (the ADR-0004
+// effect) -- n=1e4 is DISPLAYED, tagged, not gated. NO max-single-op line (worst-case cohort).
+const BS_SIZES = [1e4, 1e5, 1e6];
+const BS_BATCH = 5e5;        // large: stable timing for the O(1) test
+const BS_GATE_MIN = 1e5;     // gate over the DRAM-resident steady window [1e5, 1e6]
+
+// BitSet: fill the EVEN bits of an n-bit set, then probe a walking key over [0, n).
+function buildBitSet(n) {
+    const b = new BitSet(n);
+    for (let k = 0; k < n; k += 2) b.set(k);
+    let key = 0;
+    const op = () => {
+        key++;
+        if (key >= n) key = 0;
+        if (b.test(key)) SINK++;
+    };
+    return { op };
+}
+
+// Foil: a native Set<number> holding the SAME even members, probed with the identical key.
+function buildBitSetFoil(n) {
+    const set = new Set();
+    for (let k = 0; k < n; k += 2) set.add(k);
+    let key = 0;
+    const op = () => {
+        key++;
+        if (key >= n) key = 0;
+        if (set.has(key)) SINK++;
+    };
+    return { op };
+}
+
+// firstSet O(1) CONTROL: a bitset with a SINGLE bit set at the TOP of an n-bit capacity. firstSet
+// descends the 3-level summary (a fixed <= 32-word top scan + a 3-hop clz32/ctz32 walk) -- so its
+// throughput stays FLAT as n grows. A SCANNING firstSet would be O(n/32) and its flatness would
+// COLLAPSE (the T9 fail-path). Gated on its own flatness >= 0.70 -- the summary's O(1) proof.
+function buildBitSetFirstSet(n) {
+    const b = new BitSet(n);
+    b.set(n - 1); // the worst case for a bottom-up scan: the only set bit is the highest
+    const op = () => {
+        if (b.firstSet() >= 0) SINK++;
+    };
+    return { op };
+}
+
+const bs = witness(buildBitSet, BS_SIZES, BS_BATCH, REPS, BS_GATE_MIN);
+const bsFoil = witness(buildBitSetFoil, BS_SIZES, BS_BATCH, REPS, BS_GATE_MIN);
+const bsFirst = witness(buildBitSetFirstSet, BS_SIZES, BS_BATCH, REPS, BS_GATE_MIN);
+
+console.log('');
+console.log('O(1) Witness -- BitSet dense-membership test vs a native Set<number> (rate ops/ms, median of ' +
+    REPS + ', gate size >= ' + nStr(BS_GATE_MIN) + ')');
+console.log('');
+console.log('  bits      BitSet ops/ms      Set ops/ms   ratio');
+console.log('  --------  ----------------   ----------   -----');
+let bsRatio = Infinity;
+for (let i = 0; i < BS_SIZES.length; i++) {
+    const a = bs.rows[i].opsPerMs;
+    const b = bsFoil.rows[i].opsPerMs;
+    const ratio = b > 0 ? a / b : Infinity;
+    const gated = BS_SIZES[i] >= BS_GATE_MIN;
+    if (gated && ratio < bsRatio) bsRatio = ratio;
+    const tag = BS_SIZES[i] < BS_GATE_MIN ? '   <- L1/L2 turbo micro-case (shown, not gated)' : '';
+    console.log('  ' + nStr(BS_SIZES[i]).padEnd(8) + '  ' +
+        fmt(a).padStart(16) + '   ' + fmt(b).padStart(10) + '   ' + fmt(ratio).padStart(5) + 'x' + tag);
+}
+
+console.log('');
+console.log('  BitSet test flatness (bits >= ' + nStr(BS_GATE_MIN) + '): ' + fmt(bs.flatness) + '   (gate >= 0.70)');
+console.log('  Set foil flatness (last/first): ' + fmt(bsFoil.flatness) + '   (reported; degrades on cache+boxing, not big-O)');
+console.log('  min BitSet/Set ratio: ' + fmt(bsRatio) + 'x  (gate >= 1.50x)');
+console.log('  firstSet O(1) control flatness (single high bit, bits >= ' + nStr(BS_GATE_MIN) + '): ' +
+    fmt(bsFirst.flatness) + '   (gate >= 0.70 -- a scanning firstSet would collapse)');
+// NO MAX-single-op line: BitSet is worst-case cohort (test/set/clear/toggle are one word load +
+// one mask op; firstSet/nextSet are the summary descent). The O(words) bulk ops are the honest
+// co-headline (proven 0 B/op in torture), not a per-op spike.
+
+const bsOk = bs.flatness >= 0.70;
+const bsFoilLessFlat = bsFoil.flatness < bs.flatness; // the Set foil must be LESS flat than BitSet
+const bsRatioOk = bsRatio >= 1.5;
+const bsFirstOk = bsFirst.flatness >= 0.70;
+const bsAllOk = bsOk && bsFoilLessFlat && bsRatioOk && bsFirstOk;
+
+console.log('');
+console.log('WITNESS BitSet ' + (bsAllOk ? 'ok' : 'FAIL') +
+    ' bs.flatness=' + fmt(bs.flatness) +
+    ' set.flatness=' + fmt(bsFoil.flatness) +
+    ' minRatio=' + fmt(bsRatio) + 'x' +
+    ' firstSet.flatness=' + fmt(bsFirst.flatness));
+
+if (!bsAllOk) {
+    if (!bsOk) console.error('  violation BitSet flatness ' + fmt(bs.flatness) + ' < 0.70');
+    if (!bsFoilLessFlat) console.error('  violation Set foil flatness ' + fmt(bsFoil.flatness) + ' must be < BitSet flatness ' + fmt(bs.flatness));
+    if (!bsRatioOk) console.error('  violation min BitSet/Set ratio ' + fmt(bsRatio) + 'x < 1.50x');
+    if (!bsFirstOk) console.error('  violation firstSet O(1) control flatness ' + fmt(bsFirst.flatness) + ' < 0.70 (a scanning firstSet)');
     process.exitCode = 1;
 }

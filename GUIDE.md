@@ -1,7 +1,7 @@
 # lite-o1 -- which structure to pick (GUIDE)
 
 A repo-only decision guide for the O(1) family: which member, reach-for / avoid,
-and how to measure the constant yourself. At v1.3.1 the family is STABLE at thirteen
+and how to measure the constant yourself. At v1.4.0 the family is STABLE at fourteen
 members and this guide is complete for them -- still open (a new section lands with
 each future member), but no longer a skeleton. It is NOT an API encyclopedia (that
 is the README + `O1.d.ts`); it answers "which member, and is my constant real?"
@@ -23,7 +23,7 @@ flatness floor for YOUR workload -- run `npm run witness` and read the shape.
 
 ## Which member? (decision flowchart)
 
-ASCII, routes on the discriminating questions. Every leaf is one of the thirteen
+ASCII, routes on the discriminating questions. Every leaf is one of the fourteen
 members; `(wc)` = worst-case O(1), `(am)` = amortized O(1).
 
 ```
@@ -33,6 +33,8 @@ START -- what is the SHAPE of your workload?
 |     |
 |     +-- also need a UNIFORM-RANDOM live member (sample / removeRandom)? -> RandomSet (wc)
 |     +-- also need the LEAST-FREQUENTLY-USED key (access counts, LFU victim)? -> FreqO1 (wc)
+|     +-- a DENSE flag/dirty/visited mask over MANY bits, want O(1) firstSet
+|     |   / nextSet + bulk and/or/xor/andNot? -> BitSet (wc)
 |     +-- just add / has / delete / O(1) clear / dense iterate? -> SparseSet (wc)
 |
 +-- An exact key -> NUMBER map over SPARSE / large INTEGER keys (|k| <= 2^53),
@@ -92,6 +94,7 @@ One row per member; pick by the left column, confirm with the discriminator.
 | "keep the last N" numbers, never block, overwrite the oldest  | RingLog                | worst-case  | lossy overwrite-oldest ring; push returns the evicted; read-only, no drain |
 | an exact key -> number MAP over sparse / large INTEGER keys   | CuckooMap              | amortized*  | bucketized cuckoo, <= 8-slot probe; *lookup wc, set amortized (re-seed spike) |
 | the MIN or MAX over an ARBITRARY range of a FIXED numeric array | SparseTable            | worst-case  | STATIC build-once immutable range-min/max; O(1) query, O(n log n) build co-headline |
+| a DENSE bit/flag/dirty mask over MANY bits (N >> 32)         | BitSet                 | worst-case  | fixed multi-word bitset; O(1) test/set/clear/toggle + O(1) firstSet/nextSet via a popcount summary; O(words) bulk set-algebra |
 
 ---
 
@@ -648,13 +651,54 @@ each query) collapses (`<= 0.55`), ratio `>= 1.5x`. The ratio is gated over WIDE
 the query is worst-case O(1); the one-time O(n log n) BUILD is the honest co-headline (measured
 OUTSIDE the timed query, like every member's construction), not a per-op spike.
 
+### BitSet (v1.4.0)
+
+Fixed-capacity multi-word DENSE bitset over MANY `Uint32` words (N >> 32) plus a 3-level
+popcount SUMMARY (fan-out 32). `test` / `set` / `unset` / `toggle` are worst-case O(1)
+(one word load + one mask op); `firstSet` / `nextSet` are worst-case O(1) via the summary
+(a fixed <= 32-word top scan + a 3-hop `clz32`/`ctz32` descent, never an O(words) scan).
+Bulk `and` / `or` / `xor` / `andNot` (in place, same-capacity-or-throw) + `popcount` /
+`setAll` / `clear()` / iterate are O(words) -- a disclosed co-headline, still 0 B/op. The
+suite's canonical membership / flag structure for visited sets, dirty masks, replay windows,
+and permission bitmaps at scale.
+
+**Reach for it when:**
+
+- You track a DENSE set of flags over MANY bits (an entity dirty mask, a visited set over a
+  bounded id domain, a permission bitmap, a replay window) and want O(1) per-bit ops PLUS
+  an O(1) `firstSet` / `nextSet` frontier -- the differentiator over a raw `Uint32Array`.
+- You need in-place set-algebra (`and` / `or` / `xor` / `andNot`) between same-capacity masks
+  in O(words) with zero allocation.
+- You want the dense space win: one BIT per element, not one slot (SparseSet is O(universe)
+  Uint32 slots; BitSet is O(nbits/8) bytes + an ~nbits/1024-word summary).
+
+**Avoid it when:**
+
+- Keys are SPARSE / large (map them with CuckooMap) -- a dense bitset over a huge domain
+  wastes capacity you never touch.
+- You need to store a VALUE per key (BitSet is membership / flags only) -- reach for
+  SparseSet + a parallel column, or CuckooMap.
+- You need SCHEDULING / priority semantics -- that is BucketQueue / TimerWheel /
+  lite-scheduler's FastBitScheduler, NOT a membership bitset (the non-overlap boundary).
+- You need <= 32 flags in a single word -- reach for `@zakkster/lite-fastbit32` (the
+  single-word primitive BitSet is the multi-word sibling of, design-parity, zero-dep).
+
+**Measure it:** `npm run witness` -- BitSet `test` flatness `>= 0.70` across the bit-capacity
+sweep `[1e5..1e6]` (the 1e4 point is an L2 turbo micro-case, shown but not gated) while a
+native `Set<number>` foil degrades on cache + boxing, ratio `>= 1.5x`. A SECOND gate is the
+`firstSet` O(1) control (a single high bit in a large capacity, flatness `>= 0.70`) -- a
+scanning `firstSet` would be O(words) and miss the floor. NO MAX-single-op line (worst-case
+cohort; the O(words) bulk ops are the honest co-headline).
+
 ---
 
 ## Roadmap members (not yet shipped, planned)
 
-The public API is stable at v1.3.1's thirteen members; these are planned, not shipped.
+The public API is stable at v1.4.0's fourteen members; these are planned, not shipped.
 Placeholders so the decision axes are visible early; each fills in on release.
 
+- **AliasTable** -- Vose weighted sampling (the fifteenth member, v1.5.0): O(1) weighted
+  `sample()` after an O(n) build, the weighted complement to RandomSet's uniform draw.
 - **SlotPool** -- free-list slot allocator with generational (ABA-safe) handles.
   Reach for it as the SoA substrate; reconcile against `@zakkster/lite-arena`
   before picking one.

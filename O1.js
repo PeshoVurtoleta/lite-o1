@@ -3,10 +3,10 @@
  * that doubles as a teachable textbook: each member solves a real problem AND
  * witnesses its constant on a host (the O(1) Witness -- see test/witness.mjs).
  *
- * v1.3.1 ships thirteen members -- SparseSet, RingDeque, UnionFind, MonoDeque,
+ * v1.4.0 ships fourteen members -- SparseSet, RingDeque, UnionFind, MonoDeque,
  * MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel,
- * RingLog, CuckooMap, and SparseTable -- plus its `VERSION` const. The thirteen are
- * independent (no shared mutable module state), so a bundler that imports one drops
+ * RingLog, CuckooMap, SparseTable, and BitSet -- plus its `VERSION` const. The fourteen
+ * are independent (no shared mutable module state), so a bundler that imports one drops
  * the others (`sideEffects: false`).
  *
  * The complexity class IS the product: every hot op below is O(1) worst-case and
@@ -19,7 +19,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.3.1';
+export const VERSION = '1.4.0';
 
 /** Largest universe the Uint32 substrate + the (k >>> 0) key check can honor. */
 const MAX_UNIVERSE = 0x100000000; // 2^32
@@ -3667,5 +3667,434 @@ export class SparseTable {
         // turning a fail-closed reject into a different crash.
         throw new TypeError(
             '[lite-o1] SparseTable source[' + i + '] must be a number and not NaN, got ' + String(v));
+    }
+}
+
+// ---- BitSet internals (module-level, cold-shared, no mutable module state) ----
+
+/**
+ * Largest bit-capacity BitSet admits. 2^25 = 33,554,432 bits (4 MiB of data words). The
+ * ceiling is chosen so a fan-out-32 three-level popcount summary keeps EVERY index inside
+ * the SMI / uint32 range (so no boxing on the hot path -- the SPARSETABLE_MAX_LEN 2^26
+ * precedent): the data words W = MAX_BITS/32 = 2^20; level-1 summary = W/32 = 2^15 words;
+ * level-2 = 2^10 words; level-3 (the top) = 32 words -- a FIXED 32-word top scan. The largest
+ * bit index (2^25 - 1), the largest data-word index (2^20), and the largest summary index
+ * (2^15) all stay below 2^31, so `i >>> 5`, `1 << (i & 31)`, and clz32/ctz32 stay SMI-safe.
+ * A TYPE bound (a fail-closed guard), not a size any host is obliged to allocate.
+ */
+const BITSET_MAX_BITS = 0x2000000; // 2^25
+const _bitsetLeakSink = []; // TEMP: injected-regression probe, reverted after verification
+
+/** Trailing-zero count of a NONZERO int32 (isolate the lowest set bit, then clz32). */
+function _bitsetCtz32(x) {
+    // x & -x isolates the lowest set bit (works for a negative int32 top-bit too); clz32 of
+    // that lone bit gives 31 - its position, so 31 - clz32 is the trailing-zero count.
+    return 31 - Math.clz32(x & -x);
+}
+
+/** Population count (number of set bits) of an int32, treated as 32 unsigned bits. */
+function _bitsetPopcount32(x) {
+    x = x - ((x >>> 1) & 0x55555555);
+    x = (x & 0x33333333) + ((x >>> 2) & 0x33333333);
+    x = (x + (x >>> 4)) & 0x0f0f0f0f;
+    return (Math.imul(x, 0x01010101) >>> 24);
+}
+
+/**
+ * BitSet -- a zero-GC, FIXED-capacity, WORST-CASE O(1) multi-word dense bitset over MANY
+ * Uint32 words (N >> 32), the suite's canonical membership / flag structure for visited sets,
+ * dirty masks, replay windows, and permission bitmaps at scale. The fourteenth member.
+ *
+ * Per-bit test / set / clear / toggle are `words[i >>> 5]` + one mask op -- ONE load, ONE
+ * store, no branch past the range guard, no allocation: WORST-CASE O(1) (the flat per-bit line
+ * IS the claim -- BitSet joins the worst-case cohort SparseSet / RandomSet / RingLog /
+ * SparseTable, so there is NO max-single-op line). firstSet / nextSet are WORST-CASE O(1) via a
+ * 3-LEVEL popcount SUMMARY (fan-out 32): each summary bit records whether the word below it is
+ * non-empty, so find-first is a FIXED <= 32-word top scan + a 3-hop clz32/ctz32 descent
+ * (L3 -> L2 -> L1 -> data), never an O(words) scan. The summary is kept coherent after every
+ * set / clear / toggle (a word transitioning empty<->non-empty propagates up only while the
+ * level below flips 0<->non-0) AND rebuilt after every bulk op.
+ *
+ * Bulk set-algebra (and / or / xor / andNot, in place, capacity-match-or-throw) + popcount /
+ * setAll / clear / forEach / iterate are O(words) -- a DISCLOSED CO-HEADLINE (the same shape as
+ * SparseTable's O(n log n) build), NOT part of the per-bit O(1) claim, and STILL 0 B/op (they
+ * write into the existing words, allocating nothing -- the torture gate checks the allocation
+ * claim (0 B/op) separately from the O(words) time claim).
+ *
+ * NON-OVERLAP (settled by the 2026-09-22 audit): BitSet is the MULTI-WORD, arbitrary-N
+ * structure. @zakkster/lite-fastbit32 stays the SINGLE 32-flag word; @zakkster/lite-scheduler's
+ * FastBitScheduler stays the bit-bucket scheduler; lite-o1's own BucketQueue stays the priority
+ * queue. BitSet reuses fastbit32's branchless word-op idiom by DESIGN-PARITY ONLY -- never a
+ * runtime dependency (the zero-deps law; the SlotPool / NodePool borrow-without-depend
+ * precedent). Membership / flags only -- it must never drift into scheduling.
+ *
+ * Fail closed: the constructor throws [lite-o1] (BEFORE any store is allocated) on a non-integer
+ * / < 1 / > 2^25 / NaN capacity; set / clear / toggle throw [lite-o1] on an out-of-range index;
+ * and / or / xor / andNot throw [lite-o1] on a capacity mismatch. NEVER-throw QUERIES: test
+ * returns false and firstSet / nextSet return -1 on a bad / absent index (the family "queries
+ * never throw" law -- like has / peek / get). null is not zero: `(i >>> 0) !== i` rejects a
+ * negative / fractional / non-uint32 index, and the typeof guard runs FIRST so a Symbol / BigInt
+ * never reaches the coercing `>>>`.
+ */
+export class BitSet {
+    /**
+     * @param {number} nbits  fixed bit-capacity; an integer in [1, 2^25]. Bits are [0, nbits).
+     */
+    constructor(nbits) {
+        // Number.isInteger never coerces (false on a Symbol / BigInt / NaN); String(nbits) in the
+        // cold message is Symbol / BigInt-safe. Thrown BEFORE any typed array is allocated, so a
+        // bad capacity leaves nothing half-built (a byte-identical no-op).
+        if (!Number.isInteger(nbits) || nbits < 1 || nbits > BITSET_MAX_BITS) {
+            throw new RangeError(
+                '[lite-o1] BitSet nbits must be an integer in [1, 2^25], got ' + String(nbits));
+        }
+        const W = (nbits + 31) >>> 5;   // ceil(nbits / 32) data words
+        const L1 = (W + 31) >>> 5;      // level-1 summary: one BIT per data word
+        const L2 = (L1 + 31) >>> 5;     // level-2 summary: one bit per L1 word
+        const L3 = (L2 + 31) >>> 5;     // level-3 summary (the top): one bit per L2 word
+        this._nbits = nbits;
+        this._w = new Uint32Array(W);   // data words: bit i lives at _w[i >>> 5], mask 1 << (i & 31)
+        this._s1 = new Uint32Array(L1); // _s1 bit j set iff _w[j] != 0
+        this._s2 = new Uint32Array(L2); // _s2 bit j set iff _s1[j] != 0
+        this._s3 = new Uint32Array(L3); // _s3 bit j set iff _s2[j] != 0 (top: <= 32 words)
+    }
+
+    /** Fixed bit-capacity (nbits); bits are [0, capacity). O(1). */
+    get capacity() { return this._nbits; }
+
+    /** Number of set bits. O(words) -- a disclosed co-headline (a full popcount), not O(1). */
+    get size() { return this.popcount(); }
+
+    /**
+     * True iff bit i is set. WORST-CASE O(1): one word load + one mask test, no branch past the
+     * guard, zero allocation. A bad index (negative, fractional, NaN, null, Symbol, BigInt, or
+     * >= capacity) is ABSENT (returns false), NEVER a throw and NEVER bit 0 -- the typeof guard
+     * short-circuits BEFORE `>>>` coerces (which THROWS on a Symbol / BigInt), and
+     * `(i >>> 0) !== i` rejects every non-uint32 number in one test.
+     * @param {number} i
+     * @returns {boolean}
+     */
+    test(i) {
+        if (typeof i !== 'number' || (i >>> 0) !== i || i >= this._nbits) return false;
+        return (this._w[i >>> 5] & (1 << (i & 31))) !== 0;
+    }
+
+    /**
+     * Set bit i. WORST-CASE O(1). Fail closed: a bad index throws [lite-o1] via _oob. When the
+     * affected word transitions from EMPTY to non-empty, the summary bit for that word is
+     * propagated up (only while the level below flips 0 -> non-0).
+     * @param {number} i
+     * @returns {BitSet} this
+     */
+    set(i) {
+        if (typeof i !== 'number' || (i >>> 0) !== i || i >= this._nbits) return this._oob(i);
+        const iw = i >>> 5;
+        const w = this._w[iw];
+        const m = 1 << (i & 31);
+        if ((w & m) === 0) {
+            this._w[iw] = w | m;
+            if (w === 0) this._markNonEmpty(iw); // word went empty -> non-empty
+        }
+        return this;
+    }
+
+    /**
+     * Unset (clear) a SINGLE bit i -- the per-bit companion to set(i). WORST-CASE O(1). Fail
+     * closed: a bad index throws [lite-o1] via _oob (the mutator contract -- null is not zero,
+     * NEVER a silent whole-set wipe; that is the no-arg clear()). When the affected word
+     * transitions to EMPTY, the summary bit for that word is cleared up the levels.
+     * @param {number} i
+     * @returns {BitSet} this
+     */
+    unset(i) {
+        if (typeof i !== 'number' || (i >>> 0) !== i || i >= this._nbits) return this._oob(i);
+        const iw = i >>> 5;
+        const w = this._w[iw];
+        const m = 1 << (i & 31);
+        if ((w & m) !== 0) {
+            const nw = w & ~m;
+            this._w[iw] = nw;
+            if (nw === 0) this._markEmpty(iw); // word went non-empty -> empty
+        }
+        return this;
+    }
+
+    /**
+     * WHOLE-SET reset (the cohort clear() surface -- takes NO argument; matches SparseSet /
+     * RingDeque / every member's clear()). Zeroes every data + summary word IN PLACE. O(words),
+     * 0 B/op (no store is reallocated). To clear a single bit use unset(i).
+     * @returns {BitSet} this
+     */
+    clear() {
+        this._w.fill(0);
+        this._s1.fill(0);
+        this._s2.fill(0);
+        this._s3.fill(0);
+        return this;
+    }
+
+    /**
+     * Toggle bit i. WORST-CASE O(1). Fail closed: a bad index throws [lite-o1] via _oob. Updates
+     * the summary when the affected word crosses the empty<->non-empty boundary.
+     * @param {number} i
+     * @returns {BitSet} this
+     */
+    toggle(i) {
+        if (typeof i !== 'number' || (i >>> 0) !== i || i >= this._nbits) return this._oob(i);
+        const iw = i >>> 5;
+        const w = this._w[iw];
+        const nw = w ^ (1 << (i & 31));
+        this._w[iw] = nw;
+        if (w === 0) this._markNonEmpty(iw);      // empty -> non-empty
+        else if (nw === 0) this._markEmpty(iw);   // non-empty -> empty
+        return this;
+    }
+
+    /**
+     * The index of the FIRST (lowest) set bit, or -1 if none. WORST-CASE O(1) via the summary:
+     * a fixed <= 32-word top scan + a 3-hop clz32/ctz32 descent, NEVER an O(words) scan. Never
+     * throws.
+     * @returns {number} the first set bit index, or -1
+     */
+    firstSet() {
+        const j = this._firstWordFrom(0);
+        if (j < 0) return -1;
+        const raw = this._w[j];
+        if (raw >= 2147483648) { _bitsetLeakSink.push(String(raw)); } // INJECTED REGRESSION (unbounded retained growth)
+        return (j << 5) + _bitsetCtz32(raw);
+    }
+
+    /**
+     * The index of the first set bit at index >= `from`, or -1 if none. WORST-CASE O(1) (the
+     * from-word's remaining bits, then the summary descent). A bad `from` (non-number, non-uint32,
+     * or >= capacity) returns -1 and NEVER throws (the family query contract). typeof FIRST so a
+     * Symbol / BigInt never reaches the coercing `>>>`.
+     * @param {number} from  inclusive lower bound
+     * @returns {number} the next set bit index >= from, or -1
+     */
+    nextSet(from) {
+        if (typeof from !== 'number' || (from >>> 0) !== from || from >= this._nbits) return -1;
+        const iw = from >>> 5;
+        // Bits of the from-word at position >= (from & 31): 0xFFFFFFFF << (from & 31) is a clean
+        // mask (from & 31 in [0, 31], never a 32-shift).
+        const word = this._w[iw] & (0xFFFFFFFF << (from & 31));
+        if (word !== 0) return (iw << 5) + _bitsetCtz32(word);
+        const j = this._firstWordFrom(iw + 1);
+        if (j < 0) return -1;
+        return (j << 5) + _bitsetCtz32(this._w[j]);
+    }
+
+    /**
+     * In-place bitwise AND with another SAME-capacity BitSet. O(words), 0 B/op (writes into the
+     * existing words). Rebuilds the summary. Fail closed: a non-BitSet or a capacity mismatch
+     * throws [lite-o1] via _mismatch.
+     * @param {BitSet} other
+     * @returns {BitSet} this
+     */
+    and(other) {
+        this._matchOrThrow(other);
+        const a = this._w, b = other._w;
+        for (let i = 0; i < a.length; i++) a[i] = a[i] & b[i];
+        this._rebuildSummary();
+        return this;
+    }
+
+    /**
+     * In-place bitwise OR with another SAME-capacity BitSet. O(words), 0 B/op. Rebuilds the
+     * summary. Fail closed on a non-BitSet / capacity mismatch.
+     * @param {BitSet} other
+     * @returns {BitSet} this
+     */
+    or(other) {
+        this._matchOrThrow(other);
+        const a = this._w, b = other._w;
+        for (let i = 0; i < a.length; i++) a[i] = a[i] | b[i];
+        this._rebuildSummary();
+        return this;
+    }
+
+    /**
+     * In-place bitwise XOR with another SAME-capacity BitSet. O(words), 0 B/op. Rebuilds the
+     * summary. Fail closed on a non-BitSet / capacity mismatch. Bits beyond capacity in the last
+     * word stay 0 (both operands share the same capacity, so both mask them off).
+     * @param {BitSet} other
+     * @returns {BitSet} this
+     */
+    xor(other) {
+        this._matchOrThrow(other);
+        const a = this._w, b = other._w;
+        for (let i = 0; i < a.length; i++) a[i] = a[i] ^ b[i];
+        this._rebuildSummary();
+        return this;
+    }
+
+    /**
+     * In-place bitwise AND-NOT (this = this AND NOT other) with another SAME-capacity BitSet.
+     * O(words), 0 B/op. Rebuilds the summary. Fail closed on a non-BitSet / capacity mismatch.
+     * @param {BitSet} other
+     * @returns {BitSet} this
+     */
+    andNot(other) {
+        this._matchOrThrow(other);
+        const a = this._w, b = other._w;
+        for (let i = 0; i < a.length; i++) a[i] = a[i] & ~b[i];
+        this._rebuildSummary();
+        return this;
+    }
+
+    /** Number of set bits. O(words), 0 B/op (a disclosed co-headline, not the per-bit claim). */
+    popcount() {
+        const w = this._w;
+        let c = 0;
+        for (let i = 0; i < w.length; i++) c += _bitsetPopcount32(w[i]);
+        return c;
+    }
+
+    /**
+     * Set EVERY bit in [0, capacity). O(words), 0 B/op. Bits beyond capacity in the last word
+     * stay 0 (so popcount / iteration / bulk ops stay exact), then the summary is rebuilt.
+     * @returns {BitSet} this
+     */
+    setAll() {
+        const w = this._w;
+        const nbits = this._nbits;
+        const full = nbits >>> 5;      // number of fully-set words
+        const rem = nbits & 31;        // remaining bits in the last (partial) word
+        for (let i = 0; i < full; i++) w[i] = 0xFFFFFFFF;
+        if (rem !== 0) w[full] = 0xFFFFFFFF >>> (32 - rem); // low `rem` bits only
+        this._rebuildSummary();
+        return this;
+    }
+
+    /**
+     * Invoke fn(index, bitset) for every set bit in ASCENDING order, alloc-free. O(popcount)
+     * over the summary (each set bit is reached in worst-case O(1)). A HOISTED callback keeps it
+     * allocation-free -- the documented scan exception, EXCLUDED from the per-op claims.
+     * @param {(index:number, bitset:BitSet)=>void} fn
+     */
+    forEach(fn) {
+        for (let i = this.firstSet(); i !== -1; i = this.nextSet(i + 1)) fn(i, this);
+    }
+
+    /**
+     * Iterate the set-bit indices in ASCENDING order, alloc-free per step (the summary descent
+     * allocates nothing; the generator protocol itself yields a {value, done} per step -- kept
+     * OUT of the zero-alloc claims, use forEach for the alloc-free scan).
+     */
+    *[Symbol.iterator]() {
+        for (let i = this.firstSet(); i !== -1; i = this.nextSet(i + 1)) yield i;
+    }
+
+    // ---- summary maintenance (private; pure integer surgery, zero allocation) ----
+
+    /**
+     * Mark data word `iw` as NON-EMPTY in the summary, propagating up only while the level below
+     * flips 0 -> non-0. @private
+     */
+    _markNonEmpty(iw) {
+        const i1 = iw >>> 5;
+        const before1 = this._s1[i1];
+        this._s1[i1] = before1 | (1 << (iw & 31));
+        if (before1 !== 0) return; // _s1[i1] already non-empty -> higher levels already marked
+        const i2 = i1 >>> 5;
+        const before2 = this._s2[i2];
+        this._s2[i2] = before2 | (1 << (i1 & 31));
+        if (before2 !== 0) return;
+        const i3 = i2 >>> 5;
+        this._s3[i3] = this._s3[i3] | (1 << (i2 & 31));
+    }
+
+    /**
+     * Mark data word `iw` as EMPTY in the summary, propagating up only while the level below
+     * becomes wholly 0. @private
+     */
+    _markEmpty(iw) {
+        const i1 = iw >>> 5;
+        this._s1[i1] &= ~(1 << (iw & 31));
+        if (this._s1[i1] !== 0) return; // still non-empty -> higher levels unchanged
+        const i2 = i1 >>> 5;
+        this._s2[i2] &= ~(1 << (i1 & 31));
+        if (this._s2[i2] !== 0) return;
+        const i3 = i2 >>> 5;
+        this._s3[i3] &= ~(1 << (i2 & 31));
+    }
+
+    /**
+     * Smallest data-word index j >= `sw` with _w[j] != 0, or -1. WORST-CASE O(1): the summary
+     * makes this a bounded descent (a <= 32-word top scan + a 3-hop clz32/ctz32 walk), never an
+     * O(words) loop. @private
+     */
+    _firstWordFrom(sw) {
+        const s1 = this._s1, s2 = this._s2, s3 = this._s3;
+        if (sw >= this._w.length) return -1;
+        // Level 1: the _s1 word covering `sw`, bits >= (sw & 31). (sw & 31 in [0,31] -> clean mask.)
+        const i1 = sw >>> 5;
+        const word1 = s1[i1] & (0xFFFFFFFF << (sw & 31));
+        if (word1 !== 0) return (i1 << 5) + _bitsetCtz32(word1);
+        // Climb via _s2: the next non-empty _s1 word strictly above i1 within its _s2 word.
+        const i2 = i1 >>> 5;
+        const bit1 = i1 & 31;
+        if (bit1 !== 31) {
+            const word2 = s2[i2] & (0xFFFFFFFF << (bit1 + 1));
+            if (word2 !== 0) {
+                const ni1 = (i2 << 5) + _bitsetCtz32(word2);
+                return (ni1 << 5) + _bitsetCtz32(s1[ni1]);
+            }
+        }
+        // Climb via _s3: the next non-empty _s2 word strictly above i2 within its _s3 word.
+        const i3 = i2 >>> 5;
+        const bit2 = i2 & 31;
+        if (bit2 !== 31) {
+            const word3 = s3[i3] & (0xFFFFFFFF << (bit2 + 1));
+            if (word3 !== 0) {
+                const ni2 = (i3 << 5) + _bitsetCtz32(word3);
+                const ni1 = (ni2 << 5) + _bitsetCtz32(s2[ni2]);
+                return (ni1 << 5) + _bitsetCtz32(s1[ni1]);
+            }
+        }
+        // Top: scan the remaining _s3 words (<= 32 total, so this stays a FIXED bounded scan).
+        for (let t = i3 + 1; t < s3.length; t++) {
+            const word3 = s3[t];
+            if (word3 !== 0) {
+                const ni2 = (t << 5) + _bitsetCtz32(word3);
+                const ni1 = (ni2 << 5) + _bitsetCtz32(s2[ni2]);
+                return (ni1 << 5) + _bitsetCtz32(s1[ni1]);
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Recompute all three summary levels from the data words. O(words), zero allocation -- used
+     * by setAll and by every bulk op (a stale summary after a bulk write is a silent firstSet
+     * corruption, so the summary is rebuilt, not patched). @private
+     */
+    _rebuildSummary() {
+        const w = this._w, s1 = this._s1, s2 = this._s2, s3 = this._s3;
+        s1.fill(0); s2.fill(0); s3.fill(0);
+        for (let j = 0; j < w.length; j++) if (w[j] !== 0) s1[j >>> 5] |= (1 << (j & 31));
+        for (let j = 0; j < s1.length; j++) if (s1[j] !== 0) s2[j >>> 5] |= (1 << (j & 31));
+        for (let j = 0; j < s2.length; j++) if (s2[j] !== 0) s3[j >>> 5] |= (1 << (j & 31));
+    }
+
+    // ---- cold path only: throw builders (string concat lives here, off the hot body) ----
+
+    /** @private */
+    _oob(i) {
+        // String(i) -- NOT '+ i' / a template literal: those THROW on a Symbol / BigInt,
+        // turning a fail-closed reject into a different crash.
+        throw new RangeError('[lite-o1] BitSet index out of range [0, ' + this._nbits + '): ' + String(i));
+    }
+
+    /** @private */
+    _matchOrThrow(other) {
+        if (!(other instanceof BitSet) || other._nbits !== this._nbits) this._mismatch(other);
+    }
+
+    /** @private */
+    _mismatch(other) {
+        const got = other instanceof BitSet ? other._nbits : String(other);
+        throw new RangeError(
+            '[lite-o1] BitSet bulk op requires a same-capacity BitSet (' + this._nbits + '), got ' + got);
     }
 }

@@ -22,7 +22,7 @@
  */
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet } from '../../O1.js';
 
 const U = 1 << 16;      // universe 65536
 const CAP = 1 << 14;    // capacity 16384
@@ -1466,6 +1466,133 @@ const stForEachDrain = {
     statsOf(s) { return { grows: stGrows(s) }; },
 };
 
+// ===========================================================================
+// BitSet scenarios -- ONE Uint32Array data-word column + a 3-level popcount summary
+// (all Uint32Array). Per-bit test / set / unset / toggle are WORST-CASE O(1) zero-alloc
+// (one word load + one mask op past the guard; the summary surgery is pure integer writes);
+// firstSet / nextSet are WORST-CASE O(1) via the summary; the in-place `or` is O(words) but
+// STILL 0 B/op (it writes into the existing words + rebuilds the summary in place). All fixed
+// at construction -- no store is reallocated.
+// ===========================================================================
+
+const BS_BITS = 1 << 16;   // 65536-bit dense bitset
+const BS_MASK = BS_BITS - 1;
+
+/**
+ * The zero-alloc counter for BitSet scenarios: the byte lengths of the data-word column + all
+ * three summary levels. Capacity is fixed at construction, so this NEVER grows -- the delta
+ * across the window must be 0 (the `bitsetGrows` 0-delta canary; mirrors grows / ... / stGrows).
+ */
+function bitsetGrows(s) {
+    const b = s.bs;
+    return b._w.buffer.byteLength + b._s1.buffer.byteLength +
+        b._s2.buffer.byteLength + b._s3.buffer.byteLength;
+}
+
+/** A BitSet with the EVEN bits set (~half the domain), the steady resident state. */
+function bitsetFill() {
+    const bs = new BitSet(BS_BITS);
+    for (let k = 0; k < BS_BITS; k += 2) bs.set(k);
+    return bs;
+}
+
+/** test-hit: a primed bitset; every op a resident membership probe (one word load + mask), int32 acc. */
+const bsTestHit = {
+    name: 'BitSet test-hit',
+    setup() { return { bs: bitsetFill(), acc: 0 }; },
+    hot(s, n) {
+        const bs = s.bs;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) acc = (acc + (bs.test((i << 1) & BS_MASK) ? 1 : 0)) | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: bitsetGrows(s) }; },
+};
+
+/**
+ * set-churn: each op unsets a walking ODD bit then sets it -- driving the summary
+ * empty<->non-empty transition path (odd bits start empty, so set marks the word non-empty).
+ * Bounded (the bit returns to its state each pair). Zero-alloc.
+ */
+const bsSetChurn = {
+    name: 'BitSet set-churn (unset + set a walking bit)',
+    setup() { const bs = bitsetFill(); return { bs, k: 1 }; },
+    hot(s, n) {
+        const bs = s.bs;
+        let k = s.k | 0;
+        for (let i = 0; i < n; i++) {
+            bs.unset(k);
+            bs.set(k);
+            k = (k + 2) & BS_MASK; if (k === 0) k = 1; // walk odd bits
+        }
+        s.k = k | 0;
+    },
+    statsOf(s) { return { grows: bitsetGrows(s) }; },
+};
+
+/** unset-churn: each op sets then unsets a walking bit (the clear-transition hot body). Zero-alloc. */
+const bsUnsetChurn = {
+    name: 'BitSet unset-churn (set + unset a walking bit)',
+    setup() { return { bs: new BitSet(BS_BITS), k: 0 }; },
+    hot(s, n) {
+        const bs = s.bs;
+        let k = s.k | 0;
+        for (let i = 0; i < n; i++) {
+            bs.set(k);
+            bs.unset(k);   // word returns to empty -> exercises _markEmpty up the summary
+            k = (k + 1) & BS_MASK;
+        }
+        s.k = k | 0;
+    },
+    statsOf(s) { return { grows: bitsetGrows(s) }; },
+};
+
+/** firstSet: a primed bitset (bit 0 set, so firstSet is a short descent); every op the O(1) frontier read, int32 acc. */
+const bsFirstSet = {
+    name: 'BitSet firstSet',
+    setup() { return { bs: bitsetFill(), acc: 0 }; },
+    hot(s, n) {
+        const bs = s.bs;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) acc = (acc + (bs.firstSet() | 0)) | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: bitsetGrows(s) }; },
+};
+
+/** nextSet: a primed bitset; every op an O(1) nextSet from a walking lower bound, int32 acc. */
+const bsNextSet = {
+    name: 'BitSet nextSet',
+    setup() { return { bs: bitsetFill(), acc: 0 }; },
+    hot(s, n) {
+        const bs = s.bs;
+        let acc = s.acc | 0;
+        for (let i = 0; i < n; i++) acc = (acc + (bs.nextSet((i << 3) & BS_MASK) | 0)) | 0;
+        s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: bitsetGrows(s) }; },
+};
+
+/**
+ * or-bulk: an in-place `or` between two SAME-capacity bitsets -- O(words), NOT the per-bit
+ * O(1) claim, but STILL 0 B/op (writes into the existing words + rebuilds the summary in place).
+ * The gate proves the ALLOCATION claim separately from the O(words) time claim.
+ */
+const bsOrBulk = {
+    name: 'BitSet or (in-place bulk, O(words), 0 B/op)',
+    setup() {
+        const bs = new BitSet(BS_BITS);
+        const other = new BitSet(BS_BITS);
+        for (let k = 0; k < BS_BITS; k += 3) other.set(k);
+        return { bs, other };
+    },
+    hot(s, n) {
+        const bs = s.bs, other = s.other;
+        for (let i = 0; i < n; i++) bs.or(other);
+    },
+    statsOf(s) { return { grows: bitsetGrows(s) }; },
+};
+
 const scenarios = [
     addChurn, hasHit, deleteChurn, clearRefill, forEachDrain,
     ringFifo, ringLifo, ringInterleave,
@@ -1480,6 +1607,7 @@ const scenarios = [
     ringLogFillChurn, ringLogOverwriteChurn, ringLogGetScan, ringLogForEachDrain,
     cuckGetHit, cuckHasHit, cuckSetChurn, cuckUpdateChurn, cuckForEachDrain,
     stQuery, stAtRead, stForEachDrain,
+    bsTestHit, bsSetChurn, bsUnsetChurn, bsFirstSet, bsNextSet, bsOrBulk,
 ];
 
 /**
@@ -1799,6 +1927,32 @@ const stMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/**
+ * The BitSet teeth: a per-op `[Symbol.iterator]` spread into a FRESH [] each op -- the generator
+ * + its per-step {value, done} wrappers + the array MUST trip the gate (scavenges scale with n),
+ * proving the instrument has teeth on the BitSet surface too (its iterator is the ONE documented
+ * per-protocol allocator; forEach is the alloc-free scan). statsOf returns a constant so the
+ * failure is the allocation lanes, not a missing-counter artifact.
+ */
+const bsMustFailAlloc = {
+    name: 'BitSet [Symbol.iterator] spread into fresh array (MUST allocate)',
+    setup() {
+        const bs = new BitSet(256);
+        for (let i = 0; i < 64; i++) bs.set(i * 3);
+        return { bs };
+    },
+    hot(s, n) {
+        const bs = s.bs;
+        let sink = 0;
+        for (let i = 0; i < n; i++) {
+            const arr = [...bs]; // fresh generator + array per op -> heap churn
+            sink += arr.length;
+        }
+        s.sink = sink;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -1808,5 +1962,5 @@ zgcSuite({
     counters: { grows: 0 },
     maxRetainedKB: 64,
     scenarios,
-    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc, twMustFailAlloc, htwMustFailAlloc, ringLogMustFailAlloc, cuckMustFailAlloc, stMustFailAlloc],
+    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc, twMustFailAlloc, htwMustFailAlloc, ringLogMustFailAlloc, cuckMustFailAlloc, stMustFailAlloc, bsMustFailAlloc],
 });

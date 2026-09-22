@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-> Zero-GC, O(1) data structures that WITNESS their constant. v1.3.1 ships SparseSet (an integer set with O(1) add / has / delete / iterate and an O(1) clear() that zeroes nothing), RingDeque (a fixed-capacity numeric double-ended queue with O(1) push/pop at both ends), UnionFind (a disjoint-set forest with near-O(1) amortized find / union), MonoDeque (a monotonic deque for O(1)-amortized sliding-window min / max), MinStack (a fixed-capacity numeric stack with a worst-case-O(1) running min / max), RandomSet (an integer set with worst-case-O(1) uniform sample / removeRandom), FreqO1 (a worst-case-O(1) LFU frequency structure with O(1) add / increment / peekMin / popMin), BucketQueue (an amortized-O(1) monotone integer priority queue / Dial with O(1) insert / decreaseKey / extractMin), TimerWheel (a worst-case-O(1) bounded simple timing wheel with O(1) schedule / cancel / advance and drain-before-advance), HierarchicalTimerWheel (an amortized-O(1) cascading multi-level timing wheel with a 2^26 delay range), RingLog (a worst-case-O(1) lossy overwrite-oldest ring log whose O(1) push returns the evicted oldest), CuckooMap (a bounded-probe worst-case-O(1)-lookup exact map from general integer keys to numbers via bucketized cuckoo hashing), and SparseTable (a worst-case-O(1)-query STATIC range-minimum / range-maximum table / StaticRMQ) -- plus a throughput-invariance witness that shows the flat cost curve while a native Set, Array.prototype.shift, a naive disjoint-set, a full-window rescan, a full-stack rescan, a Set-iterate-to-the-kth, a frequency-table min-scan, a binary heap, a naive-scan scheduler, a 4-ary heap, a shift-on-full Array log, a naive linear-scan map, or a naive O(len) range-scan decays.
+> Zero-GC, O(1) data structures that WITNESS their constant. v1.4.0 ships SparseSet (an integer set with O(1) add / has / delete / iterate and an O(1) clear() that zeroes nothing), RingDeque (a fixed-capacity numeric double-ended queue with O(1) push/pop at both ends), UnionFind (a disjoint-set forest with near-O(1) amortized find / union), MonoDeque (a monotonic deque for O(1)-amortized sliding-window min / max), MinStack (a fixed-capacity numeric stack with a worst-case-O(1) running min / max), RandomSet (an integer set with worst-case-O(1) uniform sample / removeRandom), FreqO1 (a worst-case-O(1) LFU frequency structure with O(1) add / increment / peekMin / popMin), BucketQueue (an amortized-O(1) monotone integer priority queue / Dial with O(1) insert / decreaseKey / extractMin), TimerWheel (a worst-case-O(1) bounded simple timing wheel with O(1) schedule / cancel / advance and drain-before-advance), HierarchicalTimerWheel (an amortized-O(1) cascading multi-level timing wheel with a 2^26 delay range), RingLog (a worst-case-O(1) lossy overwrite-oldest ring log whose O(1) push returns the evicted oldest), CuckooMap (a bounded-probe worst-case-O(1)-lookup exact map from general integer keys to numbers via bucketized cuckoo hashing), SparseTable (a worst-case-O(1)-query STATIC range-minimum / range-maximum table / StaticRMQ), and BitSet (a fixed-capacity multi-word DENSE bitset with worst-case-O(1) test / set / unset / toggle and worst-case-O(1) firstSet / nextSet via a 3-level popcount summary) -- plus a throughput-invariance witness that shows the flat cost curve while a native Set, Array.prototype.shift, a naive disjoint-set, a full-window rescan, a full-stack rescan, a Set-iterate-to-the-kth, a frequency-table min-scan, a binary heap, a naive-scan scheduler, a 4-ary heap, a shift-on-full Array log, a naive linear-scan map, a naive O(len) range-scan, or a cache-degrading Set decays.
 
 [![npm version](https://img.shields.io/npm/v/@zakkster/lite-o1.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-o1)
 [![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
@@ -17,7 +17,7 @@
 
 Almost no JavaScript data-structure library ships the evidence that its Big-O claim survives contact with a real engine -- megamorphic call sites, GC pauses, cache misses, deopts. `lite-o1` is a curated, tree-shakeable family of the O(1) structures that actually matter, each zero-GC, each written to teach the trick that buys the constant, and each shipped with a harness that DEMONSTRATES the flat cost curve rather than asserting it. The complexity class IS the product.
 
-v1.3.1 ships thirteen members. **SparseSet**, the textbook O(1) integer set (a dense + sparse array pair) whose `clear()` runs in O(1) by resetting a count and zeroing nothing at all. **RingDeque**, a fixed-capacity double-ended queue of numbers over one circular `Float64Array` -- O(1) push/pop at both ends, the zero-GC answer to the `Array.prototype.shift` O(n) trap. **UnionFind**, a disjoint-set forest over two `Uint32Array` columns -- near-O(1) amortized `find` / `union` via path halving + union by size, the family's first amortized-honesty member. **MonoDeque**, a monotonic deque over two parallel `Float64Array` columns -- O(1)-amortized sliding-window min / max, the zero-GC answer to the full-window-rescan O(W) trap. **MinStack**, a fixed-capacity numeric stack over two parallel `Float64Array` columns (value + a running-extreme prefix) -- WORST-CASE O(1) push/pop plus a running min / max, no amortization asterisk. **RandomSet**, SparseSet's substrate plus WORST-CASE O(1) uniform `sample()` / `removeRandom()` -- the zero-GC answer to the `Array.from(set)[k]` O(n)-plus-allocation trap. **FreqO1**, a WORST-CASE O(1) frequency structure over a private bucket forest -- `add` / `increment` / `peekMin` / `popMin`, the standalone primitive behind O(1) LFU eviction, the zero-GC answer to the scan-all-counts-for-the-minimum O(n) trap. **BucketQueue**, an AMORTIZED O(1) monotone integer priority queue ("Dial") over private key columns + a static per-priority bucket array -- `insert` / `decreaseKey` / `extractMin`, the standalone primitive behind Dial's algorithm, the zero-GC answer to a binary heap's O(log n) per op when priorities are small bounded integers. And **TimerWheel**, a WORST-CASE O(1) bounded "simple" timing wheel (Varghese-Lauck) over private id columns + a static per-slot FIFO ring -- `schedule` / `cancel` / `drainDue` / `advance`, the standalone primitive behind O(1) timer scheduling, the zero-GC answer to a binary-heap timer queue's O(log n) per op (and a linear scan's O(n) per tick) when the delay horizon is bounded. And **HierarchicalTimerWheel**, an AMORTIZED O(1) CASCADING multi-level timing wheel (the Linux tvec shape: 1x256 + 3x64, delay range 2^26) over the same substrate plus a Float64 expiry column -- `schedule` / `cancel` / `drainDue` / `advance`, TimerWheel's sibling for a delay horizon too wide for one rotation, cascading coarse timers down to finer levels by index (zero allocation) and wearing an honest max-single-op cascade spike. And **RingLog**, a WORST-CASE O(1) LOSSY overwrite-oldest ring log over one circular `Float64Array` -- "keep the last N": `push` never blocks and never throws on full, it OVERWRITES the oldest entry and RETURNS it (RingDeque's substrate with its full-push policy INVERTED), the zero-GC answer to the `push`-then-`shift`-on-full Array log's O(n) trap. And **CuckooMap**, a bounded-probe WORST-CASE O(1)-lookup exact map from GENERAL INTEGER keys (`|k| <= 2^53`) to numbers over a bucketized cuckoo table (2 tables x 4 slots, `get` / `has` / `delete` probe at most 8 slots) -- the family's first general-key exact dictionary, O(capacity) space over a sparse / large integer key domain (vs SparseSet's O(universe) dense one), whose amortized `set` wears an honest in-place re-seed spike, the zero-GC answer to a general hash map's average-case-only lookup and its GC. And **SparseTable**, a WORST-CASE O(1)-QUERY STATIC range-minimum / range-maximum table (the idempotent-operation sparse table / "StaticRMQ") over two immutable `Float64Array` columns (a source copy + a flat `n*(K+1)` table) -- the family's FIRST static build-once / immutable member: build once, then answer the min OR max over any range `[l, r]` in worst-case O(1) (a floor-log2 + two table reads + one compare), the zero-GC answer to a naive O(len) range-scan (the O(n log n) build + table space are a disclosed co-headline). They share no mutable module state, so a bundler that imports one drops the others.
+v1.4.0 ships fourteen members. **SparseSet**, the textbook O(1) integer set (a dense + sparse array pair) whose `clear()` runs in O(1) by resetting a count and zeroing nothing at all. **RingDeque**, a fixed-capacity double-ended queue of numbers over one circular `Float64Array` -- O(1) push/pop at both ends, the zero-GC answer to the `Array.prototype.shift` O(n) trap. **UnionFind**, a disjoint-set forest over two `Uint32Array` columns -- near-O(1) amortized `find` / `union` via path halving + union by size, the family's first amortized-honesty member. **MonoDeque**, a monotonic deque over two parallel `Float64Array` columns -- O(1)-amortized sliding-window min / max, the zero-GC answer to the full-window-rescan O(W) trap. **MinStack**, a fixed-capacity numeric stack over two parallel `Float64Array` columns (value + a running-extreme prefix) -- WORST-CASE O(1) push/pop plus a running min / max, no amortization asterisk. **RandomSet**, SparseSet's substrate plus WORST-CASE O(1) uniform `sample()` / `removeRandom()` -- the zero-GC answer to the `Array.from(set)[k]` O(n)-plus-allocation trap. **FreqO1**, a WORST-CASE O(1) frequency structure over a private bucket forest -- `add` / `increment` / `peekMin` / `popMin`, the standalone primitive behind O(1) LFU eviction, the zero-GC answer to the scan-all-counts-for-the-minimum O(n) trap. **BucketQueue**, an AMORTIZED O(1) monotone integer priority queue ("Dial") over private key columns + a static per-priority bucket array -- `insert` / `decreaseKey` / `extractMin`, the standalone primitive behind Dial's algorithm, the zero-GC answer to a binary heap's O(log n) per op when priorities are small bounded integers. And **TimerWheel**, a WORST-CASE O(1) bounded "simple" timing wheel (Varghese-Lauck) over private id columns + a static per-slot FIFO ring -- `schedule` / `cancel` / `drainDue` / `advance`, the standalone primitive behind O(1) timer scheduling, the zero-GC answer to a binary-heap timer queue's O(log n) per op (and a linear scan's O(n) per tick) when the delay horizon is bounded. And **HierarchicalTimerWheel**, an AMORTIZED O(1) CASCADING multi-level timing wheel (the Linux tvec shape: 1x256 + 3x64, delay range 2^26) over the same substrate plus a Float64 expiry column -- `schedule` / `cancel` / `drainDue` / `advance`, TimerWheel's sibling for a delay horizon too wide for one rotation, cascading coarse timers down to finer levels by index (zero allocation) and wearing an honest max-single-op cascade spike. And **RingLog**, a WORST-CASE O(1) LOSSY overwrite-oldest ring log over one circular `Float64Array` -- "keep the last N": `push` never blocks and never throws on full, it OVERWRITES the oldest entry and RETURNS it (RingDeque's substrate with its full-push policy INVERTED), the zero-GC answer to the `push`-then-`shift`-on-full Array log's O(n) trap. And **CuckooMap**, a bounded-probe WORST-CASE O(1)-lookup exact map from GENERAL INTEGER keys (`|k| <= 2^53`) to numbers over a bucketized cuckoo table (2 tables x 4 slots, `get` / `has` / `delete` probe at most 8 slots) -- the family's first general-key exact dictionary, O(capacity) space over a sparse / large integer key domain (vs SparseSet's O(universe) dense one), whose amortized `set` wears an honest in-place re-seed spike, the zero-GC answer to a general hash map's average-case-only lookup and its GC. And **SparseTable**, a WORST-CASE O(1)-QUERY STATIC range-minimum / range-maximum table (the idempotent-operation sparse table / "StaticRMQ") over two immutable `Float64Array` columns (a source copy + a flat `n*(K+1)` table) -- the family's FIRST static build-once / immutable member: build once, then answer the min OR max over any range `[l, r]` in worst-case O(1) (a floor-log2 + two table reads + one compare), the zero-GC answer to a naive O(len) range-scan (the O(n log n) build + table space are a disclosed co-headline). And **BitSet**, a WORST-CASE O(1) fixed-capacity multi-word DENSE bitset over MANY `Uint32` words (N >> 32) plus a 3-level popcount summary -- `test` / `set` / `unset` / `toggle` are one word load + one mask op, and `firstSet` / `nextSet` are worst-case O(1) via the summary (a fixed <= 32-word top scan + a 3-hop `clz32`/`ctz32` descent, never an O(words) scan), with in-place O(words) bulk `and` / `or` / `xor` / `andNot`; the canonical membership / flag structure for visited sets, dirty masks, replay windows, and permission bitmaps at scale, the zero-GC answer to a cache-degrading `Set<number>` (and the multi-word sibling of `@zakkster/lite-fastbit32`'s single 32-flag word, design-parity only, zero runtime dep). They share no mutable module state, so a bundler that imports one drops the others.
 
 ```bash
 npm install @zakkster/lite-o1
@@ -92,6 +92,9 @@ Every op above is O(1) worst-case and allocates zero bytes after construction. T
   - [CuckooMap API reference](#cuckoomap-api-reference)
 - [SparseTable](#sparsetable)
   - [SparseTable API reference](#sparsetable-api-reference)
+- [BitSet](#bitset)
+  - [How BitSet works](#how-bitset-works)
+  - [BitSet API reference](#bitset-api-reference)
 - [Composability with the ecosystem](#composability-with-the-ecosystem)
 - [Zero-GC design notes](#zero-gc-design-notes)
 - [Design decisions worth knowing](#design-decisions-worth-knowing)
@@ -242,6 +245,8 @@ The cost of the constant is memory: `sparse` is sized to the whole universe (4 b
 ---
 
 ## API reference
+<details>
+<summary>SparseSet API reference -- constructor, add / has / delete / clear / iterate, and the constants.</summary>
 
 ### SparseSet
 
@@ -272,7 +277,7 @@ get capacity: number        // max live members as constructed
 
 | Constant   | Value     | Meaning                                            |
 | ---------- | --------- | -------------------------------------------------- |
-| `VERSION`  | `'1.3.1'` | Package version string.                            |
+| `VERSION`  | `'1.4.0'` | Package version string.                            |
 
 Contract bounds (validated, not exported):
 
@@ -328,6 +333,8 @@ Contract bounds (validated, not exported):
 | SparseTable `kind`  | `'min'` or `'max'`, frozen at construction |
 | SparseTable `query(l, r)` | `l`, `r` integers in `[0, length)` with `l <= r` (else -> `undefined`, never throws) |
 
+</details>
+
 ---
 
 ## The O(1) Witness
@@ -352,6 +359,8 @@ SparseSet's contiguous typed-array layout streams flat -- its ops/ms barely move
 ---
 
 ## RingDeque
+<details>
+<summary>Fixed-capacity numeric double-ended queue over one circular Float64Array -- O(1) push / pop at both ends.</summary>
 
 The second member: a **fixed-capacity double-ended queue of numbers** over one circular `Float64Array`. Push and pop at BOTH ends are O(1) worst-case and allocate zero bytes -- the zero-GC answer to the `Array.prototype.shift` / `unshift` O(n) trap, where every element re-indexes on each end operation.
 
@@ -387,9 +396,6 @@ Every op is O(1) worst-case and zero-allocation after construction. `pop*` / `pe
 
 ### How RingDeque works
 
-<details>
-<summary>The circular buffer, head + count, and why clear() is free.</summary>
-
 A RingDeque holds one `Float64Array` (the ring), a `head` (the index of the front element), and a `count` (how many elements are live). The physical slot for logical offset `i` from the front is:
 
 ```
@@ -408,8 +414,6 @@ Using **head + count** (not a head/tail pair) makes "full" a single test (`count
 - **`clear()`** is `head = 0; count = 0`. The store is left byte-identical. The stale numbers are unreachable (every read is bounded by `count`) and retain no references (they are numbers), so there is nothing to zero -- clearing a full ring costs the same as clearing an empty one. This is the same teachable gem as SparseSet's cross-checked clear.
 
 The cost of the constant is the value domain: a `Float64Array` holds numbers only. To queue objects, queue their integer handles / indices and keep the payloads in a parallel column or `@zakkster/lite-arena`.
-
-</details>
 
 ### RingDeque API reference
 
@@ -438,9 +442,13 @@ get capacity: number              // max elements (power-of-two, rounded up)
 
 **Reach for RingDeque when** you need FIFO / LIFO / sliding-window push-pop at O(1) with zero per-op allocation over a bounded numeric domain (ring buffers, bounded work queues, rolling windows). **Avoid it when** you need to queue non-numbers (queue their handles instead), or need the queue to grow past a bound you cannot set up front (it fails closed on a full push rather than resizing). See [`GUIDE.md`](./GUIDE.md) for the full reach-for / avoid / measure-it.
 
+</details>
+
 ---
 
 ## UnionFind
+<details>
+<summary>Disjoint-set forest -- near-O(1) amortized find / union via path halving + union by size.</summary>
 
 The third member: a **disjoint-set (union-find) forest** over two `Uint32Array` columns (parent + subtree size), fixed element count `n`. `find` / `union` / `connected` / `componentSize` are near-O(1) **amortized** (inverse Ackermann alpha(n) <= ~4) and allocate zero bytes -- the family's amortized-honesty member, and the zero-GC answer to a naive disjoint-set whose `find` degrades to O(n) as its trees deepen.
 
@@ -474,9 +482,6 @@ Every query / merge above is O(1)-amortized and zero-allocation after constructi
 
 ### How UnionFind works
 
-<details>
-<summary>Path halving, union by size, and why a single find is amortized -- not worst-case -- O(1).</summary>
-
 A UnionFind holds two `Uint32Array`s and a live component count:
 
 - **`parent`** -- `parent[i]` is `i`'s parent in its tree; `i` is a ROOT iff `parent[i] === i`. Two elements are in the same component iff they reach the same root.
@@ -499,8 +504,6 @@ Together these bound any single op at O(alpha(n)) AMORTIZED. **Honesty:** a sing
 `reset()` (re-singleton everything) and `forEachRoots(fn)` (visit every root) are the O(n) exceptions: there is no cross-check trick to make them O(1) because every element's parent must actually be read / rewritten. They still allocate nothing (a single bulk pass over the existing arrays), but they are bulk ops, not per-op hot paths -- `reset()` is named `reset()`, not `clear()`, precisely to flag that different cost class.
 
 The cost of the constant is memory: two `n`-sized `Uint32Array` columns, allocated eagerly at construction. UnionFind is the right tool when elements are a known, bounded integer range and you merge groups incrementally -- not for a huge / unbounded or non-integer element domain.
-
-</details>
 
 ### UnionFind API reference
 
@@ -528,9 +531,13 @@ get capacity: number                 // the fixed element universe n
 
 **Reach for UnionFind when** you track "which things are in the same group" over a fixed integer element set and merge groups incrementally (connected components, Kruskal MST, percolation, cycle detection, equivalence classes) at near-constant amortized cost with zero per-op allocation. **Avoid it when** you need to SPLIT / un-merge (union-find is merge-only; `reset()` re-singletons everything in O(n)), your elements are not a bounded integer range, or you are on a strict per-op WORST-CASE budget (a single `find` is amortized alpha(n), not worst-case O(1)). See [`GUIDE.md`](./GUIDE.md) for the full reach-for / avoid / measure-it.
 
+</details>
+
 ---
 
 ## MonoDeque
+<details>
+<summary>Monotonic deque -- O(1)-amortized sliding-window min / max.</summary>
 
 The fourth member: a **monotonic deque for sliding-window minimum / maximum** over two parallel `Float64Array` columns (value + monotonic seq). `push` / `evictOlderThan` are O(1) **amortized** and allocate zero bytes -- the family's second amortized-honesty member, and the zero-GC answer to the naive rolling-extreme that rescans the whole window each step (O(W) per element).
 
@@ -579,9 +586,6 @@ MonoDeque's amortized push streams flat across the window sweep while the naive 
 
 ### How MonoDeque works
 
-<details>
-<summary>The monotone invariant, the caller-driven window, and why push is amortized -- not worst-case -- O(1).</summary>
-
 A MonoDeque holds two parallel `Float64Array`s in a head + count power-of-two ring (the same substrate as RingDeque): a **value** column and a **seq** column, where `seq` is a monotonically increasing insertion number.
 
 The monotone invariant is the whole trick. For a `'min'` deque, `push(v)` first pops every back entry whose value is `>= v`:
@@ -602,8 +606,6 @@ Any entry `>= v` can never again be the window minimum while `v` is in the windo
 **Amortized, not worst-case.** A single `push` can pop a whole dominated run -- O(k) in the worst case. But every element is pushed once and popped at most once, so the pops charged across a run of pushes total at most that run's length: amortized O(1). The [witness](#the-o1-witness) demonstrates it against a naive O(W)-window-rescan foil AND prints the MAX single-op time (a deliberate O(W) pop-storm) beside a typical O(1) push, so a hidden worst-case spike shows as a tall bar even though the amortized line stays flat.
 
 The cost of the constant is the value domain (numbers only, like RingDeque) and a seq ceiling: seqs live in a `Float64Array` slot, so a push whose seq would pass `MAX_SEQ = 2^53` throws rather than lose integer precision -- `clear()` (which resets the counter) is the way to reuse a very long-lived instance.
-
-</details>
 
 ### MonoDeque API reference
 
@@ -633,9 +635,13 @@ get capacity: number                 // max simultaneously-live entries (power-o
 
 **Reach for MonoDeque when** you need the MIN or MAX of a sliding window over a numeric stream at O(1) amortized with zero per-op allocation (rolling extrema, envelope / peak detection, stock-span, bounded-window statistics) and you were about to rescan the window each step. **Avoid it when** you need BOTH extremes of one window (run two instances -- `kind` is frozen), arbitrary order statistics or a window SUM (a monotonic deque only answers the extreme), or you are on a strict per-op WORST-CASE budget (a single `push` is O(k), amortized O(1)). See [`GUIDE.md`](./GUIDE.md) for the full reach-for / avoid / measure-it.
 
+</details>
+
 ---
 
 ## MinStack
+<details>
+<summary>Fixed-capacity numeric stack with a worst-case-O(1) running min / max.</summary>
 
 The fifth member: a **fixed-capacity numeric stack** that also reports the current **minimum or maximum of every live element in WORST-CASE O(1)** -- no amortization asterisk -- over two parallel `Float64Array` columns (value + a running-extreme prefix). Where MonoDeque answers a moving WINDOW, MinStack answers the whole live STACK, and it does so with a strict per-op bound: `push` never pops a run, so there is no worst-case spike to hide.
 
@@ -682,9 +688,6 @@ MinStack's `extreme()` streams flat across the depth sweep while the naive resca
 
 ### How MinStack works
 
-<details>
-<summary>The running-extreme column, why pop needs no recompute, and why capacity is exact.</summary>
-
 A MinStack holds two parallel `Float64Array`s and a top pointer `n`: a **value** column and an **ext** column, where `ext[i]` is the extreme (min or max, per `kind`) of every element at or below index `i`.
 
 The `ext` column is the whole trick. On `push(v)`, the extreme is carried forward in ONE comparison against the prior prefix:
@@ -706,8 +709,6 @@ So `extreme()` is `ext[n-1]` -- a single read, WORST-CASE O(1) no matter how man
 **Worst-case, not amortized.** The classic "getMin stack" alternative is a compressed second stack that only records a minimum when it changes. It saves memory on friendly inputs but makes `pop` conditional (was the popped value the current min?) and degrades to the same size as the full `ext` column on an adversarial strictly-decreasing feed. The flat `ext` column trades a fixed 2x memory for an UNCONDITIONAL worst-case-O(1) push AND pop with no branch on the value -- the guarantee this member exists to make.
 
 The cost of the constant is the value domain (numbers only, like RingDeque) and memory: the `ext` column DOUBLES the backing store. That makes the `[1, 2^31]` ceiling a TYPE bound (a legal index still fits a `Float64` slot), not a size any host will allocate -- a 2^31 MinStack would be ~32 GiB. The ceiling is a fail-closed guard, stated honestly, not a capacity recommendation.
-
-</details>
 
 ### MinStack API reference
 
@@ -736,9 +737,13 @@ get capacity: number                 // max elements (exact, not rounded)
 
 **Reach for MinStack when** you push/pop a numeric stack and need the running MIN or MAX of the live elements at strict WORST-CASE O(1) with zero per-op allocation (expression evaluators, span problems, backtracking with a rolling bound, undo stacks with a live extreme). **Avoid it when** your pattern is a queue or a sliding window (reach for RingDeque or MonoDeque), you need BOTH extremes of one stack (run two instances -- `kind` is frozen), or you need order statistics / a SUM (a running-extreme column only answers the extreme). See [`GUIDE.md`](./GUIDE.md) for the full reach-for / avoid / measure-it.
 
+</details>
+
 ---
 
 ## RandomSet
+<details>
+<summary>Integer set with worst-case-O(1) uniform sample() / removeRandom().</summary>
 
 The sixth member: SparseSet's **integer set** with one power added -- a uniform-random live member in **WORST-CASE O(1)**. It duplicates SparseSet's dense + sparse cross-check substrate verbatim (so `add` / `has` / `delete` / `clear` / iterate carry the exact same contract), then adds `sample()` (a uniform peek) and `removeRandom()` (a uniform swap-remove). The dense array's contiguous packing is what makes it O(1): a uniform index into `[0, size)` IS a uniform member, no scan, no rejection loop, no reservoir. A native `Set` cannot do this better than O(n) -- it has no random index, so `Array.from(set)[k]` is an O(n) walk PLUS a per-pick allocation.
 
@@ -780,9 +785,6 @@ RandomSet's `sample()` streams flat across the size sweep while the naive Set-wa
 
 ### How RandomSet works
 
-<details>
-<summary>Why the dense array makes sampling O(1), the high-bits index map, and the disclosed multiply-bias.</summary>
-
 A RandomSet holds the SparseSet substrate -- a `dense` array packing the live members contiguously in `[0, n)`, and a `sparse` array mapping each key to its dense index, cross-checked by `sparse[k] < n && dense[sparse[k]] === k`. Because the live members are packed with no gaps, **a uniform index `i` in `[0, n)` picks `dense[i]`, a uniform member, in one read.**
 
 The index comes from a per-instance Numerical Recipes LCG advanced on each draw:
@@ -801,8 +803,6 @@ idx = Math.floor(s / 2**32 * n)             // the HIGH bits, mapped into [0, n)
 **Why NO rejection sampling.** The textbook way to remove ALL bias from a 32-bit word is to reject-and-redraw the top residue -- but that makes a single draw UNBOUNDED in the worst case, breaking the worst-case-O(1) guarantee this member exists to make. So RandomSet does not reject; the residual multiply-bias is at most `n / 2^32` (a few indices are ~`1 + n/2^32` times likelier), utterly negligible for any `n` this substrate holds. It is DISCLOSED here, not coded around. Uniformity is STATISTICAL, not cryptographic -- draw from `crypto` and index the dense array directly for adversarial use.
 
 **Seed and determinism.** The seed is a positional 3rd ctor arg stored per-instance (NEVER module-level state), validated fail-closed at the ctor door (a non-integer / non-number throws `[lite-o1]`, typeof-guarded before the coercing `>>>`; any integer is folded into the uint32 domain via `>>> 0`). Because the seed defaults to a constant and the RNG is per-instance, two DEFAULT-seeded RandomSets holding the same members produce IDENTICAL `sample()` / `removeRandom()` sequences -- a deliberate reproducibility, not a bug. Pass distinct seeds to decorrelate.
-
-</details>
 
 ### RandomSet API reference
 
@@ -833,9 +833,13 @@ get capacity: number                 // max live members as constructed
 
 **Reach for RandomSet when** you need a uniform-random element of a live integer set on a hot path -- random eviction, reservoir-style sampling, randomized load-balancing, particle / agent pools, fuzz-input selection -- at worst-case O(1) with zero per-op allocation and REPRODUCIBLE (seeded) randomness, and you were about to reach for `Array.from(set)[k]`. **Avoid it when** you need cryptographic uniformity (draw from `crypto`; the pick has a disclosed `<= n/2^32` multiply-bias), weighted (non-uniform) sampling, string / object / huge-domain keys (the SparseSet caveat applies), or you want two default-seeded instances to differ (pass distinct seeds). See [`GUIDE.md`](./GUIDE.md) for the full reach-for / avoid / measure-it.
 
+</details>
+
 ---
 
 ## FreqO1
+<details>
+<summary>Worst-case-O(1) LFU frequency structure -- add / increment / peekMin / popMin.</summary>
 
 The seventh member: a **WORST-CASE O(1) frequency structure** -- the standalone primitive behind O(1) LFU (least-frequently-used) eviction. It tracks an access **count** per integer key and answers "which key is used least?" (lowest count, oldest-first on ties) in O(1) with NO scan, over a private `Uint32Array` **bucket forest**. It holds counts, not payloads: it is the frequency PRIMITIVE, not a full cache.
 
@@ -878,9 +882,6 @@ FreqO1's hot ops stream flat across the size sweep while the naive min-scan coll
 
 ### How FreqO1 works
 
-<details>
-<summary>The bucket forest, the FIFO tie-break, and why the free-list can't run dry.</summary>
-
 FreqO1 is the classic O(1)-LFU structure -- a doubly-linked list of frequency **buckets** (sorted ascending), each holding a doubly-linked FIFO list of the keys at that frequency -- made **pointer-free** over private `Uint32Array` columns.
 
 **Keys ride SparseSet's substrate.** `_dense[i]` is the key at dense index `i`, `_sparse[k]` maps back, membership is the cross-check `_sparse[k] < _n && _dense[_sparse[k]] === k`. The dense index `i` IS the stable node identity the intrusive lists use, so `clear()` is O(1) (reset the count; the cross-check voids stale entries). Per key: `_freq[i]` (the count, >= 1), `_bkt[i]` (its bucket), and `_nk[i]` / `_pk[i]` (its neighbours in the bucket's FIFO key list).
@@ -892,8 +893,6 @@ FreqO1 is the classic O(1)-LFU structure -- a doubly-linked list of frequency **
 **Why the bucket free-list can't be exhausted.** The pool is a bump pointer plus a free stack (so `clear()` resets it in O(1)). The non-empty buckets PARTITION the live keys by frequency, so at rest there are `<= size <= capacity` of them; a single `increment` transiently creates the target bucket before freeing an emptied source, peaking at `size + 1 <= capacity + 1`. The pool holds **capacity + 1** usable buckets, so allocation always succeeds under the contract -- the `_poolExhausted` throw is a fail-closed guard, defense in depth, never reached.
 
 **The lean surface.** No `decrement` (aging is a caller policy -- rebuild or clear + refill), no `peekMax` (the LFU victim is the minimum), no `delete(k)` (the only removal is `popMin`, the eviction op). FreqO1 holds counts, not payloads: for a full LFU cache, keep values in a parallel SoA column or `@zakkster/lite-arena` and let FreqO1 pick the victim.
-
-</details>
 
 ### FreqO1 API reference
 
@@ -927,9 +926,13 @@ get maxFrequency: number             // the frequency ceiling
 
 **Reach for FreqO1 when** you are building an LFU eviction policy and need the victim -- the lowest-frequency key, oldest-first on ties -- in strict WORST-CASE O(1), or you count accesses to integer keys in a bounded range and always need the current minimum (hot/cold classification, rate-limited admission, frequency sketches). **Avoid it when** you need a full LFU CACHE (compose FreqO1 with a value store), a `decrement` / `peekMax` / `delete(k)` (the surface is deliberately lean), string / object / huge-domain keys (the SparseSet caveat applies), or a single key's count could exceed `maxFrequency`. See [`GUIDE.md`](./GUIDE.md) for the full reach-for / avoid / measure-it.
 
+</details>
+
 ---
 
 ## BucketQueue
+<details>
+<summary>Amortized-O(1) monotone integer priority queue (Dial) -- insert / decreaseKey / extractMin.</summary>
 
 The eighth member: an **AMORTIZED O(1) monotone integer priority queue** ("Dial" / bucket queue) -- the standalone primitive behind Dial's algorithm (Dijkstra over small integer priorities). It inserts integer keys at an integer **priority**, lets you `decreaseKey` them downward, and `extractMin` drains keys in **non-decreasing priority order** (FIFO tie-break) -- all amortized O(1) over private `Uint32Array` key columns + a **static per-priority bucket array**. Where a binary heap is O(log n) per op, a bucket queue is O(1) when priorities are small bounded integers.
 
@@ -977,9 +980,6 @@ BucketQueue's `extractMin` streams flat across the size sweep while the heap's O
 
 ### How BucketQueue works
 
-<details>
-<summary>The static bucket array, the monotone cursor, why clear() is free over static buckets, and why a single extractMin is amortized -- not worst-case -- O(1).</summary>
-
 A BucketQueue is the classic Dial bucket queue -- an array of buckets indexed by priority, each a FIFO list of the keys at that priority, with a cursor that sweeps forward to the lowest non-empty bucket -- made **pointer-free** over private `Uint32Array` columns.
 
 **Keys ride SparseSet's substrate.** `_dense[i]` is the key at dense index `i`, `_sparse[k]` maps back, membership is the cross-check `_sparse[k] < _n && _dense[_sparse[k]] === k`. The dense index `i` IS the stable node identity the intrusive lists use, so `clear()` is O(1). Per key: `_prio[i]` (its priority, which is also its bucket index) and `_nk[i]` / `_pk[i]` (its neighbours in the bucket's FIFO list).
@@ -998,8 +998,6 @@ A BucketQueue is the classic Dial bucket queue -- an array of buckets indexed by
 **Amortized, not worst-case.** A single `extractMin` can force the cursor to jump across a long run of empty buckets -- O(gap) in the worst case. But the cursor only moves forward, so its TOTAL travel across a full drain is at most `ceiling + 1`, charged once: amortized O(1). The [witness](#the-o1-witness) demonstrates it against a binary-heap foil AND prints the MAX single-op time (a deliberate O(gap) jump) beside a typical O(1) extractMin, so a hidden worst-case spike shows as a tall bar even though the amortized line stays flat.
 
 The cost of the constant is space: the static bucket arrays are `ceiling + 1` slots (O(ceiling)), so BucketQueue wins over a heap precisely when the priority range is small and bounded. The `[0, 2^31-1]` ceiling is a TYPE bound (a legal priority still fits a `Uint32` slot), not a practical size -- for wide/continuous priorities, reach for a binary heap.
-
-</details>
 
 ### BucketQueue API reference
 
@@ -1035,9 +1033,13 @@ get cursor: number                           // the monotone frontier priority (
 
 **Reach for BucketQueue when** you need a priority queue whose priorities are small bounded integers processed monotonically -- Dijkstra / Dial's algorithm over integer weights, discrete-event simulation with integer timestamps, bucket / radix scheduling, weighted BFS -- at amortized O(1) per op (including `decreaseKey`) with zero per-op allocation. **Avoid it when** your priorities are large / unbounded / continuous (the bucket array is `ceiling + 1` slots -- use a binary heap), your access is not monotone (you must insert below the current frontier -- it fails closed), you are on a strict per-op WORST-CASE budget (a single `extractMin` is O(gap)), or your keys are strings / objects / huge-domain integers (the SparseSet caveat applies). See [`GUIDE.md`](./GUIDE.md) for the full reach-for / avoid / measure-it.
 
+</details>
+
 ---
 
 ## TimerWheel
+<details>
+<summary>Worst-case-O(1) bounded timing wheel -- schedule / cancel / drainDue / advance.</summary>
 
 The ninth member: a **WORST-CASE O(1) bounded "simple" timing wheel** (Varghese-Lauck's single-wheel variant, NOT the hashed / hierarchical "rounds" one) -- the standalone primitive behind O(1) timer scheduling. It files integer timer ids into a ring of `slots` slots by their due tick, `drainDue` fires the slot due now, and `advance` steps the monotone clock -- all worst-case O(1) over private `Uint32Array` id columns + a **static per-slot FIFO ring**. Where a binary-heap timer queue is O(log n) per op and a linear scan is O(n) per tick, a timing wheel is O(1) when the delay horizon is bounded.
 
@@ -1081,8 +1083,7 @@ Every `schedule` / `cancel` / `advance(1)` / `has` is worst-case O(1) and zero-a
 
 TimerWheel's tick streams flat across the size sweep while the naive scan collapses -- a TRUE O(n) foil (a full factor of n lost per decade), so it hits the standard `<= 0.55` flatness bar (unlike BucketQueue's gentler O(log n) heap). There is NO MAX-single-op line: every hot op is worst-case O(1), so the flat line is the whole claim. (Absolute ops/ms is machine-specific; reproduce on your own hardware.)
 
-<details>
-<summary><strong>How TimerWheel works</strong> -- the ring, the drain-before-advance contract, and the O(1) clear</summary>
+### How TimerWheel works
 
 A timing wheel is a ring of `S` slots (a power of two, `MASK = S - 1`). Scheduling id with delay `d` files it into `slot[(now + d) & MASK]`, where it lives until fired or canceled; `now` is a monotone tick counter. This is the Varghese-Lauck (1987) SIMPLE wheel: a single ring that holds exactly ONE rotation's timers, so the delay is capped at `slots - 1` (a delay `>= slots` would wrap onto a slot already holding nearer-future timers -- it is rejected fail-closed). The bounded delay range is the honest co-headline (exactly parallel to BucketQueue's priority ceiling): space is O(capacity + slots).
 
@@ -1097,8 +1098,6 @@ The substrate mirrors BucketQueue's, over private `Uint32Array` columns (no publ
 **Why clear() is O(1) over static slots.** After `clear()`, the static `_sHead` / `_sTail` still hold stale dense indices from the prior generation -- but they are voided by the SAME `i < _size` cross-check that voids stale sparse pointers: a slot `s` is non-empty iff `_sHead[s] < _size && _slotOf[_sHead[s]] === s`. A stale head is either `>= _size` (never re-used) or points to a node no longer in slot `s`, so it reads as empty. Nothing is zeroed -- the same teachable gem as SparseSet's cross-checked clear, extended to the slot heads.
 
 **Worst-case, not amortized.** Unlike BucketQueue (a cursor that can jump O(gap)) or MonoDeque (a push that can pop a run), TimerWheel has no amortized asterisk: the drain-before-advance guarantee keeps a slot to one rotation's timers, so `schedule` / `cancel` / `advance(1)` are each a fixed number of pointer writes. The `now` counter is a plain double capped at 2^53 via a `>=` ceiling guard (`advance` past it throws rather than lose the integer-exactness the `(now + delay) & MASK` slot math needs). For unbounded delays, a hierarchical / hashed wheel is the right tool (a deferred future member) -- a simple wheel is FOR a bounded delay horizon.
-
-</details>
 
 ### TimerWheel API reference
 
@@ -1132,9 +1131,13 @@ get now: number                              // the monotone tick counter
 
 **Reach for TimerWheel when** you schedule many timers against a tick clock over a bounded delay horizon -- discrete-event simulation, connection-timeout sweeps, rate limiters, retry backoff, game-loop cooldowns -- and need `schedule` / `cancel` / firing at worst-case O(1) with zero per-op allocation. **Avoid it when** your delays are unbounded / far in the future (the ring is `slots` slots -- reach for a hierarchical / hashed wheel, or a binary-heap timer queue), you need sub-tick / floating-point deadlines (a wheel is integer-tick), or your timer ids are strings / objects / huge-domain integers (the SparseSet caveat applies). See [`GUIDE.md`](./GUIDE.md) for the full reach-for / avoid / measure-it.
 
+</details>
+
 ---
 
 ## HierarchicalTimerWheel
+<details>
+<summary>Amortized-O(1) cascading multi-level timing wheel (delay range 2^26).</summary>
 
 TimerWheel's CASCADING sibling: a bounded, multi-level timing wheel for a delay horizon too wide for one rotation of a simple wheel.
 
@@ -1172,8 +1175,7 @@ O(1) Witness -- HierarchicalTimerWheel tick (drainDue + advance, cascading) vs a
 
 The cascading wheel's tick streams flat while a FAIR alloc-free 4-ary min-heap (O(log n) per fired timer) trails by a sustained constant factor. UNLIKE TimerWheel, it WEARS a MAX-single-op line: the witness gates the cascade spike at `>= 8x` the typical tick -- the amortized-honesty bar, this member's headline. Like BucketQueue's heap, the O(log n) foil decays gently (not the O(n) foils' 0.55 collapse), so the evidence is the throughput lead, not a foil collapse. (Absolute ops/ms is machine-specific; reproduce on your own hardware.)
 
-<details>
-<summary><strong>How HierarchicalTimerWheel works</strong> -- the geometry, the by-index cascade, and drain-before-cascade</summary>
+### How HierarchicalTimerWheel works
 
 **The geometry (1x256 + 3x64).** Level 0 is 256 slots (mask `0xFF`, shift 0), scanned every `drainDue` tick -- the hot path; a wide root keeps each per-tick drain list short. Levels 1..3 are 64 slots each (mask `0x3F`, shifts 8/14/20), covering delay `[2^8, 2^14)`, `[2^14, 2^20)`, `[2^20, 2^26)`. A timer expiring at absolute tick `expiry` with `delta = expiry - now` files at: `delta < 2^8` -> L0 slot `expiry & 0xFF`; `< 2^14` -> L1 `(expiry >>> 8) & 0x3F`; `< 2^20` -> L2 `(expiry >>> 14) & 0x3F`; else L3 `(expiry >>> 20) & 0x3F`. All 448 (`= 256 + 3*64`) list heads live in ONE flat `_head` / `_tail` array plus a reserved DRAINING identity -- a FIXED 449-head cost independent of the horizon (the hierarchy is what buys a `2^26` reach for O(1) space in the levels).
 
@@ -1182,8 +1184,6 @@ The cascading wheel's tick streams flat while a FAIR alloc-free 4-ary min-heap (
 **Drain-before-cascade + the substrate.** It reuses TimerWheel's exact substrate -- IDs on SparseSet's dense + sparse cross-check, a per-node intrusive FIFO, static list heads voided by the same cross-check so `clear()` is O(1) -- and diverges only where the multi-level heads require it: `_listOf` names a flat list index, and a Float64 `_expiry` column stores the absolute expiry needed to re-file on cascade (24 B/live vs TimerWheel's 16 B/live -- the price of cascading). Because a rotation is fully drained (`advance()` throws if a level-0 slot left behind is undrained) before the wrap that cascades the next level down, a cascade never buries an un-fired due timer -- TimerWheel's drain-before-advance extended to DRAIN-BEFORE-CASCADE.
 
 **Amortized, not worst-case.** A level-wrap `advance(1)` is O(bucket) -- the cascade spike -- while a normal tick is O(1). Each timer cascades at most `levels - 1` times over its life, so `advance` amortizes to O(1) per tick. Re-entrancy: `schedule` / `cancel` / `clear` from inside a fired `drainDue` callback are legal; a re-entrant `advance()` (nested, or from inside a callback) throws `[lite-o1]` (guarded by a `_busy` flag). The `now` counter is a plain double capped at `2^53` via a `>=` ceiling guard, keeping `now` and the stored `expiry` integer-exact.
-
-</details>
 
 ### HierarchicalTimerWheel API reference
 
@@ -1207,9 +1207,13 @@ forEach(fn: (id: number, expiry: number, wheel: HierarchicalTimerWheel) => void)
 
 **Reach for HierarchicalTimerWheel when** your delay horizon is WIDE but bounded (up to `2^26` ticks) -- too far for a simple TimerWheel, but you do not want a heap's O(log n) per op -- and you can tolerate a periodic cascade spike in exchange for an amortized-O(1) average. **Avoid it when** your horizon fits one rotation of a simple wheel (reach for TimerWheel -- worst-case O(1), no spike, 16 B/live), your delays are unbounded (a `delay >= 2^26` throws), or you cannot tolerate ANY per-op spike (a hard-real-time deadline on the worst single tick). See [`GUIDE.md`](./GUIDE.md) for the full reach-for / avoid / measure-it.
 
+</details>
+
 ---
 
 ## RingLog
+<details>
+<summary>Worst-case-O(1) lossy overwrite-oldest ring log -- push returns the evicted oldest.</summary>
 
 The eleventh member: a **LOSSY overwrite-oldest ring log** of numbers over one circular `Float64Array` -- "keep the last N". It reuses RingDeque's exact substrate (one `Float64Array`, head + count, power-of-two capacity, `& MASK` wrap) but INVERTS the full-push policy: `push(v)` never blocks and never throws on full -- it OVERWRITES the oldest entry and RETURNS it. A full push is a single read + a single overwrite + a head advance, so push is WORST-CASE O(1) with no amortized spike.
 
@@ -1264,9 +1268,13 @@ Every op is WORST-CASE O(1) and zero-allocation after construction. The value co
 
 **Reach for RingLog when** you want to keep only the last N numbers of a stream and never block -- rolling telemetry / metrics windows, a recent-events / audit-breadcrumb ring, the last N samples of a signal -- and dropping the oldest on overflow is the DESIRED behavior. **Avoid it when** you must not lose data on overflow or need to drain entries (reach for RingDeque -- it fails closed and is consumable), you need the running MIN / MAX of the window (MonoDeque) or of a stack (MinStack), or you need to store non-numbers (queue integer handles instead). See [`GUIDE.md`](./GUIDE.md) for the full reach-for / avoid / measure-it.
 
+</details>
+
 ---
 
 ## CuckooMap
+<details>
+<summary>Bounded-probe worst-case-O(1)-lookup exact integer-key map.</summary>
 
 The twelfth member: the family's first **general-key exact map** -- a bounded-probe map from GENERAL INTEGER keys (`|k| <= 2^53`, `Number.isSafeInteger`) to numbers, over a bucketized cuckoo table (2 tables x 4 slots). A lookup probes AT MOST 8 slots (2 candidate buckets x 4), so `get` / `has` / `delete` are WORST-CASE O(1) -- a HARD per-lookup bound, not an average. `set` is AMORTIZED O(1): a full home-bucket pair kicks a resident to its alternate bucket (an eviction chain bounded by `MaxLoop = 8*log2(cap)`), and on a dead end performs ONE in-place O(capacity) re-seed -- the max-single-op spike, the thematic sibling of HierarchicalTimerWheel's cascade.
 
@@ -1326,9 +1334,13 @@ Every lookup op is WORST-CASE O(1) and zero-allocation after construction; `set`
 
 **Reach for CuckooMap when** you need an exact integer-key -> number map with a hard `<= 8`-read lookup and zero GC -- entity / handle ids, truncated hashes, sparse node ids over a domain too large or too sparse for a dense SparseSet array. **Avoid it when** keys are dense + bounded (SparseSet / RandomSet / FreqO1), keys are strings / objects (map them to integer handles, or use a native `Map`), you can tolerate false positives for a memory win (`@zakkster/lite-filter`), or you cannot tolerate the occasional re-seed spike on a hard-real-time WRITE path (the lookup path has no spike). See [`GUIDE.md`](./GUIDE.md) for the full reach-for / avoid / measure-it.
 
+</details>
+
 ---
 
 ## SparseTable
+<details>
+<summary>Worst-case-O(1)-query static range-min / range-max table (StaticRMQ).</summary>
 
 ```js
 import { SparseTable } from '@zakkster/lite-o1';
@@ -1377,6 +1389,88 @@ get kind: 'min' | 'max' // the frozen extreme
 ```
 
 `query` and `at` are WORST-CASE O(1) and zero-allocation. The value contract is IDENTICAL to RingDeque / MonoDeque / MinStack / RingLog (`typeof 'number'` and not `NaN`; `+/-Infinity` accepted) applied to every source element, with the typeof guard FIRST so a Symbol / BigInt element never reaches coercion (it throws `[lite-o1]` at construction, a byte-identical no-op -- nothing half-built escapes). Queries never throw: a bad `l` / `r` / `i` returns `undefined`.
+
+</details>
+
+---
+
+## BitSet
+<details>
+<summary>A worst-case-O(1) fixed-capacity dense bitset over MANY words: test / set / unset / toggle + O(1) firstSet / nextSet via a 3-level popcount summary, with O(words) bulk and / or / xor / andNot.</summary>
+
+```js
+import { BitSet } from '@zakkster/lite-o1';
+
+const visited = new BitSet(1_000_000); // fixed bit-capacity, bits are [0, nbits)
+
+visited.set(42);          // set bit 42          -- worst-case O(1)
+visited.test(42);         // true                -- one word load + one mask test
+visited.unset(42);        // clear bit 42        -- the per-bit companion to set(i)
+visited.toggle(999_999);  // flip the top bit
+visited.firstSet();       // 999999              -- O(1) via the summary, NOT an O(words) scan
+visited.set(7);
+visited.firstSet();       // 7
+visited.nextSet(8);       // 999999              -- next set bit at index >= 8
+
+// bulk set-algebra between two SAME-capacity bitsets, in place, O(words)
+const a = new BitSet(64).set(1).set(2).set(3);
+const b = new BitSet(64).set(2).set(3).set(4);
+a.and(b);                 // a = {2, 3}
+a.popcount();             // 2
+a.clear();                // whole-set reset (no argument) -- O(words), no reallocation
+
+visited.test(-1);         // false   -- a bad index is ABSENT, never throws
+visited.set(1e9);         // throws [lite-o1] -- a mutator fails closed on an out-of-range index
+```
+
+`BitSet` is the family's canonical **dense membership / flag** structure -- a fixed-capacity bitset over MANY `Uint32` words (`N >> 32`) for visited sets, dirty masks, replay windows, and permission bitmaps at scale. Per-bit `test` / `set` / `unset` / `toggle` are **worst-case O(1)** (one word load + one mask op past the guard, zero allocation). `firstSet` / `nextSet` are **worst-case O(1)** via a 3-level popcount SUMMARY -- never the O(words) scan a hand-rolled `Uint32Array` gets wrong. It joins the worst-case cohort (SparseSet / RandomSet / RingLog / SparseTable): the flat per-bit line IS the claim, so there is NO max-single-op line.
+
+**The summary (why firstSet is O(1)).** Alongside the data words, BitSet keeps three tiny popcount levels (`_s1`/`_s2`/`_s3`, fan-out 32): each summary bit records whether the word BELOW it is non-empty. `firstSet` / `nextSet` descend `L3 -> L2 -> L1 -> data` with `Math.clz32`/`ctz32` -- a FIXED `<= 32`-word top scan plus a 3-hop descent, independent of `nbits`. The summary is kept coherent after every `set` / `unset` / `toggle` (a word crossing the empty<->non-empty boundary propagates up only while the level below flips `0<->non-0`) and rebuilt after every bulk op. Summary overhead is `~ nbits/1024` words.
+
+**Bulk set-algebra is a disclosed co-headline.** `and` / `or` / `xor` / `andNot` (in place, capacity-match-or-throw) plus `popcount` / `setAll` / `clear()` are **O(words)** -- NOT part of the per-bit O(1) claim (the same honesty shape as SparseTable's O(n log n) build), but STILL **0 B/op**: they write into the existing words and rebuild the summary in place, allocating nothing (the torture gate checks that allocation claim separately from the O(words) time claim).
+
+**`clear()` vs `unset(i)`.** `clear()` takes NO argument and is the whole-set reset (matching every cohort member's `clear()`), O(words). To clear a single bit use `unset(i)` -- it pairs with `set(i)` and, like every mutator, throws `[lite-o1]` on an out-of-range index (never a silent whole-set wipe -- fail closed, null is not zero).
+
+**Non-overlap (settled).** BitSet is the MULTI-WORD, arbitrary-N structure. `@zakkster/lite-fastbit32` stays the SINGLE 32-flag word; `@zakkster/lite-scheduler`'s `FastBitScheduler` stays the bit-bucket scheduler. BitSet reuses fastbit32's branchless word-op idiom by DESIGN-PARITY only -- never a runtime dependency (the SlotPool / NodePool borrow-without-depend precedent). Membership / flags only; it never drifts into scheduling.
+
+**Reach for BitSet when** you track a DENSE set of flags over many bits and want O(1) per-bit ops PLUS an O(1) `firstSet` / `nextSet` frontier and in-place set-algebra. **Avoid it when** keys are SPARSE / large (use CuckooMap), you need a VALUE per key (SparseSet + a parallel column, or CuckooMap), you need scheduling / priority semantics (BucketQueue / TimerWheel), or you have `<= 32` flags in one word (`@zakkster/lite-fastbit32`). See [`GUIDE.md`](./GUIDE.md) for the full reach-for / avoid / measure-it.
+
+### How BitSet works
+
+The data lives in ONE `Uint32Array` `_w` of `ceil(nbits/32)` words; bit `i` is `_w[i >>> 5] & (1 << (i & 31))`. The 3-level summary is three more `Uint32Array`s where `_s1` bit `j` is set iff `_w[j] != 0`, `_s2` bit `j` iff `_s1[j] != 0`, and `_s3` bit `j` iff `_s2[j] != 0`. At the `2^25` ceiling that is `2^20` data words, `2^15` / `2^10` / `32` summary words -- the top is a FIXED 32-word scan, and every index stays under `2^31` (SMI-safe, no boxing on the hot path). `firstSet` finds the first non-empty data word via the summary (a bounded descent), then `ctz32` gives the bit; `nextSet(from)` masks the from-word's remaining bits, then falls back to the same descent for the next word. Trailing-zero count is `31 - Math.clz32(x & -x)`; popcount is a SWAR fold -- both module-level helpers, off the class so they stay monomorphic.
+
+### BitSet API reference
+
+```ts
+new BitSet(nbits: number)   // fixed bit-capacity, integer in [1, 2^25]; bits are [0, nbits)
+                            // throws [lite-o1] on a non-integer / < 1 / > 2^25 / NaN nbits
+                            // (before any store is allocated -- nothing half-built escapes)
+
+test(i: number): boolean    // true iff bit i is set; worst-case O(1); a bad index is false (never throws)
+set(i: number): this        // set bit i; worst-case O(1); throws [lite-o1] on an out-of-range index
+unset(i: number): this      // clear bit i; worst-case O(1); throws [lite-o1] on an out-of-range index
+toggle(i: number): this     // flip bit i; worst-case O(1); throws [lite-o1] on an out-of-range index
+firstSet(): number          // lowest set bit index, or -1; worst-case O(1) via the summary (never throws)
+nextSet(from: number): number // lowest set bit index >= from, or -1; worst-case O(1) (a bad from -> -1, never throws)
+
+and(other: BitSet): this    // in-place AND with a same-capacity BitSet; O(words); throws [lite-o1] on a capacity mismatch
+or(other: BitSet): this     // in-place OR;      O(words); throws [lite-o1] on a capacity mismatch
+xor(other: BitSet): this    // in-place XOR;     O(words); throws [lite-o1] on a capacity mismatch
+andNot(other: BitSet): this // in-place AND-NOT; O(words); throws [lite-o1] on a capacity mismatch
+
+popcount(): number          // number of set bits; O(words)
+setAll(): this              // set every bit in [0, capacity); O(words)
+clear(): this               // whole-set reset (NO argument); O(words), no reallocation
+forEach(fn: (index: number, bitset: BitSet) => void): void  // ascending set-bit indices, alloc-free
+[Symbol.iterator](): IterableIterator<number>               // ascending set-bit indices; allocates per protocol
+
+get capacity: number        // fixed bit-capacity (nbits)
+get size: number            // number of set bits (a full popcount; O(words), not O(1))
+```
+
+The per-bit ops are WORST-CASE O(1) and zero-allocation; `firstSet` / `nextSet` are worst-case O(1) via the summary. Fail closed on the mutators (`set` / `unset` / `toggle` throw `[lite-o1]` on an out-of-range index, typeof-first so a Symbol / BigInt never reaches the coercing `>>>`; `null` is not bit 0); absent on the queries (`test` -> `false`, `firstSet` / `nextSet` -> `-1`, never throw). `BITSET_MAX_BITS = 2^25` (33,554,432 bits) is the fixed-capacity ceiling -- a TYPE bound (a fail-closed guard keeping every index SMI-safe), not a size any host must allocate.
+
+</details>
 
 ---
 
@@ -1607,6 +1701,20 @@ Both the key and value guards are branchless typeof-first checks (`typeof k !== 
 
 The element guard is the same branchless typeof-first check as RingDeque / MinStack (`typeof v !== 'number' || v !== v`) applied to every source element at build, with the `_badElem` throw builder (using `String(v)`) on the cold path -- so a Symbol / BigInt element fails closed rather than crashing raw, and a bad source is a byte-identical no-op (the throw precedes any table allocation -- nothing half-built escapes). The query is WORST-CASE O(1) (never a run), so there is no amortized spike and no max-single-op line; the one-time O(n log n) build + `n*(floor(log2 n)+1)`-cell table space are the disclosed co-headline (paid at construction, EXCLUDED from the per-op claim). The torture and perf gates prove SparseTable at **0 B/op** across query (wide window) / at-read / forEach-drain scenarios, with a 0-delta on both immutable backing buffers (build-once -- no rebuild) and the leak tracker back at `size() = 0`. `forEach` is the alloc-free O(length) scan; `[Symbol.iterator]` is the one op that allocates, by generator protocol.
 
+**BitSet** allocates its fixed backing store once, at construction (one `Uint32Array` of `ceil(nbits/32)` data words plus the three summary levels, ~n/1024 extra words):
+
+| Operation                        | Steady-state allocations |
+| -------------------------------- | ------------------------ |
+| `test(i)`                        | **0** (one word load + one mask) |
+| `set(i)` / `unset(i)` / `toggle(i)` | **0** (one word read-modify-write + at most one summary bit) |
+| `firstSet()` / `nextSet(from)`   | **0** (a fixed `<= 32`-word top scan + a 3-hop `clz32`/`ctz32` descent) |
+| `and` / `or` / `xor` / `andNot`  | **0** (in-place O(words) word loop + summary rebuild -- a disclosed co-headline) |
+| `popcount()` / `setAll()` / `clear()` | **0** (O(words) word loop, no reallocation) |
+| `[Symbol.iterator]()`            | a `{value,done}` per step (protocol) |
+| `new BitSet(nbits)`              | once, at construction (data words + the 3-level popcount summary) |
+
+The index guard is the same branchless typeof-first check as the rest of the family (`(i >>> 0) !== i || i >= nbits`), with the mutator throw builder on the cold path -- so `set` / `unset` / `toggle` on a Symbol / BigInt / out-of-range index fail closed as a byte-identical no-op, while `test` / `firstSet` / `nextSet` never throw (a bad index is absent -> `false` / `-1`). The per-bit ops are WORST-CASE O(1) (one word op), and `firstSet` / `nextSet` are WORST-CASE O(1) too -- the 3-level fan-out-32 summary caps the top at `<= 32` words at the `2^25` capacity ceiling, so find-first is a bounded descent, never an O(words) scan (that boundedness is the differentiator over a raw `Uint32Array` + `@zakkster/lite-fastbit32`'s single 32-flag word, which it mirrors by design-parity, zero runtime dep). The bulk `and` / `or` / `xor` / `andNot` are O(words) -- a disclosed co-headline, NOT part of the per-bit claim -- and still allocate nothing (they write into existing words and rebuild the summary in place; a stale summary after a bulk write would be a silent `firstSet` corruption, so the gate proves coherence). The torture and perf gates prove BitSet at **0 B/op** across test-hit / set / unset / toggle / firstSet / nextSet / bulk-`or` scenarios, with a 0-delta on all backing buffers (fixed capacity -- no resize) and the leak tracker back at `size() = 0`. `forEach` is the alloc-free ascending-set-bit scan; `[Symbol.iterator]` is the one op that allocates, by generator protocol.
+
 </details>
 
 ---
@@ -1633,10 +1741,10 @@ The element guard is the same branchless typeof-first check as RingDeque / MinSt
 
 ## Testing
 
-**542 deterministic `node:test` cases**, plus a torture gate, a hard perf gate, and the O(1) witness gate.
+**599 deterministic `node:test` cases**, plus a torture gate, a hard perf gate, and the O(1) witness gate.
 
 ```bash
-npm test           # 542 node:test cases (contract + boundary + differential fuzz)
+npm test           # 599 node:test cases (contract + boundary + differential fuzz)
 npm run test:types # tsc --noEmit against O1.d.ts
 npm run torture    # @zakkster/lite-leak + lite-gc-profiler: 0 B/op + leak-free
 npm run witness    # the O(1) throughput-invariance harness + foils + flatness gate
@@ -1652,12 +1760,14 @@ For SparseSet the suite covers: constructor validation (every bad `universe` / `
 
 The **eight-dimension benchmark suite** -- the ecosystem MVP of the research notes --
 lives in `benchmark/` as repo-only dev infra (it is NOT in the published tarball and
-NOT a data-structure member). It profiles all ten members against the JS built-in
+NOT a data-structure member). It profiles all fourteen members against the JS built-in
 each one replaces, across eight axes that a single ops/ms number hides: D1 latency
 distribution (p50..max, with + without forced GC), D2 amortized drift, D3 memory,
 D4 cache behaviour (a labelled PORTABLE PROXY -- no native perf counters), D5 bundle
 size + tree-shaking, D6 GC pressure + allocation curve, D7 key-type + load-factor
-scaling, and D8 workload micro-benches -- **ten members x 8 dimensions = 80 cells**.
+scaling, and D8 workload micro-benches -- **fourteen members x 8 dimensions = 112 cells**.
+(The recorded D5 / D6 tables below are a snapshot of an earlier ten-member run; the
+newer members refresh on the next `npm run bench`.)
 
 The suite is a full-rigor "Bench v2": strong (alloc-free) baselines, a 95% bootstrap
 confidence interval on each subject median, a Mann-Whitney U significance test vs the
@@ -1667,7 +1777,7 @@ ADR [`0009`](./decisions/0009-benchmark-suite.md) and
 [`benchmark/METHODOLOGY.md`](./benchmark/METHODOLOGY.md) for the design and the settled calls.
 
 ```bash
-npm run bench          # run all 80 (member x dimension) cells, one child process each
+npm run bench          # run all 112 (member x dimension) cells, one child process each
 npm run bench:report   # the above, then render a zero-dep HTML report (hand-rolled SVG)
                        #   -> benchmark/report.html (open it for the full charts + tables)
 ```
@@ -1693,7 +1803,7 @@ drops the other nine; the all-member import is ~5.0 KB gzipped (5085 B):
 | HierarchicalTimerWheel | ~1593 B       | ~5085 B    | ~0.31        |
 
 Tree-shaking works for every member (each lone import is smaller than the whole).
-The "< 40% of all" claim holds for all ten; with ten members the all-member bundle
+The "< 40% of all" claim holds for all fourteen; with fourteen members the all-member bundle
 grew, so each lone import is a small fraction and the two timing wheels
 (HierarchicalTimerWheel ~0.31 / TimerWheel ~0.28) are the closest to the line, while
 SparseSet is the lightest at ~0.11. (Numbers shift as members are added; reproduce
@@ -1714,9 +1824,9 @@ with `npm run bench`.)
 | TimerWheel             | 0            | ~0.21                    |
 | HierarchicalTimerWheel | 0            | ~50.8 (all minor GC)     |
 
-**0 major GC across all ten.** The torture + perf gates are the authoritative
-zero-alloc proof and hold **0 B/op** per steady-state op for all ten members (incl.
-HierarchicalTimerWheel). D6's coarse heap-delta sampler reads a 0-2 B/op rounding
+**0 major GC across all fourteen.** The torture + perf gates are the authoritative
+zero-alloc proof and hold **0 B/op** per steady-state op for all fourteen members (incl.
+HierarchicalTimerWheel and BitSet). D6's coarse heap-delta sampler reads a 0-2 B/op rounding
 wobble on RingDeque / TimerWheel / HierarchicalTimerWheel (driver granularity, not a
 per-op allocation in the structure); HierarchicalTimerWheel's ~50.8 ms figure is
 minor-GC pause from the D6 workload driver at n=1e6, again not a structure-side
@@ -1758,9 +1868,9 @@ ADR [`0009`](./decisions/0009-benchmark-suite.md) for the design and the settled
 - **Not an unbounded timer queue.** TimerWheel is a BOUNDED "simple" wheel: the delay range is `[0, slots-1]` (space O(slots)), and a delay `>= slots` throws. For delays far in the future or of unknown horizon, reach for a hierarchical / hashed wheel (a deferred future member) or a binary-heap timer queue. It is integer-tick (no sub-tick / floating-point deadlines), and its clock must be drained before it advances (an undrained slot throws).
 - **Not a consumable queue (RingLog).** RingLog is LOSSY and READ-ONLY: a push on a full log OVERWRITES the oldest entry (returning it) rather than blocking or failing, and there is deliberately no `popOldest` / drain -- it is a rolling window you read (keep the last N), not a queue you consume. If you must not lose data on overflow, or you need to drain entries, reach for RingDeque, which FAILS CLOSED on a full push (throws, no silent overwrite) and is consumable via `popFront` / `popBack`. That fail-closed (RingDeque) vs lossy-overwrite (RingLog) split is the deliberate teaching pair, not two ways to spell one member. RingLog stores numbers only (queue integer handles for object payloads).
 - **Not a general-purpose (string / object) map (CuckooMap).** CuckooMap keys are INTEGERS (`|k| <= 2^53`), and its values are numbers -- the zero-GC law forbids storing references. For string / object keys, map them to integer handles (keep the payloads in a parallel column or `@zakkster/lite-arena`), or use a native `Map`. It is EXACT (no false positives -- for approximate membership reach for `@zakkster/lite-filter`), fixed-capacity (fail closed at the 0.90 load ceiling, never a resize), and its `set` wears an occasional in-place re-seed spike (the lookup path does not). Choose it over SparseSet only when the key domain is SPARSE / large; for a dense bounded `[0, universe)`, SparseSet's O(universe) array is faster and simpler.
-- **Not a growable collection.** All thirteen members are fixed-capacity: a SparseSet / RandomSet / FreqO1 / BucketQueue / TimerWheel / HierarchicalTimerWheel key or id past capacity, a CuckooMap key past the load ceiling, or a RingDeque / MonoDeque / MinStack push on a full store, throws; a RingLog push on a full store OVERWRITES the oldest (lossy by design, never a resize); UnionFind's element universe `n` and SparseTable's source are fixed at construction (SparseTable is immutable -- rebuild to change the data). This is deliberate (worst-case / amortized bounds, fail closed or lossy -- no hidden resize), not a missing feature.
+- **Not a growable collection.** All fourteen members are fixed-capacity: a SparseSet / RandomSet / FreqO1 / BucketQueue / TimerWheel / HierarchicalTimerWheel key or id past capacity, a CuckooMap key past the load ceiling, or a RingDeque / MonoDeque / MinStack push on a full store, throws; a RingLog push on a full store OVERWRITES the oldest (lossy by design, never a resize); UnionFind's element universe `n` and SparseTable's source are fixed at construction (SparseTable is immutable -- rebuild to change the data). This is deliberate (worst-case / amortized bounds, fail closed or lossy -- no hidden resize), not a missing feature.
 - **Not a payload store.** SparseSet holds membership, RingDeque holds numbers, UnionFind holds connectivity, MonoDeque holds numeric window extremes, MinStack holds numeric stack values + their running extreme, RandomSet holds integer membership + uniform sampling, FreqO1 holds integer keys + their access frequency, BucketQueue holds integer keys + their integer priority, TimerWheel holds integer timer ids filed by delay, HierarchicalTimerWheel holds integer timer ids filed by a wide bounded delay, RingLog holds the last N numbers, CuckooMap holds an exact integer-key -> number map, SparseTable holds an immutable numeric array for O(1) range-min/max queries -- none holds object payloads. Store component data in a parallel SoA column or `@zakkster/lite-arena` keyed by the same ids / handles.
-- **Not the full roster forever.** v1.3.1 is the thirteen-member stable API: SparseSet + RingDeque + UnionFind + MonoDeque + MinStack + RandomSet + FreqO1 + BucketQueue + TimerWheel + HierarchicalTimerWheel + RingLog + CuckooMap + SparseTable. SlotPool (a free-list slot allocator with generational handles) is not in this release; a fully unbounded / hashed timer wheel remains a deferred future member.
+- **Not the full roster forever.** v1.4.0 is the fourteen-member stable API: SparseSet + RingDeque + UnionFind + MonoDeque + MinStack + RandomSet + FreqO1 + BucketQueue + TimerWheel + HierarchicalTimerWheel + RingLog + CuckooMap + SparseTable + BitSet. AliasTable (Vose weighted sampling) is the planned fifteenth member; SlotPool (a free-list slot allocator with generational handles) is not in this release; a fully unbounded / hashed timer wheel remains a deferred future member.
 - **Not itself a benchmark suite.** The witness demonstrates throughput invariance (one axis); the full eight-dimension latency/memory/cache/GC suite lives in `benchmark/` as repo-only dev infra (`npm run bench:report`), NOT shipped in the published package.
 
 ---

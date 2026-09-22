@@ -18,14 +18,14 @@ import * as O1Module from '../O1.js';
 
 const litO1 = (e) => e instanceof Error && /^\[lite-o1]/.test(e.message);
 
-// The thirteen shipped member class names (SparseTable added at v1.3.0). This list is the
+// The fourteen shipped member class names (BitSet added at v1.4.0). This list is the
 // regression guard itself: it does NOT read O1.js to discover members, so
 // adding/removing/renaming a member without touching this test -- or without
 // updating the docs below -- is exactly the drift this test exists to catch.
-const THIRTEEN_MEMBERS = [
+const FOURTEEN_MEMBERS = [
     'SparseSet', 'RingDeque', 'UnionFind', 'MonoDeque', 'MinStack',
     'RandomSet', 'FreqO1', 'BucketQueue', 'TimerWheel', 'HierarchicalTimerWheel',
-    'RingLog', 'CuckooMap', 'SparseTable',
+    'RingLog', 'CuckooMap', 'SparseTable', 'BitSet',
 ];
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -1470,20 +1470,20 @@ test('SparseTable IMMUTABILITY: a post-build mutation of the caller source never
 // versa (docs claim thirteen but the module does not export thirteen).
 // ===========================================================================
 
-test('O1.js exports exactly the thirteen frozen members plus VERSION -- no more, no fewer', () => {
-    for (const name of THIRTEEN_MEMBERS) {
+test('O1.js exports exactly the fourteen frozen members plus VERSION -- no more, no fewer', () => {
+    for (const name of FOURTEEN_MEMBERS) {
         assert.equal(typeof O1Module[name], 'function', name + ' must be an exported class/function');
     }
     const exportedNames = Object.keys(O1Module).sort();
-    const expected = [...THIRTEEN_MEMBERS, 'VERSION'].sort();
-    assert.deepEqual(exportedNames, expected, 'O1.js export surface drifted from the frozen thirteen-member + VERSION list');
+    const expected = [...FOURTEEN_MEMBERS, 'VERSION'].sort();
+    assert.deepEqual(exportedNames, expected, 'O1.js export surface drifted from the frozen fourteen-member + VERSION list');
 });
 
-test('README.md, GUIDE.md, and llms.txt all describe the roster as "thirteen members" (case-insensitive), never a stale count', () => {
+test('README.md, GUIDE.md, and llms.txt all describe the roster as "fourteen members" (case-insensitive), never a stale count', () => {
     const files = ['README.md', 'GUIDE.md', 'llms.txt'];
     for (const f of files) {
         const text = readFileSync(join(ROOT, f), 'utf8');
-        assert.match(text, /thirteen members?/i, f + ' must describe the roster as "thirteen member(s)" somewhere');
+        assert.match(text, /fourteen members?/i, f + ' must describe the roster as "fourteen member(s)" somewhere');
         // Stale roster-size prose from earlier releases must not survive verbatim.
         // NOTE: "ten members" is NOT rejected here -- the repo-only benchmark suite
         // deliberately still profiles TEN members (RingLog + CuckooMap + SparseTable are
@@ -1494,13 +1494,14 @@ test('README.md, GUIDE.md, and llms.txt all describe the roster as "thirteen mem
         assert.doesNotMatch(text, /\bnine members\b/i, f + ' must not still say "nine members"');
         assert.doesNotMatch(text, /\beleven members\b/i, f + ' must not still say "eleven members"');
         assert.doesNotMatch(text, /\btwelve members\b/i, f + ' must not still say "twelve members"');
+        assert.doesNotMatch(text, /\bthirteen members\b/i, f + ' must not still say "thirteen members"');
         assert.doesNotMatch(text, /\b72 cells\b/, f + ' must not still say the stale 72-cell benchmark count');
     }
 });
 
-test('every THIRTEEN_MEMBERS name appears in the GUIDE.md picker table and decision flowchart', () => {
+test('every FOURTEEN_MEMBERS name appears in the GUIDE.md picker table and decision flowchart', () => {
     const guide = readFileSync(join(ROOT, 'GUIDE.md'), 'utf8');
-    for (const name of THIRTEEN_MEMBERS) {
+    for (const name of FOURTEEN_MEMBERS) {
         const count = (guide.match(new RegExp('\\b' + name + '\\b', 'g')) || []).length;
         assert.ok(count >= 2, name + ' must appear at least twice in GUIDE.md (flowchart leaf + picker table row), found ' + count);
     }

@@ -723,3 +723,79 @@ export class SparseTable {
     /** Iterate the source values in index order. Allocates a {value, done} per step by protocol. */
     [Symbol.iterator](): IterableIterator<number>;
 }
+
+/**
+ * BitSet -- a zero-GC, FIXED-capacity, WORST-CASE O(1) multi-word dense bitset over many
+ * Uint32 words (N >> 32); the suite's canonical membership / flag structure for visited sets,
+ * dirty masks, replay windows, and permission bitmaps at scale. Per-bit test / set / clear /
+ * toggle are `words[i >>> 5]` + one mask op -- worst-case O(1), zero allocation (the flat
+ * per-bit line IS the claim; NO max-single-op line). firstSet / nextSet are worst-case O(1) via
+ * a 3-level popcount summary (fan-out 32): a fixed <= 32-word top scan + a 3-hop clz32/ctz32
+ * descent, never an O(words) scan. Bulk set-algebra (and / or / xor / andNot, in place,
+ * capacity-match-or-throw) + popcount / setAll / clear / forEach / iterate are O(words) -- a
+ * disclosed co-headline (NOT the per-bit claim) and still 0 B/op (they write into the existing
+ * words). NON-OVERLAP: BitSet is the MULTI-WORD structure; @zakkster/lite-fastbit32 stays the
+ * single 32-flag word and @zakkster/lite-scheduler's FastBitScheduler the bit-bucket scheduler
+ * -- design-parity only, ZERO runtime dependency. Fail closed: the constructor throws [lite-o1]
+ * on a non-integer / < 1 / > 2^25 capacity (before any store is allocated); set / unset / toggle
+ * throw [lite-o1] on an out-of-range index; the bulk ops throw [lite-o1] on a capacity mismatch.
+ * clear() takes NO argument (whole-set reset). Never-throw queries: test returns false and
+ * firstSet / nextSet return -1 on a bad / absent index.
+ */
+export class BitSet {
+    /**
+     * @param nbits  fixed bit-capacity; an integer in [1, 2^25]. Bits are [0, nbits).
+     */
+    constructor(nbits: number);
+
+    /** Fixed bit-capacity (nbits); bits are [0, capacity). */
+    readonly capacity: number;
+
+    /** Number of set bits (a full popcount; O(words), not O(1)). */
+    readonly size: number;
+
+    /** True iff bit i is set. Worst-case O(1). A bad index is absent (false); never throws. */
+    test(i: number): boolean;
+
+    /** Set bit i. Worst-case O(1). Throws [lite-o1] on an out-of-range index. */
+    set(i: number): this;
+
+    /** Unset (clear) bit i -- the per-bit companion to set(i). Throws [lite-o1] on an out-of-range index. */
+    unset(i: number): this;
+
+    /** Toggle bit i. Worst-case O(1). Throws [lite-o1] on an out-of-range index. */
+    toggle(i: number): this;
+
+    /** The lowest set bit index, or -1 if none. Worst-case O(1) via the summary. Never throws. */
+    firstSet(): number;
+
+    /** The lowest set bit index >= from, or -1 if none. Worst-case O(1). A bad from returns -1; never throws. */
+    nextSet(from: number): number;
+
+    /** In-place bitwise AND with a same-capacity BitSet. O(words). Throws [lite-o1] on a capacity mismatch. */
+    and(other: BitSet): this;
+
+    /** In-place bitwise OR with a same-capacity BitSet. O(words). Throws [lite-o1] on a capacity mismatch. */
+    or(other: BitSet): this;
+
+    /** In-place bitwise XOR with a same-capacity BitSet. O(words). Throws [lite-o1] on a capacity mismatch. */
+    xor(other: BitSet): this;
+
+    /** In-place bitwise AND-NOT (this AND NOT other) with a same-capacity BitSet. O(words). Throws [lite-o1] on a capacity mismatch. */
+    andNot(other: BitSet): this;
+
+    /** Number of set bits. O(words). */
+    popcount(): number;
+
+    /** Set every bit in [0, capacity). O(words). */
+    setAll(): this;
+
+    /** Whole-set reset (no argument): zero every bit in place. O(words), no reallocation. */
+    clear(): this;
+
+    /** Invoke fn for every set bit in ascending order, alloc-free. O(popcount). */
+    forEach(fn: (index: number, bitset: BitSet) => void): void;
+
+    /** Iterate the set-bit indices in ascending order. Allocates a {value, done} per step by protocol. */
+    [Symbol.iterator](): IterableIterator<number>;
+}

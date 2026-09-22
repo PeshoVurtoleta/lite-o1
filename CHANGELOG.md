@@ -8,6 +8,60 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.4.0] - 2026-09-22
+
+### Added
+
+- **`BitSet` -- the fourteenth member: a zero-GC, WORST-CASE O(1), fixed-capacity multi-word
+  DENSE bitset over MANY `Uint32` words (N >> 32), with a 3-level popcount summary that keeps
+  `firstSet` / `nextSet` worst-case O(1).** The canonical membership / flag structure the roster
+  lacked -- visited sets, dirty masks, replay windows, permission bitmaps at scale. `test` / `set`
+  / `unset` / `toggle` are one word load + one mask op (worst-case O(1), 0 B/op). `firstSet` /
+  `nextSet` are worst-case O(1) via the summary: a 3-level, fan-out-32 popcount hierarchy over the
+  data words, so find-first is a bounded descent (a `<= 32`-word top scan + a 3-hop `clz32` /
+  `ctz32` walk), NEVER an O(words) scan -- that boundedness is the differentiator over a raw
+  `Uint32Array`. `BITSET_MAX_BITS = 2^25` (33,554,432 bits): the derivation ([`decisions/0019`](./decisions/0019-bitset.md))
+  is that at 2^25 the 3-level summary's top is `<= 32` words and every index (bit 2^25-1, word 2^20,
+  summary 2^15) stays a tagged SMI under 2^31 -- no boxing on any path (the SPARSETABLE_MAX_LEN
+  precedent). Fixed-capacity, fail-closed: a bad `nbits` throws `[lite-o1]` at construction before
+  any store is allocated. Value contract matches the family: mutators (`set` / `unset` / `toggle`)
+  throw `[lite-o1]` on an out-of-range index; queries (`test` / `firstSet` / `nextSet`) never throw
+  (a bad index is absent -> `false` / `-1`). In-place bulk set-algebra `and` / `or` / `xor` /
+  `andNot` between two same-capacity bitsets is O(words) -- a DISCLOSED co-headline, NOT part of the
+  per-bit claim -- and still 0 B/op (writes into existing words and rebuilds the summary in place;
+  the gate proves summary coherence after every bulk write). `popcount` / `setAll` / `clear` are
+  O(words); `forEach` / `[Symbol.iterator]` yield ascending set-bit indices (the iterator is the one
+  allocator, by protocol). WORST-CASE cohort -> NO max-single-op line. NON-OVERLAP: BitSet is the
+  MULTI-WORD, arbitrary-N structure; `@zakkster/lite-fastbit32` stays the single 32-flag word and
+  `@zakkster/lite-scheduler`'s `FastBitScheduler` the bit-bucket scheduler -- BitSet reuses
+  fastbit32's branchless word-op idiom by DESIGN-PARITY only, with ZERO runtime dependency (the
+  SlotPool / NodePool precedent). See the settled calls in [`decisions/0019`](./decisions/0019-bitset.md).
+- **`test/BitSet.test.js`** -- full behavioral suite: constructor validation (bad `nbits`: 0, -1,
+  2.5, NaN, `> 2^25` all throw before allocation), word-boundary round-trips (bits 31 / 32 / 33 /
+  `cap-1`, `test(cap)` false, `set(cap)` throws), `-0` aliases bit 0, the value contract (mutators
+  throw on a Symbol / BigInt / out-of-range index; queries never throw), `firstSet` / `nextSet`
+  ascending walk to `-1`, the worst-case-O(1) find-first proof (a lone high bit at `cap-1` on a
+  large capacity), bulk `and` / `or` / `xor` / `andNot` vs a bit-by-bit reference with summary
+  coherence checked after each, capacity-mismatch throw, iterator ascending + alloc-free, and a
+  1e5-op differential fuzz against a `Set` oracle.
+- **The witness, torture, and perf gates extended to BitSet** -- witness `test` flatness ~1.02
+  (gate `>= 0.70`) against a cache-degrading `Set<number>` foil (~0.78), min ratio ~3.9x (gate
+  `>= 1.5x`), plus a `firstSet` single-high-bit flatness control (~0.99) that a scanning
+  implementation would fail; torture 0 B/op on the per-bit ops AND the bulk `or`, leak tracker back
+  at `size() = 0`; six new perf-gate zero-alloc scenarios (test-hit / set / unset / firstSet /
+  nextSet / bulk-or) plus the iterator-spread must-allocate control, all under `--max-semi-space-size=4`.
+
+### Changed
+
+- **`O1.js` grows by exactly the appended `BitSet` class** (+ its `BITSET_MAX_BITS` const and two
+  module-level word helpers) plus the header member-count word ("thirteen" -> "fourteen") and the
+  `VERSION` bump. The prior thirteen member classes are BYTE-IDENTICAL (a pure append -- verified
+  `git diff -U0 O1.js` shows only the header/VERSION hunks and the trailing append).
+- **README `<details>` restructure**: each member section now collapses behind a one-line
+  `<summary>` so the page reads as a scannable index that expands on demand; the BitSet section, TOC
+  entries, the test-count (`599`), and the benchmark grid count (fourteen members x 8 = 112 cells)
+  are added / refreshed. Three-place version sync (`O1.js` / `package.json` / `llms.txt`) to 1.4.0.
+
 ## [1.3.1] - 2026-09-19
 
 Documentation / wording patch. No runtime-code logic change: `O1.js` hot bodies are

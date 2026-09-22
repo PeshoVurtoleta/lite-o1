@@ -510,11 +510,11 @@ test('D1 perOpTail: exactly the 5 amortized members carry a tail object; the oth
 
 const NEW_MEMBERS = ['RingLog', 'CuckooMap', 'SparseTable'];
 
-test('adoption: SUBJECTS is 13; cells() is 104; each new member has exactly 8 cells', () => {
-    assert.equal(SUBJECTS.length, 13, 'SUBJECTS must be the 13 shipped members');
+test('adoption: SUBJECTS is 14; cells() is 112; each new member has exactly 8 cells', () => {
+    assert.equal(SUBJECTS.length, 14, 'SUBJECTS must be the 14 shipped members');
     for (const m of NEW_MEMBERS) assert.ok(SUBJECTS.includes(m), m + ' must be registered');
     const all = cells();
-    assert.equal(all.length, 104, 'grid must be 13 x 8 = 104 cells');
+    assert.equal(all.length, 112, 'grid must be 14 x 8 = 112 cells');
     assert.equal(all.length, SUBJECTS.length * DIMENSIONS.length);
     for (const m of NEW_MEMBERS) {
         assert.equal(all.filter((c) => c.member === m).length, 8, m + ' must have exactly 8 cells');
@@ -695,9 +695,9 @@ test('adoption: D3 memberBytes is stable across 5 fill/clear cycles (no backing-
         'SparseTable of equal length must have equal backing bytes');
 });
 
-test('shipping discipline -- package.json.version is the 1.3.1 patch bump; benchmark/ stays repo-only', () => {
+test('shipping discipline -- package.json.version is the 1.4.0 bump; benchmark/ stays repo-only', () => {
     const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
-    assert.equal(pkg.version, '1.3.1', 'witness/docs session ships the 1.3.1 patch bump');
+    assert.equal(pkg.version, '1.4.0', '1.4.0 ships the fourteenth member (BitSet)');
     // benchmark/ must NOT be shipped (it is repo-only infra) even in a shipping session.
     assert.ok(!pkg.files.includes('benchmark'), 'benchmark/ must not appear in package.json files[]');
 });
@@ -980,9 +980,10 @@ const ALLOC_SECTION_MARKER = Object.freeze({
     RingLog: '**RingLog** allocates',
     CuckooMap: '**CuckooMap** allocates',
     SparseTable: '**SparseTable** allocates',
+    BitSet: '**BitSet** allocates',
 });
 
-test('#3 doc gate hardened: EVERY one of the 13 members carries its OWN per-member alloc-"proven" ' +
+test('#3 doc gate hardened: EVERY one of the 14 members carries its OWN per-member alloc-"proven" ' +
     'claim, attributed by PARAGRAPH SEGMENT not a bare line-includes(name) check (QA: the >= 10 ' +
     'aggregate threshold above is vacuous to softening any ONE of the 11 "gates prove" lines, since ' +
     '11-1=10 still clears it; a naive per-member l.includes(m) check is ALSO vacuous, because ' +
@@ -1053,7 +1054,7 @@ test('#1 CLEAR_WITNESS is EXACTLY the four container members; each has a clear()
     }
     // The EXCLUDED table names the other nine, each with a reason (never silently dropped).
     const excl = Object.keys(CLEAR_WITNESS_EXCLUDED);
-    assert.equal(excl.length, 9, 'nine members excluded with reasons');
+    assert.equal(excl.length, 10, 'ten members excluded with reasons');
     assert.equal(excl.length + CLEAR_WITNESS.length, SUBJECTS.length, 'every member is either in or excluded');
     for (const m of excl) {
         assert.ok(SUBJECTS.includes(m), m + ' must be a real member');
@@ -1197,17 +1198,17 @@ test('#4 report: D6 + D8 render ADJACENT to the D2 witness plot; clear + per-op 
     assert.ok(html.includes('n/a'), 'inapplicable cells must render the n/a string');
 });
 
-test('#6 trinity + shipping surface: VERSION 1.3.1 across O1.js/package.json/llms.txt; benchmark/ not shipped', () => {
+test('#6 trinity + shipping surface: VERSION 1.4.0 across O1.js/package.json/llms.txt; benchmark/ not shipped', () => {
     const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
-    assert.equal(VERSION, '1.3.1', 'O1.js VERSION const');
-    assert.equal(pkg.version, '1.3.1', 'package.json version');
+    assert.equal(VERSION, '1.4.0', 'O1.js VERSION const');
+    assert.equal(pkg.version, '1.4.0', 'package.json version');
     const m = LLMS.match(/^Version:\s*(\S+)/m);
     assert.ok(m, 'llms.txt Version header present');
-    assert.equal(m[1], '1.3.1', 'llms.txt Version header');
+    assert.equal(m[1], '1.4.0', 'llms.txt Version header');
     assert.equal(VERSION, pkg.version, 'trinity string-equal (VERSION === package.json)');
     assert.equal(VERSION, m[1], 'trinity string-equal (VERSION === llms.txt)');
     // README + llms.txt are shipped; benchmark/ is repo-only.
     assert.ok(pkg.files.includes('README.md') && pkg.files.includes('llms.txt'), 'README + llms.txt ship');
     assert.ok(!pkg.files.includes('benchmark'), 'benchmark/ stays repo-only');
-    assert.equal(cells().length, 104, 'bench grid stays 13 x 8 = 104 cells');
+    assert.equal(cells().length, 112, 'bench grid stays 14 x 8 = 112 cells');
 });
