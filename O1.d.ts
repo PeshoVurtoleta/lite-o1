@@ -1098,3 +1098,51 @@ export class Reservoir {
     /** Iterate the sampled values (reservoir order). O(size). */
     [Symbol.iterator](): IterableIterator<number>;
 }
+
+/** The three associative bitwise monoid operators of a WindowFoldUint32 (identities 0 / 0xFFFFFFFF / 0). */
+export type WindowFoldUint32Op = 'OR' | 'AND' | 'XOR';
+
+/**
+ * WindowFoldUint32 -- the bitwise / masking sliding-window engine: a zero-GC, WORST-CASE O(1) FIFO
+ * sliding-window fold over a frozen bitwise operator (OR / AND / XOR) on 32-bit MASKS, over two
+ * Uint32Array lanes (the DABA-Lite de-amortized core, identical to WindowFold). A Float64 aggregate
+ * lane cannot honestly carry 32-bit bitwise ops (they coerce to 32-bit; AND's all-ones identity has no
+ * clean Float64 form), so register width forces a separate typed member -- NOT a WindowFold clone.
+ * push(mask) / evict() / query() are each worst-case O(1) (<= 2 combines, a single ALU |/&/^, no flip
+ * spike, NO max-single-op line). The mask arg is a STRICT uint32: an integer in [0, 2^32) -- a float,
+ * negative, >= 2^32, NaN, Symbol, or BigInt throws [lite-o1] (typeof-first, byte-identical no-op); it is
+ * NEVER coerced (so a 53-bit compound integer cannot silently truncate). -1 is NOT all-ones; pass
+ * 0xFFFFFFFF. query() returns the aggregate as an unsigned uint32, or the operator identity on an empty
+ * window (0 / 0xFFFFFFFF / 0), never undefined.
+ */
+export class WindowFoldUint32 {
+    /** @param capacity max simultaneously-live masks (integer in [1, 2^31], rounded up to a power of two). @param op the frozen bitwise operator. */
+    constructor(capacity: number, op: WindowFoldUint32Op);
+
+    /** The frozen operator name. O(1). */
+    readonly op: WindowFoldUint32Op;
+
+    /** Number of live masks in the window. O(1). */
+    readonly size: number;
+
+    /** Max simultaneously-live masks (power-of-two, rounded up). O(1). */
+    readonly capacity: number;
+
+    /** The current window aggregate as an unsigned uint32 (worst-case O(1), <= 2 combines). Returns the operator identity on an empty window. Never throws. */
+    query(): number;
+
+    /** Append mask as the newest element. Worst-case O(1). mask must be an integer in [0, 2^32); a float / negative / >= 2^32 / NaN / non-number throws [lite-o1] (never coerced), as does a full window or the 2^53 position ceiling. */
+    push(mask: number): this;
+
+    /** Drop the oldest mask. Worst-case O(1). An empty window is a no-op (never throws). */
+    evict(): this;
+
+    /** Empty the window in O(1) (resets positions + running aggregate + flip state; zeroes no store). */
+    clear(): void;
+
+    /** Iterate live masks front -> back (oldest -> newest), alloc-free. fn is (value, index, fold). */
+    forEach(fn: (value: number, index: number, fold: WindowFoldUint32) => void): void;
+
+    /** Iterate live mask values front -> back (oldest -> newest). */
+    [Symbol.iterator](): IterableIterator<number>;
+}

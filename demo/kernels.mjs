@@ -12,7 +12,8 @@
 
 import { SparseSet, CuckooMap, BitSet, RingLog, RingDeque, MonoDeque, MinStack, WindowFold,
     UnionFind, TimerWheel, HierarchicalTimerWheel, CoarseTimerWheel,
-    BucketQueue, SparseTable, RandomSet, FreqO1, AliasTable, VERSION } from '../O1.js';
+    BucketQueue, SparseTable, RandomSet, FreqO1, AliasTable,
+    WindowFoldUint32, Reservoir, RankSelect, EliasFano, VERSION } from '../O1.js';
 
 // Re-export the SHIPPED VERSION so index.html and Demo.test.mjs read the one true source
 // (never a hardcoded string -- the version-trinity test in Demo.test.mjs gates this).
@@ -1268,4 +1269,301 @@ export function naiveAliasSample(state, world) {
     state.allocCount += n;                   // one increment per outcome examined (the O(n) cost)
     if (state.naiveJunk.length > 400) state.naiveJunk.splice(0, state.naiveJunk.length - 400);
     return pick;
+}
+
+// ---- WindowFoldUint32 world (Scene-02 fourth wall: BITWISE rolling aggregate vs WindowFold's SUM) ----
+// The contrast beat (DEMO.md section 3): WindowFold folds ARITHMETIC monoids (SUM/MIN/MAX/PRODUCT) over a
+// Float64 lane. WindowFoldUint32 is the BITWISE sibling: it folds a sliding window of 32-bit MASKS under
+// OR (union) / AND (intersection) / XOR (parity) -- the "which component flags are live across the window"
+// aggregate a Float64 aggregate lane CANNOT honestly carry (JS `& | ^` coerce to a signed int32, and AND's
+// all-ones identity 0xFFFFFFFF has no clean Float64 form). SAME DABA-Lite worst-case-O(1) core as WindowFold
+// (no O(W) flip spike), but the register width (Uint32 vs Float64) forced a separate typed member (ADR 0027).
+// It reads side by side with WindowFold's numeric SUM band over the SAME window slider. query() on the EMPTY
+// window returns the operator IDENTITY (0 for OR / XOR, 0xFFFFFFFF for AND) -- never undefined (null is not
+// zero). The naive foil re-folds the WHOLE window from scratch every frame (O(W)) -- the ONLY new Scene-02
+// code allowed to allocate, and it CLIMBS as the window grows.
+
+/** Flag-mask width: per-frame masks are drawn in [0, 2^WFU_BITS) so OR fills toward all-flags-live, AND
+ *  stays occasionally non-zero (a shared flag), and XOR parity is legible. Every drawn mask is a STRICT
+ *  uint32 (< 2^32), so WindowFoldUint32's fail-closed value contract accepts it verbatim, NEVER coerced.
+ *  16 keeps every aggregate an SMI (< 2^31), so query() never boxes a HeapNumber (the maxMinor:0 gate). */
+export const WFU_BITS = 16;
+
+/**
+ * Build the Scene-02 WindowFoldUint32 world ONCE (warmup). Allocates THREE real WindowFoldUint32 instances
+ * (OR / AND / XOR) over the same window plus a deterministic per-frame flag-mask stream and the flat rail the
+ * draw path reuses forever. A separate world (the createWindowFoldWorld precedent) so the bitwise triptych
+ * shares the window slider but never entangles the numeric SUM kernel. Fails closed on a bad window / op via
+ * WindowFoldUint32's own constructor guards.
+ * @param {number} waveLen  pre-generated mask count (rounded up to a power of two)
+ * @param {number} windowSize  the sliding window W (masks)
+ * @param {number} [seed]  optional uint32 seed for the deterministic mask stream
+ */
+export function createWindowFoldU32World(waveLen, windowSize, seed) {
+    const wlen = _pow2(waveLen);
+    const rng = new Uint32Array(1);
+    rng[0] = (seed >>> 0) || 0xB17F1A65;
+    const flagMask = ((1 << WFU_BITS) - 1) >>> 0;   // WFU_BITS-wide flag space (a strict uint32)
+    const maskWave = new Uint32Array(wlen);
+    for (let i = 0; i < wlen; i++) maskWave[i] = (nextRand(rng) & flagMask) >>> 0; // strict uint32 masks
+    const foldOr = new WindowFoldUint32(windowSize, 'OR');    // union of the live flag masks
+    const foldAnd = new WindowFoldUint32(windowSize, 'AND');  // intersection (flags common to ALL live masks)
+    const foldXor = new WindowFoldUint32(windowSize, 'XOR');  // parity of the live flag masks
+    const railCap = _pow2(windowSize);
+    return {
+        maskWave, waveLen: wlen, waveMask: wlen - 1, pos: 0,
+        window: windowSize, sampleNo: 0, flagMask,
+        foldOr, foldAnd, foldXor,
+        railCap, railMask: railCap - 1, railHead: 0, railCount: 0,
+        railOr: new Float64Array(railCap), // popcount(OR aggregate) per scroll slot (draw overlay)
+        out: new Float64Array(4),          // [mask, orAgg, andAgg, xorAgg] -- read by the draw path + test
+    };
+}
+
+/**
+ * One full lite-path frame of the Scene-02 WindowFoldUint32 triptych. Emits the next flag mask (advancing a
+ * ring index, no per-frame RNG) and feeds it through ALL THREE real folds:
+ *   - evict() the oldest when the live window is full, keeping exactly the last W masks
+ *   - push(mask) the newest (WORST-CASE O(1); the DABA-Lite flip is de-amortized, no O(W) spike)
+ *   - query() the running OR / AND / XOR aggregate (WORST-CASE O(1); returns the operator identity on empty)
+ * With WFU_BITS <= 16 every aggregate is an SMI, so query() never boxes a HeapNumber. Every produced value is
+ * written into reused Float64Arrays (railOr + out), so the frame allocates ZERO bytes after warmup --
+ * Demo.test.mjs gates it at 0 B/op with maxMinor:0.
+ * @returns {number} the rail sample count (an SMI fold so the swept work is never DCE'd)
+ */
+export function frameWindowFoldU32(world) {
+    const mask = world.maskWave[world.pos];
+    world.pos = (world.pos + 1) & world.waveMask;
+
+    // Keep exactly the last W masks: evict the oldest BEFORE pushing when full, so push() never trips the
+    // fail-closed full-ring throw (capacity == pow2(W) >= W). Never empty at query -> AND never returns its
+    // all-ones identity here (which would be a > 2^31 HeapNumber); every aggregate stays an SMI.
+    const fo = world.foldOr, fa = world.foldAnd, fx = world.foldXor, W = world.window;
+    if (fo.size === W) fo.evict();
+    if (fa.size === W) fa.evict();
+    if (fx.size === W) fx.evict();
+    fo.push(mask); fa.push(mask); fx.push(mask);
+    const orv = fo.query();   // union: worst-case O(1) unsigned uint32 (identity 0 on empty)
+    const andv = fa.query();  // intersection: worst-case O(1) (identity 0xFFFFFFFF on empty)
+    const xorv = fx.query();  // parity: worst-case O(1) (identity 0 on empty)
+
+    // rail: store the popcount of the OR aggregate (how many flags are live anywhere in the window).
+    let pc = orv, cnt = 0;
+    while (pc !== 0) { pc &= pc - 1; cnt++; } // bounded WFU_BITS-step popcount, 0 B/op
+    const cap = world.railCap, rmask = world.railMask;
+    if (world.railCount === cap) {
+        const h = world.railHead;
+        world.railOr[h] = cnt;
+        world.railHead = (h + 1) & rmask;
+    } else {
+        const i = (world.railHead + world.railCount) & rmask;
+        world.railOr[i] = cnt;
+        world.railCount++;
+    }
+
+    world.out[0] = mask; world.out[1] = orv; world.out[2] = andv; world.out[3] = xorv;
+    world.sampleNo++;
+    return world.railCount;
+}
+
+/**
+ * The Scene-02 WindowFoldUint32 naive foil: the O(W) FULL-window bitwise refold. Allocates a FRESH
+ * window-sized Uint32Array every call and re-folds the ENTIRE window (OR/AND/XOR) from scratch -- the exact
+ * O(W) work WindowFoldUint32's worst-case O(1) push+evict+query refuses -- and bumps the owned allocation
+ * counter by `window` (a REAL per-element count that CLIMBS as the window grows). Returns the refolded OR
+ * aggregate -- which the faithfulness test proves equals the lite foldOr.query() when the window is full.
+ * Retained garbage is capped so the foil's own process survives a long session. This is the ONLY new
+ * Scene-02 code allowed to allocate.
+ * @returns {number} the refolded window OR aggregate (folded so the scan is never DCE'd)
+ */
+export function naiveWindowU32Refold(state, world) {
+    const window = world.window, mw = world.maskWave, mask = world.waveMask, pos = world.pos;
+    const tmp = new Uint32Array(window); // the O(W) allocation the DABA-Lite fold refuses
+    let orv = 0, andv = 0xFFFFFFFF, xorv = 0;
+    for (let i = 0; i < window; i++) {
+        const v = mw[(pos - 1 - i) & mask];
+        tmp[i] = v;
+        orv = (orv | v) >>> 0; andv = (andv & v) >>> 0; xorv = (xorv ^ v) >>> 0;
+    }
+    state.naiveJunk.push(tmp);
+    state.allocCount += window;
+    if (state.naiveJunk.length > 400) state.naiveJunk.splice(0, state.naiveJunk.length - 400);
+    return orv;
+}
+
+// =======================================================================================
+// Scene 04 additions -- the STREAMING sampler + the STATIC succinct index. Both are separate
+// worlds (the createBitSetWorld / createAliasWorld precedent) so they never entangle the
+// existing frameSample / frameAliasWorld kernels or their 0-B/op gates.
+// =======================================================================================
+
+// ---- Reservoir world (Scene-04 sampling: STREAMING uniform sample over an UNBOUNDED stream) ----
+// The third sampling contrast in the casino (DEMO.md section 3): RandomSet.sample() draws uniformly from a
+// MATERIALIZED set (every member retained), AliasTable draws from a STATIC WEIGHTED vector (build-once), and
+// Reservoir (Vitter's Algorithm R) draws uniformly from an UNBOUNDED stream in FIXED memory k -- it STORES
+// NOTHING BUT THE SAMPLE. add() is WORST-CASE O(1) (one LCG advance + one compare + one conditional store),
+// 0 B/op, independent of the number of items seen. The naive foil BUFFERS the whole stream just to sample it
+// (one allocation per streamed item) -- the exact memory the reservoir refuses; its cost CLIMBS with the
+// STREAM LENGTH (frames), while the reservoir's memory stays pinned at k. This is the ONLY new sampling code
+// allowed to allocate.
+
+/** Reservoir size k (retained samples). EXACT (Reservoir does NOT round to a power of two). */
+export const RSV_K = 32;
+/** Stream items fed per frame (each a worst-case O(1) add). */
+export const RSV_RATE = 8;
+
+/**
+ * Build the Scene-04 Reservoir world ONCE (warmup). Allocates the REAL Reservoir(k) plus a Float64 stream
+ * cursor + output slots the draw path reuses forever. The stream cursor lives in a Float64Array (NOT a boxed
+ * object field), so a long session's growing item id never boxes a HeapNumber. Fails closed on a bad k / seed
+ * via Reservoir's own constructor guards.
+ * @param {number} [k]     reservoir size (defaults to RSV_K)
+ * @param {number} [seed]  optional uint32 seed for the deterministic retention draws
+ */
+export function createReservoirWorld(k, seed) {
+    const K = k || RSV_K;
+    const rng = new Uint32Array(1);
+    rng[0] = (seed >>> 0) || 0x9e3779b1;
+    const res = new Reservoir(K, (rng[0] ^ 0x2545f491) >>> 0);
+    return {
+        rng, res, k: K, rate: RSV_RATE,
+        pos: new Float64Array(1),  // stream cursor -- a double kept OUT of a boxed field
+        out: new Float64Array(2),  // [lastItem, seen] -- doubles kept OUT of boxed fields
+    };
+}
+
+/**
+ * One full lite-path frame of the Scene-04 Reservoir: feed RSV_RATE fresh stream items into the REAL
+ * Reservoir (each add() WORST-CASE O(1), 0 B/op -- fill-phase verbatim store or one LCG-drawn retention),
+ * then read seen + the last item into reused Float64 slots. The reservoir holds a uniform sample of
+ * min(seen, k) items in FIXED memory; the stream itself is never stored. ZERO bytes/op after warmup --
+ * Demo.test.mjs gates it at 0 B/op with maxMinor:0.
+ * @returns {number} the live sample fill min(seen, k) (an SMI fold so the swept work survives)
+ */
+export function frameReservoir(world) {
+    const res = world.res, rate = world.rate, pos = world.pos;
+    let v = pos[0];
+    for (let t = 0; t < rate; t++) { res.add(v); v += 1; } // worst-case O(1) per item, 0 B/op
+    pos[0] = v;
+    world.out[0] = v - 1;      // last item id fed
+    world.out[1] = res.seen;   // total items seen (unbounded; a double kept in a typed slot)
+    return res.size;           // min(seen, k) -- the fixed-memory sample fill
+}
+
+/**
+ * The Scene-04 Reservoir naive foil: BUFFER the whole stream. Allocates one fresh object per streamed item
+ * (the exact per-item memory the reservoir's fixed-k store refuses) and bumps the owned allocation counter by
+ * `rate` -- a REAL per-item cost. Over a session the counter CLIMBS WITHOUT BOUND (memory grows with the
+ * stream length), while the reservoir's memory stays pinned at k -- the streaming contrast. Retained garbage
+ * is capped so the foil's own process survives a long session. This is the ONLY new sampling code allowed to
+ * allocate.
+ * @returns {number} the number of items buffered this frame (== rate)
+ */
+export function naiveReservoirStep(state, world) {
+    const rate = world.rate, base = world.pos[0];
+    for (let i = 0; i < rate; i++) {
+        const o = { v: base + i };  // buffer the stream item (the alloc the reservoir refuses)
+        state.naiveJunk.push(o);
+        state.allocCount++;
+    }
+    if (state.naiveJunk.length > 6000) state.naiveJunk.splice(0, state.naiveJunk.length - 6000);
+    return rate;
+}
+
+// ---- Succinct static index world (Scene-04 static cameo: RankSelect + EliasFano over a FROZEN bitvector) ----
+// The static / immutable beat (DEMO.md section 3), the succinct siblings of SparseTable: build ONCE over a
+// FROZEN structure, then query forever in worst-case O(1). RankSelect answers rank1(i) (set bits before i)
+// and select1(k) (position of the k-th set bit) over a frozen "hard terrain" bitvector via the cs-poppy
+// 3-level directory -- WORST-CASE O(1), no O(n) scan. EliasFano is the succinct codec for the SORTED
+// hard-cell positions: access(i) (the i-th hard cell) is WORST-CASE O(1) (one select1 + one packed-low read)
+// at ~2 + ceil(log2(U/n)) bits/element, near the information-theoretic minimum. The O(n) BUILD + the succinct
+// SPACE are the disclosed one-time co-headlines (the SparseTable shape). The naive foil linear-scans the
+// whole bitvector for rank1 (O(n), allocating) -- the exact work the directory makes needless. This is the
+// ONLY new succinct code allowed to allocate.
+
+/** Terrain cell count the succinct index spans (reuses the Scene-04 grid geometry). */
+export const SC_CELLS = SP_CELLS;
+/** Hardness threshold: a cell is "hard" (a set bit) iff its terrain cost >= SC_HARD. */
+export const SC_HARD = 7;
+
+/**
+ * Build the Scene-04 succinct-index world ONCE (warmup). Generates a FROZEN terrain-cost grid, derives the
+ * frozen "hard cell" bitvector (bit c set iff cost[c] >= SC_HARD), builds the REAL RankSelect over it and the
+ * REAL EliasFano over the SORTED hard-cell positions, plus the output slots the draw path reuses forever.
+ * Fails closed on any bad size via each class's own constructor guard. Seed-only (nextRand over an integer
+ * state word -- no wall-clock entropy).
+ * @param {number} [seed]  optional uint32 seed for the deterministic terrain
+ */
+export function createSuccinctWorld(seed) {
+    const rng = new Uint32Array(1);
+    rng[0] = (seed >>> 0) || 0x5c0ffee1;
+    const cells = SC_CELLS;
+    const cost = new Uint8Array(cells);
+    for (let i = 0; i < cells; i++) cost[i] = SP_MINCOST + (nextRand(rng) % (SP_MAXCOST - SP_MINCOST + 1));
+    // frozen "hard cell" bitvector + the sorted hard-cell position list (one O(n) build pass).
+    let hardCount = 0;
+    for (let c = 0; c < cells; c++) if (cost[c] >= SC_HARD) hardCount++;
+    const words = new Uint32Array((cells + 31) >>> 5);
+    const hard = new Uint32Array(hardCount);
+    let h = 0;
+    for (let c = 0; c < cells; c++) {
+        if (cost[c] >= SC_HARD) { words[c >>> 5] |= (1 << (c & 31)); hard[h++] = c; }
+    }
+    const rs = new RankSelect(words, cells);  // worst-case O(1) rank1/select1/access (cs-poppy directory)
+    const ef = new EliasFano(hard);           // worst-case O(1) access over the sorted hard positions
+    return {
+        rng, cost, cells, rs, ef, hardCount, words, hard,
+        cursor: 0,
+        out: new Float64Array(4), // [rank1(cursor), select1(k), ef.access(i), access(cursor)] -- draw + test
+        lastRank: 0, lastSel: -1, lastEf: -1, lastBit: 0,
+    };
+}
+
+/**
+ * One full lite-path frame of the Scene-04 succinct cameo: advance a cursor over the frozen bitvector and run
+ * the WORST-CASE O(1) succinct queries:
+ *   - rs.rank1(cursor)  -- set bits (hard cells) before the cursor (cs-poppy directory lookup)
+ *   - rs.select1(k)     -- position of the k-th hard cell (sampling-layer jump)
+ *   - ef.access(i)      -- the i-th hard-cell position from the succinct codec (one select1 + low read)
+ *   - rs.access(cursor) -- the bit at the cursor (0/1)
+ * Every result is a small SMI written into a reused Float64Array, so the frame allocates ZERO bytes after
+ * warmup -- Demo.test.mjs gates it at 0 B/op with maxMinor:0.
+ * @returns {number} rank1 + max(0, select1) (an SMI fold so the swept work survives)
+ */
+export function frameSuccinct(world) {
+    const rs = world.rs, ef = world.ef, cells = world.cells, n = world.hardCount;
+    let c = world.cursor + 1; if (c >= cells) c = 0; world.cursor = c;
+    const r = rs.rank1(c);                        // hard cells before the cursor -- worst-case O(1)
+    const k = r > 0 ? r - 1 : 0;
+    const sel = n > 0 ? rs.select1(k) : -1;       // position of the k-th hard cell -- worst-case O(1)
+    const i = n > 0 ? (r % n) : 0;
+    const efv = n > 0 ? ef.access(i) : -1;        // the i-th hard cell via EliasFano -- worst-case O(1)
+    const bit = rs.access(c);                     // the bit at the cursor (0/1, or undefined past the end)
+    world.out[0] = r; world.out[1] = sel; world.out[2] = efv;
+    world.out[3] = bit === undefined ? -1 : bit;
+    world.lastRank = r; world.lastSel = sel; world.lastEf = efv; world.lastBit = world.out[3];
+    return r + (sel < 0 ? 0 : sel);
+}
+
+/**
+ * The Scene-04 succinct naive foil: the O(n) LINEAR bit-scan the cs-poppy directory makes needless. Allocates
+ * a FRESH cells-sized array to hold the scan and bumps the owned allocation counter by `cells` (a REAL
+ * per-bit cost that CLIMBS with the bitvector, unlike rank1's flat worst-case O(1)). Returns the linear
+ * rank1(cursor) -- which the faithfulness test proves equals rs.rank1(cursor). Retained garbage is capped so
+ * the foil's own process survives a long session. This is the ONLY new succinct code allowed to allocate.
+ * @returns {number} the linear rank1 at the cursor (folded so the scan is never DCE'd)
+ */
+export function naiveSuccinctScan(state, world) {
+    const rs = world.rs, cells = world.cells, c = world.cursor;
+    const found = new Array(cells);   // the O(n) scratch the cs-poppy directory refuses
+    let count = 0;
+    for (let i = 0; i < cells; i++) {
+        const b = rs.access(i);
+        found[i] = b;
+        if (i < c && b === 1) count++; // linear rank1(c): count set bits before the cursor
+    }
+    state.naiveJunk.push(found);
+    state.allocCount += cells;         // one increment per bit examined (the O(n) cost)
+    if (state.naiveJunk.length > 400) state.naiveJunk.splice(0, state.naiveJunk.length - 400);
+    return count;                      // == rs.rank1(c)
 }

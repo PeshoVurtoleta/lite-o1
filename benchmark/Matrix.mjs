@@ -24,13 +24,14 @@
  *   - BitSet vs a native Set<number> (the fair, familiar sparse-membership default)
  *   - AliasTable vs an alloc-free O(n) cumulative-scan sampler (linear scan per draw)
  *   - Reservoir vs a growing Array that stores the whole stream then picks k at the end
+ *   - WindowFoldUint32 vs a naive O(W) full-window bitwise refold (OR/AND/XOR each query)
  */
 
 /** Sentinel for a cell that does not apply. NEVER 0. */
 export const NA = 'n/a';
 
-/** The twenty shipped members, in build order. */
-export const SUBJECTS = ['SparseSet', 'RingDeque', 'UnionFind', 'MonoDeque', 'MinStack', 'RandomSet', 'FreqO1', 'BucketQueue', 'TimerWheel', 'HierarchicalTimerWheel', 'RingLog', 'CuckooMap', 'SparseTable', 'BitSet', 'AliasTable', 'CoarseTimerWheel', 'WindowFold', 'RankSelect', 'EliasFano', 'Reservoir'];
+/** The twenty-one shipped members, in build order. */
+export const SUBJECTS = ['SparseSet', 'RingDeque', 'UnionFind', 'MonoDeque', 'MinStack', 'RandomSet', 'FreqO1', 'BucketQueue', 'TimerWheel', 'HierarchicalTimerWheel', 'RingLog', 'CuckooMap', 'SparseTable', 'BitSet', 'AliasTable', 'CoarseTimerWheel', 'WindowFold', 'RankSelect', 'EliasFano', 'Reservoir', 'WindowFoldUint32'];
 
 /** The eight measurement dimensions (RESEARCH.md section 3). */
 export const DIMENSIONS = ['D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7', 'D8'];
@@ -69,6 +70,7 @@ export const BASELINE = {
     RankSelect: 'scan-fold',     // an alloc-free O(words) popcount scan that recomputes rank each query
     EliasFano: 'scan-fold',      // a plain sorted-array binary search (8 bytes/elem, O(log n) access)
     Reservoir: 'growing-array',  // a growing Array storing the whole stream, then a final k-pick (O(n) memory)
+    WindowFoldUint32: 'naive-window', // an alloc-free O(W) full-window bitwise refold recomputed each query
 };
 
 /**
@@ -111,6 +113,7 @@ export const STRONG_BASELINE = {
     RankSelect: NA,
     EliasFano: NA,
     Reservoir: NA,
+    WindowFoldUint32: NA,
 };
 
 /**
@@ -262,6 +265,14 @@ export const RATIONALE = {
             'O(n) unbounded memory and its per-item push cost curves away as the array grows/relocates, ' +
             'while Reservoir samples in worst-case-O(1) per item over ONE fixed Float64Array of size k.',
     },
+    WindowFoldUint32: {
+        verdict: 'FAIR-ALREADY', strong: NA,
+        why: 'the foil is a naive O(W) full-window bitwise refold (OR/AND/XOR over every live mask each ' +
+            'query) -- the obvious approach before the DABA-Lite de-amortized two-stacks, honest not a ' +
+            'strawman; WindowFoldUint32 wins by a WORST-CASE-O(1) constant (<= 2 combines per op, a single ' +
+            'ALU |/&/^, no flip spike). It is the Uint32-mask sibling of WindowFold: a Float64 lane cannot ' +
+            'honestly carry 32-bit bitwise ops, so register width forces the separate typed member.',
+    },
 };
 
 // ===========================================================================
@@ -304,6 +315,7 @@ export const MEMBER_TAGS = {
     RankSelect: ['steady'], // static build-once: rank/select are worst-case O(1), no periodic spike
     EliasFano: ['steady'], // static build-once: access is worst-case O(1), no periodic spike
     Reservoir: ['steady'], // Algorithm R: add is worst-case O(1) (one draw + one compare + one store), no periodic spike
+    WindowFoldUint32: ['steady'], // de-amortized bitwise fold: <= 2 combines/op, no periodic spike (like WindowFold)
 };
 
 /**
@@ -318,6 +330,7 @@ export const RANDOM_LOOKUP = {
     RingLog: false, CuckooMap: false, SparseTable: false, BitSet: false, AliasTable: false,
     CoarseTimerWheel: false, WindowFold: false, RankSelect: false, EliasFano: false,
     Reservoir: false, // get(i) is a positional read, not a random-key lookup like has/find
+    WindowFoldUint32: false, // aggregate read only, no random-key lookup (like WindowFold)
 };
 
 /**
@@ -338,6 +351,7 @@ export const CAPACITY_KNOB = {
     RankSelect: false, // static build-once: cost is a build cost (like SparseTable / AliasTable), not on the Pareto axes
     EliasFano: false, // static build-once: cost is a build cost (like SparseTable / AliasTable), not on the Pareto axes
     Reservoir: true, // fixed capacity knob (k): ops/ms vs bytes/live on the Pareto (mutable streaming sampler)
+    WindowFoldUint32: true, // fixed capacity knob: ops/ms vs bytes/live on the Pareto (mutable window, like WindowFold)
 };
 
 /**
@@ -367,7 +381,7 @@ export function baselineFor(member, dim) {
  */
 export function supportsKeyType(member, keyType) {
     if (!SUBJECTS.includes(member)) return false;
-    return keyType === 'int'; // all twenty members are integer/numeric substrates
+    return keyType === 'int'; // all twenty-one members are integer/numeric substrates
 }
 
 /**
@@ -395,7 +409,7 @@ export function supportsWorkload(member, workload) {
  * The strong baseline is an EXTRA COMPARISON INSIDE an existing cell (it is timed
  * within D1 and carried on the D1 result as strongBaselineDist), NOT a new dimension
  * column and NOT a separate cell -- so the matrix stays exactly SUBJECTS x DIMENSIONS
- * (20 x 8 = 160) cells. Each descriptor carries `strongBaseline` (NA for the
+ * (21 x 8 = 168) cells. Each descriptor carries `strongBaseline` (NA for the
  * FAIR-ALREADY members) purely as metadata; it never multiplies the cell count.
  * @returns {{member:string, dim:string, baseline:string, strongBaseline:string}[]}
  */
@@ -480,7 +494,7 @@ export function classifyClaim(line) {
 export const CLEAR_WITNESS = ['SparseSet', 'RingDeque', 'RandomSet', 'RingLog'];
 
 /**
- * The sixteen members EXCLUDED from CLEAR_WITNESS, each with a short honest reason.
+ * The seventeen members EXCLUDED from CLEAR_WITNESS, each with a short honest reason.
  * SparseTable is static (no mutators at all); UnionFind's reset surface is reset()
  * (an O(n) bulk primitive, not an O(1) clear()); CuckooMap's clear() fills an
  * occupancy map (O(capacity), touches a store) rather than a pure counter reset; the
@@ -505,6 +519,7 @@ export const CLEAR_WITNESS_EXCLUDED = Object.freeze({
     RankSelect: 'static/immutable -- build-once succinct index, no clear() surface at all',
     EliasFano: 'static/immutable -- build-once succinct codec, no clear() surface at all',
     Reservoir: 'O(1) clear()/reset() reset the seen count (+ reset() the PRNG seed); streaming sampler, transitively covered by RandomSet',
+    WindowFoldUint32: 'sliding-window aggregator; reuse idiom is evict, clear() resets positions + flip state, incidental (like WindowFold)',
 });
 
 // ===========================================================================
@@ -553,4 +568,5 @@ export const OP_CLASS = Object.freeze({
     RankSelect: { insert: NA, delete: NA, iterate: NA },
     EliasFano: { insert: NA, delete: NA, iterate: NA },
     Reservoir: { insert: 'worst-case-O(1)', delete: NA, iterate: 'O(n)-per-call' },
+    WindowFoldUint32: { insert: 'worst-case-O(1)', delete: 'worst-case-O(1)', iterate: 'O(n)-per-call' },
 });

@@ -3,10 +3,10 @@
  * that doubles as a teachable textbook: each member solves a real problem AND
  * witnesses its constant on a host (the O(1) Witness -- see test/witness.mjs).
  *
- * v1.10.0 ships twenty members -- SparseSet, RingDeque, UnionFind, MonoDeque,
+ * v1.11.0 ships twenty-one members -- SparseSet, RingDeque, UnionFind, MonoDeque,
  * MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel,
- * RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano, and Reservoir --
- * plus its `VERSION` const. The twenty are independent (no shared mutable module state),
+ * RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano, Reservoir, and WindowFoldUint32 --
+ * plus its `VERSION` const. The twenty-one are independent (no shared mutable module state),
  * so a bundler that imports one drops the others (`sideEffects: false`).
  *
  * The complexity class IS the product: every hot op below is O(1) worst-case and
@@ -19,7 +19,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.10.0';
+export const VERSION = '1.11.0';
 
 /** Largest universe the Uint32 substrate + the (k >>> 0) key check can honor. */
 const MAX_UNIVERSE = 0x100000000; // 2^32
@@ -4855,7 +4855,7 @@ export class CoarseTimerWheel {
  * monoid with a compile-time identity: SUM -> 0, MIN -> +Infinity, MAX -> -Infinity,
  * PRODUCT -> 1. The ctor maps a name to its int, cached as `_op` to drive a switch-free combine
  * (no per-op operator-string test, no lambda -- the MonoDeque frozen-`kind` pattern). The bitwise
- * trio (AND / OR / XOR) is DEFERRED to a future int32-lane sibling `WindowFoldInt32` (a Float64
+ * trio (AND / OR / XOR) now SHIPS in the uint32-lane sibling `WindowFoldUint32` (a Float64
  * aggregate lane cannot honestly carry 32-bit bitwise semantics); MINMAX / SUMSQ (extra lanes) /
  * COUNT (a `size` read) / GCD (a per-combine loop, not O(1)) are DROPPED (see decisions/0023).
  * A plain object is fine: the ctor validates via `typeof WINDOWFOLD_OPS[op] === 'number'`, so an
@@ -5949,5 +5949,318 @@ export class Reservoir {
     /** @private */
     _seenOverflow() {
         throw new RangeError('[lite-o1] Reservoir seen count ceiling 2^53 reached; call clear() to reuse');
+    }
+}
+
+/**
+ * WindowFoldUint32's FROZEN operator enum (names -> ints). EXACTLY three BITWISE / MASKING operators
+ * over 32-bit register masks, each a monoid with a compile-time identity: OR -> 0, AND -> 0xFFFFFFFF,
+ * XOR -> 0. The ctor maps a name to its int, cached as `_op` to drive a switch-free combine (no
+ * per-op operator-string test, no lambda -- the WindowFold / MonoDeque frozen-`kind` pattern). This
+ * is the bitwise trio WindowFold DEFERRED: a Float64 aggregate lane cannot honestly carry 32-bit
+ * `& | ^` (they coerce to a 32-bit int, and AND's all-ones identity has no clean Float64 form), so
+ * the register width forces this separate typed member (see decisions/0025). A plain object is fine:
+ * the ctor validates via `typeof WINDOWFOLDU32_OPS[op] === 'number'`, so an inherited key
+ * ('constructor' etc.) reads as a function and is rejected fail-closed.
+ */
+const WINDOWFOLDU32_OPS = { OR: 0, AND: 1, XOR: 2 };
+
+/** Per-op identity, indexed by the frozen `_op` int. Returned verbatim by query() on an empty window. */
+const WINDOWFOLDU32_IDENT = [0, 0xFFFFFFFF, 0];
+
+/** Largest element count a WindowFoldUint32 ring can honor (2^31 slots per column; identical to MAX_CAPACITY). */
+const WINDOWFOLDU32_MAX_CAPACITY = 0x80000000; // 2^31
+
+/**
+ * WindowFoldUint32 -- a zero-GC, WORST-CASE O(1) BITWISE / MASKING FIFO sliding-window engine
+ * (DABA-Lite -- the De-Amortized Banker's Aggregator, Tangwongsan/Hirzel/Schneider, IBM Research,
+ * arXiv:2009.13768) over TWO parallel `Uint32Array` columns (raw mask + partial aggregate) in one
+ * power-of-two ring. The twenty-first and CLOSING member.
+ *
+ * THIS IS NOT A WINDOWFOLD CLONE. Where WindowFold folds arithmetic monoids over a Float64 lane,
+ * WindowFoldUint32 folds the BITWISE trio -- sliding-window OR (union) / AND (intersection) / XOR
+ * (parity) -- over 32-bit register masks. A Float64 aggregate lane cannot HONESTLY carry 32-bit
+ * `& | ^`: JS bitwise ops coerce their operands to a SIGNED 32-bit int, and AND's all-ones identity
+ * (0xFFFFFFFF) has no clean Float64 form. Register width forces a separate typed member -- the two
+ * lanes are `Uint32Array` and the combine is bitwise, normalized back to UNSIGNED with `>>> 0`.
+ *
+ * MODEL (DABA-Lite -- IDENTICAL to WindowFold's de-amortized banker's two-stacks; see that class for
+ * the full narrative). The window is two logical stacks over the ring at monotone logical positions
+ * [F, E): a FRONT region [F, s) holding SUFFIX aggregates (`_agg[i] = combine([i, s))`) and a BACK
+ * region [s, E) folded into a running accumulator `_bsum`. `query()` is `combine(_agg[F], _bsum)`.
+ * The classic two-stacks FLIP (an O(window) evict spike) is DE-AMORTIZED into a REVERSE phase and a
+ * MERGE phase spread ONE step per push / evict, triggered as soon as `|back| >= |front|`. There is
+ * NO O(window) spike, so WindowFoldUint32 prints NO max-single-op line -- it stays in the worst-case
+ * cohort (MinStack / TimerWheel / SparseTable / BitSet / CoarseTimerWheel / WindowFold).
+ *
+ * OPERATOR (frozen at construction, the WindowFold `kind` pattern). `op` is one of the three names
+ * 'OR' | 'AND' | 'XOR', validated fail-closed and cached as the int `_op` (0..2) that drives a
+ * SWITCH-FREE combine (`_cmb` -- an int branch, no operator-string test, no lambda). Each combine
+ * result is normalized with `>>> 0` so the SIGNED int32 that a JS bitwise op yields is stored /
+ * returned as an UNSIGNED uint32. The identity (0 / 0xFFFFFFFF / 0) is cached as `_ident` and
+ * returned verbatim by query() on an EMPTY window -- `null` is not zero: an empty AND window IS
+ * 0xFFFFFFFF (all ones), an empty OR / XOR window IS 0, never undefined.
+ *
+ * VALUE CONTRACT (STRICT, fail-closed, NO coercion). A pushed mask must satisfy the family's
+ * canonical inline uint32 guard `typeof mask === 'number' && (mask >>> 0) === mask`, which runs
+ * typeof-FIRST so a Symbol / BigInt never reaches the coercion. It rejects a non-number, NaN, a
+ * float (1.5), a NEGATIVE (-1 is NOT accepted as all-ones -- pass 0xFFFFFFFF explicitly), and any
+ * value >= 2^32 (a 53-bit compound integer like 0x100000001) -- ALL throw `[lite-o1]` as a
+ * byte-identical no-op (`-0` passes as 0). The input is NEVER coerced via `>>> 0`; that would
+ * silently truncate a compound integer and corrupt the aggregate, the fail-open the law forbids. The
+ * `>>> 0` inside `_cmb` is on the RESULT of an already-validated combine, not input coercion.
+ *
+ * Fail closed, mirroring the suite: `push` on a FULL ring throws `[lite-o1]` as a BYTE-IDENTICAL
+ * no-op (every guard precedes the first store); a non-clean mask throws `[lite-o1]`; the monotone
+ * position counter is capped at 2^53 (the WindowFold precedent) -- once `_E` would reach it push
+ * THROWS rather than lose integer precision (call clear() to reuse). `evict()` on an EMPTY window is
+ * a no-op (never throws). `query()` NEVER throws.
+ *
+ * `forEach(fn)` (front -> back, alloc-free, fn is (value, index, fold)) and `[Symbol.iterator]()`
+ * (front -> back, the ONE documented per-protocol allocator) are the O(k) scan exceptions, EXCLUDED
+ * from the zero-alloc-per-op claims, the witness, and the perf gate. Capacity ROUNDS UP to the next
+ * power of two (the WindowFold ring precedent).
+ */
+export class WindowFoldUint32 {
+    /**
+     * @param {number} capacity  max simultaneously-live masks; an integer in [1, 2^31],
+     *                           rounded UP to the next power of two.
+     * @param {'OR'|'AND'|'XOR'} op  the frozen bitwise operator.
+     */
+    constructor(capacity, op) {
+        // typeof guard BEFORE any coercion (Number.isInteger never coerces; false on a Symbol /
+        // BigInt), and String(x) in the cold message is Symbol/BigInt-safe.
+        if (typeof capacity !== 'number' || !Number.isInteger(capacity) ||
+            capacity < 1 || capacity > WINDOWFOLDU32_MAX_CAPACITY) {
+            return this._badCapacity(capacity);
+        }
+        // op must be one of the three frozen names. `typeof WINDOWFOLDU32_OPS[op] === 'number'` rejects
+        // a non-string (undefined lookup) AND an inherited key ('constructor' -> a function), fail-closed.
+        const opId = typeof op === 'string' ? WINDOWFOLDU32_OPS[op] : undefined;
+        if (typeof opId !== 'number') return this._badOp(op);
+        const cap = _roundPow2(capacity);
+        this._val = new Uint32Array(cap);    // raw pushed masks (read by the reverse pass + scans)
+        this._agg = new Uint32Array(cap);    // partial aggregates (suffix aggs in the front region)
+        this._cap = cap;                     // power-of-two capacity (rounded)
+        this._mask = cap - 1;                // wrap mask: (pos & MASK) is the physical slot
+        this._op = opId;                     // frozen operator int (0 OR / 1 AND / 2 XOR)
+        this._opName = op;                   // frozen operator name (for the `op` getter)
+        this._ident = WINDOWFOLDU32_IDENT[opId];// operator identity (empty-window query result)
+        // ---- DABA-Lite state (monotone logical positions; ring-indexed by & MASK) ----
+        this._F = 0;                         // front position (next to evict)
+        this._E = 0;                         // end position (next push slot); size = _E - _F
+        this._s = 0;                         // front/back split: front [F, s), back [s, E)
+        this._bsum = this._ident;            // running aggregate of the back region [s, E)
+        this._job = 0;                       // 0 idle, 1 reverse phase, 2 merge phase
+        // reverse-phase cursors
+        this._e0 = 0;                        // frozen back end at flip start
+        this._aggMid = this._ident;          // frozen aggregate of [s, e0) during reverse
+        this._c = 0;                         // reverse cursor (walks e0-1 down to s)
+        this._revAcc = this._ident;          // running suffix accumulator during reverse
+        // merge-phase cursors
+        this._m = 0;                         // old-front / new-front boundary
+        this._p = 0;                         // merge frontier (walks F up to m)
+        this._aggS2 = this._ident;           // frozen aggregate of [m, s) during merge
+    }
+
+    /** The frozen operator name, 'OR' | 'AND' | 'XOR'. O(1). */
+    get op() { return this._opName; }
+
+    /** Number of live masks in the window. O(1). */
+    get size() { return this._E - this._F; }
+
+    /** Max simultaneously-live masks (power-of-two, rounded up). O(1). */
+    get capacity() { return this._cap; }
+
+    /**
+     * The frozen operator's combine, driven by the ctor-cached `_op` int (switch-free: an int branch,
+     * no operator-string test, no lambda). `>>> 0` normalizes the SIGNED int32 a JS bitwise op yields
+     * back to an UNSIGNED uint32 before it is stored / returned -- it is NOT input coercion. @private
+     */
+    _cmb(x, y) {
+        const op = this._op;
+        if (op === 0) return (x | y) >>> 0;      // OR
+        if (op === 1) return (x & y) >>> 0;      // AND
+        return (x ^ y) >>> 0;                    // XOR
+    }
+
+    /**
+     * The current window aggregate as an UNSIGNED uint32. O(1) WORST-CASE (<= 2 combines), zero-alloc.
+     * Returns the operator IDENTITY on an EMPTY window -- NEVER undefined, NEVER throws. During a
+     * de-amortized flip the window reads at most three stored aggregates (old-front top + a frozen
+     * middle + the back sum); idle / merge read `_agg[F]` (the whole front) + the back sum.
+     * @returns {number}
+     */
+    query() {
+        if (this._F === this._E) return this._ident;
+        const F = this._F;
+        if (this._job === 1) {
+            // reverse: front [F, s) is still a single suffix stack; + frozen mid + fresh back.
+            const f = F < this._s ? this._agg[F & this._mask] : this._ident;
+            return this._cmb(this._cmb(f, this._aggMid), this._bsum) >>> 0;
+        }
+        if (this._job === 2 && F === this._p) {
+            // merge not yet past F: agg[F] is still rel m -> fold in the frozen S2 aggregate.
+            const f = F < this._m ? this._agg[F & this._mask] : this._ident;
+            return this._cmb(this._cmb(f, this._aggS2), this._bsum) >>> 0;
+        }
+        // idle, or merge past F: agg[F] is rel s = the whole front aggregate.
+        const f = F < this._s ? this._agg[F & this._mask] : this._ident;
+        return this._cmb(f, this._bsum) >>> 0;
+    }
+
+    /**
+     * Append mask as the newest window element (folded into the running back sum), then advance the
+     * de-amortized flip by one step. O(1) WORST-CASE (<= 2 combines), zero-alloc. The STRICT uint32
+     * guard runs typeof FIRST so a Symbol / BigInt never reaches the coercion. Fails closed, ALL
+     * guards preceding every store (a byte-identical no-op on any reject): a non-uint32 mask throws
+     * via _badMask; a position counter that would reach 2^53 throws via _seqOverflow; a FULL ring
+     * throws via _full.
+     * @param {number} mask  a uint32 (an integer in [0, 2^32-1]); NO coercion, -1 is REJECTED
+     * @returns {WindowFoldUint32} this
+     */
+    push(mask) {
+        if (typeof mask !== 'number' || (mask >>> 0) !== mask) return this._badMask(mask);
+        if (this._E >= MAX_SEQ) return this._seqOverflow();
+        if (this._E - this._F === this._cap) return this._full();
+        this._val[this._E & this._mask] = mask;
+        this._bsum = this._cmb(this._bsum, mask);
+        this._E++;
+        this._advance();
+        return this;
+    }
+
+    /**
+     * Drop the OLDEST window mask (slide the front forward), then advance the de-amortized flip by one
+     * step. O(1) WORST-CASE, zero-alloc. An EMPTY window is a no-op (never throws).
+     * @returns {WindowFoldUint32} this
+     */
+    evict() {
+        if (this._F === this._E) return this;
+        this._F++;
+        this._advance();
+        return this;
+    }
+
+    /**
+     * Empty the window in O(1): resets the positions + running sum + flip state, touches NO store.
+     * The stale masks are unreachable (reads are bounded by [F, E)) and retain no references, so there
+     * is nothing to zero (mirrors WindowFold). After clear() the position counter restarts at 0.
+     */
+    clear() {
+        this._F = 0; this._E = 0; this._s = 0;
+        this._bsum = this._ident;
+        this._job = 0;
+        this._e0 = 0; this._aggMid = this._ident; this._c = 0; this._revAcc = this._ident;
+        this._m = 0; this._p = 0; this._aggS2 = this._ident;
+    }
+
+    /**
+     * One step of the de-amortized flip (called once per push / evict). Triggers a new flip when the
+     * back has caught the front, then does one REVERSE or MERGE combine. WORST-CASE O(1). @private
+     */
+    _advance() {
+        const mask = this._mask;
+        if (this._job === 0) {
+            // trigger a flip as soon as |back| >= |front| (bounds the reversal to the front's size).
+            const front = this._s - this._F;
+            const back = this._E - this._s;
+            if (back > 0 && back >= front) {
+                this._e0 = this._E;
+                this._aggMid = this._bsum;
+                this._bsum = this._ident;
+                this._c = this._e0 - 1;
+                this._revAcc = this._ident;
+                this._job = 1;
+            }
+        }
+        if (this._job === 1) {
+            // REVERSE: rebuild [s, e0) right-to-left into suffix aggregates, one element per step.
+            const c = this._c;
+            this._revAcc = this._cmb(this._val[c & mask], this._revAcc);
+            this._agg[c & mask] = this._revAcc;
+            this._c = c - 1;
+            if (this._c < this._s) this._finishReverse();
+        } else if (this._job === 2) {
+            // MERGE: fold the old front's aggregates into the new right boundary, one per step.
+            const p = this._p;
+            this._agg[p & mask] = this._cmb(this._agg[p & mask], this._aggS2);
+            this._p = p + 1;
+            if (this._p >= this._m) this._job = 0;
+        }
+        // an evict may have drained the old front while merging -> promote to a single stack.
+        if (this._job === 2 && this._F >= this._m) this._job = 0;
+    }
+
+    /**
+     * Reverse complete: the frozen [s, e0) segment is now a suffix stack rel e0. Promote the split
+     * (the old back becomes the new front's newer half), then start the MERGE phase unless the old
+     * front already drained (then it is already a single stack). @private
+     */
+    _finishReverse() {
+        this._m = this._s;
+        this._s = this._e0;
+        this._aggS2 = this._aggMid;
+        if (this._F < this._m) { this._job = 2; this._p = this._F; }
+        else this._job = 0;
+    }
+
+    /**
+     * Iterate live masks FRONT -> BACK (oldest -> newest), alloc-free. O(k) -- the documented
+     * exception, EXCLUDED from the zero-alloc-per-op claims. A HOISTED callback keeps it
+     * allocation-free. `index` is the position from the front (0 == oldest).
+     * @param {(value:number, index:number, fold:WindowFoldUint32)=>void} fn
+     */
+    forEach(fn) {
+        const val = this._val;
+        const mask = this._mask;
+        const F = this._F;
+        const count = this._E - F;
+        for (let i = 0; i < count; i++) fn(val[(F + i) & mask], i, this);
+    }
+
+    /**
+     * Iterate live mask values FRONT -> BACK (oldest -> newest). O(k). The ONE documented
+     * per-protocol ALLOCATOR (a {value, done} per step) -- kept OUT of the zero-alloc claims (use
+     * forEach for the alloc-free scan).
+     */
+    *[Symbol.iterator]() {
+        const val = this._val;
+        const mask = this._mask;
+        const F = this._F;
+        const E = this._E;
+        for (let i = F; i < E; i++) yield val[i & mask];
+    }
+
+    // ---- cold path only: throw builders (string concat lives here, off the hot body) ----
+
+    /** @private */
+    _badMask(mask) {
+        // String(mask) -- NOT '+ mask' / a template literal: those THROW on a Symbol or BigInt, which
+        // would turn a fail-closed reject into a different crash.
+        throw new TypeError(
+            '[lite-o1] WindowFoldUint32 mask must be a uint32 (an integer in [0, 2^32-1]), got ' + String(mask));
+    }
+
+    /** @private */
+    _badCapacity(capacity) {
+        throw new RangeError(
+            '[lite-o1] WindowFoldUint32 capacity must be an integer in [1, 2^31], got ' + String(capacity));
+    }
+
+    /** @private */
+    _badOp(op) {
+        throw new RangeError(
+            '[lite-o1] WindowFoldUint32 op must be one of "OR" | "AND" | "XOR", got ' + String(op));
+    }
+
+    /** @private */
+    _full() {
+        throw new RangeError('[lite-o1] WindowFoldUint32 full (capacity ' + this._cap + ')');
+    }
+
+    /** @private */
+    _seqOverflow() {
+        throw new RangeError('[lite-o1] WindowFoldUint32 position ceiling 2^53 reached; call clear() to reuse');
     }
 }

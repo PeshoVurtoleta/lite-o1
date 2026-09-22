@@ -48,7 +48,7 @@
  * metric are unchanged; only the measurement is made steadier.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano, Reservoir } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano, Reservoir, WindowFoldUint32 } from '../O1.js';
 
 const SIZES = [1e3, 1e4, 1e5, 1e6, 1e7];
 const BATCH = 1e6;
@@ -2323,5 +2323,91 @@ if (!rvAllOk) {
     if (!rvOk) console.error('  violation Reservoir flatness ' + fmt(rvw.flatness) + ' < 0.70');
     if (!rvFoilOk) console.error('  violation naive foil flatness ' + fmt(rvFoil.flatness) + ' > 0.55');
     if (!rvRatioOk) console.error('  violation min Reservoir ratio ' + fmt(rvRatio) + 'x < 1.50x');
+    process.exitCode = 1;
+}
+
+// ===========================================================================
+// WindowFoldUint32 witness -- WORST-CASE-O(1) bitwise query (DABA-Lite) vs a naive
+// O(W)-refold foil over the same sliding window of 32-bit masks.
+// ===========================================================================
+// The bitwise / masking sibling of WindowFold: a sliding OR window over Uint32 masks. push / evict /
+// query are each WORST-CASE O(1) (<= 2 combines, a single ALU |), so the op streams FLAT as W grows --
+// no O(W) refold, no flip spike. The foil re-ORs the whole window each step (O(W)), collapsing.
+function buildWindowFoldUint32(n) {
+    const W = n;
+    const wf = new WindowFoldUint32(W + 1, 'OR'); // cap rounds up above W -> never full
+    let v = 0;
+    for (let k = 0; k < W; k++) { v = (v + 0x9e3779b1) >>> 0; wf.push(v & 0xffff); } // pre-fill the window
+    const op = () => {
+        v = (v + 0x9e3779b1) >>> 0;
+        wf.push(v & 0xffff);
+        wf.evict();               // keep exactly W live -> the window slides by one
+        SINK += wf.query();       // O(1) worst-case aggregate read
+    };
+    return { op };
+}
+// Foil: a naive sliding-window OR that REFOLDS the whole window each step -- a Uint32Array ring holds
+// the last W masks; every op overwrites the oldest and then linearly ORs all W. O(W) per element, so
+// ops/ms collapses as W grows -- the exact trap DABA-Lite kills.
+function buildWindowFoldUint32RefoldFoil(n) {
+    const W = n;
+    const win = new Uint32Array(W);
+    let v = 0;
+    for (let k = 0; k < W; k++) { v = (v + 0x9e3779b1) >>> 0; win[k] = v & 0xffff; }
+    let head = 0;
+    const op = () => {
+        v = (v + 0x9e3779b1) >>> 0;
+        win[head] = v & 0xffff;
+        head = head + 1; if (head === W) head = 0;
+        let acc = 0;
+        for (let j = 0; j < W; j++) acc = (acc | win[j]) >>> 0; // O(W) bitwise refold
+        SINK += acc;
+    };
+    return { op };
+}
+
+const wfuw = witness(buildWindowFoldUint32, MONO_SIZES, MONO_BATCH, REPS, WF_GATE_MIN);
+const wfuFoil = witness(buildWindowFoldUint32RefoldFoil, MONO_SIZES, NAIVE_WIN_BATCH, REPS, WF_GATE_MIN);
+
+console.log('');
+console.log('O(1) Witness -- WindowFoldUint32 query (OR, DABA-Lite bitwise) vs a naive window refold (rate ops/ms, median of ' +
+    REPS + ', gate size >= ' + nStr(WF_GATE_MIN) + ')');
+console.log('');
+console.log('  W         WFUint32 ops/ms    naive ops/ms   ratio');
+console.log('  --------  ----------------   ------------   -----');
+let minWfuRatio = Infinity;
+for (let i = 0; i < MONO_SIZES.length; i++) {
+    const a = wfuw.rows[i].opsPerMs;
+    const b = wfuFoil.rows[i].opsPerMs;
+    const ratio = b > 0 ? a / b : Infinity;
+    const gated = MONO_SIZES[i] >= WF_GATE_MIN;
+    if (gated && ratio < minWfuRatio) minWfuRatio = ratio;
+    const tag = MONO_SIZES[i] < WF_GATE_MIN ? '   <- L1 turbo micro-case (shown, not gated)' : '';
+    console.log('  ' + nStr(MONO_SIZES[i]).padEnd(8) + '  ' +
+        fmt(a).padStart(16) + '   ' + fmt(b).padStart(12) + '   ' + fmt(ratio).padStart(5) + 'x' + tag);
+}
+
+console.log('');
+console.log('  WindowFoldUint32 flatness (size >= ' + nStr(WF_GATE_MIN) + '): ' + fmt(wfuw.flatness) + '   (gate >= 0.70)');
+console.log('  naive foil flatness (last/first): ' + fmt(wfuFoil.flatness) + '   (gate <= 0.55 -- true O(W) collapse)');
+console.log('  min WindowFoldUint32/naive ratio: ' + fmt(minWfuRatio) + 'x  (gate >= 1.50x)');
+// NO MAX-single-op line: push / evict / query are WORST-CASE O(1) (the DABA-Lite flip is de-amortized to
+// <= 2 combines per op, a single ALU |/&/^), so the flat query line IS the worst-case claim.
+
+const wfuOk = wfuw.flatness >= 0.70;
+const wfuFoilOk = wfuFoil.flatness <= 0.55;
+const wfuRatioOk = minWfuRatio >= 1.5;
+const wfuAllOk = wfuOk && wfuFoilOk && wfuRatioOk;
+
+console.log('');
+console.log('WITNESS WindowFoldUint32 ' + (wfuAllOk ? 'ok' : 'FAIL') +
+    ' wfu.flatness=' + fmt(wfuw.flatness) +
+    ' naive.flatness=' + fmt(wfuFoil.flatness) +
+    ' minRatio=' + fmt(minWfuRatio) + 'x');
+
+if (!wfuAllOk) {
+    if (!wfuOk) console.error('  violation WindowFoldUint32 flatness ' + fmt(wfuw.flatness) + ' < 0.70');
+    if (!wfuFoilOk) console.error('  violation naive foil flatness ' + fmt(wfuFoil.flatness) + ' > 0.55');
+    if (!wfuRatioOk) console.error('  violation min WindowFoldUint32 ratio ' + fmt(minWfuRatio) + 'x < 1.50x');
     process.exitCode = 1;
 }

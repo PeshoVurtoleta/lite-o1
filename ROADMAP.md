@@ -31,7 +31,7 @@ verbatim from RESEARCH.md so they are not a surprise at planning time.
 | **M18** | **RankSelect bitvector** (cs-poppy class) | 1.8.0 | O(1) worst-case rank + O(1) select (after O(n) build) | SHIPPED (ADR 0024; awaiting publish) |
 | **M19** | **EliasFano** (succinct monotone-sequence codec) | 1.9.0 | O(1) worst-case access + data-dependent O(1)-typical/O(log n)-worst nextGEQ, ~2+log2(U/n) bits/elem, on the M18 rank/select layer | SHIPPED (ADR 0025; HOME resolved = lite-o1, lite-loglogn is DYNAMIC so it does not fit a static codec) |
 | **M20** | **Reservoir** (Algorithm R streaming sampler) | 1.10.0 | exact uniform k-sample from an UNBOUNDED stream, worst-case O(1)/item | SHIPPED (ADR 0026; Algorithm R -- per-item worst-case O(1); L rejected as data-dependent; add()/get(), no sample(); clear() vs reset()) |
-| **M21** | **WindowFoldInt32** (int32-lane WindowFold sibling) | 1.11.0 | bitwise AND/OR/XOR sliding-window folds; DABA-Lite core by design-parity | FINISH seq (lowest value; confirm worth doing) |
+| **M21** | **WindowFoldUint32** (bitwise/masking window engine) | 1.11.0 | bitwise OR/AND/XOR sliding-window folds over Uint32 masks; DABA-Lite core | SHIPPED (ADR 0027; renamed from WindowFoldInt32 -> Uint32 lane; strict uint32 fail-closed, never coerced; CLOSES lite-o1 at 21) |
 
 M14 is the 14th member, M15 the 15th. Suggested order (RESEARCH.md): **BitSet
 first** (broadest reuse, easy win, mutable worst-case cohort), then **AliasTable**
@@ -712,11 +712,11 @@ in `RESEARCH.md` section 4, "Deferred candidates beyond M18".
 |---|--------|-----|----------|------------|--------------|
 | **M19** | **EliasFano** (succinct monotone-sequence codec) | 1.9.0 | O(1) worst-case access + data-dependent O(1)-typical/O(log n)-worst nextGEQ, ~2 + log2(U/n) bits/elem, on the M18 rank/select layer | M18 (RankSelect, shipped) | **SHIPPED (ADR 0025).** HOME RESOLVED = lite-o1: lite-loglogn is a DYNAMIC add/delete predecessor family and does NOT fit a STATIC codec (and does not actually plan EliasFano -- the earlier note was stale). Framing A: access() worst-case O(1) headline + succinct space; nextGEQ() shipped and labeled DATA-DEPENDENT (O(1) typical / O(log n) worst), the family's first data-dependent op -- NOT a clean expected-O(1). |
 | **M20** | **Reservoir** (Algorithm R) | 1.10.0 | exact uniform k-sample from an UNBOUNDED stream, worst-case O(1)/item; distinct from RandomSet (live set) / AliasTable (static weights) | none | **SHIPPED (ADR 0026).** Algorithm R chosen (per-item worst-case O(1) -- the honesty fit); Algorithm L REJECTED (skip-based EXPECTED cost -- a second data-dependent member). Fixed EXACT k, ONE Float64 store, per-instance NR-LCG seed. Surface: add(v)/get(i)/forEach/iterate + size/seen/capacity/seed + clear() (no reseed) / reset() (reseed); NO sample() (the reservoir IS the sample). 2^53 seen ceiling fails closed. Weighted reservoir (A-Res) OUT of scope. |
-| **M21** | **WindowFoldInt32** (int32-lane WindowFold sibling) | 1.11.0 | bitwise AND/OR/XOR sliding-window folds a Float64 lane cannot honestly carry (ADR 0023 deferral) | M17 (DABA-Lite core, design-parity) | **CONFIRM WORTH DOING** -- the lowest-value of the three (near-clone of WindowFold with an Int32 lane). Separate class vs re-param; exact op set (AND/OR/XOR; int32 MIN/MAX here or on WindowFold's Float64?); int32 value contract. Could stay deferred if "closed" does not require it. |
+| **M21** | **WindowFoldUint32** (bitwise/masking window engine) | 1.11.0 | bitwise OR/AND/XOR sliding-window folds a Float64 lane cannot honestly carry (ADR 0023 deferral) | M17 (DABA-Lite core, design-parity) | **SHIPPED (ADR 0027).** Branded as the BITWISE/MASKING engine (not a clone) -- register width dictates structure. RENAMED WindowFoldInt32 -> **WindowFoldUint32** (Uint32 lane: masks are unsigned; AND identity 0xFFFFFFFF reads as 4294967295). Op set = the three associative bitwise monoids OR/AND/XOR only (no int MIN/MAX -- WindowFold's Float64 covers numeric). Separate class. Value contract = STRICT fail-closed uint32 (`(mask>>>0)!==mask` throws; NEVER coerced -- silent truncation of a 53-bit int would violate the fail-closed law). Same DABA-Lite worst-case-O(1) core; query = a single ALU op. CLOSES lite-o1 at 21 members. |
 
-Suggested next session: **M21 WindowFoldInt32** (only if you want the roster literally complete -- the
-lowest-value of the three, a near-clone of WindowFold with an Int32 lane; could stay deferred if
-"closed" does not require it). M19 Elias-Fano (ADR 0025) and M20 Reservoir (ADR 0026) are SHIPPED.
-ADR 0027 (WindowFoldInt32) remains.
+**lite-o1 is CLOSED at twenty-one members (2026-09-23).** The M19-M21 closing sequence is complete:
+M19 Elias-Fano (ADR 0025), M20 Reservoir (ADR 0026), and M21 WindowFoldUint32 (ADR 0027) are all
+SHIPPED. The public roster is frozen; new work moves to the @zakkster/lite-sketch approximate-summary
+sibling. (Any future lite-o1 member would be a deliberate re-opening, not a planned continuation.)
 
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>

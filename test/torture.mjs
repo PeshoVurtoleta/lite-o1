@@ -39,7 +39,7 @@ async function main() {
     const { GcProfiler, checkNoGc, measureAllocs } =
         await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano, Reservoir } = await import('../O1.js');
+    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano, Reservoir, WindowFoldUint32 } = await import('../O1.js');
 
     const U = 1 << 16;      // universe 65536
     const CAP = 1 << 14;    // capacity 16384
@@ -296,6 +296,16 @@ async function main() {
             rv1.add(i);
             rv1.reset();
             tracker.track(rv1, noop, 'reservoir', { audit: true });
+            // WindowFoldUint32 owns only its two Uint32Array columns (raw mask + partial aggregate);
+            // nothing external to release. Fill a bounded window, exercise push/evict/query/forEach/clear,
+            // then track; reclaim proven by size()->0.
+            const wfu1 = new WindowFoldUint32(256, ['OR', 'AND', 'XOR'][i % 3]);
+            for (let k = 0; k < 200; k++) wfu1.push(((k * 2654435761) ^ i) >>> 0 & 0xffff);
+            wfu1.query();
+            wfu1.evict();
+            wfu1.forEach(noop);
+            wfu1.clear();
+            tracker.track(wfu1, noop, 'windowfolduint32', { audit: true });
         }
         return tracker.size();
     }
@@ -825,6 +835,26 @@ async function main() {
     const rvGetAllocBytes = Math.max(0, Math.round(rvGetBpc));
     const rvGetAllocOk = rvGetAllocBytes === 0;
 
+    // WindowFoldUint32 hot path: a bounded resident sliding window (DABA-Lite, bitwise OR) churned by
+    // push + evict + query each step. WFU_W masks are primed (< cap so never full); each step pushes one
+    // mask, evicts one (the window slides, driving the de-amortized flip), and reads the aggregate.
+    // Every op is <= 2 combines (a single ALU |) over two Uint32Array columns -- zero JS allocation.
+    const WFU_CAP = 1 << 12;                 // 4096 slots (power of two)
+    const WFU_W = 1 << 11;                   // 2048 resident masks, < cap so never full
+    const wfu = new WindowFoldUint32(WFU_CAP, 'OR');
+    for (let k = 0; k < WFU_W; k++) wfu.push((k * 2654435761) >>> 0 & 0xffff); // bounded resident window
+    let wfuv = 0, wfuSink = 0;
+    const wfuStep = () => {
+        wfuv = (wfuv + 0x9e3779b1) >>> 0;
+        wfu.push(wfuv & 0xffff);
+        wfu.evict();
+        wfuSink = (wfuSink + wfu.query()) | 0;
+    };
+    const wfuAllocRes = measureAllocs(wfuStep, { iterations: 100000, batches: 8 });
+    const wfuBpc = wfuAllocRes.bytesPerCall === null ? 0 : wfuAllocRes.bytesPerCall;
+    const wfuAllocBytes = Math.max(0, Math.round(wfuBpc));
+    const wfuAllocOk = wfuAllocBytes === 0;
+
     // "0 B/op" resolved at the sampling floor: heapUsed deltas are quantized and
     // noisy, so a truly non-allocating op reads a sub-byte figure (a lone blip
     // in one batch / iterations). Round to the nearest byte -- any per-op
@@ -1073,6 +1103,10 @@ async function main() {
         rvHot.clear();
         for (let k = 0; k < CAP; k++) rvHot.add(k);      // stream past capacity (sampling); fixed k-slot store
         rvHot.clear();                                   // O(1): resets seen, the reused Float64 store grows nothing
+        wfu.clear();
+        for (let k = 0; k < WFU_CAP; k++) wfu.push(k & 0xffff); // fill to capacity (flip-heavy)
+        while (wfu.size > 0) wfu.evict();                // drain to empty (completes every flip)
+        wfu.clear();                                     // O(1): resets positions + flip state, no store
     }
     globalThis.gc();
     const abAfter = process.memoryUsage().arrayBuffers;
@@ -1083,7 +1117,7 @@ async function main() {
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
         findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && monoAllocOk &&
         minAllocOk && randAllocOk && freqAllocOk && buckAllocOk && twAllocOk && htwAllocOk &&
-        ringLogAllocOk && cuckAllocOk && stAllocOk && bitAllocOk && bitHighAllocOk && bitOrAllocOk && bitRetOk && aliasAllocOk && ctwAllocOk && wfAllocOk && rsRankAllocOk && rsSelAllocOk && efAccAllocOk && efNextAllocOk && rvAddAllocOk && rvGetAllocOk && abOk;
+        ringLogAllocOk && cuckAllocOk && stAllocOk && bitAllocOk && bitHighAllocOk && bitOrAllocOk && bitRetOk && aliasAllocOk && ctwAllocOk && wfAllocOk && rsRankAllocOk && rsSelAllocOk && efAccAllocOk && efNextAllocOk && rvAddAllocOk && rvGetAllocOk && wfuAllocOk && abOk;
 
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
@@ -1110,10 +1144,11 @@ async function main() {
         efAccAllocBytes + ' B/op (EliasFano access) ' +
         efNextAllocBytes + ' B/op (EliasFano nextGEQ) ' +
         rvAddAllocBytes + ' B/op (Reservoir add) ' +
-        rvGetAllocBytes + ' B/op (Reservoir get)' +
+        rvGetAllocBytes + ' B/op (Reservoir get) ' +
+        wfuAllocBytes + ' B/op (WindowFoldUint32)' +
         ' | bitRetGrowth=' + bitRetGrowth + ' B' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
-        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' bsSink=' + bsSink + ' bhSink=' + bhSink + ' brSink=' + brSink + ' atSink=' + atSink + ' wfSink=' + wfSink + ' rsRankSink=' + rsRankSink + ' rsSelSink=' + rsSelSink + ' efAccSink=' + efAccSink + ' efNextSink=' + efNextSink + ' rvAddSink=' + rvAddSink + ' rvGetSink=' + rvGetSink + ' abGrowth=' + abDelta + ')');
+        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' bsSink=' + bsSink + ' bhSink=' + bhSink + ' brSink=' + brSink + ' atSink=' + atSink + ' wfSink=' + wfSink + ' rsRankSink=' + rsRankSink + ' rsSelSink=' + rsSelSink + ' efAccSink=' + efAccSink + ' efNextSink=' + efNextSink + ' rvAddSink=' + rvAddSink + ' rvGetSink=' + rvGetSink + ' wfuSink=' + wfuSink + ' abGrowth=' + abDelta + ')');
 
     if (!ok) {
         if (!trackedOk) console.error('  vacuous: tracker held ' + trackedMid + ' instances (expected > 0)');
@@ -1148,6 +1183,7 @@ async function main() {
         if (!efNextAllocOk) console.error('  alloc ' + efNextAllocBytes + ' B/op EliasFano nextGEQ (raw bytesPerCall ' + efNextBpc + ')');
         if (!rvAddAllocOk) console.error('  alloc ' + rvAddAllocBytes + ' B/op Reservoir add (raw bytesPerCall ' + rvAddBpc + ')');
         if (!rvGetAllocOk) console.error('  alloc ' + rvGetAllocBytes + ' B/op Reservoir get (raw bytesPerCall ' + rvGetBpc + ')');
+        if (!wfuAllocOk) console.error('  alloc ' + wfuAllocBytes + ' B/op WindowFoldUint32 (raw bytesPerCall ' + wfuBpc + ')');
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;
     }

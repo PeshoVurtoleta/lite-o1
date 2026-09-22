@@ -411,17 +411,23 @@ it is promoted to M19+. Listed newest-first by how load-bearing the open questio
   the family's first data-dependent op, NOT a clean expected-O(1). It composes M18's RankSelect (reuse,
   never fork). Sub-logarithmic (O(log log U)) predecessor remains lite-loglogn's separate domain.
 
-- **WindowFoldInt32** -- the int32-lane sibling of WindowFold (M17), carrying the BITWISE associative
-  operators (AND identity -1 / OR identity 0 / XOR identity 0 -- clean monoids) and any int-domain monoid
-  that a Float64 value lane CANNOT honestly hold. Same DABA-Lite worst-case-O(1) push/evict/query engine,
-  but over an Int32Array value + aggregate lane. User-named and DEFERRED at the M17 session (ADR 0023).
-  RESEARCH NEEDED: (a) a SEPARATE class (lean -- a frozen lane TYPE, not just a frozen op, keeps each variant
-  0 B/op and avoids a union lane) vs a re-parameterized WindowFold; (b) the exact operator set (AND/OR/XOR
-  certainly; whether int32 MIN/MAX belong here or stay on WindowFold's Float64 lane, which already covers
-  integer values to 2^53); (c) the value contract (int32 coercion vs a typeof-int guard; how |v| > 2^31
-  fails closed); (d) whether it shares the DABA-Lite six-cursor core with WindowFold via a private helper by
-  DESIGN-PARITY without a runtime cross-dep. Feeds bitmask-window / rolling-permission / windowed-flags
-  workloads.
+- **WindowFoldUint32** (renamed from the provisional WindowFoldInt32) -- **SHIPPED at v1.11.0 (M21, ADR
+  0027), the CLOSING member.** The BITWISE / MASKING sliding-window engine: the bitwise sibling of
+  WindowFold (M17), carrying the associative BITWISE operators a Float64 value lane cannot honestly hold.
+  Same DABA-Lite worst-case-O(1) push/evict/query engine, over TWO Uint32Array lanes (value + aggregate).
+  RESOLVED research questions: (a) **a SEPARATE class** (a frozen lane TYPE keeps it 0 B/op; register width
+  dictates structure -- the ADR 0027 thesis), NOT a re-parameterized WindowFold; (b) operator set = **OR /
+  AND / XOR only** (the three associative bitwise monoids; NAND/NOR are non-associative -> out; int MIN/MAX
+  stay on WindowFold's Float64 lane, which already covers integers to 2^53); (c) **Uint32, not Int32** --
+  masks are unsigned, so a `>>> 0`-normalized Uint32Array lane makes `0xFFFFFFFF` round-trip as 4294967295
+  and AND's identity read as unsigned; the value contract is **STRICT fail-closed uint32**
+  (`typeof mask !== 'number' || (mask >>> 0) !== mask` throws, the family's canonical inline guard) --
+  NEVER coerced, because silently truncating a 53-bit compound integer under `>>> 0` would corrupt the
+  aggregate and violate the fail-closed law (the HierarchicalTimerWheel / Reservoir precedent); `-1` is not
+  all-ones (pass 0xFFFFFFFF); (d) it shares the DABA-Lite six-cursor core with WindowFold by
+  DESIGN-PARITY (an inlined copy at Uint32 width), NO runtime cross-dep. `query()` is a single ALU op
+  (`|`/`&`/`^`), identity-on-empty (0 / 0xFFFFFFFF / 0). Feeds bitmask-window / rolling-permission /
+  windowed-flags / presence-bitmap workloads. This closes the lite-o1 roster; new work -> lite-sketch.
 
 - **Reservoir sampler (Algorithm R)** -- **SHIPPED as `Reservoir` at v1.10.0 (M20, ADR 0026).** Exact
   UNIFORM sampling of k items from an unbounded STREAM of unknown length in worst-case O(1) per item (for

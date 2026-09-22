@@ -203,6 +203,8 @@ test('supportsWorkload: churn is every mutable member (static SparseTable/AliasT
     assert.equal(supportsWorkload('AliasTable', 'churn'), false, 'AliasTable is static -> no churn');
     assert.equal(supportsWorkload('RankSelect', 'churn'), false, 'RankSelect is static -> no churn');
     assert.equal(supportsWorkload('EliasFano', 'churn'), false, 'EliasFano is static -> no churn');
+    assert.equal(supportsWorkload('Reservoir', 'churn'), true, 'Reservoir is a MUTABLE streaming member -> churn applies');
+    assert.equal(supportsWorkload('WindowFoldUint32', 'churn'), true, 'WindowFoldUint32 is a MUTABLE sliding-window member -> churn applies');
     assert.equal(supportsWorkload('SparseSet', 'ecs'), true);
     assert.equal(supportsWorkload('SparseSet', 'cache'), true);
     for (const member of ['RingDeque', 'UnionFind', 'MonoDeque']) {

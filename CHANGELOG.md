@@ -8,6 +8,50 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.11.0] - 2026-09-23
+
+### Added
+
+- **`WindowFoldUint32` -- the twenty-first (and closing) member: the BITWISE / MASKING sliding-window
+  engine.** A zero-GC, WORST-CASE O(1) general FIFO sliding-window fold over a frozen BITWISE operator
+  (`OR` / `AND` / `XOR`) on 32-bit MASKS, over TWO `Uint32Array` columns -- the same DABA-Lite
+  de-amortized six-cursor core as `WindowFold`, at Uint32 width. It is its OWN class, NOT a `WindowFold`
+  operator flag: a `Float64` aggregate lane cannot honestly carry 32-bit `& | ^` (they coerce to 32-bit;
+  AND's all-ones identity has no clean Float64 form), so register width -- not taste -- forces a separate
+  typed member (data type dictates structure). `push(mask)` / `evict()` / `query()` are each worst-case
+  O(1) (<= 2 combines, a single ALU `|`/`&`/`^`, no flip spike, NO max-single-op line); `query()` is a
+  single ALU op with zero FP. Three associative bitwise monoids: `OR` (identity `0`, union), `AND`
+  (identity `0xFFFFFFFF`, intersection), `XOR` (identity `0`, parity); the operator is frozen at
+  construction (a ctor-cached int drives a switch-free combine). `query()` on an empty window returns the
+  operator identity as an UNSIGNED uint32, never undefined. **The mask arg is a STRICT uint32** --
+  `typeof mask === 'number' && (mask >>> 0) === mask`, an integer in `[0, 2^32)`: a float / negative /
+  `>= 2^32` / NaN / Symbol / BigInt throws `[lite-o1]` typeof-first (byte-identical no-op). It is NEVER
+  coerced -- a 53-bit compound integer would silently strip its top bits under `>>> 0` and corrupt the
+  aggregate, so it fails closed instead (the HierarchicalTimerWheel / Reservoir precedent); `-1` is NOT
+  accepted as all-ones (pass `0xFFFFFFFF`). Fixed capacity (rounds up to a power of two), fail closed on
+  a full push. The bitwise sibling of `WindowFold`'s numeric SUM/MIN/MAX/PRODUCT aggregator. See
+  [`decisions/0027`](./decisions/0027-windowfolduint32.md).
+- **`test/WindowFoldUint32.test.js`** -- full behavioral suite: all three ops vs a naive O(W) full-window
+  refold oracle (union / intersection / parity, incl. the AND all-ones + XOR parity edges); identity on
+  empty; the Uint32 round-trip (`0xFFFFFFFF` reads back as `4294967295`, not `-1`); the STRICT fail-closed
+  value matrix (float / negative / `>= 2^32` compound / NaN / Symbol / BigInt all throw, `-1` rejected,
+  `0xFFFFFFFF` accepted, `-0` -> `0`); constructor + full-window fail-closed; clear + reuse.
+- Gate coverage extended for the twenty-first member: `test/torture.mjs` (retention -> `size() = 0` plus a
+  `0 B/op` hot-path phase on `push` / `evict` / `query`), `test/witness.mjs` (a flat query line vs a naive
+  O(W) bitwise-refold foil that collapses, NO max-single-op line), `test/perf/PerfGate.test.mjs`
+  (push-evict-query / query-read / evict-refill scenarios + an allocating-iterator teeth case), and
+  `benchmark/` (`SUBJECTS` -> 21; a MUTABLE sliding-window member, IN the churn workload).
+
+### Changed
+
+- Roster is now TWENTY-ONE members and lite-o1 is CLOSED at twenty-one; `O1.js` header member-count +
+  roster list + `VERSION` bumped to `1.11.0`, with `package.json` (version + description + keywords) and
+  `llms.txt` in sync. `O1.js` is a PURE APPEND -- the prior twenty member classes are byte-identical (only
+  the header comment, the `VERSION` const, and the `WindowFold` deferral note changed). The `WindowFold`
+  doc note now records that its deferred bitwise trio SHIPS here (renamed from the provisional
+  "WindowFoldInt32" to `WindowFoldUint32`, ADR 0027 supersedes the ADR 0023 deferral). README + GUIDE
+  document the bitwise/masking window leaf.
+
 ## [1.10.0] - 2026-09-23
 
 ### Added

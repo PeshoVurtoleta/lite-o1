@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-Version: 1.10.0
+Version: 1.11.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -13,13 +13,14 @@ op is O(1) worst-case (or O(1)-amortized where stated) and allocates zero bytes
 after construction, and a shipped witness harness demonstrates the flat
 throughput curve against a built-in foil.
 
-v1.10.0 ships twenty members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
+v1.11.0 ships twenty-one members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
 RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap,
-SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano, and Reservoir.
-They share no mutable module state, so a bundler that imports one drops the others (tree-shakeable).
-1.10.0 adds Reservoir (the twentieth member; 1.9.0 added EliasFano, 1.8.0 added RankSelect, 1.7.0
-added WindowFold, 1.6.0 added CoarseTimerWheel, 1.5.0 added AliasTable, 1.4.0 added BitSet, 1.3.0
-added SparseTable, 1.2.0 added CuckooMap, 1.1.0 added RingLog).
+SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano, Reservoir, and
+WindowFoldUint32. They share no mutable module state, so a bundler that imports one drops the others
+(tree-shakeable). 1.11.0 adds WindowFoldUint32 (the twenty-first member; 1.10.0 added Reservoir, 1.9.0
+added EliasFano, 1.8.0 added RankSelect, 1.7.0 added WindowFold, 1.6.0 added CoarseTimerWheel, 1.5.0
+added AliasTable, 1.4.0 added BitSet, 1.3.0 added SparseTable, 1.2.0 added CuckooMap, 1.1.0 added
+RingLog).
 
 ## Exports (from the single main file O1.js)
 
@@ -152,7 +153,22 @@ added SparseTable, 1.2.0 added CuckooMap, 1.1.0 added RingLog).
   alloc), on a non-clean value (typeof-first, byte-identical no-op), and at the 2^53 seen-count ceiling;
   get() never throws (a bad i -> undefined). For a weighted stream sample (A-Res) or a sliding-window
   sample, neither ships -- Reservoir is the exact uniform whole-stream sampler.
-- `VERSION` -- string, '1.10.0'.
+- `WindowFoldUint32` -- class. The BITWISE / MASKING sliding-window engine: a zero-GC, WORST-CASE O(1)
+  general FIFO sliding-window fold over a frozen BITWISE operator (OR / AND / XOR) on 32-bit MASKS, over
+  TWO Uint32Array columns (the DABA-Lite de-amortized core, identical to WindowFold). It is its OWN class,
+  NOT a WindowFold operator flag: a Float64 aggregate lane cannot honestly carry 32-bit `& | ^` (they
+  coerce to 32-bit; AND's all-ones identity has no clean Float64 form), so register width forces a
+  separate typed member -- data type dictates structure. push(mask) / evict() / query() are each
+  worst-case O(1) (<= 2 combines, a single ALU |/&/^, no flip spike, NO max-single-op line). The three
+  operators form monoids: OR (identity 0), AND (identity 0xFFFFFFFF), XOR (identity 0); query() on an
+  empty window returns the identity, never undefined, as an UNSIGNED uint32. The mask arg is a STRICT
+  uint32 (integer in [0, 2^32)): a float / negative / >= 2^32 / NaN / Symbol / BigInt throws [lite-o1]
+  typeof-first (a byte-identical no-op) -- it is NEVER coerced (so a 53-bit compound integer cannot
+  silently truncate the aggregate); -1 is NOT all-ones (pass 0xFFFFFFFF). Fixed capacity (rounds up to a
+  power of two), fail closed on a full push; the sibling of WindowFold's numeric SUM/MIN/MAX/PRODUCT
+  aggregator. For numeric folds use WindowFold; for arbitrary-index / out-of-order range aggregation use
+  @zakkster/lite-logn's Fenwick.
+- `VERSION` -- string, '1.11.0'.
 
 ## SparseSet
 
@@ -1307,6 +1323,51 @@ Non-overlap: RandomSet draws uniformly from a MATERIALIZED live set (stores ever
 delete); AliasTable is the STATIC WEIGHTED draw from a frozen distribution; Reservoir samples uniformly
 from an UNBOUNDED stream in FIXED memory, storing nothing but the sample (no delete, no re-draw). A
 weighted stream sample (A-Res) and a sliding-window sample are neither -- out of scope.
+
+## WindowFoldUint32
+
+    new WindowFoldUint32(capacity, op)
+
+- capacity: max simultaneously-live masks; integer in [1, 2^31], ROUNDS UP to the next power of two
+  (the capacity getter reports the rounded value). Same head+count power-of-two ring as WindowFold.
+- op: 'OR' | 'AND' | 'XOR', FROZEN at construction (a ctor-cached int drives a switch-free combine --
+  NO hot-path lambda). Anything else throws [lite-o1].
+- Substrate: TWO Uint32Array columns (a raw-mask lane + a partial-aggregate lane), the DABA-Lite
+  de-amortized six-cursor core IDENTICAL to WindowFold -- only the lane type (Uint32 vs Float64) and the
+  combine (bitwise vs numeric) differ. The combine normalizes the signed int32 result of the JS bitwise
+  op back to unsigned via `>>> 0` (on the RESULT of a validated combine, never on the input).
+
+The bitwise / masking window engine (NOT a WindowFold clone): a Float64 aggregate lane cannot honestly
+carry 32-bit `& | ^` (they coerce to 32-bit; AND's all-ones identity has no clean Float64 form), so
+register width -- not taste -- forces a separate typed member. Data type dictates structure.
+
+Hot surface (all WORST-CASE O(1), zero allocation):
+
+- push(mask) -> this        Append mask as the newest element. The mask MUST be a uint32 -- an integer in
+                            [0, 2^32). Fail closed: a non-number / NaN / float / negative / >= 2^32 value
+                            throws [lite-o1] (typeof-first: `typeof mask !== 'number' || (mask >>> 0) !==
+                            mask`), a byte-identical no-op. It is NEVER coerced -- a 53-bit compound
+                            integer cannot silently truncate the aggregate. -1 is NOT accepted as
+                            all-ones; pass 0xFFFFFFFF explicitly. Also fail closed on a FULL window and
+                            the 2^53 position ceiling. (-0 aliases 0.)
+- evict() -> this           Drop the oldest mask (the window slides). An empty window is a no-op, never throws.
+- query() -> number         The current window aggregate as an UNSIGNED uint32 (<= 2 combines, a single ALU
+                            |/&/^). On an EMPTY window returns the operator IDENTITY (OR 0 / AND 0xFFFFFFFF
+                            / XOR 0), never undefined. Never throws.
+- op (getter)               The frozen operator name ('OR' | 'AND' | 'XOR').
+- size (getter)             Live mask count in the window.
+- capacity (getter)         Max simultaneously-live masks (power-of-two, rounded up).
+- clear() -> void           O(1): resets positions + running aggregate + flip state, touches NO store.
+- forEach(fn) -> void       O(size) alloc-free scan oldest -> newest; fn is (value, index, fold).
+- [Symbol.iterator]()       O(size) scan; ALLOCATES per protocol -- use forEach for the alloc-free scan.
+
+Operators (LOCKED to the three associative bitwise monoids -- NAND/NOR are non-associative, correctly
+out): OR (identity 0, "any flag set anywhere in the window" = union), AND (identity 0xFFFFFFFF, "flags
+set in EVERY frame" = intersection), XOR (identity 0, rolling parity). The classic two-stacks aggregator
+would flip the back stack into a fresh front with an O(W) evict spike; DABA-Lite de-amortizes that one
+step per op, so there is NO max-single-op line (the worst-case cohort). Non-overlap: WindowFold is the
+NUMERIC (SUM/MIN/MAX/PRODUCT, Float64) sibling; WindowFoldUint32 is the BITWISE (OR/AND/XOR, Uint32)
+one. For arbitrary-index / out-of-order range aggregation use @zakkster/lite-logn's Fenwick tree.
 
 ## Design bounds
 

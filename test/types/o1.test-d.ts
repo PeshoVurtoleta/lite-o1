@@ -5,7 +5,7 @@
  * fails `npm run test:types`. Not executed; only type-checked.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano, Reservoir, VERSION } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano, Reservoir, WindowFoldUint32, VERSION } from '../../O1.js';
 import type { WindowFoldOp } from '../../O1.js';
 
 // VERSION is a string.
@@ -793,3 +793,47 @@ new Reservoir('16');
 resv.add('1');
 // @ts-expect-error -- get index must be a number.
 resv.get('0');
+
+// --- WindowFoldUint32 -------------------------------------------------------
+import type { WindowFoldUint32Op } from '../../O1.js';
+const wfuOp: WindowFoldUint32Op = 'OR';
+const wfu: WindowFoldUint32 = new WindowFoldUint32(16, wfuOp);
+const wfu2: WindowFoldUint32 = new WindowFoldUint32(16, 'XOR');
+void wfu2;
+
+// push -> this (chainable); query / getters -> number; op -> the union type.
+const wfuChain: WindowFoldUint32 = wfu.push(1).push(0xff);
+void wfuChain;
+const wfuAgg: number = wfu.query();
+const wfuSize: number = wfu.size;
+const wfuCap: number = wfu.capacity;
+const wfuOpName: WindowFoldUint32Op = wfu.op;
+void wfuAgg; void wfuSize; void wfuCap; void wfuOpName;
+
+// evict -> this; clear -> void.
+const wfuEvict: WindowFoldUint32 = wfu.evict();
+const wfuClear: void = wfu.clear();
+void wfuEvict; void wfuClear;
+
+// @ts-expect-error -- size is readonly.
+wfu.size = 5;
+// @ts-expect-error -- op is readonly.
+wfu.op = 'AND';
+
+// forEach callback gets (value, index, fold).
+wfu.forEach((value, index, fold) => {
+    const v: number = value;
+    const i: number = index;
+    const f: WindowFoldUint32 = fold;
+    void v; void i; void f;
+});
+
+// iterable of the mask values (numbers).
+for (const v of wfu) { const vv: number = v; void vv; }
+
+// @ts-expect-error -- capacity must be a number.
+new WindowFoldUint32('16', 'OR');
+// @ts-expect-error -- op must be one of the WindowFoldUint32Op literals.
+new WindowFoldUint32(16, 'or');
+// @ts-expect-error -- push mask must be a number.
+wfu.push('1');

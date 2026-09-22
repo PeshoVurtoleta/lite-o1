@@ -22,7 +22,7 @@
  */
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano, Reservoir } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano, Reservoir, WindowFoldUint32 } from '../../O1.js';
 
 const U = 1 << 16;      // universe 65536
 const CAP = 1 << 14;    // capacity 16384
@@ -2141,6 +2141,80 @@ const rvClearRefill = {
     statsOf(s) { return { grows: rvGrows(s) }; },
 };
 
+// ===========================================================================
+// WindowFoldUint32 scenarios -- TWO Uint32Array columns (raw mask + partial aggregate), a WORST-CASE
+// O(1) bitwise sliding-window aggregator (DABA-Lite, OR/AND/XOR). push / evict / query are each <= 2
+// combines (a single ALU |/&/^) over recycled typed slots -- no window-size branch, no closure, no
+// coercion, no allocation. The store is fixed at construction, so `grows` must be a 0 delta.
+// ===========================================================================
+
+const WFU_CAP = 1 << 14;  // capacity 16384 (power of two)
+const WFU_W = 1 << 12;    // 4096 resident masks -> steady state, never full/empty
+
+/** Zero-alloc counter for WindowFoldUint32: the byte lengths of BOTH backing Uint32Array columns -- fixed at construction. */
+function wfuGrows(s) { const w = s.wf; return w._val.buffer.byteLength + w._agg.buffer.byteLength; }
+
+/** push-evict-query churn (OR): a bounded resident window slid by one each op -- drives the de-amortized flip; every op zero-alloc. */
+const wfuPushEvictQuery = {
+    name: 'WindowFoldUint32 push-evict-query (slide by one, OR)',
+    setup() {
+        const wf = new WindowFoldUint32(WFU_CAP, 'OR');
+        for (let k = 0; k < WFU_W; k++) wf.push(k & 0xffff);
+        return { wf, v: 0, sink: 0 };
+    },
+    hot(s, n) {
+        const wf = s.wf;
+        let v = s.v | 0, sink = s.sink | 0;
+        for (let i = 0; i < n; i++) {
+            v = (v + 0x9e37) & 0xffff; // SMI-safe mask stream (no >>> 0 large-double boxing in the reader)
+            wf.push(v);
+            wf.evict();
+            sink = (sink + wf.query()) | 0;
+        }
+        s.v = v | 0; s.sink = sink | 0;
+    },
+    statsOf(s) { return { grows: wfuGrows(s) }; },
+};
+
+/** query-read (AND): a primed resident window queried each op -- proves query() itself allocates nothing. */
+const wfuQueryRead = {
+    name: 'WindowFoldUint32 query-read (steady window, AND)',
+    setup() {
+        const wf = new WindowFoldUint32(WFU_CAP, 'AND');
+        for (let k = 0; k < WFU_W; k++) wf.push((k * 2654435761) >>> 0 & 0xffff);
+        return { wf, sink: 0 };
+    },
+    hot(s, n) {
+        const wf = s.wf;
+        let sink = s.sink | 0;
+        for (let i = 0; i < n; i++) sink = (sink + wf.query()) | 0;
+        s.sink = sink | 0;
+    },
+    statsOf(s) { return { grows: wfuGrows(s) }; },
+};
+
+/** evict-refill (XOR): fill to a resident window then drain by evict, refilling -- exercises the flip both directions, zero-alloc. */
+const wfuEvictRefill = {
+    name: 'WindowFoldUint32 evict-refill (XOR)',
+    setup() {
+        const wf = new WindowFoldUint32(WFU_CAP, 'XOR');
+        for (let k = 0; k < WFU_W; k++) wf.push(k & 0xffff);
+        return { wf, v: 0, sink: 0 };
+    },
+    hot(s, n) {
+        const wf = s.wf;
+        let v = s.v | 0, sink = s.sink | 0;
+        for (let i = 0; i < n; i++) {
+            v = (v + 0x9e37) & 0xffff; // SMI-safe mask stream (no >>> 0 large-double boxing in the reader)
+            wf.push(v);
+            wf.evict();
+            sink = (sink + wf.query()) | 0;
+        }
+        s.v = v | 0; s.sink = sink | 0;
+    },
+    statsOf(s) { return { grows: wfuGrows(s) }; },
+};
+
 const scenarios = [
     addChurn, hasHit, deleteChurn, clearRefill, forEachDrain,
     ringFifo, ringLifo, ringInterleave,
@@ -2162,6 +2236,7 @@ const scenarios = [
     rsRank, rsSelect, rsForEachDrain,
     efAccess, efNextGEQ, efForEachDrain,
     rvAddStream, rvGetRead, rvClearRefill,
+    wfuPushEvictQuery, wfuQueryRead, wfuEvictRefill,
 ];
 
 /**
@@ -2633,6 +2708,30 @@ const rvMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/**
+ * The WindowFoldUint32 teeth: a per-op `[Symbol.iterator]` spread into a FRESH [] each op -- the
+ * generator + wrappers + array MUST trip the gate, proving the instrument has teeth on this surface too
+ * (its iterator is the ONE documented per-protocol allocator; forEach is the alloc-free scan).
+ */
+const wfuMustFailAlloc = {
+    name: 'WindowFoldUint32 [Symbol.iterator] spread into fresh array (MUST allocate)',
+    setup() {
+        const wf = new WindowFoldUint32(256, 'OR');
+        for (let i = 0; i < 200; i++) wf.push(i & 0xffff);
+        return { wf };
+    },
+    hot(s, n) {
+        const wf = s.wf;
+        let sink = 0;
+        for (let i = 0; i < n; i++) {
+            const arr = [...wf]; // fresh generator + array per op -> heap churn
+            sink += arr.length;
+        }
+        s.sink = sink;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -2642,5 +2741,5 @@ zgcSuite({
     counters: { grows: 0 },
     maxRetainedKB: 64,
     scenarios,
-    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc, twMustFailAlloc, htwMustFailAlloc, ringLogMustFailAlloc, cuckMustFailAlloc, stMustFailAlloc, bsMustFailAlloc, atMustFailAlloc, wfMustFailAlloc, rsMustFailAlloc, efMustFailAlloc, rvMustFailAlloc],
+    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc, twMustFailAlloc, htwMustFailAlloc, ringLogMustFailAlloc, cuckMustFailAlloc, stMustFailAlloc, bsMustFailAlloc, atMustFailAlloc, wfMustFailAlloc, rsMustFailAlloc, efMustFailAlloc, rvMustFailAlloc, wfuMustFailAlloc],
 });

@@ -1,7 +1,7 @@
 # lite-o1 -- which structure to pick (GUIDE)
 
 A repo-only decision guide for the O(1) family: which member, reach-for / avoid,
-and how to measure the constant yourself. At v1.10.0 the family is STABLE at twenty
+and how to measure the constant yourself. At v1.11.0 the family is STABLE at twenty-one
 members and this guide is complete for them -- still open (a new section lands with
 each future member), but no longer a skeleton. It is NOT an API encyclopedia (that
 is the README + `O1.d.ts`); it answers "which member, and is my constant real?"
@@ -23,7 +23,7 @@ flatness floor for YOUR workload -- run `npm run witness` and read the shape.
 
 ## Which member? (decision flowchart)
 
-ASCII, routes on the discriminating questions. Every leaf is one of the twenty
+ASCII, routes on the discriminating questions. Every leaf is one of the twenty-one
 members; `(wc)` = worst-case O(1), `(am)` = amortized O(1), and EliasFano is the one
 DATA-DEPENDENT member (wc access, O(1)-typical / O(log n)-worst nextGEQ).
 
@@ -53,6 +53,9 @@ START -- what is the SHAPE of your workload?
 +-- The SUM / MIN / MAX / PRODUCT AGGREGATE of a SLIDING WINDOW over a numeric
 |   stream (ANY associative operator / monoid, not just min/max), with a HARD
 |   per-op budget (no flip spike)? -> WindowFold (wc)
+|
++-- The bitwise OR / AND / XOR of a SLIDING WINDOW of 32-bit MASKS (component
+|   masks, state flags, permission sets -- union / intersection / parity)? -> WindowFoldUint32 (wc)
 |
 +-- The MIN or MAX over an ARBITRARY range [l, r] of a FIXED numeric array you
 |   build ONCE and never mutate (static range-min/max query)? -> SparseTable (wc query)
@@ -86,7 +89,7 @@ START -- what is the SHAPE of your workload?
 ```
 
 Budget rule of thumb: if you cannot tolerate ANY per-op spike (hard-real-time on
-the WORST single op), stay on the fourteen `(wc)` members. The five `(am)` members
+the WORST single op), stay on the fifteen `(wc)` members. The five `(am)` members
 (UnionFind, MonoDeque, BucketQueue, HierarchicalTimerWheel, CuckooMap) buy their constant
 with an amortized average and wear an honest worst-single-op tail -- read the MAX-single-op
 line the witness prints, and the per-member "avoid it when" notes below. (CuckooMap's
@@ -120,6 +123,7 @@ One row per member; pick by the left column, confirm with the discriminator.
 | a random outcome drawn by WEIGHT from a FIXED distribution   | AliasTable             | worst-case  | STATIC build-once Vose alias method; O(1) weighted sample() after an O(n) build co-headline; the weighted complement to RandomSet |
 | timers over a NEAR-UNBOUNDED horizon, hard per-tick budget, approximate fire OK | CoarseTimerWheel  | worst-case  | Linux-4.8 NON-cascading coarse-bucket wheel; O(1) schedule/cancel/advance/drainDue, NO spike; APPROXIMATE bounded-late fire (< 12.5%, L0 exact) is the co-headline |
 | the SUM/MIN/MAX/PRODUCT aggregate of a SLIDING WINDOW, hard per-op budget | WindowFold             | worst-case  | GENERAL FIFO monoid aggregator (DABA-Lite); O(1) push/evict/query (<= 2 combines), NO flip spike; the general complement to MonoDeque's amortized min/max |
+| the bitwise OR/AND/XOR of a SLIDING WINDOW of 32-bit MASKS (flags/permissions) | WindowFoldUint32       | worst-case  | the BITWISE/MASKING window engine; DABA-Lite over TWO Uint32 lanes, O(1) push/evict/query (single ALU \|/&/^), NO flip spike; a Float64 lane can't honestly carry 32-bit ops so it is a separate typed member; strict uint32 (fail closed, never coerced) |
 | rank1(i) / select1(k) over a FIXED bitvector (succinct positional index)     | RankSelect             | worst-case  | STATIC build-once cs-poppy directory; O(1) rank/select/access over a frozen bitvector, ~3-6% index co-headline; the positional index BitSet stops short of |
 | the i-th value / successor of a SORTED integer set in near-optimal space     | EliasFano              | wc access / data-dep nextGEQ | STATIC build-once succinct codec (~2+log2(U/n) bits/elem) on a composed RankSelect; access O(1), nextGEQ O(1) typical / O(log n) worst; the compressed-monotone-sequence primitive |
 | a UNIFORM sample of k items from an UNBOUNDED stream, in FIXED memory        | Reservoir              | worst-case  | Vitter's Algorithm R; O(1)/item add keeps a uniform k-sample without storing the stream; the streaming complement to RandomSet (materialized) and AliasTable (weighted) |
@@ -759,7 +763,7 @@ cohort; the O(n) build + 2n typed-array space are the honest co-headline).
 
 ## Roadmap members (not yet shipped, planned)
 
-The public API is stable at v1.10.0's twenty members; these are planned, not shipped.
+The public API is stable at v1.11.0's twenty-one members; these are planned, not shipped.
 Placeholders so the decision axes are visible early; each fills in on release.
 
 - **SlotPool** -- free-list slot allocator with generational (ABA-safe) handles.

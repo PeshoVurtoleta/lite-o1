@@ -19,6 +19,7 @@ import { dirname, join } from 'node:path';
 import { SparseSet, CuckooMap, BitSet, VERSION as O1_VERSION } from '../O1.js';
 import { RingDeque, WindowFold, UnionFind, TimerWheel, HierarchicalTimerWheel, CoarseTimerWheel } from '../O1.js';
 import { BucketQueue, SparseTable, RandomSet, FreqO1, AliasTable } from '../O1.js';
+import { WindowFoldUint32, Reservoir, RankSelect, EliasFano } from '../O1.js';
 import {
     VERSION as KERNEL_VERSION,
     createSparseWorld, stepSparseWorld, crossCheck, layoutGrid, frameSparseWorld,
@@ -34,6 +35,9 @@ import {
     stRangeExtreme, bqBucketHead,
     SP_COLS, SP_ROWS, SP_CELLS, SP_CEIL, SP_CHIPS, SP_FQCAP,
     createAliasWorld, frameAliasWorld, naiveAliasSample, AT_OUTCOMES, AT_WEIGHTS, AT_DRAWS,
+    createWindowFoldU32World, frameWindowFoldU32, naiveWindowU32Refold, WFU_BITS,
+    createReservoirWorld, frameReservoir, naiveReservoirStep, RSV_K, RSV_RATE,
+    createSuccinctWorld, frameSuccinct, naiveSuccinctScan, SC_CELLS, SC_HARD,
 } from './kernels.mjs';
 import { safePath, handle, DEFAULT_PORT } from './serve.mjs';
 
@@ -485,6 +489,101 @@ test('faithfulness: frameWindowFold return is the real WindowFold rail truth, no
         assert.equal(world.railMean[ri], world.out[2], 'the newest rail mean must equal the frame mean at frame ' + i);
         // And the window never exceeds W (evict-before-push keeps exactly the last W samples).
         assert.ok(world.fold.size <= W, 'the live window must never exceed W');
+    }
+    assert.equal(world.railCount, world.railCap, 'a long run must saturate the rail ring');
+});
+
+// The Scene-02 bitwise fourth wall: WindowFoldUint32 -- the BITWISE sibling of WindowFold's numeric SUM.
+
+// Brute-force OR / AND / XOR over the last `w` masks of an independently-recorded stream -- the demo NEVER
+// sees this; it is the external truth the WindowFoldUint32 triptych is checked against.
+function bruteBitwise(rec, count, w, op) {
+    const start = count - w < 0 ? 0 : count - w;
+    if (start >= count) return op === 1 ? 0xFFFFFFFF : 0; // empty -> operator identity
+    let acc = op === 1 ? 0xFFFFFFFF : 0;
+    for (let i = start; i < count; i++) {
+        const v = rec[i];
+        acc = op === 0 ? (acc | v) >>> 0 : op === 1 ? (acc & v) >>> 0 : (acc ^ v) >>> 0;
+    }
+    return acc >>> 0;
+}
+
+test('faithfulness: WindowFoldUint32 OR/AND/XOR aggregates equal an INDEPENDENT O(W) window refold, every frame', () => {
+    const W = 48;
+    const world = createWindowFoldU32World(1024, W, 0x13572468);
+    const rec = new Uint32Array(20000);
+    let count = 0;
+    for (let i = 0; i < 20000; i++) {
+        frameWindowFoldU32(world);
+        rec[count++] = world.out[0] >>> 0; // the mask fed this frame
+        const size = count < W ? count : W;
+        // world.out[1]/[2]/[3] are foldOr/foldAnd/foldXor query(). Compare to an INDEPENDENT refold of the
+        // same recorded stream. A wrong evict cadence or a DABA-Lite flip bug diverges here (bitwise = EXACT).
+        assert.equal(world.out[1], bruteBitwise(rec, count, W, 0), 'OR aggregate must equal the brute window OR at frame ' + i);
+        assert.equal(world.out[2], bruteBitwise(rec, count, W, 1), 'AND aggregate must equal the brute window AND at frame ' + i);
+        assert.equal(world.out[3], bruteBitwise(rec, count, W, 2), 'XOR aggregate must equal the brute window XOR at frame ' + i);
+        // And the library objects themselves must agree (not just the cached out[] copy).
+        assert.equal(world.foldOr.query(), world.out[1], 'foldOr.query() live-read must equal out[1]');
+        assert.equal(world.foldAnd.query(), world.out[2], 'foldAnd.query() live-read must equal out[2]');
+        assert.equal(world.foldXor.query(), world.out[3], 'foldXor.query() live-read must equal out[3]');
+        assert.equal(world.foldOr.size, size, 'foldOr.size must equal the live window element count');
+    }
+    assert.ok(count === 20000, 'the run must have fed the full stream');
+});
+
+test('faithfulness: WindowFoldUint32 query() on the EMPTY window returns the operator IDENTITY (null is not zero)', () => {
+    // A fresh world has fed nothing: query() must be the operator IDENTITY, never undefined.
+    const world = createWindowFoldU32World(1024, 64, 0x0a0b0c0d);
+    assert.equal(world.foldOr.size, 0, 'a fresh WindowFoldUint32 window must be empty');
+    assert.equal(world.foldOr.query(), 0, 'empty OR window must return the identity 0');
+    assert.equal(world.foldAnd.query(), 0xFFFFFFFF, 'empty AND window must return the identity 0xFFFFFFFF (all flags)');
+    assert.equal(world.foldXor.query(), 0, 'empty XOR window must return the identity 0');
+    assert.equal(world.foldOr.op, 'OR', 'the OR fold reports its frozen op');
+    assert.equal(world.foldAnd.op, 'AND', 'the AND fold reports its frozen op');
+    // Fill then drain back to empty: each returns to its identity, not a stale last value.
+    const f = new WindowFoldUint32(4, 'AND');
+    f.push(0xF0).push(0x30);
+    assert.equal(f.query(), 0x30, 'a populated AND window intersects its live masks');
+    f.evict(); f.evict();
+    assert.equal(f.size, 0, 'draining every element empties the window');
+    assert.equal(f.query(), 0xFFFFFFFF, 'a re-emptied AND window returns to the identity 0xFFFFFFFF');
+});
+
+test('faithfulness: driving WindowFoldUint32 with a non-uint32 mask fails closed (the strict push contract)', () => {
+    const f = new WindowFoldUint32(8, 'OR');
+    assert.throws(() => f.push(-1), /\[lite-o1\]/, 'push(-1) must throw (a negative is NOT all-ones)');
+    assert.throws(() => f.push(1.5), /\[lite-o1\]/, 'push(a float) must throw');
+    assert.throws(() => f.push(0x100000000), /\[lite-o1\]/, 'push(>= 2^32) must throw (never coerced)');
+    assert.throws(() => f.push(NaN), /\[lite-o1\]/, 'push(NaN) must throw');
+    assert.throws(() => f.push('7'), /\[lite-o1\]/, 'push(non-number) must throw');
+    // The throw is a byte-identical no-op: nothing was folded in.
+    assert.equal(f.size, 0, 'a rejected push must leave the window empty (no half-write)');
+    assert.equal(f.query(), 0, 'a rejected push must leave the aggregate at the identity');
+    // A clean uint32 (including 0 and 0xFFFFFFFF) is accepted.
+    assert.doesNotThrow(() => f.push(0), '0 is an accepted clean mask');
+    assert.doesNotThrow(() => f.push(0xFFFFFFFF), '0xFFFFFFFF (all flags) is an accepted clean mask');
+    assert.equal(f.size, 2, 'the two clean pushes are live');
+    assert.equal(f.query(), 0xFFFFFFFF, 'OR of 0 and all-flags is all-flags');
+});
+
+test('faithfulness: frameWindowFoldU32 masks are strict uint32 and the rail popcount tracks the OR aggregate', () => {
+    const W = 32;
+    const world = createWindowFoldU32World(1024, W, 0x77777777);
+    for (let i = 0; i < 6000; i++) {
+        const railN = frameWindowFoldU32(world);
+        assert.equal(railN, world.railCount, 'frameWindowFoldU32 must return the live rail count');
+        assert.ok(world.railCount <= world.railCap, 'rail count must never exceed the rail cap');
+        // Every fed mask must be a strict uint32 within the WFU_BITS flag space (never coerced).
+        const m = world.out[0];
+        assert.equal(m >>> 0, m, 'the fed mask must be a strict uint32');
+        assert.ok(m < (1 << WFU_BITS), 'the fed mask must stay in the WFU_BITS flag space');
+        // The newest rail slot must equal the popcount of the current OR aggregate.
+        let pc = world.out[1] >>> 0, cnt = 0;
+        while (pc !== 0) { pc &= pc - 1; cnt++; }
+        const ri = (world.railHead + world.railCount - 1) & world.railMask;
+        assert.equal(world.railOr[ri], cnt, 'the newest rail slot must equal popcount(OR aggregate) at frame ' + i);
+        // The window never exceeds W (evict-before-push keeps exactly the last W masks).
+        assert.ok(world.foldOr.size <= W, 'the live window must never exceed W');
     }
     assert.equal(world.railCount, world.railCap, 'a long run must saturate the rail ring');
 });
@@ -1000,6 +1099,179 @@ test('faithfulness: AliasTable fails closed at construction on an all-zero / neg
     assert.equal(at.weightOf(AT_OUTCOMES), 0, 'weightOf past the end is 0, never a throw');
 });
 
+// The streaming sampler: Reservoir -- uniform sample of an UNBOUNDED stream in FIXED memory k (Algorithm R).
+
+test('faithfulness: Reservoir holds min(seen, k) samples, every slot a genuinely-seen stream item', () => {
+    const world = createReservoirWorld(RSV_K, 0x13572468);
+    const res = world.res, k = world.k;
+    for (let i = 0; i < 8000; i++) {
+        frameReservoir(world);
+        const seen = res.seen;
+        // size is exactly min(seen, k) -- the fixed-memory fill (the demo readout is the real truth).
+        assert.equal(res.size, seen < k ? seen : k, 'reservoir size must equal min(seen, k) at frame ' + i);
+        assert.equal(world.out[1], seen, 'out[1] must equal res.seen');
+        if ((i & 255) === 0) {
+            // Every retained slot must be a genuine stream item id in [0, seen) -- never garbage / a stale
+            // slot beyond the live fill. get() reads the SAMPLE, and the stream ids are 0..seen-1.
+            for (let s = 0; s < res.size; s++) {
+                const v = res.get(s);
+                assert.equal(Number.isInteger(v), true, 'every reservoir slot must be an integer item id');
+                assert.ok(v >= 0 && v < seen, 'reservoir slot ' + s + ' must be an item actually seen');
+            }
+            // get() past the live fill is a soft undefined (never a throw, never a stale slot).
+            assert.equal(res.get(res.size), undefined, 'get past the live fill is undefined, never a stale slot');
+            assert.equal(res.get(-1), undefined, 'get(-1) is undefined, never a throw');
+        }
+    }
+    assert.equal(res.size, k, 'a long stream must fill the reservoir to k');
+});
+
+test('faithfulness: same-seed Reservoirs fed the same stream are bit-identical; reset() replays the draws', () => {
+    // Determinism: the PRNG is per-instance, so two reservoirs from the same k + seed fed the identical
+    // stream must retain the exact same sample (no shared mutable module state, no wall-clock entropy).
+    const a = new Reservoir(16, 0x1357abcd);
+    const b = new Reservoir(16, 0x1357abcd);
+    assert.equal(a.seed, b.seed, 'same-seed reservoirs must report the same seed');
+    for (let i = 0; i < 50000; i++) { a.add(i); b.add(i); }
+    for (let s = 0; s < a.size; s++) assert.equal(a.get(s), b.get(s), 'same-seed samples must match at slot ' + s);
+    // reset() restores the PRNG to the construction seed AND empties -> the retention sequence replays.
+    const c = new Reservoir(16, 0xfeedface);
+    for (let i = 0; i < 50000; i++) c.add(i);
+    const snap = new Float64Array(c.size);
+    for (let s = 0; s < c.size; s++) snap[s] = c.get(s);
+    c.reset();
+    assert.equal(c.size, 0, 'reset() empties the reservoir');
+    for (let i = 0; i < 50000; i++) c.add(i);
+    for (let s = 0; s < c.size; s++) assert.equal(c.get(s), snap[s], 'reset() must replay the exact retention at slot ' + s);
+    // clear() empties WITHOUT reseeding: the next draws continue the generator, not replay it.
+    const d = new Reservoir(16, 0x99999999);
+    for (let i = 0; i < 50000; i++) d.add(i);
+    d.clear();
+    assert.equal(d.size, 0, 'clear() empties the reservoir');
+    assert.equal(d.seen, 0, 'clear() resets the seen counter');
+});
+
+test('faithfulness: the Reservoir retention frequency converges to k/seen (a genuine UNIFORM sample)', () => {
+    // Over many independent trials, each of the M stream indices must survive into the final reservoir with
+    // frequency ~ k/M -- the Algorithm R invariant. A biased draw (e.g. s % (n+1) low-bit bias, or a wrong
+    // keep-probability) skews the histogram and diverges here.
+    const M = 64, k = 8, TRIALS = 40000;
+    const tally = new Float64Array(M);
+    for (let t = 0; t < TRIALS; t++) {
+        const r = new Reservoir(k, (0x2545f491 ^ (t * 2654435761)) >>> 0);
+        for (let i = 0; i < M; i++) r.add(i);
+        r.forEach((v) => { tally[v] += 1; }); // v IS the stream index (ids 0..M-1)
+    }
+    const expected = k / M; // each index's retention probability
+    let maxDev = 0, sum = 0;
+    for (let i = 0; i < M; i++) {
+        sum += tally[i];
+        const emp = tally[i] / TRIALS;
+        const dev = Math.abs(emp - expected);
+        if (dev > maxDev) maxDev = dev;
+    }
+    assert.equal(sum, TRIALS * k, 'every trial must retain exactly k items (no slot lost / double-counted)');
+    // 40k trials over 64 indices converge well inside this bound (empirically ~5e-3).
+    assert.ok(maxDev < 0.02, 'retention histogram must converge to k/M uniform, max dev ' + maxDev.toFixed(4));
+});
+
+test('faithfulness: Reservoir fails closed on a bad k / seed / value (the fixed-memory contract)', () => {
+    assert.throws(() => new Reservoir(0), /\[lite-o1\]/, 'k must be >= 1');
+    assert.throws(() => new Reservoir(1.5), /\[lite-o1\]/, 'k must be an integer');
+    assert.throws(() => new Reservoir(8, 1.5), /\[lite-o1\]/, 'a non-integer seed must throw');
+    const r = new Reservoir(4, 7);
+    assert.throws(() => r.add(NaN), /\[lite-o1\]/, 'add(NaN) must throw fail-closed');
+    assert.throws(() => r.add('7'), /\[lite-o1\]/, 'add(non-number) must throw');
+    assert.equal(r.size, 0, 'a rejected add must leave the reservoir empty (no half-write)');
+    // A clean value (including +/-Infinity) is accepted.
+    assert.doesNotThrow(() => r.add(Infinity), '+Infinity is an accepted clean value');
+    assert.equal(r.size, 1, 'the clean add is live');
+    // createReservoirWorld builds a valid reservoir and never throws.
+    assert.doesNotThrow(() => createReservoirWorld(RSV_K, 0xabc), 'the demo world must build a valid Reservoir');
+});
+
+// The static succinct cameo: RankSelect + EliasFano -- build-once, query-forever, worst-case O(1).
+
+test('faithfulness: RankSelect rank1/select1/access equal a brute scan over the frozen bitvector, every query', () => {
+    const world = createSuccinctWorld(0x0a11ce);
+    const rs = world.rs, cells = world.cells, words = world.words;
+    // Independent per-bit oracle read straight from the raw words the demo never re-derives from.
+    const bit = (i) => (words[i >>> 5] >>> (i & 31)) & 1;
+    // rank1(i) == brute count of set bits in [0, i), for EVERY i in [0, cells].
+    let cum = 0;
+    for (let i = 0; i <= cells; i++) {
+        assert.equal(rs.rank1(i), cum, 'rank1(' + i + ') must equal the brute prefix popcount');
+        if (i < cells) cum += bit(i);
+    }
+    assert.equal(rs.size, cum, 'RankSelect.size must equal the total set-bit count');
+    assert.equal(world.hardCount, cum, 'the demo hard-cell count must equal the real popcount');
+    // access(i) == the raw bit; select1(k) == the k-th set bit; rank1(select1(k)) round-trips.
+    let k = 0;
+    for (let i = 0; i < cells; i++) {
+        assert.equal(rs.access(i), bit(i), 'access(' + i + ') must equal the raw bit');
+        if (bit(i) === 1) {
+            assert.equal(rs.select1(k), i, 'select1(' + k + ') must equal the k-th set bit position');
+            assert.equal(rs.rank1(i), k, 'rank1(select1(k)) must round-trip to k');
+            k++;
+        }
+    }
+    assert.equal(k, cum, 'select1 must enumerate every set bit');
+    assert.equal(rs.select1(cum), -1, 'select1 past the last set bit is -1, never a throw');
+});
+
+test('faithfulness: EliasFano.access equals the sorted hard-cell positions AND RankSelect.select1', () => {
+    const world = createSuccinctWorld(0x5ca1ab1e);
+    const ef = world.ef, rs = world.rs, hard = world.hard, n = world.hardCount;
+    assert.equal(ef.length, n, 'EliasFano length must equal the hard-cell count');
+    assert.equal(ef.size, n, 'EliasFano size must equal the hard-cell count');
+    for (let i = 0; i < n; i++) {
+        // The succinct codec, the sorted source list, and the RankSelect select1 must all agree bit for bit.
+        assert.equal(ef.access(i), hard[i], 'EliasFano.access(' + i + ') must equal the sorted hard position');
+        assert.equal(ef.access(i), rs.select1(i), 'EliasFano.access must equal RankSelect.select1');
+    }
+    // Queries never throw: access past the end is undefined; nextGEQ past the max is -1.
+    assert.equal(ef.access(n), undefined, 'access past the end is undefined, never a throw');
+    assert.ok(ef.bitsPerElement > 0, 'a non-empty EliasFano must report a positive bits/element');
+    // nextGEQ is a genuine successor-or-equal over the sorted positions (an independent scan oracle).
+    if (n > 0) {
+        for (let x = 0; x < world.cells; x += 7) {
+            let want = -1;
+            for (let i = 0; i < n; i++) { if (hard[i] >= x) { want = hard[i]; break; } }
+            assert.equal(ef.nextGEQ(x), want, 'nextGEQ(' + x + ') must equal the brute successor-or-equal');
+        }
+    }
+});
+
+test('faithfulness: frameSuccinct return is the real RankSelect/EliasFano truth, not a hand-tracked shadow', () => {
+    const world = createSuccinctWorld(0xbeef01);
+    const rs = world.rs, ef = world.ef, n = world.hardCount;
+    for (let f = 0; f < 4000; f++) {
+        frameSuccinct(world);
+        const c = world.cursor;
+        // out[0]/[1]/[2]/[3] must each equal the live library query at the current cursor.
+        assert.equal(world.out[0], rs.rank1(c), 'out[0] must equal rank1(cursor) at frame ' + f);
+        const k = world.out[0] > 0 ? world.out[0] - 1 : 0;
+        assert.equal(world.out[1], n > 0 ? rs.select1(k) : -1, 'out[1] must equal select1(k)');
+        const i = n > 0 ? (world.out[0] % n) : 0;
+        assert.equal(world.out[2], n > 0 ? ef.access(i) : -1, 'out[2] must equal EliasFano.access(i)');
+        const bit = rs.access(c);
+        assert.equal(world.out[3], bit === undefined ? -1 : bit, 'out[3] must equal access(cursor)');
+    }
+});
+
+test('faithfulness: RankSelect / EliasFano fail closed at construction on a bad source', () => {
+    assert.throws(() => new RankSelect(new Uint32Array(1), 0), /\[lite-o1\]/, 'nbits < 1 must throw');
+    assert.throws(() => new RankSelect(null, 8), /\[lite-o1\]/, 'a null source must throw');
+    assert.throws(() => new EliasFano([3, 1, 2]), /\[lite-o1\]/, 'a non-monotone source must throw');
+    assert.throws(() => new EliasFano([1, -2, 3]), /\[lite-o1\]/, 'a negative value must throw');
+    assert.throws(() => new EliasFano(null), /\[lite-o1\]/, 'a null source must throw');
+    // Queries never throw: a bad index is undefined / -1.
+    const rs = new RankSelect(new Uint32Array([0b101]), 3);
+    assert.equal(rs.access(99), undefined, 'access past the end is undefined, never a throw');
+    assert.equal(rs.select1(99), -1, 'select1 overflow is -1, never a throw');
+    assert.doesNotThrow(() => createSuccinctWorld(0xabc), 'the demo world must build a valid succinct index');
+});
+
 /* ==================== owned allocation counter (Truth Panel) =============== */
 
 test('owned allocation counter: 0 after N lite frames, > 0 after N naive frames (a real count)', () => {
@@ -1223,6 +1495,79 @@ test('owned allocation counter: Scene-04 AliasTable lite frames leave it 0; the 
     for (let i = 0; i < N; i++) naiveAliasSample(alloc2, wide);
     assert.ok(alloc2.allocCount > alloc.allocCount, 'a wider weight vector must climb the counter faster');
     assert.equal(alloc2.allocCount, N * AT_OUTCOMES * 2, 'wide-table scan count must equal N * outcomes');
+    const junk = alloc.naiveJunk;
+    assert.ok(junk.length > 0 && junk.length <= 400, 'naiveJunk must be capped, got ' + junk.length);
+    assert.notEqual(junk[junk.length - 1], junk[0], 'retained scans must be distinct instances, not one shared array');
+});
+
+test('owned allocation counter: WindowFoldUint32 lite frames leave it 0; the O(W) bitwise refold climbs with W', () => {
+    const N = 500;
+    const world = createWindowFoldU32World(1024, 64, 0x2468ace0);
+    const alloc = createAllocState();
+    for (let i = 0; i < N; i++) frameWindowFoldU32(world); // lite path: never touches the counter
+    assert.equal(alloc.allocCount, 0, 'the WindowFoldUint32 lite path must never touch the allocation counter');
+
+    // The naive O(W) full bitwise refold bumps the counter by EXACTLY `window` per call -- a real per-element
+    // count that grows with the window -- and returns the same OR aggregate the lite foldOr.query() does.
+    for (let i = 0; i < N; i++) {
+        const got = naiveWindowU32Refold(alloc, world);
+        assert.equal(got, world.foldOr.query(), 'naiveWindowU32Refold must equal the lite foldOr.query() OR (exact)');
+    }
+    assert.equal(alloc.allocCount, N * world.window, 'naive refold must allocate exactly window elements/frame');
+    const wide = createWindowFoldU32World(1024, 128, 0x2468ace0);
+    const alloc2 = createAllocState();
+    for (let i = 0; i < N; i++) naiveWindowU32Refold(alloc2, wide);
+    assert.ok(alloc2.allocCount > alloc.allocCount, 'a wider window must climb the counter faster');
+    assert.equal(alloc2.allocCount, N * wide.window, 'wide-window refold count must equal N * window');
+    const junk = alloc.naiveJunk;
+    assert.ok(junk.length > 0 && junk.length <= 400, 'naiveJunk must be capped, got ' + junk.length);
+    assert.notEqual(junk[junk.length - 1], junk[0], 'retained arrays must be distinct instances, not one shared array');
+});
+
+test('owned allocation counter: Reservoir lite frames leave it 0; the whole-stream buffer foil climbs each frame', () => {
+    const N = 800;
+    // Lite path: drive the REAL Reservoir (add() into fixed-k memory), never call the foil -> counter stays 0.
+    const lite = createReservoirWorld(RSV_K, 0x0badcafe);
+    const liteAlloc = createAllocState();
+    for (let i = 0; i < N; i++) frameReservoir(lite);
+    assert.equal(liteAlloc.allocCount, 0, 'the Reservoir lite path must never touch the allocation counter');
+
+    // The naive buffer-the-whole-stream foil bumps the counter by EXACTLY RSV_RATE per call -- a real
+    // per-item cost that accumulates WITHOUT BOUND over frames (memory grows with the stream length), while
+    // the reservoir's memory stays pinned at k.
+    const world = createReservoirWorld(RSV_K, 0x0badcafe);
+    const alloc = createAllocState();
+    for (let i = 0; i < N; i++) {
+        const got = naiveReservoirStep(alloc, world);
+        frameReservoir(world);
+        assert.equal(got, RSV_RATE, 'naiveReservoirStep must buffer exactly RSV_RATE items/frame');
+    }
+    assert.equal(alloc.allocCount, N * RSV_RATE, 'naive path must buffer one object per stream item, got ' + alloc.allocCount);
+    // The reservoir's OWN memory never grows: size is bounded by k no matter how long the stream is.
+    assert.ok(world.res.size <= world.k, 'the reservoir memory stays fixed at k regardless of stream length');
+    const junk = alloc.naiveJunk;
+    assert.ok(junk.length > 0 && junk.length <= 6000, 'naiveJunk must be capped, got ' + junk.length);
+    assert.equal(junk[junk.length - 1].v, alloc.allocCount - 1, 'the last retained item carries the final stream id');
+    assert.notEqual(junk[junk.length - 1], junk[0], 'retained objects must be distinct instances, not one shared object');
+});
+
+test('owned allocation counter: succinct lite frames leave it 0; the O(n) linear rank scan climbs with the bitvector', () => {
+    const N = 500;
+    // Lite path: drive the REAL RankSelect/EliasFano (rank1/select1/access), never call the foil -> 0.
+    const world = createSuccinctWorld(0x0badf00d);
+    const liteAlloc = createAllocState();
+    for (let i = 0; i < N; i++) frameSuccinct(world);
+    assert.equal(liteAlloc.allocCount, 0, 'the succinct lite path must never touch the allocation counter');
+
+    // The naive O(n) linear bit-scan bumps the counter by EXACTLY `cells` per call -- a real per-bit cost --
+    // and returns the same rank1(cursor) the cs-poppy directory does in worst-case O(1).
+    const alloc = createAllocState();
+    for (let i = 0; i < N; i++) {
+        const got = naiveSuccinctScan(alloc, world);
+        assert.equal(got, world.rs.rank1(world.cursor), 'naiveSuccinctScan must equal RankSelect.rank1(cursor)');
+    }
+    assert.equal(alloc.allocCount, N * SC_CELLS, 'naive scan must allocate one increment per bit, got ' + alloc.allocCount);
+    assert.equal(SC_CELLS, world.cells, 'the scanned bit count is the real bitvector length');
     const junk = alloc.naiveJunk;
     assert.ok(junk.length > 0 && junk.length <= 400, 'naiveJunk must be capped, got ' + junk.length);
     assert.notEqual(junk[junk.length - 1], junk[0], 'retained scans must be distinct instances, not one shared array');
@@ -1638,6 +1983,129 @@ test('0-B/op: 200k Scene-02 WindowFold rolling-aggregate frames allocate ~0 byte
     assert.equal(s.gc.minor, 0, '200k WindowFold frames must trigger 0 minor GC, got ' + s.gc.minor);
     assert.ok(report.ok, 'checkNoGc must report ok: ' + JSON.stringify(report.violations));
     assert.ok(bytesPerOp < 1, 'WindowFold lite frame kernel must allocate ~0 B/op, got ' + bytesPerOp.toFixed(3));
+});
+
+test('0-B/op: 200k Scene-02 WindowFoldUint32 bitwise-aggregate frames allocate ~0 bytes/op and trigger 0 GC', async (t) => {
+    if (typeof global.gc !== 'function') {
+        t.skip('needs --expose-gc: node --expose-gc --test demo/Demo.test.mjs');
+        return;
+    }
+    // World allocated ONCE, outside the measured loop. This frame drives THREE real WindowFoldUint32 folds
+    // (OR/AND/XOR) per step -- each evict()+push()+query() WORST-CASE O(1) (DABA-Lite, no O(W) spike). Every
+    // aggregate is an SMI (WFU_BITS <= 16), so query() never boxes a HeapNumber; if one slipped in, maxMinor:0 catches it.
+    const world = createWindowFoldU32World(1024, 96, 0x51ed270b);
+    for (let i = 0; i < 60000; i++) frameWindowFoldU32(world);
+
+    global.gc();
+    global.gc();
+    const heapBefore = process.memoryUsage().heapUsed;
+    const gc = new GcProfiler().start();
+
+    const HOT = 200000;
+    let sink = 0;
+    for (let i = 0; i < HOT; i++) {
+        sink += frameWindowFoldU32(world);
+        if ((i & 8191) === 0) gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
+    }
+    assert.ok(sink >= 0, 'sink keeps the swept work live (never dead-code eliminated)');
+
+    await new Promise((r) => setTimeout(r, 50));
+    const s = gc.summary();
+    const report = checkNoGc(s, { maxMajor: 0, maxMinor: 0, maxPauseMs: 4 });
+    gc.stop();
+    global.gc();
+    const heapAfter = process.memoryUsage().heapUsed;
+
+    const bytesPerOp = (heapAfter - heapBefore) / HOT;
+    process.stdout.write('  demo Scene-02 WindowFoldUint32 gate: alloc=' + (bytesPerOp <= 0 ? 0 : bytesPerOp.toFixed(3)) +
+        ' B/op | gc major=' + s.gc.major + ' minor=' + s.gc.minor + ' maxMs=' + s.gc.maxMs.toFixed(2) + '\n');
+
+    assert.equal(s.gc.major, 0, '200k WindowFoldUint32 frames must trigger 0 major GC, got ' + s.gc.major);
+    assert.equal(s.gc.minor, 0, '200k WindowFoldUint32 frames must trigger 0 minor GC, got ' + s.gc.minor);
+    assert.ok(report.ok, 'checkNoGc must report ok: ' + JSON.stringify(report.violations));
+    assert.ok(bytesPerOp < 1, 'WindowFoldUint32 lite frame kernel must allocate ~0 B/op, got ' + bytesPerOp.toFixed(3));
+});
+
+test('0-B/op: 200k Scene-04 Reservoir streaming-sampler frames allocate ~0 bytes/op and trigger 0 GC', async (t) => {
+    if (typeof global.gc !== 'function') {
+        t.skip('needs --expose-gc: node --expose-gc --test demo/Demo.test.mjs');
+        return;
+    }
+    // World allocated ONCE, outside the measured loop. This frame feeds RSV_RATE items into the REAL Reservoir
+    // (each add() WORST-CASE O(1): one LCG advance + one compare + one conditional store into fixed-k memory).
+    // The stream cursor + seen live in Float64 slots -- no boxed HeapNumber; if one slipped in, maxMinor:0 catches it.
+    const world = createReservoirWorld(RSV_K, 0x51ed270b);
+    for (let i = 0; i < 60000; i++) frameReservoir(world);
+
+    global.gc();
+    global.gc();
+    const heapBefore = process.memoryUsage().heapUsed;
+    const gc = new GcProfiler().start();
+
+    const HOT = 200000;
+    let sink = 0;
+    for (let i = 0; i < HOT; i++) {
+        sink += frameReservoir(world);
+        if ((i & 8191) === 0) gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
+    }
+    assert.ok(sink >= 0, 'sink keeps the swept work live (never dead-code eliminated)');
+
+    await new Promise((r) => setTimeout(r, 50));
+    const s = gc.summary();
+    const report = checkNoGc(s, { maxMajor: 0, maxMinor: 0, maxPauseMs: 4 });
+    gc.stop();
+    global.gc();
+    const heapAfter = process.memoryUsage().heapUsed;
+
+    const bytesPerOp = (heapAfter - heapBefore) / HOT;
+    process.stdout.write('  demo Scene-04 Reservoir gate: alloc=' + (bytesPerOp <= 0 ? 0 : bytesPerOp.toFixed(3)) +
+        ' B/op | gc major=' + s.gc.major + ' minor=' + s.gc.minor + ' maxMs=' + s.gc.maxMs.toFixed(2) + '\n');
+
+    assert.equal(s.gc.major, 0, '200k Reservoir frames must trigger 0 major GC, got ' + s.gc.major);
+    assert.equal(s.gc.minor, 0, '200k Reservoir frames must trigger 0 minor GC, got ' + s.gc.minor);
+    assert.ok(report.ok, 'checkNoGc must report ok: ' + JSON.stringify(report.violations));
+    assert.ok(bytesPerOp < 1, 'Reservoir lite frame kernel must allocate ~0 B/op, got ' + bytesPerOp.toFixed(3));
+});
+
+test('0-B/op: 200k Scene-04 succinct (RankSelect+EliasFano) frames allocate ~0 bytes/op and trigger 0 GC', async (t) => {
+    if (typeof global.gc !== 'function') {
+        t.skip('needs --expose-gc: node --expose-gc --test demo/Demo.test.mjs');
+        return;
+    }
+    // World allocated ONCE, outside the measured loop. This frame runs the WORST-CASE O(1) succinct queries
+    // (rank1 / select1 / access over the frozen RankSelect + EliasFano.access) on a moving cursor. Every result
+    // is a small SMI written into a reused Float64Array -- no boxed HeapNumber; if one slipped in, maxMinor:0 catches it.
+    const world = createSuccinctWorld(0x51ed270b);
+    for (let i = 0; i < 60000; i++) frameSuccinct(world);
+
+    global.gc();
+    global.gc();
+    const heapBefore = process.memoryUsage().heapUsed;
+    const gc = new GcProfiler().start();
+
+    const HOT = 200000;
+    let sink = 0;
+    for (let i = 0; i < HOT; i++) {
+        sink += frameSuccinct(world);
+        if ((i & 8191) === 0) gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
+    }
+    assert.ok(sink >= 0, 'sink keeps the swept work live (never dead-code eliminated)');
+
+    await new Promise((r) => setTimeout(r, 50));
+    const s = gc.summary();
+    const report = checkNoGc(s, { maxMajor: 0, maxMinor: 0, maxPauseMs: 4 });
+    gc.stop();
+    global.gc();
+    const heapAfter = process.memoryUsage().heapUsed;
+
+    const bytesPerOp = (heapAfter - heapBefore) / HOT;
+    process.stdout.write('  demo Scene-04 succinct gate: alloc=' + (bytesPerOp <= 0 ? 0 : bytesPerOp.toFixed(3)) +
+        ' B/op | gc major=' + s.gc.major + ' minor=' + s.gc.minor + ' maxMs=' + s.gc.maxMs.toFixed(2) + '\n');
+
+    assert.equal(s.gc.major, 0, '200k succinct frames must trigger 0 major GC, got ' + s.gc.major);
+    assert.equal(s.gc.minor, 0, '200k succinct frames must trigger 0 minor GC, got ' + s.gc.minor);
+    assert.ok(report.ok, 'checkNoGc must report ok: ' + JSON.stringify(report.violations));
+    assert.ok(bytesPerOp < 1, 'succinct lite frame kernel must allocate ~0 B/op, got ' + bytesPerOp.toFixed(3));
 });
 
 /* ============================ serve.mjs ================================== */

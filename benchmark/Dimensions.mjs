@@ -17,7 +17,7 @@
 import {
     SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet,
     FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel,
-    RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano, Reservoir,
+    RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano, Reservoir, WindowFoldUint32,
 } from '../O1.js';
 import {
     prng, median, warm, gcNow, hasGc, percentile, collect, timeNsPerOp, foldHash,
@@ -266,6 +266,21 @@ export function makeSubject(member, n, rng) {
         for (let k = 0; k < n; k++) r.add(k); // fill to capacity -> steady sampling phase
         let v = 0;
         return { obj: r, op: () => { r.add(v); v = (v + 1) | 0; SINK = (SINK + r.seen) | 0; } };
+    }
+    if (member === 'WindowFoldUint32') {
+        // A sliding window of width W = n over OR (DABA-Lite, bitwise). Each op pushes one uint32 mask,
+        // evicts the oldest (the window slides, driving the de-amortized reverse/merge flip), and reads
+        // the aggregate -- WORST-CASE O(1) (<= 2 combines, a single ALU |). The masks stay in the SMI
+        // lane and the query folds into SINK.
+        const W = n;
+        const wf = new WindowFoldUint32(W + 1, 'OR');
+        let v = 0;
+        const nextMask = () => { v = (v + 0x9e3779b1) >>> 0; return v & 0xffff; };
+        for (let k = 0; k < W; k++) wf.push(nextMask());
+        return {
+            obj: wf,
+            op: () => { wf.push(nextMask()); wf.evict(); SINK = (SINK + wf.query()) | 0; },
+        };
     }
     throw new Error('[bench] unhandled member: ' + member);
 }
@@ -827,6 +842,25 @@ export function makeBaseline(member, n) {
             },
         };
     }
+    if (member === 'WindowFoldUint32') {
+        // naive sliding-window bitwise refold (O(W) per element): a Uint32 ring overwritten in place,
+        // re-OR'd from scratch on every op -- the obvious approach before the DABA-Lite trick.
+        const W = n;
+        const win = new Uint32Array(W);
+        let v = 0;
+        const nextMask = () => { v = (v + 0x9e3779b1) >>> 0; return v & 0xffff; };
+        for (let k = 0; k < W; k++) win[k] = nextMask();
+        let head = 0;
+        return {
+            op: () => {
+                win[head] = nextMask();
+                head = head + 1; if (head === W) head = 0;
+                let acc = 0;
+                for (let j = 0; j < W; j++) acc = (acc | win[j]) >>> 0; // O(W) bitwise refold
+                SINK = (SINK + acc) | 0;
+            },
+        };
+    }
     throw new Error('[bench] unhandled member: ' + member);
 }
 
@@ -924,6 +958,7 @@ const LINEAR_BASELINE = {
     RankSelect: true,    // popcount-scan foil is an O(words) rank rescan per query
     EliasFano: true,     // sorted-array binary-search foil is O(log n) per lookup (timed gently)
     Reservoir: false,    // growing-array foil is amortized-O(1) push (+ O(1) reset), a fast rival
+    WindowFoldUint32: true, // naive-window bitwise refold foil is O(W) per element
 };
 
 /** Exact backing-store byte footprint of a member instance (typed-array buffers). */
@@ -1009,6 +1044,7 @@ export function memberBytes(member, obj) {
         return obj.sizeBytes;
     }
     if (member === 'Reservoir') return obj._store.buffer.byteLength; // ONE Float64 reservoir of k slots (fixed)
+    if (member === 'WindowFoldUint32') return obj._val.buffer.byteLength + obj._agg.buffer.byteLength; // two Uint32 lanes (value + partial-agg)
     throw new Error('[bench] unhandled member: ' + member);
 }
 
@@ -1059,6 +1095,7 @@ export function theoreticalMinPerLive(member) {
     if (member === 'EliasFano') return 0.375; // ~3 bits per live element (2 + log2(U/n) with L = 1 for a
     // dense sequence) / 8 = 0.375 byte -- the near-information-theoretic succinct floor Elias-Fano is FOR.
     // The RankSelect directory over the upper bits is the DISCLOSED index overhead, NOT folded in here.
+    if (member === 'WindowFoldUint32') return 8; // value + agg Uint32 per entry (the two DABA-Lite columns, 4+4)
     if (member === 'Reservoir') return 8;    // one Float64 reservoir slot (8) per live sample element =
     // the actual-column-width floor. `seen` grows unbounded but the STORE is fixed at k slots -- the
     // sample is the live payload, so the per-live floor is the sample slot, not the stream length.
@@ -1450,6 +1487,16 @@ function makeMixed(member, cap, rng) {
         let v = 0;
         return () => { r.add(v); v = (v + 1) | 0; if (r.size > 0) SINK = (SINK + (r.get(0) | 0)) | 0; };
     }
+    if (member === 'WindowFoldUint32') {
+        // A sliding OR window of width cap>>1: push one mask, evict oldest (drives the de-amortized
+        // flip), read the aggregate -- worst-case O(1), so cumulative ns/op stays flat over the trace.
+        const W = cap >> 1;
+        const wf = new WindowFoldUint32(cap, 'OR');
+        let v = 0;
+        const nextMask = () => { v = (v + 0x9e3779b1) >>> 0; return v & 0xffff; };
+        for (let k = 0; k < W; k++) wf.push(nextMask());
+        return () => { wf.push(nextMask()); wf.evict(); SINK = (SINK + wf.query()) | 0; };
+    }
     // Fail closed (mirrors every other dispatch helper): a member NOT handled above must
     // throw, so a future member cannot silently inherit MonoDeque's mixed trace.
     throw new Error('[bench] unhandled member: ' + member);
@@ -1559,6 +1606,12 @@ function fillMember(member, obj, count) {
     if (member === 'CuckooMap') { obj.clear(); for (let k = 0; k < count; k++) obj.set(k, k); return; }
     if (member === 'BitSet') { obj.clear(); for (let k = 0; k < count; k++) obj.set(k); return; }
     if (member === 'Reservoir') { obj.clear(); for (let k = 0; k < count; k++) obj.add(k); return; }
+    if (member === 'WindowFoldUint32') {
+        obj.clear();
+        let v = 0;
+        for (let k = 0; k < count; k++) { v = (v + 0x9e3779b1) >>> 0; obj.push(v & 0xffff); }
+        return;
+    }
     // SparseTable is STATIC (build-once, no clear / mutators): D3 handles it on a dedicated
     // path and NEVER calls fillMember for it, so it stays fail-closed here.
     throw new Error('[bench] unhandled member: ' + member);
@@ -1664,6 +1717,7 @@ export function D3(member, opts = {}) {
     else if (member === 'CuckooMap') obj = new CuckooMap(n);
     else if (member === 'BitSet') obj = new BitSet(n);
     else if (member === 'Reservoir') obj = new Reservoir(n, 0x9e3779b1); // fixed-k reservoir (mutable, capacity knob)
+    else if (member === 'WindowFoldUint32') obj = new WindowFoldUint32(n, 'OR'); // bitwise sliding window (mutable, capacity knob)
     else throw new Error('[bench] unhandled member: ' + member);
 
     gcNow();
@@ -2158,6 +2212,16 @@ export function churnNs(member, n, seed) {
         const op = () => { r.add(v); v = (v + 1) | 0; SINK = (SINK + r.seen) | 0; };
         return median(collect(op, 4000, 60));
     }
+    if (member === 'WindowFoldUint32') {
+        // Slide a bitwise OR window by one each op (push + evict + query) -- real mutate churn.
+        const wf = new WindowFoldUint32(n, 'OR');
+        const W = n >> 1;
+        let v = 0;
+        const nextMask = () => { v = (v + 0x9e3779b1) >>> 0; return v & 0xffff; };
+        for (let k = 0; k < W; k++) wf.push(nextMask());
+        const op = () => { wf.push(nextMask()); wf.evict(); SINK = (SINK + wf.query()) | 0; };
+        return median(collect(op, 4000, 60));
+    }
     // SparseTable is STATIC (no insert/delete): churn is inapplicable. D8 gates it via
     // supportsWorkload and never calls churnNs for it, so it stays fail-closed here.
     throw new Error('[bench] unhandled member: ' + member);
@@ -2314,7 +2378,7 @@ export function traceHash(member, seed = DEFAULT_SEED, length = 100000) {
         member === 'HierarchicalTimerWheel' || member === 'RingLog' ||
         member === 'CuckooMap' || member === 'SparseTable' || member === 'BitSet' ||
         member === 'AliasTable' || member === 'CoarseTimerWheel' || member === 'RankSelect' ||
-        member === 'EliasFano' || member === 'Reservoir') mode = 0;
+        member === 'EliasFano' || member === 'Reservoir' || member === 'WindowFoldUint32') mode = 0;
     else if (member === 'RingDeque' || member === 'MinStack') mode = 1;
     else if (member === 'MonoDeque' || member === 'WindowFold') mode = 2;
     else throw new Error('[bench] unhandled member: ' + member);
