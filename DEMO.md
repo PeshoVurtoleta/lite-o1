@@ -55,9 +55,9 @@ Truth Panel's primary signal (Section 4) are ours.
 
 ---
 
-## 2. Roster -> scene map (17 of 18 shipped members demoed)
+## 2. Roster -> scene map (all 21 shipped members demoed)
 
-The 13 public members of O1.js (v1.3.1): SparseSet, RingDeque, UnionFind,
+The 13 original public members of O1.js (v1.3.1): SparseSet, RingDeque, UnionFind,
 MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel,
 HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable. (`IS` in O1.js is an
 internal helper, NOT a public member -- it does not appear in the demo. There is
@@ -66,23 +66,30 @@ no `SlotMap` and no `MaxStack`; MinStack carries a frozen `min`|`max` kind.)
 Every member appears in exactly one scene as its primary home; a member may make a
 cameo in another scene where it earns the contrast.
 
-Scene-extension COMPLETE: each of the four scenes gained one new roster member, so the demo
-now shows all 17 members that have a scene home -- the entire v1.7.0 roster (v1.7.0 added
-BitSet, AliasTable, CoarseTimerWheel, WindowFold to the original 13). The lone shipped member
-without a scene is RankSelect (M18, new in v1.8.0), which is deferred to a future scene and is
-NOT demoed here. Scene 01: BitSet joins as the DENSE-membership fourth wall against SparseSet's
-sparse set. Scene 02: WindowFold joins as the GENERAL rolling-aggregate contrast to MonoDeque's
-min/max-only sliding envelope. Scene 03: CoarseTimerWheel joins as the NEAR-UNBOUNDED,
-NON-CASCADING, APPROXIMATE third wheel against TimerWheel (bounded + exact) and
-HierarchicalTimerWheel (bounded 2^26 + exact + cascade). Scene 04: AliasTable joins the casino
-as the WEIGHTED-draw complement (Vose, worst-case O(1)) to RandomSet's UNIFORM draw.
+Scene-extension COMPLETE: the demo now shows ALL twenty-one shipped members (v1.11.0). The
+roster grew from the original 13 to 17 at v1.7.0 (BitSet, AliasTable, CoarseTimerWheel,
+WindowFold), then to 21 (RankSelect at M18/v1.8.0; WindowFoldUint32, Reservoir, EliasFano
+landing through v1.9.0-v1.11.0). Every one now has a scene home:
+
+- Scene 01: BitSet joins as the DENSE-membership fourth wall against SparseSet's sparse set.
+- Scene 02: WindowFold joins as the GENERAL rolling-aggregate contrast to MonoDeque's
+  min/max-only sliding envelope; WindowFoldUint32 joins as the BITWISE sibling (OR/AND/XOR
+  masks) of WindowFold's numeric SUM.
+- Scene 03: CoarseTimerWheel joins as the NEAR-UNBOUNDED, NON-CASCADING, APPROXIMATE third
+  wheel against TimerWheel (bounded + exact) and HierarchicalTimerWheel (bounded 2^26 +
+  exact + cascade).
+- Scene 04: AliasTable joins the casino as the WEIGHTED-draw complement (Vose, worst-case
+  O(1)) to RandomSet's UNIFORM draw; Reservoir joins as the STREAMING uniform sampler
+  (Vitter R, fixed memory k over an unbounded stream); and RankSelect + EliasFano join as
+  the SUCCINCT static cameo (rank/select/access over a frozen bitvector, the succinct
+  siblings of SparseTable's build-once/query-forever shape).
 
 | Scene | Title | Members | Beat |
 |-------|-------|---------|------|
 | 01 | Sparse World       | SparseSet, CuckooMap, BitSet                          | memory architecture: swap-and-pop defrag; bucketized cuckoo kick; dense bitfield walk + set-algebra |
-| 02 | Sliding Extremes   | RingLog, RingDeque, MonoDeque, MinStack, WindowFold   | telemetry: lossy vs fail-closed ring; sliding-window min/max envelope; general worst-case rolling sum/mean |
+| 02 | Sliding Extremes   | RingLog, RingDeque, MonoDeque, MinStack, WindowFold, WindowFoldUint32 | telemetry: lossy vs fail-closed ring; sliding-window min/max envelope; general worst-case rolling sum/mean; bitwise OR/AND/XOR window fold |
 | 03 | Connectivity+Timers| TimerWheel, HierarchicalTimerWheel, UnionFind, CoarseTimerWheel | game loop: single-wheel horizon overflow -> HTW cascade; islands; near-unbounded non-cascading approximate wheel |
-| 04 | Priority & Sampling| BucketQueue, SparseTable, RandomSet, FreqO1, AliasTable | graph + casino: Dijkstra wavefront; static RMQ heatmap; O(1) uniform sample/LFU; weighted O(1) Vose draw |
+| 04 | Priority & Sampling| BucketQueue, SparseTable, RandomSet, FreqO1, AliasTable, Reservoir, RankSelect, EliasFano | graph + casino: Dijkstra wavefront; static RMQ heatmap; O(1) uniform sample/LFU; weighted O(1) Vose draw; streaming reservoir sample; succinct rank/select/access |
 
 ---
 
@@ -134,10 +141,23 @@ as the WEIGHTED-draw complement (Vose, worst-case O(1)) to RandomSet's UNIFORM d
   the window-size slider and value axis with the MonoDeque envelope but drives its own
   WindowFold instance + rail, so the general aggregator and the min/max specialist read
   side by side.
+- **WindowFoldUint32**: the BITWISE sibling of WindowFold's numeric SUM -- the
+  register-width contrast a Float64 aggregate lane cannot honestly carry (JS `& | ^`
+  coerce to a signed int32, and AND's all-ones identity `0xFFFFFFFF` has no clean
+  Float64 form). Below the waveform plot, a three-row triptych folds a sliding window
+  of 16-bit flag MASKS under OR (union) / AND (intersection) / XOR (parity), each a
+  real `WindowFoldUint32` instance sharing the window slider, WORST-CASE O(1) per
+  `push`+`evict`+`query` (SAME DABA-Lite core, no O(W) flip spike). Each row lights the
+  live flag bits of that aggregate; the Truth Panel reads the OR/AND/XOR popcounts.
+  `query()` on the EMPTY window returns the operator IDENTITY (0 for OR/XOR,
+  `0xFFFFFFFF` for AND), never undefined (null is not zero). It reads side by side with
+  WindowFold's numeric SUM band over the SAME window slider. (The lite triptych is the
+  wired beat; its O(W) full-window bitwise-refold foil stays test-only.)
 - **Contrast**: MonoDeque does sliding min/max in AMORTIZED O(1) via a monotonic
-  deque (the order-dominating extreme trick); WindowFold folds ANY monoid
-  (SUM/MIN/MAX/PRODUCT) in WORST-CASE O(1) -- the general SWAG aggregator vs the
-  min/max specialist, side by side over the same waveform.
+  deque (the order-dominating extreme trick); WindowFold folds ANY arithmetic monoid
+  (SUM/MIN/MAX/PRODUCT) in WORST-CASE O(1); WindowFoldUint32 folds the bitwise monoids
+  (OR/AND/XOR) in WORST-CASE O(1) -- the general SWAG aggregator and its bitwise sibling
+  vs the min/max specialist, side by side over the same waveform.
 - Slider: window size. The Truth Panel proves ops/ms stays flat (O(1)) versus a
   naive O(k)-window-rescan / O(W)-refold toggle that climbs as the window grows.
 
@@ -196,6 +216,29 @@ as the WEIGHTED-draw complement (Vose, worst-case O(1)) to RandomSet's UNIFORM d
   co-headline (paid once at construction, excluded from the per-draw claim) -- the same
   build-once / immutable / query-only shape as SparseTable. The naive foil rebuilds an
   O(n) cumulative array per draw and linear-scans it; the counter climbs with n.
+- **Reservoir** (Vitter's Algorithm R): the STREAMING uniform sampler -- the third
+  sampling point next to RandomSet (uniform over a MATERIALIZED set) and AliasTable
+  (weighted over a STATIC vector). It draws a uniform sample of an UNBOUNDED stream in
+  FIXED memory k, storing NOTHING but the sample; `add()` is WORST-CASE O(1) (one LCG
+  advance + one compare + one conditional store), 0 B/op, independent of items seen.
+  In the band above the bucket strip, a row of k retained slots shimmers -- each slot
+  brighter the more recent its retained stream item (read via the library's own public
+  `get(i)`) -- as newer items replace older samples; the Truth Panel reads `seen`
+  (unbounded) vs the fixed sample fill `min(seen, k)`. The naive foil BUFFERS the whole
+  stream (one alloc per item) -- the exact memory the reservoir refuses -- so its counter
+  climbs WITHOUT BOUND while the reservoir's memory stays pinned at k.
+- **RankSelect + EliasFano** (the SUCCINCT static cameo): the succinct siblings of
+  SparseTable -- build ONCE over a FROZEN structure, then query forever in worst-case
+  O(1). `RankSelect` answers `rank1(i)` (set bits before i) and `select1(k)` (position of
+  the k-th set bit) over a frozen "hard terrain" bitvector via the cs-poppy 3-level
+  directory; `EliasFano` is the succinct codec for the SORTED hard-cell positions, with
+  `access(i)` in worst-case O(1) at ~`2 + ceil(log2(U/n))` bits/element (near the
+  information-theoretic minimum). The band draws a scrolling window of the frozen
+  bitvector: set bits (hard cells) light accent, the cursor bit is ringed amber (its
+  `rank1`), the `select1` position is ringed cyan; the Truth Panel reads `rank1 @cursor`
+  and `select1`. The O(n) BUILD + the succinct SPACE are the disclosed one-time
+  co-headlines (the SparseTable shape). The naive foil linear-scans the whole bitvector
+  for `rank1` (O(n), allocating) -- the exact work the directory makes needless.
 
 ---
 

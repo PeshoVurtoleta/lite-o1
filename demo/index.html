@@ -371,9 +371,12 @@
                         The <code>lite</code> path keeps the window min/max in O(1) via two
                         <code>MonoDeque</code>s AND folds the GENERAL rolling sum/mean (cyan) via
                         <code>WindowFold</code> in worst-case O(1) -- the aggregate MonoDeque cannot
-                        do -- and never allocates. The <code>naive</code> path rescans the whole
-                        window every frame into fresh <code>O(k)</code>/<code>O(W)</code> arrays --
-                        watch the allocation counter CLIMB as you widen the window.
+                        do -- and never allocates. Below the plot, <code>WindowFoldUint32</code> folds
+                        the same window BITWISE (OR union / AND intersection / XOR parity) -- the
+                        register-width sibling a Float64 aggregate cannot honestly carry. The
+                        <code>naive</code> path rescans the whole window every frame into fresh
+                        <code>O(k)</code>/<code>O(W)</code> arrays -- watch the allocation counter
+                        CLIMB as you widen the window.
                     </p>
                 </section>
 
@@ -423,6 +426,7 @@
                             <div class="stat-row"><span class="k">window sum (WindowFold)</span><span class="v" id="sl-wfsum">0.00</span></div>
                             <div class="stat-row"><span class="k">window mean (WindowFold)</span><span class="v" id="sl-wfmean">0.00</span></div>
                             <div class="stat-row"><span class="k">WindowFold op / size</span><span class="v" id="sl-wfop">SUM / 0</span></div>
+                            <div class="stat-row"><span class="k">bitwise flags OR/AND/XOR (WindowFoldUint32)</span><span class="v" id="sl-wfu">--</span></div>
                             <div class="stat-row"><span class="k">RingLog size / cap</span><span class="v" id="sl-rl">0 / 0</span></div>
                             <div class="stat-row"><span class="k">frame rate</span><span class="v" id="sl-fps">--</span></div>
                         </div>
@@ -562,9 +566,12 @@
                         alloc/frame. The casino also runs an <code>AliasTable</code> (Vose) drawing
                         a WEIGHTED loot outcome in worst-case O(1) -- the complement to
                         <code>RandomSet</code>'s UNIFORM chip draw; its histogram converges to the
-                        target weights. The <code>naive</code> path <code>new</code>s one object per
-                        edge relaxation AND rebuilds an O(n) cumulative array per weighted draw --
-                        watch the counter climb.
+                        target weights. A <code>Reservoir</code> (Vitter R) draws a uniform sample
+                        of a fast UNBOUNDED stream in FIXED memory k, and a <code>RankSelect</code> +
+                        <code>EliasFano</code> succinct index answers O(1) rank/select/access over a
+                        FROZEN bitvector. The <code>naive</code> path <code>new</code>s one object per
+                        edge relaxation, rebuilds an O(n) cumulative array per weighted draw, BUFFERS
+                        the whole stream, and linear-scans the bitvector -- watch the counter climb.
                     </p>
                 </section>
 
@@ -617,6 +624,8 @@
                             <div class="stat-row"><span class="k">LFU evicted (FreqO1)</span><span class="v" id="sp-lfu">--</span></div>
                             <div class="stat-row"><span class="k">weighted draw (AliasTable)</span><span class="v accent" id="sp-alias-last">--</span></div>
                             <div class="stat-row"><span class="k">histogram fit (max |emp - weight|)</span><span class="v" id="sp-alias-fit">--</span></div>
+                            <div class="stat-row"><span class="k">stream seen / sample (Reservoir)</span><span class="v accent" id="sp-rsv">--</span></div>
+                            <div class="stat-row"><span class="k">rank1 @cursor / select1 (RankSelect/EliasFano)</span><span class="v" id="sp-sc">--</span></div>
                             <div class="stat-row"><span class="k">frame rate</span><span class="v" id="sp-fps">--</span></div>
                         </div>
                         <div>
@@ -650,10 +659,13 @@
         createAllocState, naiveStep,
         createSlidingWorld, frameSlidingExtremes, naiveRescan,
         createWindowFoldWorld, frameWindowFold, naiveWindowRefold,
+        createWindowFoldU32World, frameWindowFoldU32, WFU_BITS,
         createConnectWorld, frameConnect, naiveConnectStep,
         createCoarseWorld, frameCoarseWorld, naiveCoarseScan, CW_TRACK, CW_LEVELS,
         createSampleWorld, frameSample, restartWavefront, naiveSampleStep,
         createAliasWorld, frameAliasWorld, naiveAliasSample, AT_OUTCOMES,
+        createReservoirWorld, frameReservoir, naiveReservoirStep, RSV_K,
+        createSuccinctWorld, frameSuccinct, naiveSuccinctScan, SC_CELLS, SC_HARD,
         bqBucketHead, SP_COLS, SP_ROWS, SP_CELLS, SP_RELAX_BUDGET, SP_CHIPS, SP_MAXCOST,
     } from './kernels.mjs';
 
@@ -980,6 +992,9 @@
     // WindowFold(SUM) over the SAME window: the GENERAL rolling aggregate MonoDeque cannot do
     // (min/max only). Its rolling mean = query()/size draws a cyan band tracking the waveform.
     let wfWorld = createWindowFoldWorld(SL_WAVELEN, SL_WIN, 0x51ed270b);
+    // WindowFoldUint32 over the SAME window: the BITWISE sibling (OR/AND/XOR) of WindowFold's numeric
+    // SUM -- three real folds tracking a sliding window of 32-bit flag masks, all worst-case O(1).
+    let wfuWorld = createWindowFoldU32World(SL_WAVELEN, SL_WIN, 0x51ed270b);
     let naiveSl = false;
 
     // scene-02 stage canvas + plot geometry (recomputed on resize / window-size change ONLY)
@@ -988,6 +1003,17 @@
     let slPlotX = 0, slPlotY = 0, slPlotW = 0, slPlotH = 0;
     const SL_VMIN = -1.25, SL_VMAX = 1.25; // fixed value axis (waveform range ~[-1, 1])
     const SL_TITLE = 'waveform + sliding-window envelope   (accent band = MonoDeque min..max, amber = MinStack all-time max, cyan = WindowFold rolling mean)';
+
+    // WindowFoldUint32 bitwise triptych (OR/AND/XOR) geometry -- three bit-strip rows below the plot.
+    const WFU_TRIP_H = 96;                  // vertical budget reserved beneath the waveform plot
+    const WFU_GAP = 4;
+    let wfuX = 0, wfuY = 0, WFU_CW = 16, WFU_CH = 12, WFU_ROWGAP = 8, wfuLabelW = 44;
+    const WFU_TITLE = 'WindowFoldUint32  -  BITWISE rolling aggregate over the flag-mask window   (accent = flag live in the aggregate; row = OR union / AND intersection / XOR parity)';
+    const WFU_ROW_NAMES = ['OR', 'AND', 'XOR'];
+    const WFU_ROW_RGB = ['157,123,255', '125,211,252', '245,185,66'];
+
+    // 16-bit popcount for the 10Hz telemetry readout (off the hot draw path).
+    function _pc16(v) { let x = v | 0, c = 0; while (x !== 0) { x &= x - 1; c++; } return c; }
 
     function slValY(v) {
         let t = (v - SL_VMIN) / (SL_VMAX - SL_VMIN);
@@ -1000,8 +1026,13 @@
         slCtx = s.ctx; SL_W = s.w; SL_H = s.h;
         slPlotX = PAD; slPlotY = PAD + 26;
         slPlotW = SL_W - PAD * 2;
-        slPlotH = SL_H - slPlotY - PAD - 20;
+        slPlotH = SL_H - slPlotY - PAD - 20 - WFU_TRIP_H; // leave room for the bitwise triptych below
         if (slPlotH < 20) slPlotH = 20;
+        // WindowFoldUint32 triptych: three OR/AND/XOR bit-strip rows under the plot.
+        wfuX = PAD;
+        wfuY = slPlotY + slPlotH + 34;
+        WFU_CH = 12; WFU_ROWGAP = 8; wfuLabelW = 44;
+        WFU_CW = Math.min(22, (slPlotW - wfuLabelW - (WFU_BITS - 1) * WFU_GAP) / WFU_BITS);
     }
     window.addEventListener('resize', () => { if (activeScene === 'sliding') computeSlidingLayout(); });
 
@@ -1013,6 +1044,7 @@
     function stepSliding() {
         frameSlidingExtremes(slWorld);
         frameWindowFold(wfWorld); // GENERAL rolling SUM/mean band (worst-case O(1), 0 alloc)
+        frameWindowFoldU32(wfuWorld); // BITWISE rolling OR/AND/XOR triptych (worst-case O(1), 0 alloc)
         if (naiveSl) {
             naiveRescan(allocState, slWorld);       // the O(k) min/max rescan foil
             naiveWindowRefold(allocState, wfWorld); // the O(W) full-window refold foil
@@ -1084,13 +1116,32 @@
             }
             g.strokeStyle = COL_CYAN; g.lineWidth = 1.5; g.stroke();
         }
+
+        // --- WindowFoldUint32 bitwise triptych: OR / AND / XOR aggregate over the flag-mask window ---
+        // The BITWISE contrast to WindowFold's numeric SUM band above. Reads the three real folds'
+        // aggregates from wfuWorld.out [mask, OR, AND, XOR]; each bit cell lit = that flag is live in
+        // the aggregate. Pure reads (rgbaq is the built-once cache); zero allocation per frame.
+        const wu = wfuWorld;
+        g.fillStyle = COL_DIM; g.fillText(WFU_TITLE, wfuX, wfuY - 12);
+        for (let r = 0; r < 3; r++) {
+            const rowY = wfuY + r * (WFU_CH + WFU_ROWGAP);
+            const val = wu.out[r + 1] | 0; // out[1]=OR, out[2]=AND, out[3]=XOR
+            const rgb = WFU_ROW_RGB[r];
+            g.fillStyle = COL_FAINT; g.fillText(WFU_ROW_NAMES[r], wfuX, rowY + WFU_CH - 1);
+            for (let b = 0; b < WFU_BITS; b++) {
+                const x = wfuX + wfuLabelW + b * (WFU_CW + WFU_GAP);
+                const on = (val >>> b) & 1;
+                g.fillStyle = on ? rgbaq(rgb, 0.9) : rgbaq(STALE_RGB, 0.12);
+                g.fillRect(x, rowY, WFU_CW, WFU_CH);
+            }
+        }
     }
 
     // scene-02 telemetry DOM (cached once); text updated at ~7.5Hz off the frameN mask
     const sldom = {
         allocBig: $('sl-alloc-big'), wmin: $('sl-wmin'), wmax: $('sl-wmax'),
         life: $('sl-life'), rl: $('sl-rl'), fps: $('sl-fps'), heap: $('sl-heap'), modeTag: $('sl-mode-tag'),
-        wfsum: $('sl-wfsum'), wfmean: $('sl-wfmean'), wfop: $('sl-wfop'),
+        wfsum: $('sl-wfsum'), wfmean: $('sl-wfmean'), wfop: $('sl-wfop'), wfu: $('sl-wfu'),
     };
     let slLastAlloc = -1, slLastRl = -1, slLastHeapTenths = -1;
 
@@ -1109,6 +1160,9 @@
         sldom.wfsum.textContent = (Math.round(wfout[1] * 100) / 100).toFixed(2);
         sldom.wfmean.textContent = (Math.round(wfout[2] * 100) / 100).toFixed(2);
         sldom.wfop.textContent = wfWorld.fold.op + ' / size ' + wfWorld.fold.size;
+        // WindowFoldUint32: live flag counts (popcount) of the OR / AND / XOR aggregates.
+        const wfuout = wfuWorld.out; // [mask, OR, AND, XOR]
+        sldom.wfu.textContent = 'OR ' + _pc16(wfuout[1]) + ' / AND ' + _pc16(wfuout[2]) + ' / XOR ' + _pc16(wfuout[3]);
         const size = slWorld.ringlog.size;
         if (size !== slLastRl) { slLastRl = size; sldom.rl.textContent = size + ' / ' + slWorld.ringlog.capacity; }
         sldom.fps.textContent = String(fpsValue);
@@ -1170,6 +1224,7 @@
         slWinV.textContent = String(SL_WIN);
         slWorld = createSlidingWorld(SL_WAVELEN, SL_WIN, 0x51ed270b);
         wfWorld = createWindowFoldWorld(SL_WAVELEN, SL_WIN, 0x51ed270b);
+        wfuWorld = createWindowFoldU32World(SL_WAVELEN, SL_WIN, 0x51ed270b);
         slLastRl = -1;
         computeSlidingLayout();
     });
@@ -1464,6 +1519,8 @@
     // ==================================================================================
     const spWorld = createSampleWorld(0x51ed270b); // frozen terrain + frontier + casino, built once
     const spAliasWorld = createAliasWorld(0x51ed270b); // WEIGHTED-draw loot table (Vose), built once
+    const spRsvWorld = createReservoirWorld(RSV_K, 0x51ed270b); // STREAMING uniform sample (Vitter R), fixed memory k
+    const spScWorld = createSuccinctWorld(0x51ed270b); // RankSelect + EliasFano over a FROZEN bitvector, built once
     let naiveSp = false;
     let spRelaxBudget = SP_RELAX_BUDGET;
     // peak target proportion (weightOf), computed ONCE, so the histogram scales to fill its band.
@@ -1478,6 +1535,8 @@
     const SP_BUCKET_TITLE = 'BucketQueue dials  -  monotone cursor never rewinds (buckets light as the frontier advances)';
     const SP_CASINO_TITLE = 'RandomSet chips  -  FreqO1 LFU heat   (bright = most-visited, ring = LFU victim)';
     const SP_ALIAS_TITLE = 'AliasTable  -  WEIGHTED draw (Vose, O(1)) vs UNIFORM chips   (bar = empirical, cyan = weightOf target)';
+    const SP_RSV_TITLE = 'Reservoir  -  uniform stream sample (Vitter R)';
+    const SP_SC_TITLE = 'RankSelect + EliasFano  -  succinct index';
 
     const spCanvas = $('sp-canvas');
     let spCtx = null, SP_W = 0, SP_H = 0;
@@ -1487,6 +1546,10 @@
     let spBucketX = 0, spBucketY = 0, SP_BUCKETS_SHOWN = 48, SP_BW = 8;
     // AliasTable weighted-draw histogram band (right column, below the RandomSet chip grid)
     let spAliasX = 0, spAliasY = 0, SP_ALIAS_W = 0, SP_ALIAS_H = 64, SP_ABW = 12, SP_ABGAP = 6;
+    // Reservoir stream + succinct index band (full-width, between the grid and the bucket strip)
+    const SP_BAND_H = 98;
+    let spRsvX = 0, spRsvY = 0, SP_RSV_W = 0, SP_RSV_CW = 12, SP_RSV_CH = 18, SP_RSV_GAP = 3;
+    let spScX = 0, spScY = 0, SP_SC_W = 0, SP_SC_CW = 10, SP_SC_CH = 18, SP_SC_GAP = 2, SP_SC_SHOWN = 64;
 
     function computePriorityLayout() {
         const s = sizeCanvas(spCanvas);
@@ -1494,7 +1557,8 @@
         const titleH = PAD + 26;
         const bottomH = 84;                       // the bucket strip lives here
         const gridAreaW = SP_W * 0.62;
-        const gridAreaH = SP_H - titleH - bottomH - PAD;
+        // reserve a full-width band for the Reservoir stream + succinct index above the bucket strip
+        const gridAreaH = SP_H - titleH - SP_BAND_H - bottomH - PAD;
         const cw = (gridAreaW - (SP_COLS - 1) * SP_GAP) / SP_COLS;
         const ch = (gridAreaH - (SP_ROWS - 1) * SP_GAP) / SP_ROWS;
         const cell = Math.max(4, Math.min(cw, ch));
@@ -1519,6 +1583,22 @@
         const bw = SP_W - PAD * 2;
         SP_BUCKETS_SHOWN = 64;
         SP_BW = (bw - (SP_BUCKETS_SHOWN - 1) * 2) / SP_BUCKETS_SHOWN;
+        // Reservoir + succinct band: full-width, anchored just above the bucket strip. Left ~40% is
+        // the Reservoir slot row; the right side is the succinct bitvector window.
+        const bandBody = SP_H - bottomH - SP_BAND_H + 24; // +title gutter
+        spRsvX = PAD;
+        spRsvY = bandBody;
+        SP_RSV_W = SP_W * 0.40 - PAD;
+        SP_RSV_GAP = 3;
+        SP_RSV_CW = Math.max(6, Math.min(16, (SP_RSV_W - (RSV_K - 1) * SP_RSV_GAP) / RSV_K));
+        SP_RSV_CH = 20;
+        spScX = SP_W * 0.46;
+        spScY = bandBody;
+        SP_SC_W = SP_W - PAD - spScX;
+        SP_SC_SHOWN = 64;
+        SP_SC_GAP = 2;
+        SP_SC_CW = Math.max(4, (SP_SC_W - (SP_SC_SHOWN - 1) * SP_SC_GAP) / SP_SC_SHOWN);
+        SP_SC_CH = 20;
     }
     window.addEventListener('resize', () => { if (activeScene === 'priority') computePriorityLayout(); });
 
@@ -1532,9 +1612,13 @@
         // whole-frame advances per rAF tick to speed the wavefront (still zero-alloc each call).
         for (let b = 0; b < spRelaxBudget; b += SP_RELAX_BUDGET) frameSample(spWorld);
         frameAliasWorld(spAliasWorld); // WEIGHTED draws folded into the reused histogram (0 alloc)
+        frameReservoir(spRsvWorld);    // STREAMING uniform sample over an unbounded stream (worst-case O(1), 0 alloc)
+        frameSuccinct(spScWorld);      // RankSelect + EliasFano succinct queries over the frozen bitvector (0 alloc)
         if (naiveSp) {
-            naiveSampleStep(allocState, spWorld);        // the O(1)-relax foil (allocates / relax)
-            naiveAliasSample(allocState, spAliasWorld);  // the O(n) cumulative-scan draw foil (allocates)
+            naiveSampleStep(allocState, spWorld);          // the O(1)-relax foil (allocates / relax)
+            naiveAliasSample(allocState, spAliasWorld);    // the O(n) cumulative-scan draw foil (allocates)
+            naiveReservoirStep(allocState, spRsvWorld);    // BUFFER the whole stream (allocates / item)
+            naiveSuccinctScan(allocState, spScWorld);      // the O(n) linear bit-scan foil (allocates)
         }
     }
 
@@ -1607,6 +1691,46 @@
             g.fillStyle = COL_CYAN;                     // the weight target the histogram converges to
             g.fillRect(x, baseY - th - 1, SP_ABW, 2);
         }
+
+        // --- Reservoir: a streaming uniform sample of an unbounded stream in FIXED memory k ---
+        // Each retained slot is drawn accent; brighter = a more recent stream item (value near seen),
+        // so the row shimmers as older samples are replaced -- the streaming-retention beat. The
+        // sample values are read via the library's own public get(i); zero allocation per frame.
+        g.fillStyle = COL_DIM; g.fillText(SP_RSV_TITLE, spRsvX, spRsvY - 8);
+        const res = spRsvWorld.res, rk = spRsvWorld.k, rsize = res.size;
+        const rseen = res.seen > 0 ? res.seen : 1;
+        for (let i = 0; i < rk; i++) {
+            const x = spRsvX + i * (SP_RSV_CW + SP_RSV_GAP);
+            if (i < rsize) {
+                const v = res.get(i);                    // the i-th retained sample (public accessor)
+                const rec = v === undefined ? 0 : v / rseen; // recency in [0, 1]
+                g.fillStyle = rgbaq(ACCENT_RGB, 0.3 + rec * 0.65);
+            } else {
+                g.fillStyle = rgbaq(STALE_RGB, 0.14);
+            }
+            g.fillRect(x, spRsvY, SP_RSV_CW, SP_RSV_CH);
+        }
+
+        // --- RankSelect + EliasFano: succinct queries over a FROZEN bitvector (window at the cursor) ---
+        // A scrolling window of the frozen "hard cell" bitvector: set bits (hard cells) light accent,
+        // the cursor bit is ringed amber (its rank1), and the select1 position is ringed cyan. The bits
+        // are read from the world's own frozen words buffer; zero allocation per frame.
+        g.fillStyle = COL_DIM; g.fillText(SP_SC_TITLE, spScX, spScY - 8);
+        const sc = spScWorld, scWords = sc.words, scCells = sc.cells, scCur = sc.cursor;
+        let scOrigin = scCur - (SP_SC_SHOWN >> 1);
+        if (scOrigin < 0) scOrigin = 0;
+        else if (scOrigin > scCells - SP_SC_SHOWN) scOrigin = scCells - SP_SC_SHOWN > 0 ? scCells - SP_SC_SHOWN : 0;
+        const scSel = sc.out[1] | 0;                     // select1(k) position
+        for (let i = 0; i < SP_SC_SHOWN; i++) {
+            const pos = scOrigin + i;
+            if (pos >= scCells) break;
+            const x = spScX + i * (SP_SC_CW + SP_SC_GAP);
+            const bit = (scWords[pos >>> 5] >>> (pos & 31)) & 1;
+            g.fillStyle = bit ? rgbaq(ACCENT_RGB, 0.9) : rgbaq(STALE_RGB, 0.14);
+            g.fillRect(x, spScY, SP_SC_CW, SP_SC_CH);
+            if (pos === scCur) { g.strokeStyle = COL_AMBER; g.lineWidth = 2; g.strokeRect(x - 1, spScY - 1, SP_SC_CW + 2, SP_SC_CH + 2); }
+            else if (pos === scSel) { g.strokeStyle = COL_CYAN; g.lineWidth = 2; g.strokeRect(x - 1, spScY - 1, SP_SC_CW + 2, SP_SC_CH + 2); }
+        }
     }
 
     // scene-04 telemetry DOM (cached once); text updated at ~7.5Hz off the frameN mask
@@ -1615,6 +1739,7 @@
         cursor: $('sp-cursor'), hard: $('sp-hard'), lfu: $('sp-lfu'), fps: $('sp-fps'),
         heap: $('sp-heap'), modeTag: $('sp-mode-tag'),
         aliasLast: $('sp-alias-last'), aliasFit: $('sp-alias-fit'),
+        rsv: $('sp-rsv'), sc: $('sp-sc'),
     };
     let spLastAlloc = -1, spLastSettled = -1, spLastFrontier = -1, spLastCursor = -1,
         spLastHard = -1, spLastLfu = -2, spLastHeapTenths = -1,
@@ -1652,6 +1777,12 @@
         for (let i = 0; i < AT_OUTCOMES; i++) { const d = Math.abs(at[i] / atotal - aweights[i] / awsum); if (d > fit) fit = d; }
         const fitMilli = (fit * 1000 + 0.5) | 0;
         if (fitMilli !== spLastAliasFitMilli) { spLastAliasFitMilli = fitMilli; spdom.aliasFit.textContent = (fitMilli / 1000).toFixed(3); }
+        // Reservoir: total items seen (unbounded) vs the fixed retained sample fill min(seen, k).
+        const rres = spRsvWorld.res;
+        spdom.rsv.textContent = rres.seen + ' / ' + rres.size;
+        // RankSelect / EliasFano: rank1 at the cursor and the select1 position (out [rank1, select1, ...]).
+        const scout = spScWorld.out;
+        spdom.sc.textContent = (scout[0] | 0) + ' / ' + (scout[1] | 0);
         spdom.fps.textContent = String(fpsValue);
         const m = mem();
         if (m) {
