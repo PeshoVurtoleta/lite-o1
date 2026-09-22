@@ -8,6 +8,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.4.1] - 2026-09-22
+
+### Fixed
+
+- **`BitSet.firstSet()` no longer leaks.** A debugging probe injected during the 1.4.0 cycle to
+  verify a torture gate could fail was left in `O1.js` and shipped in 1.4.0: a module-level
+  `_bitsetLeakSink` array plus, in `firstSet()`, a `if (raw >= 2147483648) { _bitsetLeakSink.push(String(raw)); }`
+  that ran whenever the first non-empty word's value had bit 31 set (`_w[j] >= 2^31`). Each such
+  `firstSet` call pushed a string into a never-drained array -- a hot-path allocation with unbounded
+  memory retention. Both lines are reverted; `firstSet()` is again a pure bounded read (0 B/op, no
+  retention). Anyone on 1.4.0 who calls `firstSet` on a bitset whose lowest set bit lands on a word's
+  top bit should upgrade.
+
+### Changed
+
+- **`test/torture.mjs` gains a `firstSet` RETENTION gate** that closes the blind spot which let the
+  1.4.0 probe pass the release gate. The existing bytes/op gates missed it because `String(raw)` ran
+  on a constant `raw` (`0x80000000`), so V8 interned the string and the growing array amortized to a
+  sub-byte per-call figure that rounded to 0 B/op. The new gate hammers `firstSet` 2e6 times on a
+  bit-31 bitset and asserts live-heap growth across a full GC stays under 1 MiB (a leak retains
+  > 16 MB); its teeth are verified (re-injecting the probe makes it fail at ~24 MB while every
+  bytes/op gate still reads 0). No API or behavioral change to any member.
+
 ## [1.4.0] - 2026-09-22
 
 ### Added

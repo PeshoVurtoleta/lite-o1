@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-Version: 1.4.0
+Version: 1.4.1
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -13,7 +13,7 @@ op is O(1) worst-case (or O(1)-amortized where stated) and allocates zero bytes
 after construction, and a shipped witness harness demonstrates the flat
 throughput curve against a built-in foil.
 
-v1.4.0 ships fourteen members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
+v1.4.1 ships fourteen members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
 RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap,
 SparseTable, and BitSet. They share no mutable module state, so a bundler that imports one drops
 the others (tree-shakeable). 1.4.0 adds BitSet (the fourteenth member; 1.3.0 added SparseTable,
@@ -72,7 +72,7 @@ the others (tree-shakeable). 1.4.0 adds BitSet (the fourteenth member; 1.3.0 add
   MULTI-WORD structure; @zakkster/lite-fastbit32 stays the single 32-flag word and
   @zakkster/lite-scheduler's FastBitScheduler the bit-bucket scheduler (design-parity only, ZERO
   runtime dep). Fixed capacity, fail closed at construction; test/firstSet/nextSet never throw.
-- `VERSION` -- string, '1.4.0'.
+- `VERSION` -- string, '1.4.1'.
 
 ## SparseSet
 

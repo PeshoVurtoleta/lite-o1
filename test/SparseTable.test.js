@@ -36,8 +36,8 @@ function brute(arr, l, r, min) {
 
 // --- version + surface -----------------------------------------------------
 
-test('VERSION is the frozen 1.4.0 string', () => {
-    assert.equal(VERSION, '1.4.0');
+test('VERSION is the frozen 1.4.1 string', () => {
+    assert.equal(VERSION, '1.4.1');
 });
 
 test('empty-input-safe surface: length / kind getters + query/at over a singleton', () => {

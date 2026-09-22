@@ -580,6 +580,28 @@ async function main() {
     const bitOrAllocBytes = Math.max(0, Math.round(bitOrBpc));
     const bitOrAllocOk = bitOrAllocBytes === 0;
 
+    // BitSet firstSet RETENTION gate (closes the blind spot that let a 1.4.0 probe ship: it
+    // pushed String(_w[j]) into a module-level array whenever firstSet read a word >= 2^31).
+    // The bitHighAllocOk bytes/op gate above MISSED that probe -- `raw` was a CONSTANT
+    // (0x80000000 every call), so String(raw) interned to a single string and the growing array
+    // amortized to a sub-byte per-call figure that rounded to 0. Unbounded RETENTION, not per-op
+    // allocation, is the true signal: pound firstSet on a bit-31 bitset and assert the live JS
+    // heap does not grow across a full GC. A leak of 2e6 (interned-ref + array-slot) entries would
+    // retain > 16 MB; a clean firstSet retains nothing. The 1 MiB ceiling sits far above post-GC
+    // heapUsed noise yet far below a real leak.
+    const bitRet = new BitSet(BS_BITS);
+    bitRet.set(31);                          // word 0 = 0x80000000: firstSet reads a raw >= 2^31 every call
+    let brSink = 0;
+    for (let w = 0; w < 100000; w++) brSink = (brSink + bitRet.firstSet()) | 0; // warm + settle the heap
+    globalThis.gc();
+    const brBefore = process.memoryUsage().heapUsed;
+    for (let w = 0; w < 2000000; w++) brSink = (brSink + bitRet.firstSet()) | 0;
+    globalThis.gc();
+    const brAfter = process.memoryUsage().heapUsed;
+    const bitRetGrowth = Math.max(0, brAfter - brBefore);
+    const bitRetOk = bitRetGrowth < (1 << 20); // < 1 MiB retained across 2e6 firstSet calls
+    if (brSink === 0x7fffffff) process.stderr.write(''); // keep brSink live (defeat dead-code elimination)
+
     // "0 B/op" resolved at the sampling floor: heapUsed deltas are quantized and
     // noisy, so a truly non-allocating op reads a sub-byte figure (a lone blip
     // in one batch / iterations). Round to the nearest byte -- any per-op
@@ -799,7 +821,7 @@ async function main() {
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
         findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && monoAllocOk &&
         minAllocOk && randAllocOk && freqAllocOk && buckAllocOk && twAllocOk && htwAllocOk &&
-        ringLogAllocOk && cuckAllocOk && stAllocOk && bitAllocOk && bitHighAllocOk && bitOrAllocOk && abOk;
+        ringLogAllocOk && cuckAllocOk && stAllocOk && bitAllocOk && bitHighAllocOk && bitOrAllocOk && bitRetOk && abOk;
 
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
@@ -818,8 +840,9 @@ async function main() {
         bitAllocBytes + ' B/op (BitSet per-bit) ' +
         bitHighAllocBytes + ' B/op (BitSet firstSet/nextSet >=2^31 word) ' +
         bitOrAllocBytes + ' B/op (BitSet or)' +
+        ' | bitRetGrowth=' + bitRetGrowth + ' B' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
-        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' bsSink=' + bsSink + ' bhSink=' + bhSink + ' abGrowth=' + abDelta + ')');
+        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' bsSink=' + bsSink + ' bhSink=' + bhSink + ' brSink=' + brSink + ' abGrowth=' + abDelta + ')');
 
     if (!ok) {
         if (!trackedOk) console.error('  vacuous: tracker held ' + trackedMid + ' instances (expected > 0)');
@@ -844,6 +867,7 @@ async function main() {
         if (!bitAllocOk) console.error('  alloc ' + bitAllocBytes + ' B/op BitSet per-bit (raw bytesPerCall ' + bitBpc + ')');
         if (!bitHighAllocOk) console.error('  alloc ' + bitHighAllocBytes + ' B/op BitSet firstSet/nextSet >=2^31 word (raw bytesPerCall ' + bitHighBpc + ')');
         if (!bitOrAllocOk) console.error('  alloc ' + bitOrAllocBytes + ' B/op BitSet or (raw bytesPerCall ' + bitOrBpc + ')');
+        if (!bitRetOk) console.error('  retain ' + bitRetGrowth + ' B heap growth over 2e6 BitSet firstSet calls (>= 2^31 word); limit ' + (1 << 20) + ' B -- a firstSet must retain nothing');
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;
     }
