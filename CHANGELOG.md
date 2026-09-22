@@ -8,6 +8,47 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.8.0] - 2026-09-22
+
+### Added
+
+- **`RankSelect` -- the eighteenth member: a zero-GC, WORST-CASE O(1) STATIC rank/select bitvector
+  (cs-poppy class).** `BitSet` has `popcount` O(words) and `firstSet` / `nextSet`, but NOT O(1)
+  `rank1(i)` (set bits in `[0, i)`) nor O(1) `select1(k)` (position of the k-th set bit). `RankSelect`
+  is a build-once popcount-directory INDEX over an immutable bitvector: `rank1` / `rank0` / `select1`
+  / `select0` / `access` are all worst-case O(1), zero-alloc, via a cs-poppy 512-bit-basic-block
+  4-level directory plus a genuine O(1) select sampling layer (not rank + binary search) -- ~3-6%
+  index overhead, the disclosed co-headline (the ADR 0018 static-member honesty contract, alongside
+  `SparseTable` / `AliasTable`). It prints NO max-single-op line (the O(n) build is a one-time
+  construction cost, not a per-op spike). The source is a raw word array (`Array` | numeric
+  `TypedArray`) plus an explicit `nbits`, COPIED into a private `Uint32Array` (immutable, no
+  mutators, rebuild to change) -- NOT a `BitSet` instance, so it stays decoupled from the mutable
+  member; it reuses `BitSet`'s popcount / `clz32` idiom by DESIGN-PARITY only (no cross-class call,
+  no dep). Fail closed at construction (a bad `nbits` throws `[lite-o1]` typeof-first, before any
+  typed array is allocated); queries never throw (a bad index -> `0` / `-1` / `undefined`). ROUTING
+  (ADR 0024): built here as pure worst-case O(1); `@zakkster/lite-loglogn` RE-ADOPTS it as substrate
+  (never forks). Elias-Fano (O(1) access on top of this select) is a DEFERRED follow-on, not this
+  member. See [`decisions/0024`](./decisions/0024-rankselect.md).
+- **`test/RankSelect.test.js`** -- full behavioral suite: `rank1` equals a naive prefix-popcount for
+  every index over random bitvectors (nbits `1` / `511` / `512` / `513` / `1e6`); `rank1(0) = 0`,
+  `rank1(nbits) = size`; `select1(k)` = the k-th set bit and `-1` past `size`; `rank1(select1(k))`
+  round-trips (and the `rank0` / `select0` complements); fail-closed construction before any alloc;
+  the queries-never-throw contract.
+- Gate coverage extended for the eighteenth member: `test/torture.mjs` (retention -> `size() = 0`
+  plus a `0 B/op` hot-path phase on `rank` / `select`), `test/witness.mjs` (a flat `RankSelect`
+  `rank` line vs an O(words)-popcount-scan foil that decays, NO max-single-op line),
+  `test/perf/PerfGate.test.mjs` (zero-alloc `rank` / `select` / `forEach-drain` scenarios), and
+  `benchmark/` (`SUBJECTS` -> 18; a STATIC member, excluded from the churn workload alongside
+  `SparseTable` / `AliasTable`).
+
+### Changed
+
+- Roster is now EIGHTEEN members; `O1.js` header member-count + roster list + `VERSION` bumped to
+  `1.8.0`, with `package.json` (version + description + keywords) and `llms.txt` in sync. `O1.js` is
+  a PURE APPEND -- the prior seventeen member classes are byte-identical (only the header comment and
+  the `VERSION` const changed). README + GUIDE document the succinct rank/select positional-index
+  leaf.
+
 ## [1.7.0] - 2026-09-22
 
 ### Added

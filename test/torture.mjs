@@ -39,7 +39,7 @@ async function main() {
     const { GcProfiler, checkNoGc, measureAllocs } =
         await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold } = await import('../O1.js');
+    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect } = await import('../O1.js');
 
     const U = 1 << 16;      // universe 65536
     const CAP = 1 << 14;    // capacity 16384
@@ -260,6 +260,20 @@ async function main() {
             wf1.forEach(noop);
             wf1.clear();
             tracker.track(wf1, noop, 'windowfold', { audit: true });
+            // RankSelect owns only its private Uint32Array data words + the cs-poppy directory
+            // (_l0/_l1/_l2 + the two select sample arrays); nothing external to release. Its arrays
+            // hold numbers, so a reclaimed instance is the desired outcome, proven by size()->0.
+            // STATIC/immutable: build once from a raw word array, then exercise the rank/select/access
+            // + forEach query-only surface before tracking.
+            const rsWords = new Uint32Array(32); // 1024 bits
+            for (let k = 0; k < 32; k++) rsWords[k] = (k ^ i) * 2654435761;
+            const rsel = new RankSelect(rsWords, 1024);
+            rsel.rank1(i & 1023);
+            rsel.rank0((i + 1) & 1023);
+            if (rsel.size > 0) { const sk = rsel.select1(i % rsel.size); rsel.rank1(sk); }
+            rsel.access(i & 1023);
+            rsel.forEach(noop);
+            tracker.track(rsel, noop, 'rankselect', { audit: true });
         }
         return tracker.size();
     }
@@ -700,6 +714,37 @@ async function main() {
     const wfAllocBytes = Math.max(0, Math.round(wfBpc));
     const wfAllocOk = wfAllocBytes === 0;
 
+    // RankSelect hot path: a STATIC build-once cs-poppy index, BUILT ONCE OUTSIDE the measured window
+    // (the O(n) build + the ~3.2% index space are the disclosed co-headline, EXCLUDED from the per-op
+    // claim). Two measured hot loops -- rank1 over a walking i, and select1 over a walking k -- both
+    // worst-case O(1), zero-alloc (a fixed directory lookup + a bounded <= 16-word block scan; the
+    // immutable typed columns are slots, never a JS allocation). Both returns fold into int32 sinks so
+    // V8 cannot elide them and no heap double is promoted (all values are SMI ints).
+    const RS_BITS = 1 << 20;               // 1,048,576 bits (many lower blocks -> the directory is real)
+    const rsWordsHot = new Uint32Array(RS_BITS >>> 5);
+    for (let k = 0; k < rsWordsHot.length; k++) rsWordsHot[k] = (k * 2654435761) >>> 0; // ~half set, spread
+    const rankSelect = new RankSelect(rsWordsHot, RS_BITS); // built once, outside the measured loops
+    let rsRankKey = 0, rsRankSink = 0;
+    const rsRankStep = () => {
+        rsRankKey = (rsRankKey + 1) & (RS_BITS - 1);
+        rsRankSink = (rsRankSink + rankSelect.rank1(rsRankKey)) | 0; // O(1) worst-case rank
+    };
+    const rsRankAllocRes = measureAllocs(rsRankStep, { iterations: 100000, batches: 8 });
+    const rsRankBpc = rsRankAllocRes.bytesPerCall === null ? 0 : rsRankAllocRes.bytesPerCall;
+    const rsRankAllocBytes = Math.max(0, Math.round(rsRankBpc));
+    const rsRankAllocOk = rsRankAllocBytes === 0;
+
+    const rsSize = rankSelect.size;
+    let rsSelKey = 0, rsSelSink = 0;
+    const rsSelStep = () => {
+        rsSelKey = (rsSelKey + 1) % rsSize;
+        rsSelSink = (rsSelSink + rankSelect.select1(rsSelKey)) | 0; // O(1) worst-case select via the sample layer
+    };
+    const rsSelAllocRes = measureAllocs(rsSelStep, { iterations: 100000, batches: 8 });
+    const rsSelBpc = rsSelAllocRes.bytesPerCall === null ? 0 : rsSelAllocRes.bytesPerCall;
+    const rsSelAllocBytes = Math.max(0, Math.round(rsSelBpc));
+    const rsSelAllocOk = rsSelAllocBytes === 0;
+
     // "0 B/op" resolved at the sampling floor: heapUsed deltas are quantized and
     // noisy, so a truly non-allocating op reads a sub-byte figure (a lone blip
     // in one batch / iterations). Round to the nearest byte -- any per-op
@@ -730,6 +775,8 @@ async function main() {
         aliasStep();
         ctwStep();
         wfStep();
+        rsRankStep();
+        rsSelStep();
         if ((i & 8191) === 0) {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
         }
@@ -953,7 +1000,7 @@ async function main() {
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
         findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && monoAllocOk &&
         minAllocOk && randAllocOk && freqAllocOk && buckAllocOk && twAllocOk && htwAllocOk &&
-        ringLogAllocOk && cuckAllocOk && stAllocOk && bitAllocOk && bitHighAllocOk && bitOrAllocOk && bitRetOk && aliasAllocOk && ctwAllocOk && wfAllocOk && abOk;
+        ringLogAllocOk && cuckAllocOk && stAllocOk && bitAllocOk && bitHighAllocOk && bitOrAllocOk && bitRetOk && aliasAllocOk && ctwAllocOk && wfAllocOk && rsRankAllocOk && rsSelAllocOk && abOk;
 
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
@@ -974,10 +1021,12 @@ async function main() {
         bitOrAllocBytes + ' B/op (BitSet or) ' +
         aliasAllocBytes + ' B/op (AliasTable sample) ' +
         ctwAllocBytes + ' B/op (CoarseTimerWheel) ' +
-        wfAllocBytes + ' B/op (WindowFold)' +
+        wfAllocBytes + ' B/op (WindowFold) ' +
+        rsRankAllocBytes + ' B/op (RankSelect rank1) ' +
+        rsSelAllocBytes + ' B/op (RankSelect select1)' +
         ' | bitRetGrowth=' + bitRetGrowth + ' B' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
-        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' bsSink=' + bsSink + ' bhSink=' + bhSink + ' brSink=' + brSink + ' atSink=' + atSink + ' wfSink=' + wfSink + ' abGrowth=' + abDelta + ')');
+        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' bsSink=' + bsSink + ' bhSink=' + bhSink + ' brSink=' + brSink + ' atSink=' + atSink + ' wfSink=' + wfSink + ' rsRankSink=' + rsRankSink + ' rsSelSink=' + rsSelSink + ' abGrowth=' + abDelta + ')');
 
     if (!ok) {
         if (!trackedOk) console.error('  vacuous: tracker held ' + trackedMid + ' instances (expected > 0)');
@@ -1006,6 +1055,8 @@ async function main() {
         if (!aliasAllocOk) console.error('  alloc ' + aliasAllocBytes + ' B/op AliasTable sample (raw bytesPerCall ' + aliasBpc + ')');
         if (!ctwAllocOk) console.error('  alloc ' + ctwAllocBytes + ' B/op CoarseTimerWheel (raw bytesPerCall ' + ctwBpc + ')');
         if (!wfAllocOk) console.error('  alloc ' + wfAllocBytes + ' B/op WindowFold (raw bytesPerCall ' + wfBpc + ')');
+        if (!rsRankAllocOk) console.error('  alloc ' + rsRankAllocBytes + ' B/op RankSelect rank1 (raw bytesPerCall ' + rsRankBpc + ')');
+        if (!rsSelAllocOk) console.error('  alloc ' + rsSelAllocBytes + ' B/op RankSelect select1 (raw bytesPerCall ' + rsSelBpc + ')');
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;
     }

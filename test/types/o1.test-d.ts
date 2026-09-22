@@ -5,7 +5,7 @@
  * fails `npm run test:types`. Not executed; only type-checked.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, BitSet, AliasTable, CoarseTimerWheel, WindowFold, VERSION } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, VERSION } from '../../O1.js';
 import type { WindowFoldOp } from '../../O1.js';
 
 // VERSION is a string.
@@ -665,3 +665,48 @@ new WindowFold('1000', 'SUM');
 new WindowFold(1000, 'XOR');
 // @ts-expect-error -- push value must be a number.
 wf.push('3');
+
+// --- RankSelect ------------------------------------------------------------
+
+const rsWords: Uint32Array = new Uint32Array([0xff, 0x0f]);
+const rksel: RankSelect = new RankSelect(rsWords, 40);
+const rsArr: RankSelect = new RankSelect([0xff, 0x0f], 40); // a plain number[] source is accepted
+void rsArr;
+
+// length / size / indexBytes are readonly numbers.
+const rsLen: number = rksel.length;
+const rsSize: number = rksel.size;
+const rsIdx: number = rksel.indexBytes;
+void rsLen; void rsSize; void rsIdx;
+
+// @ts-expect-error -- length is readonly.
+rksel.length = 5;
+// @ts-expect-error -- size is readonly.
+rksel.size = 5;
+
+// rank1 / rank0 / select1 / select0 -> number; access -> number | undefined.
+const rsRank1: number = rksel.rank1(10);
+const rsRank0: number = rksel.rank0(10);
+const rsSel1: number = rksel.select1(3);
+const rsSel0: number = rksel.select0(3);
+const rsAccess: number | undefined = rksel.access(7);
+void rsRank1; void rsRank0; void rsSel1; void rsSel0; void rsAccess;
+
+// forEach callback gets (index, rankSelect).
+rksel.forEach((index, rankSelect) => {
+    const i: number = index;
+    const r: RankSelect = rankSelect;
+    void i; void r;
+});
+
+// iterable of set-bit indices (numbers).
+for (const i of rksel) { const ii: number = i; void ii; }
+
+// @ts-expect-error -- nbits must be a number.
+new RankSelect(rsWords, '40');
+// @ts-expect-error -- source must be an Array or a numeric TypedArray, not a number.
+new RankSelect(42, 40);
+// @ts-expect-error -- rank1 index must be a number.
+rksel.rank1('10');
+// @ts-expect-error -- select1 k must be a number.
+rksel.select1('3');

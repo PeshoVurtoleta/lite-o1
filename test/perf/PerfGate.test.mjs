@@ -22,7 +22,7 @@
  */
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect } from '../../O1.js';
 
 const U = 1 << 16;      // universe 65536
 const CAP = 1 << 14;    // capacity 16384
@@ -1916,6 +1916,95 @@ const wfForEachDrain = {
     statsOf(s) { return { grows: wfGrows(s) }; },
 };
 
+// ===========================================================================
+// RankSelect scenarios -- a STATIC build-once cs-poppy index over a private Uint32Array data-word
+// column + the L0/L1/L2 rank directory + the two select sample arrays. rank1 / rank0 / select1 /
+// select0 / access are WORST-CASE O(1) zero-alloc (a fixed directory lookup + a bounded <= 16-word
+// in-block popcount scan + a bounded in-word step). The O(n) BUILD + the ~3.2% index space are the
+// disclosed co-headline, done in setup() OUTSIDE the measured window. Static / immutable: the single
+// reused index is re-queried, never rebuilt.
+// ===========================================================================
+
+const RS_BITS = 1 << 20;   // 1,048,576 bits (many lower blocks -> a real cs-poppy directory)
+
+/**
+ * The zero-alloc counter for RankSelect scenarios, KEYED ON indexBytes: the private data words plus
+ * the cs-poppy directory (rs.indexBytes -- the L0/L1/L2 + select sample arrays). All fixed at
+ * construction, so this NEVER grows -- the delta across the window must be 0 (mirrors stGrows / atGrows).
+ */
+function rsGrows(s) {
+    return s.rs._w.buffer.byteLength + s.rs.indexBytes;
+}
+
+/** A RankSelect built ONCE over a bounded ~half-set word pattern (the O(n) build is out of the window). */
+function rsBuild() {
+    const words = new Uint32Array(RS_BITS >>> 5);
+    for (let i = 0; i < words.length; i++) words[i] = (i * 2654435761) >>> 0; // ~half set, spread
+    return new RankSelect(words, RS_BITS);
+}
+
+/**
+ * rank: a prebuilt index; every op one rank1 over a walking WIDE index (the worst-case-O(1) hot body
+ * -- a fixed directory lookup + a bounded <= 16-word block scan, independent of nbits), int32-wrapped
+ * acc so the returned count is never dead-code-eliminated / promoted to a heap double.
+ */
+const rsRank = {
+    name: 'RankSelect rank1 (walking index)',
+    setup() { return { rs: rsBuild(), key: 0, acc: 0 }; },
+    hot(s, n) {
+        const rs = s.rs;
+        let key = s.key | 0, acc = s.acc | 0;
+        for (let i = 0; i < n; i++) {
+            key = (key + 1) & (RS_BITS - 1);
+            acc = (acc + rs.rank1(key)) | 0;
+        }
+        s.key = key | 0; s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: rsGrows(s) }; },
+};
+
+/**
+ * select: a prebuilt index; every op one select1 over a walking k (the worst-case-O(1) hot body via
+ * the sample layer + a bounded in-block scan), int32-wrapped acc.
+ */
+const rsSelect = {
+    name: 'RankSelect select1 (walking k)',
+    setup() { const rs = rsBuild(); return { rs, size: rs.size, k: 0, acc: 0 }; },
+    hot(s, n) {
+        const rs = s.rs;
+        const size = s.size;
+        let k = s.k | 0, acc = s.acc | 0;
+        for (let i = 0; i < n; i++) {
+            k = (k + 1) % size;
+            acc = (acc + rs.select1(k)) | 0;
+        }
+        s.k = k | 0; s.acc = acc | 0;
+    },
+    statsOf(s) { return { grows: rsGrows(s) }; },
+};
+
+/**
+ * RankSelect forEach-drain: a prebuilt SMALL index scanned each op through a HOISTED module-scope
+ * callback (never re-created per op). Proves forEach itself (the alloc-free ascending set-bit scan;
+ * the ONE per-protocol allocator is [Symbol.iterator], gated separately by rsMustFailAlloc) allocates
+ * nothing over its own dedicated window.
+ */
+let rsDrainAcc = 0;
+function rsForEachInto(i) { rsDrainAcc = (rsDrainAcc + i) | 0; }
+const rsForEachDrain = {
+    name: 'RankSelect forEach-drain',
+    setup() {
+        const words = new Uint32Array(8); // 256 bits, a bounded resident set to scan
+        for (let i = 0; i < words.length; i++) words[i] = (i * 2654435761) >>> 0;
+        return { rs: new RankSelect(words, 256) };
+    },
+    hot(s, n) {
+        const rs = s.rs;
+        for (let i = 0; i < n; i++) rs.forEach(rsForEachInto);
+    },
+    statsOf(s) { return { grows: rsGrows(s) }; },
+};
+
 const scenarios = [
     addChurn, hasHit, deleteChurn, clearRefill, forEachDrain,
     ringFifo, ringLifo, ringInterleave,
@@ -1934,6 +2023,7 @@ const scenarios = [
     atSample, atForEachDrain,
     ctwScheduleChurn, ctwDrainAdvance, ctwCancelChurn, ctwAdvanceTick, ctwForEachDrain,
     wfPushEvictQuery, wfQueryRead, wfEvictRefill, wfForEachDrain,
+    rsRank, rsSelect, rsForEachDrain,
 ];
 
 /**
@@ -2328,6 +2418,32 @@ const wfMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/**
+ * The RankSelect teeth: a per-op `[Symbol.iterator]` spread into a FRESH [] each op -- the generator
+ * + its per-step {value, done} wrappers + the array MUST trip the gate (scavenges scale with n),
+ * proving the instrument has teeth on the RankSelect surface too (its iterator is the ONE documented
+ * per-protocol allocator; forEach is the alloc-free scan). statsOf returns a constant so the failure
+ * is the allocation lanes, not a missing-counter artifact.
+ */
+const rsMustFailAlloc = {
+    name: 'RankSelect [Symbol.iterator] spread into fresh array (MUST allocate)',
+    setup() {
+        const words = new Uint32Array(8); // 256 bits
+        for (let i = 0; i < words.length; i++) words[i] = (i * 2654435761) >>> 0;
+        return { rs: new RankSelect(words, 256) };
+    },
+    hot(s, n) {
+        const rs = s.rs;
+        let sink = 0;
+        for (let i = 0; i < n; i++) {
+            const arr = [...rs]; // fresh generator + array per op -> heap churn
+            sink += arr.length;
+        }
+        s.sink = sink;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -2337,5 +2453,5 @@ zgcSuite({
     counters: { grows: 0 },
     maxRetainedKB: 64,
     scenarios,
-    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc, twMustFailAlloc, htwMustFailAlloc, ringLogMustFailAlloc, cuckMustFailAlloc, stMustFailAlloc, bsMustFailAlloc, atMustFailAlloc, wfMustFailAlloc],
+    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc, twMustFailAlloc, htwMustFailAlloc, ringLogMustFailAlloc, cuckMustFailAlloc, stMustFailAlloc, bsMustFailAlloc, atMustFailAlloc, wfMustFailAlloc, rsMustFailAlloc],
 });

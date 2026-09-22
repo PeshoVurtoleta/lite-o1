@@ -955,3 +955,58 @@ export class WindowFold {
     /** Iterate live element values front -> back (oldest -> newest). */
     [Symbol.iterator](): IterableIterator<number>;
 }
+
+/** A raw bit-word source for RankSelect: a real Array or a numeric TypedArray (uint32 per element). */
+export type RankSelectSource =
+    | number[]
+    | Uint32Array
+    | Int32Array
+    | Uint16Array
+    | Int16Array
+    | Uint8Array
+    | Int8Array
+    | Uint8ClampedArray
+    | Float32Array
+    | Float64Array;
+
+/**
+ * RankSelect -- a zero-GC, WORST-CASE O(1) STATIC succinct rank/select bitvector index over a frozen
+ * bit pattern (cs-poppy: 512-bit basic blocks + a select sampling layer). Built from a RAW WORD ARRAY
+ * + an explicit nbits (COPIED into a private Uint32Array; NOT a BitSet instance -- zero coupling).
+ * rank1/rank0/select1/select0/access are worst-case O(1), 0 B/op; the O(n) build + the ~3.2% index
+ * space are a disclosed co-headline (no max-single-op line). Build-once, query-only: no mutators.
+ */
+export class RankSelect {
+    /** @param source the raw bit words (uint32 each), the first ceil(nbits/32) COPIED. @param nbits number of bits, an integer in [1, 2^25]. Throws [lite-o1] on a bad nbits (before any alloc) or a non-Array / non-TypedArray source. */
+    constructor(source: RankSelectSource, nbits: number);
+
+    /** Number of bits (nbits); bits are [0, length). O(1). */
+    readonly length: number;
+
+    /** Number of set bits (popcount, precomputed at build). O(1). */
+    readonly size: number;
+
+    /** The cs-poppy directory byte footprint (the disclosed index overhead). O(1). */
+    readonly indexBytes: number;
+
+    /** The bit at index i (0 or 1). Worst-case O(1). Returns undefined for a bad i. Never throws. */
+    access(i: number): number | undefined;
+
+    /** Number of set bits in [0, i). Worst-case O(1). Bad i -> 0; i > length clamps to length. Never throws. */
+    rank1(i: number): number;
+
+    /** Number of clear bits in [0, i) (i - rank1(i)). Worst-case O(1). Bad i -> 0. Never throws. */
+    rank0(i: number): number;
+
+    /** Position of the k-th set bit (0-indexed). Worst-case O(1) via the sample layer. Bad / overflow k -> -1. Never throws. */
+    select1(k: number): number;
+
+    /** Position of the k-th clear bit (0-indexed). Worst-case O(1) via the clear-bit sample layer. Bad / overflow k -> -1. Never throws. */
+    select0(k: number): number;
+
+    /** Iterate set-bit indices in ascending order, alloc-free. O(nbits). fn is (index, rankSelect). */
+    forEach(fn: (index: number, rankSelect: RankSelect) => void): void;
+
+    /** Iterate set-bit indices in ascending order. O(nbits). */
+    [Symbol.iterator](): IterableIterator<number>;
+}

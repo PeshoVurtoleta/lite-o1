@@ -17,7 +17,7 @@
 import {
     SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet,
     FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel,
-    RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold,
+    RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect,
 } from '../O1.js';
 import {
     prng, median, warm, gcNow, hasGc, percentile, collect, timeNsPerOp, foldHash,
@@ -233,6 +233,18 @@ export function makeSubject(member, n, rng) {
         for (let k = 0; k < n; k++) w[k] = (k & 63) + 1; // all positive, a spread of weights
         const t = new AliasTable(w, 0x9e3779b1);
         return { obj: t, op: () => { if (t.sample() >= 0) SINK++; } };
+    }
+    if (member === 'RankSelect') {
+        // A STATIC build-once cs-poppy rank/select index (built here, OUTSIDE the timed op -- the
+        // O(n) build + the ~3.2% index space are the disclosed co-headline, EXCLUDED from the per-op
+        // claim). The hot op is rank1 over a walking WIDE index (worst-case O(1): a fixed directory
+        // lookup + a bounded <= 16-word block scan, independent of nbits). The rank folds into SINK.
+        const W = (n + 31) >>> 5;
+        const words = new Uint32Array(W);
+        for (let k = 0; k < W; k++) words[k] = (k * 2654435761) >>> 0; // ~half set, spread
+        const rs = new RankSelect(words, n);
+        let key = 0;
+        return { obj: rs, op: () => { key++; if (key >= n) key = 0; SINK = (SINK + rs.rank1(key)) | 0; } };
     }
     throw new Error('[bench] unhandled member: ' + member);
 }
@@ -734,6 +746,34 @@ export function makeBaseline(member, n) {
             },
         };
     }
+    if (member === 'RankSelect') {
+        // An alloc-free O(words) popcount-scan foil: recompute rank1(i) by popcounting every word
+        // before i on every query -- the obvious approach before the cs-poppy directory. A full
+        // factor of the word count lost per query, so it collapses as nbits grows -> O(words), timed
+        // gently. Uses the SAME ~half-set word pattern as the subject.
+        const W = (n + 31) >>> 5;
+        const words = new Uint32Array(W);
+        for (let k = 0; k < W; k++) words[k] = (k * 2654435761) >>> 0;
+        const rem = n & 31;
+        if (rem !== 0) words[W - 1] &= ((1 << rem) >>> 0) - 1;
+        const popcount = (x) => {
+            x = x - ((x >>> 1) & 0x55555555);
+            x = (x & 0x33333333) + ((x >>> 2) & 0x33333333);
+            x = (x + (x >>> 4)) & 0x0f0f0f0f;
+            return (Math.imul(x, 0x01010101) >>> 24);
+        };
+        let key = 0;
+        return {
+            op: () => {
+                key++; if (key >= n) key = 0;
+                const word = key >>> 5, bitOff = key & 31;
+                let r = 0;
+                for (let j = 0; j < word; j++) r += popcount(words[j]); // O(words) scan
+                if (bitOff !== 0) r += popcount(words[word] & (((1 << bitOff) >>> 0) - 1));
+                SINK = (SINK + r) | 0;
+            },
+        };
+    }
     throw new Error('[bench] unhandled member: ' + member);
 }
 
@@ -828,6 +868,7 @@ const LINEAR_BASELINE = {
     BitSet: false,       // native Set foil is O(1) per op (fair-already; degrades on cache, not big-O)
     AliasTable: true,    // cumulative-scan foil is an O(n) linear prefix scan per draw
     CoarseTimerWheel: true, // 4-ary-heap foil is O(log n) per fired timer
+    RankSelect: true,    // popcount-scan foil is an O(words) rank rescan per query
 };
 
 /** Exact backing-store byte footprint of a member instance (typed-array buffers). */
@@ -901,6 +942,12 @@ export function memberBytes(member, obj) {
             obj._fireAt.buffer.byteLength + obj._head.buffer.byteLength + obj._tail.buffer.byteLength +
             obj._bits.buffer.byteLength;
     }
+    if (member === 'RankSelect') {
+        // private data words (Uint32, ceil(nbits/32)) + the cs-poppy directory (L0 Float64 +
+        // L1/L2 Uint32 + the two select sample Uint32 arrays -- the disclosed ~3.2% index overhead).
+        return obj._w.buffer.byteLength + obj._l0.buffer.byteLength + obj._l1.buffer.byteLength +
+            obj._l2.buffer.byteLength + obj._sel1.buffer.byteLength + obj._sel0.buffer.byteLength;
+    }
     throw new Error('[bench] unhandled member: ' + member);
 }
 
@@ -945,6 +992,9 @@ export function theoreticalMinPerLive(member) {
     // so the dense floor is 24, NOT widened to absorb the universe-sized sparse array, the fixed
     // 577-bucket heads, or the 18-word bitmap (the HierarchicalTimerWheel discipline).
     if (member === 'CoarseTimerWheel') return 24;
+    if (member === 'RankSelect') return 0.125; // ONE BIT per live (indexed) element = 1/8 byte -- the
+    // raw bit-storage floor a bitvector index is FOR (the BitSet convention). The cs-poppy directory
+    // (~3.2%) is the DISCLOSED index overhead, NOT folded into the per-live floor (the FreqO1 discipline).
     throw new Error('[bench] unhandled member: ' + member);
 }
 
@@ -952,6 +1002,7 @@ export function theoreticalMinPerLive(member) {
 function liveCount(member, obj) {
     if (member === 'UnionFind') return obj.capacity;   // fixed universe (all elements live)
     if (member === 'SparseTable') return obj.length;   // static: source-element count (no `size`)
+    if (member === 'RankSelect') return obj.length;    // static: bit count (nbits), the indexed universe
     return obj.size;
 }
 
@@ -1298,6 +1349,18 @@ function makeMixed(member, cap, rng) {
         const t = new AliasTable(w, 0x9e3779b1);
         return () => { if (t.sample() >= 0) SINK++; };
     }
+    if (member === 'RankSelect') {
+        // STATIC / immutable: there is no mutation trace to amortize, so D2 reports drift as n/a
+        // (see D2). The trace here is a long stream of rank1 queries over an index built ONCE -- it
+        // proves the query cost is FLAT (constant by construction), which keeps the cell non-vacuous
+        // (real query nsPerOp points), never a mutation drift.
+        const W = (cap + 31) >>> 5;
+        const words = new Uint32Array(W);
+        for (let k = 0; k < W; k++) words[k] = (k * 2654435761) >>> 0;
+        const rs = new RankSelect(words, cap);
+        let key = 0;
+        return () => { key++; if (key >= cap) key = 0; SINK = (SINK + rs.rank1(key)) | 0; };
+    }
     // Fail closed (mirrors every other dispatch helper): a member NOT handled above must
     // throw, so a future member cannot silently inherit MonoDeque's mixed trace.
     throw new Error('[bench] unhandled member: ' + member);
@@ -1327,7 +1390,7 @@ export function D2(member, opts = {}) {
     // amortized-DRIFT metric is n/a (the STRING, never a numeric 0 -- "not applicable", not
     // "measured zero"). The points above are a real WIDE-range QUERY trace, kept so the cell
     // stays non-vacuous and shows the query cost is flat by construction.
-    const isStatic = member === 'SparseTable' || member === 'AliasTable';
+    const isStatic = member === 'SparseTable' || member === 'AliasTable' || member === 'RankSelect';
     const drift = isStatic ? NA : (first > 0 ? last / first : 0);
     const reason = isStatic
         ? 'static/immutable: no mutation trace to amortize; points are the flat query/sample trace' : undefined;
@@ -1434,6 +1497,12 @@ function D3Static(member, opts) {
             for (let k = 0; k < len; k++) w[k] = (k & 63) + 1; // all positive
             return new AliasTable(w, 0x9e3779b1);
         }
+        if (member === 'RankSelect') {
+            const W = (len + 31) >>> 5;
+            const words = new Uint32Array(W);
+            for (let k = 0; k < W; k++) words[k] = (k * 2654435761) >>> 0; // ~half set
+            return new RankSelect(words, len);
+        }
         const src = new Float64Array(len);
         for (let k = 0; k < len; k++) src[k] = (k * 2654435761) & 0x7fffffff;
         return new SparseTable(src, 'min');
@@ -1481,7 +1550,7 @@ function D3Static(member, opts) {
 }
 
 export function D3(member, opts = {}) {
-    if (member === 'SparseTable' || member === 'AliasTable') return D3Static(member, opts);
+    if (member === 'SparseTable' || member === 'AliasTable' || member === 'RankSelect') return D3Static(member, opts);
     const n = opts.n ?? 65536;
     let obj;
     if (member === 'SparseSet') obj = new SparseSet(n, n);
@@ -1830,7 +1899,7 @@ export function D7(member, opts = {}) {
     // fraction and no near-full / just-resized state, so the load-factor sweep is n/a (the STRING,
     // never a numeric 0 -- "not applicable", not "measured zero"). The int-key QUERY / SAMPLE
     // throughput (keyTypes.int) + the scan-fold baseline keep the cell non-vacuous.
-    if (member === 'SparseTable' || member === 'AliasTable') {
+    if (member === 'SparseTable' || member === 'AliasTable' || member === 'RankSelect') {
         return {
             dim: 'D7', member, baseline: baselineFor(member, 'D7'), unit: 'ns/op',
             keyTypes, baselineIntNs: baseIntNs,
@@ -2031,8 +2100,8 @@ export function D8(member, opts = {}) {
     // (AliasTable) over a table built ONCE. This keeps the cell non-vacuous (a real nsPerOp) even
     // though ecs / cache / churn are all n/a for a static member.
     let query = NA;
-    if (member === 'SparseTable' || member === 'AliasTable') {
-        const built = makeSubject(member, n, prng(seed)); // builds the table; op = a query / sample
+    if (member === 'SparseTable' || member === 'AliasTable' || member === 'RankSelect') {
+        const built = makeSubject(member, n, prng(seed)); // builds the table; op = a query / sample / rank
         query = { nsPerOp: median(collect(built.op, 5000, 60)) };
     }
 
@@ -2138,7 +2207,7 @@ export function traceHash(member, seed = DEFAULT_SEED, length = 100000) {
         member === 'FreqO1' || member === 'BucketQueue' || member === 'TimerWheel' ||
         member === 'HierarchicalTimerWheel' || member === 'RingLog' ||
         member === 'CuckooMap' || member === 'SparseTable' || member === 'BitSet' ||
-        member === 'AliasTable' || member === 'CoarseTimerWheel') mode = 0;
+        member === 'AliasTable' || member === 'CoarseTimerWheel' || member === 'RankSelect') mode = 0;
     else if (member === 'RingDeque' || member === 'MinStack') mode = 1;
     else if (member === 'MonoDeque' || member === 'WindowFold') mode = 2;
     else throw new Error('[bench] unhandled member: ' + member);

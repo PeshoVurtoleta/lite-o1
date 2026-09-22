@@ -55,7 +55,7 @@ Truth Panel's primary signal (Section 4) are ours.
 
 ---
 
-## 2. Roster -> scene map (all 13 real members)
+## 2. Roster -> scene map (17 of 18 shipped members demoed)
 
 The 13 public members of O1.js (v1.3.1): SparseSet, RingDeque, UnionFind,
 MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel,
@@ -66,12 +66,23 @@ no `SlotMap` and no `MaxStack`; MinStack carries a frozen `min`|`max` kind.)
 Every member appears in exactly one scene as its primary home; a member may make a
 cameo in another scene where it earns the contrast.
 
+Scene-extension COMPLETE: each of the four scenes gained one new roster member, so the demo
+now shows all 17 members that have a scene home -- the entire v1.7.0 roster (v1.7.0 added
+BitSet, AliasTable, CoarseTimerWheel, WindowFold to the original 13). The lone shipped member
+without a scene is RankSelect (M18, new in v1.8.0), which is deferred to a future scene and is
+NOT demoed here. Scene 01: BitSet joins as the DENSE-membership fourth wall against SparseSet's
+sparse set. Scene 02: WindowFold joins as the GENERAL rolling-aggregate contrast to MonoDeque's
+min/max-only sliding envelope. Scene 03: CoarseTimerWheel joins as the NEAR-UNBOUNDED,
+NON-CASCADING, APPROXIMATE third wheel against TimerWheel (bounded + exact) and
+HierarchicalTimerWheel (bounded 2^26 + exact + cascade). Scene 04: AliasTable joins the casino
+as the WEIGHTED-draw complement (Vose, worst-case O(1)) to RandomSet's UNIFORM draw.
+
 | Scene | Title | Members | Beat |
 |-------|-------|---------|------|
-| 01 | Sparse World       | SparseSet, CuckooMap                                   | memory architecture: swap-and-pop defrag; bucketized cuckoo kick |
-| 02 | Sliding Extremes   | RingLog, RingDeque, MonoDeque, MinStack               | telemetry: lossy vs fail-closed ring; sliding-window envelope |
-| 03 | Connectivity+Timers| TimerWheel, HierarchicalTimerWheel, UnionFind         | game loop: single-wheel horizon overflow -> HTW cascade; islands |
-| 04 | Priority & Sampling| BucketQueue, SparseTable, RandomSet, FreqO1           | graph + casino: Dijkstra wavefront; static RMQ heatmap; O(1) sample/LFU |
+| 01 | Sparse World       | SparseSet, CuckooMap, BitSet                          | memory architecture: swap-and-pop defrag; bucketized cuckoo kick; dense bitfield walk + set-algebra |
+| 02 | Sliding Extremes   | RingLog, RingDeque, MonoDeque, MinStack, WindowFold   | telemetry: lossy vs fail-closed ring; sliding-window min/max envelope; general worst-case rolling sum/mean |
+| 03 | Connectivity+Timers| TimerWheel, HierarchicalTimerWheel, UnionFind, CoarseTimerWheel | game loop: single-wheel horizon overflow -> HTW cascade; islands; near-unbounded non-cascading approximate wheel |
+| 04 | Priority & Sampling| BucketQueue, SparseTable, RandomSet, FreqO1, AliasTable | graph + casino: Dijkstra wavefront; static RMQ heatmap; O(1) uniform sample/LFU; weighted O(1) Vose draw |
 
 ---
 
@@ -89,8 +100,18 @@ cameo in another scene where it earns the contrast.
   worst-case (<= 8 probes always) while `set` shows the amortized kick spike and,
   rarely, a re-seed sweep (the max-single-op line). Slider: load factor toward the
   0.90 ceiling; pushing past it flashes the fail-closed throw.
+- **BitSet**: the DENSE-membership fourth wall against SparseSet's SPARSE live set. A
+  dirty-mask grid (one row per 32-bit data word) marks cells with O(1) `test`/`set`/`unset`;
+  the `firstSet`/`nextSet` summary walk lights the live bits in WORST-CASE O(1) per hop via
+  the 3-level popcount summary -- an amber cursor marks `firstSet`. The naive/"vs" toggle runs
+  the O(n) linear bit-scan the summary makes needless (the ONLY new code allowed to allocate,
+  bumping the owned counter by nbits per call). Below the grid, a set-algebra triptych shows
+  two seeded operands a, b and the result `c = a OP b`, cycling `and`/`or`/`xor`/`andNot`
+  (bulk, in place, O(words) DISCLOSED). Slider: live bit count.
 - **Contrast**: SparseSet's O(universe) dense-domain vs CuckooMap's O(capacity)
-  sparse-key domain -- the exact space trade, side by side.
+  sparse-key domain vs BitSet's DENSE bitfield (O(bits) space, O(1) per-bit test/set,
+  summary-driven O(1) firstSet/nextSet) -- SPARSE set vs DENSE mask, the exact membership
+  trade, side by side.
 
 ### Scene 02 -- Sliding Extremes (telemetry)
 - A noisy waveform scrolls across the canvas (pre-generated into a reused
@@ -102,8 +123,23 @@ cameo in another scene where it earns the contrast.
 - **MonoDeque** draws a tight sliding-window min/max bounding envelope in real
   time; **MinStack** (a second instance set to `max`) drives the upper envelope
   rail (stack-lifetime extreme vs MonoDeque's sliding-window extreme).
+- **WindowFold**: the GENERAL rolling-aggregate contrast to MonoDeque's min/max-only
+  envelope -- what a monotonic deque CANNOT do. A `WindowFold(W, 'SUM')` folds a
+  rolling **SUM / mean** band (mean = `query()/size`, cyan) tracking the SAME scrolling
+  waveform in real time, WORST-CASE O(1) per `push`+`evict`+`query` (DABA-Lite, no
+  O(W) flip spike), against the same naive O(W) full-window-refold foil (re-sum the
+  whole window every frame) that climbs as the window grows -- the ONLY new Scene-02
+  code allowed to allocate. `query()` on the EMPTY window returns the operator IDENTITY
+  (0 for SUM), never undefined (null is not zero) -- a teaching micro-beat. It shares
+  the window-size slider and value axis with the MonoDeque envelope but drives its own
+  WindowFold instance + rail, so the general aggregator and the min/max specialist read
+  side by side.
+- **Contrast**: MonoDeque does sliding min/max in AMORTIZED O(1) via a monotonic
+  deque (the order-dominating extreme trick); WindowFold folds ANY monoid
+  (SUM/MIN/MAX/PRODUCT) in WORST-CASE O(1) -- the general SWAG aggregator vs the
+  min/max specialist, side by side over the same waveform.
 - Slider: window size. The Truth Panel proves ops/ms stays flat (O(1)) versus a
-  naive O(k)-window-rescan toggle that climbs as the window grows.
+  naive O(k)-window-rescan / O(W)-refold toggle that climbs as the window grows.
 
 ### Scene 03 -- Connectivity + Timers (game loop)
 - **TimerWheel** (single-level): schedule timers on a ring; attempting to schedule
@@ -116,6 +152,28 @@ cameo in another scene where it earns the contrast.
 - **UnionFind**: HTW fires randomized edge events; UnionFind merges endpoints;
   `componentSize()` colorizes the largest island; live `count` shown. Path-halving
   is visible as the tree flattening on `find`.
+- **CoarseTimerWheel**: the NEAR-UNBOUNDED, NON-CASCADING, APPROXIMATE third wheel --
+  the genuinely distinct third point in the design space next to TimerWheel (bounded +
+  EXACT; a delay `>= slots` overflows -> the teaching throw) and HierarchicalTimerWheel
+  (bounded 2^26 + EXACT + CASCADES; the max-single-op spike). It schedules far-future
+  timers (delays reaching toward ~2^30, WAY past what TW/HTW can hold) that sit in a
+  COARSE bucket and fire IN PLACE with NO cascade -- worst-case O(1) with NO
+  max-single-op line -- by trading PRECISION for range: each fires LATE by
+  `<= gran(level) - 1`, NEVER early (L0 exact). A full-width far-horizon track plots
+  each tracked timer by `log2` ticks-to-fire (near-future dots cluster left, far
+  beacons sit far right near 2^30) on a level-banded y-axis; the disclosed one-sided
+  lateness is `fireTimeOf(id) - (scheduled_now + delay)`, read directly per slot. An
+  amber `peekNext()` marker (the NOHZ "next due tick") is the clean micro-beat. We track
+  a bounded set of timers, one per level band, re-arming each on fire (the Linux
+  "cancelled / re-armed before expiry" churn model) so the live set stays bounded and
+  the per-level lateness readout is legible. The naive foil linear-scans every live
+  timer for the soonest due tick (O(n), allocating) -- the O(1) bitmap find-first-set
+  makes it needless, and it is the only new Scene-03 code allowed to allocate.
+- **Contrast (three wheels side by side)**: exact-bounded (TimerWheel, a single ring),
+  exact-bounded-cascading (HierarchicalTimerWheel, concentric dials that spill DOWN on a
+  256-tick wrap), and approximate-near-unbounded-flat (CoarseTimerWheel, a far-horizon
+  track with NO cascade and NO max-single-op line) -- the exactness-vs-range trade made
+  visible. For EXACT far-future deadlines the answer is a min-heap (`@zakkster/lite-logn`).
 
 ### Scene 04 -- Priority & Sampling (graph + casino)
 - **BucketQueue** (Dial's): a Dijkstra wavefront over a 2D maze; internal priority
@@ -129,6 +187,15 @@ cameo in another scene where it earns the contrast.
 - **Casino side panel**: **RandomSet** picks in exact O(1) (`sample`/`removeRandom`
   over the SparseSet substrate); **FreqO1** maintains an O(1) LFU of collisions via
   intrusive-list promotions -- no `.sort()`, `popMin()` is the min bucket head.
+- **AliasTable** (Vose weighted sampler): the WEIGHTED-draw complement to RandomSet's
+  UNIFORM draw. A frozen loot / drop table (fixed weight vector) drawn by WEIGHT in
+  WORST-CASE O(1) -- two per-instance LCG advances + one compare + one read, independent
+  of n and of the weight spread. The empirical draw histogram converges to the target
+  weights (`weightOf(i)`, drawn as cyan ticks); the per-instance seed makes the sequence
+  replayable (`clear()` resets the PRNG). The O(n) BUILD is the disclosed one-time
+  co-headline (paid once at construction, excluded from the per-draw claim) -- the same
+  build-once / immutable / query-only shape as SparseTable. The naive foil rebuilds an
+  O(n) cumulative array per draw and linear-scans it; the counter climbs with n.
 
 ---
 

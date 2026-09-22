@@ -48,7 +48,7 @@
  * metric are unchanged; only the measurement is made steadier.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect } from '../O1.js';
 
 const SIZES = [1e3, 1e4, 1e5, 1e6, 1e7];
 const BATCH = 1e6;
@@ -2016,5 +2016,120 @@ if (!wfAllOk) {
     if (!wfOk) console.error('  violation WindowFold flatness ' + fmt(wfw.flatness) + ' < 0.70');
     if (!wfFoilOk) console.error('  violation naive foil flatness ' + fmt(wfFoil.flatness) + ' > 0.55');
     if (!wfRatioOk) console.error('  violation min WindowFold ratio ' + fmt(minWfRatio) + 'x < 1.50x');
+    process.exitCode = 1;
+}
+
+// ===========================================================================
+// RankSelect witness -- WORST-CASE-O(1) STATIC rank1 QUERY vs a naive O(words)
+// popcount-scan foil (recompute the rank by popcounting every word before i).
+// ===========================================================================
+// nbits is the bit-capacity. The QUERY (rank1) is the hot op (the O(n) BUILD + the ~3.2% index
+// space are the disclosed co-headline, done in build() OUTSIDE the timed loop, EXCLUDED from the
+// per-op claim). Each op ranks a WIDE index (~nbits): the cs-poppy directory answers in a fixed
+// lookup + a bounded <= 16-word in-block scan, O(1) INDEPENDENT of nbits, while the foil POPCOUNTS
+// all ~nbits/32 words before i, O(words) per query -- so the foil diverges as nbits grows. This is
+// a TRUE O(words) foil (a full factor of nbits lost per decade), so it collapses to the <= 0.55 bar
+// (like the SparseTable range-scan foil). ops/ms is a RATE, so the index (batch 5e5) and the foil
+// (batch 2e3) use DIFFERENT batches yet flatness + ratio compare directly. Gated over the steady
+// window nbits >= 1e4 (the 1e3 point is a pure-L1 micro-case, shown but not gated). NO max-single-op
+// line: rank is WORST-CASE O(1), so there is no amortized spike to expose (see decisions/0024).
+const RS_SIZES = [1e3, 1e4, 1e5];
+const RS_BATCH = 5e5;        // large: stable timing for the O(1) rank
+const RS_FOIL_BATCH = 2e3;   // small: an O(words) scan at nbits=1e5 must stay tractable
+const RS_GATE_MIN = 1e4;
+
+// RankSelect: build an index over `nbits` bits ONCE (outside the timed op), then each op ranks a
+// WIDE index over a walking left edge -- worst-case O(1), independent of nbits.
+function buildRankSelect(nbits) {
+    const W = (nbits + 31) >>> 5;
+    const words = new Uint32Array(W);
+    for (let k = 0; k < W; k++) words[k] = (k * 2654435761) >>> 0; // ~half set, spread across the words
+    const rs = new RankSelect(words, nbits); // the O(n) BUILD -- excluded from the timed op
+    const half = nbits >> 1;
+    let l = 0;
+    const op = () => {
+        l++;
+        if (l >= half) l = 0;
+        SINK += rs.rank1(l + half); // WIDE index (~nbits) -> the foil diverges
+    };
+    return { op };
+}
+
+// Foil: an alloc-free naive O(words) popcount scan. A Uint32Array holds the same words; every op
+// RECOMPUTES the rank by popcounting every word before i -- O(words) per query, so ops/ms collapses
+// as nbits grows, the exact trap the cs-poppy directory's O(1) lookup kills.
+function buildRankScanFoil(nbits) {
+    const W = (nbits + 31) >>> 5;
+    const words = new Uint32Array(W);
+    for (let k = 0; k < W; k++) words[k] = (k * 2654435761) >>> 0;
+    const rem = nbits & 31;
+    if (rem !== 0) words[W - 1] &= ((1 << rem) >>> 0) - 1;
+    const popcount = (x) => {
+        x = x - ((x >>> 1) & 0x55555555);
+        x = (x & 0x33333333) + ((x >>> 2) & 0x33333333);
+        x = (x + (x >>> 4)) & 0x0f0f0f0f;
+        return (Math.imul(x, 0x01010101) >>> 24);
+    };
+    const half = nbits >> 1;
+    let l = 0;
+    const op = () => {
+        l++;
+        if (l >= half) l = 0;
+        const i = l + half;
+        const word = i >>> 5, bitOff = i & 31;
+        let r = 0;
+        for (let j = 0; j < word; j++) r += popcount(words[j]); // O(words) scan
+        if (bitOff !== 0) r += popcount(words[word] & (((1 << bitOff) >>> 0) - 1));
+        SINK += r;
+    };
+    return { op };
+}
+
+const rsw = witness(buildRankSelect, RS_SIZES, RS_BATCH, REPS, RS_GATE_MIN);
+const rsFoil = witness(buildRankScanFoil, RS_SIZES, RS_FOIL_BATCH, REPS, RS_GATE_MIN);
+
+console.log('');
+console.log('O(1) Witness -- RankSelect rank1 query vs a naive O(words) popcount scan (rate ops/ms, median of ' +
+    REPS + ', gate nbits >= ' + nStr(RS_GATE_MIN) + ')');
+console.log('');
+console.log('  nbits     RankSelect ops/ms  naive ops/ms   ratio');
+console.log('  --------  ----------------   ------------   -----');
+let rsRatio = Infinity;
+for (let i = 0; i < RS_SIZES.length; i++) {
+    const a = rsw.rows[i].opsPerMs;
+    const b = rsFoil.rows[i].opsPerMs;
+    const ratio = b > 0 ? a / b : Infinity;
+    const gated = RS_SIZES[i] >= RS_GATE_MIN;
+    if (gated && ratio < rsRatio) rsRatio = ratio; // ratio gate: steady window only
+    const tag = RS_SIZES[i] < RS_GATE_MIN ? '   <- L1 micro-case (shown, not gated)' : '';
+    console.log('  ' + nStr(RS_SIZES[i]).padEnd(8) + '  ' +
+        fmt(a).padStart(16) + '   ' + fmt(b).padStart(12) + '   ' + fmt(ratio).padStart(5) + 'x' + tag);
+}
+
+console.log('');
+console.log('  RankSelect flatness (nbits >= ' + nStr(RS_GATE_MIN) + '): ' + fmt(rsw.flatness) + '   (gate >= 0.70)');
+console.log('  naive foil flatness (last/first): ' + fmt(rsFoil.flatness) + '   (gate <= 0.55 -- true O(words) collapse)');
+console.log('  min RankSelect/naive ratio:       ' + fmt(rsRatio) + 'x  (gate >= 1.50x)');
+// NO MAX-single-op line here (unlike the amortized cohort): RankSelect's rank / select / access are
+// WORST-CASE O(1) (a fixed directory lookup + a bounded <= 16-word block scan, INDEPENDENT of nbits),
+// never a run and never a cascade. The O(n) BUILD + the ~3.2% index SPACE are the disclosed
+// co-headline (paid once at construction), not a per-op spike. The flat rank line IS the worst-case
+// claim (the O(words) scan foil is the honest 0.55-collapse rival; see decisions/0024).
+
+const rsOk = rsw.flatness >= 0.70;
+const rsFoilOk = rsFoil.flatness <= 0.55;
+const rsRatioOk = rsRatio >= 1.5;
+const rsAllOk = rsOk && rsFoilOk && rsRatioOk;
+
+console.log('');
+console.log('WITNESS RankSelect ' + (rsAllOk ? 'ok' : 'FAIL') +
+    ' rs.flatness=' + fmt(rsw.flatness) +
+    ' naive.flatness=' + fmt(rsFoil.flatness) +
+    ' minRatio=' + fmt(rsRatio) + 'x');
+
+if (!rsAllOk) {
+    if (!rsOk) console.error('  violation RankSelect flatness ' + fmt(rsw.flatness) + ' < 0.70');
+    if (!rsFoilOk) console.error('  violation naive foil flatness ' + fmt(rsFoil.flatness) + ' > 0.55');
+    if (!rsRatioOk) console.error('  violation min RankSelect ratio ' + fmt(rsRatio) + 'x < 1.50x');
     process.exitCode = 1;
 }

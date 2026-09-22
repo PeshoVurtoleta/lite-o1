@@ -269,10 +269,11 @@
                         <span class="toggle-label">path: <b id="mode-label">lite (0 alloc)</b></span>
                     </div>
                     <p class="help-line">
-                        The <code>lite</code> path drives the REAL <code>SparseSet</code> +
-                        <code>CuckooMap</code> and allocates nothing per frame. The
-                        <code>naive</code> path <code>new</code>s an object per entity every
-                        frame -- watch the allocation counter and jank bars react.
+                        The <code>lite</code> path drives the REAL <code>SparseSet</code>,
+                        <code>CuckooMap</code> + <code>BitSet</code> and allocates nothing per
+                        frame. The <code>naive</code> path <code>new</code>s an object per entity
+                        AND runs the O(n) linear bit-scan the <code>BitSet</code> summary makes
+                        needless -- watch the allocation counter and jank bars react.
                     </p>
                 </section>
 
@@ -306,6 +307,10 @@
                         <label>CuckooMap load factor <span class="field-value" id="load-v">0.55</span></label>
                         <input type="range" id="load" min="0" max="0.90" step="0.01" value="0.55">
                     </div>
+                    <div class="field">
+                        <label>BitSet set bits <span class="field-value" id="bstgt-v">96</span></label>
+                        <input type="range" id="bstgt" min="0" max="256" step="1" value="96">
+                    </div>
                 </section>
 
                 <section>
@@ -324,6 +329,9 @@
                             <div class="stat-row"><span class="k">SparseSet size</span><span class="v accent" id="ss-size">0</span></div>
                             <div class="stat-row"><span class="k">CuckooMap size</span><span class="v accent" id="cm-size">0</span></div>
                             <div class="stat-row"><span class="k">CuckooMap load</span><span class="v" id="cm-load">0.00</span></div>
+                            <div class="stat-row"><span class="k">BitSet set bits</span><span class="v accent" id="bs-size">0</span></div>
+                            <div class="stat-row"><span class="k">BitSet firstSet</span><span class="v" id="bs-first">-1</span></div>
+                            <div class="stat-row"><span class="k">a OP b -> |c|</span><span class="v" id="bs-alg">--</span></div>
                             <div class="stat-row"><span class="k">frame rate</span><span class="v" id="fps">--</span></div>
                         </div>
                         <div>
@@ -361,8 +369,10 @@
                     </div>
                     <p class="help-line">
                         The <code>lite</code> path keeps the window min/max in O(1) via two
-                        <code>MonoDeque</code>s and never allocates. The <code>naive</code> path
-                        rescans the whole window every frame into a fresh <code>O(k)</code> array --
+                        <code>MonoDeque</code>s AND folds the GENERAL rolling sum/mean (cyan) via
+                        <code>WindowFold</code> in worst-case O(1) -- the aggregate MonoDeque cannot
+                        do -- and never allocates. The <code>naive</code> path rescans the whole
+                        window every frame into fresh <code>O(k)</code>/<code>O(W)</code> arrays --
                         watch the allocation counter CLIMB as you widen the window.
                     </p>
                 </section>
@@ -410,6 +420,9 @@
                             <div class="stat-row"><span class="k">window min (MonoDeque)</span><span class="v accent" id="sl-wmin">0.00</span></div>
                             <div class="stat-row"><span class="k">window max (MonoDeque)</span><span class="v accent" id="sl-wmax">0.00</span></div>
                             <div class="stat-row"><span class="k">all-time max (MinStack)</span><span class="v" id="sl-life">0.00</span></div>
+                            <div class="stat-row"><span class="k">window sum (WindowFold)</span><span class="v" id="sl-wfsum">0.00</span></div>
+                            <div class="stat-row"><span class="k">window mean (WindowFold)</span><span class="v" id="sl-wfmean">0.00</span></div>
+                            <div class="stat-row"><span class="k">WindowFold op / size</span><span class="v" id="sl-wfop">SUM / 0</span></div>
                             <div class="stat-row"><span class="k">RingLog size / cap</span><span class="v" id="sl-rl">0 / 0</span></div>
                             <div class="stat-row"><span class="k">frame rate</span><span class="v" id="sl-fps">--</span></div>
                         </div>
@@ -479,6 +492,11 @@
                         Each frame HTW may cascade a coarser dial DOWN into the finer wheel on a
                         256-tick wrap -- the amortized max-single-op spike is architecture, not a
                         stall. TimerWheel (single ring) has no hierarchy to cascade into.
+                        <code>CoarseTimerWheel</code> is the third wheel: NEAR-UNBOUNDED (delay to
+                        ~2^30, way past TW/HTW) and worst-case O(1) with NO cascade -- a far timer
+                        sits in a coarse bucket and fires IN PLACE, LATE by &lt;= gran(level)-1,
+                        never early (L0 exact). The far-horizon track plots each timer by log2
+                        ticks-to-fire; the amber marker is <code>peekNext</code> (the next due tick).
                     </p>
                 </section>
 
@@ -499,6 +517,9 @@
                             <div class="stat-row"><span class="k">largest island</span><span class="v accent" id="cx-island">0</span></div>
                             <div class="stat-row"><span class="k">HTW live timers</span><span class="v" id="cx-htw">0</span></div>
                             <div class="stat-row"><span class="k">last cascade (levels)</span><span class="v" id="cx-cascade">0</span></div>
+                            <div class="stat-row"><span class="k">CoarseTimerWheel live timers</span><span class="v" id="cx-cw-live">0</span></div>
+                            <div class="stat-row"><span class="k">peekNext (next due tick)</span><span class="v" id="cx-cw-next">--</span></div>
+                            <div class="stat-row"><span class="k">max approx lateness (ticks)</span><span class="v" id="cx-cw-late">0</span></div>
                             <div class="stat-row"><span class="k">frame rate</span><span class="v" id="cx-fps">--</span></div>
                         </div>
                         <div>
@@ -538,8 +559,12 @@
                         The <code>lite</code> path runs a Dijkstra wavefront off the real
                         <code>BucketQueue</code> (Dial's monotone dial) and answers O(1)
                         "hardest terrain" from an immutable <code>SparseTable</code> with 0
-                        alloc/frame. The <code>naive</code> path <code>new</code>s one object per
-                        edge relaxation -- watch the counter climb.
+                        alloc/frame. The casino also runs an <code>AliasTable</code> (Vose) drawing
+                        a WEIGHTED loot outcome in worst-case O(1) -- the complement to
+                        <code>RandomSet</code>'s UNIFORM chip draw; its histogram converges to the
+                        target weights. The <code>naive</code> path <code>new</code>s one object per
+                        edge relaxation AND rebuilds an O(n) cumulative array per weighted draw --
+                        watch the counter climb.
                     </p>
                 </section>
 
@@ -590,6 +615,8 @@
                             <div class="stat-row"><span class="k">monotone cursor</span><span class="v" id="sp-cursor">0</span></div>
                             <div class="stat-row"><span class="k">hardest terrain (row, SparseTable)</span><span class="v" id="sp-hard">0</span></div>
                             <div class="stat-row"><span class="k">LFU evicted (FreqO1)</span><span class="v" id="sp-lfu">--</span></div>
+                            <div class="stat-row"><span class="k">weighted draw (AliasTable)</span><span class="v accent" id="sp-alias-last">--</span></div>
+                            <div class="stat-row"><span class="k">histogram fit (max |emp - weight|)</span><span class="v" id="sp-alias-fit">--</span></div>
                             <div class="stat-row"><span class="k">frame rate</span><span class="v" id="sp-fps">--</span></div>
                         </div>
                         <div>
@@ -619,10 +646,14 @@
     import {
         createSparseWorld, stepSparseWorld, crossCheck,
         createCuckooWorld, stepCuckooWorld, nextRand,
+        createBitSetWorld, stepBitSetWorld, bitAlgebra, naiveBitScan, BS_NBITS, BS_OPS, BS_OP_PERIOD,
         createAllocState, naiveStep,
         createSlidingWorld, frameSlidingExtremes, naiveRescan,
+        createWindowFoldWorld, frameWindowFold, naiveWindowRefold,
         createConnectWorld, frameConnect, naiveConnectStep,
+        createCoarseWorld, frameCoarseWorld, naiveCoarseScan, CW_TRACK, CW_LEVELS,
         createSampleWorld, frameSample, restartWavefront, naiveSampleStep,
+        createAliasWorld, frameAliasWorld, naiveAliasSample, AT_OUTCOMES,
         bqBucketHead, SP_COLS, SP_ROWS, SP_CELLS, SP_RELAX_BUDGET, SP_CHIPS, SP_MAXCOST,
     } from './kernels.mjs';
 
@@ -668,6 +699,9 @@
     // Pre-built static canvas labels (no per-frame string construction).
     const SS_TITLE = 'SparseSet  -  universe grid   (accent = live, dim = inert/stale)';
     const DS_TITLE = 'dense array  -  contiguous, O(1) swap-and-pop, no holes';
+    const BS_TITLE = 'BitSet  -  dense dirty-mask   (accent = set bit; amber = firstSet cursor; row = one 32-bit word)';
+    const BS_ALG_TITLE = 'set-algebra  -  a, b, c = a OP b   (bulk and/or/xor/andNot, in place, O(words))';
+    const BS_OP_NAMES = ['and', 'or', 'xor', 'andNot']; // indexed by algebraOp (no per-frame concat)
     const CM_TITLE = 'CuckooMap  -  2 tables x 4 slots   (bucketized cuckoo hashing)';
 
     // ---- worlds (allocated ONCE, at warmup) --------------------------------------------
@@ -676,6 +710,8 @@
     const CM_CAP = 96;
     let ssWorld = createSparseWorld(UNIVERSE, SS_CAP);
     const cmWorld = createCuckooWorld(CM_CAP, 0x51ed270b);
+    const bsWorld = createBitSetWorld(BS_NBITS);   // dense dirty-mask + set-algebra operands
+    let bsTarget = 96;                             // target live bits in the dirty mask
 
     // ---- geometry (recomputed ONLY on resize / topology change) -------------------------
     const stageCanvas = $('stage-canvas');
@@ -683,6 +719,8 @@
     const PAD = 24;
     let SS_COLS = 24, ssRows = 10, ssX = 0, ssY = 0, SS_CW = 20, SS_CH = 20, SS_GAP = 3;
     let dsX = 0, dsY = 0, DS_CW = 6, DS_CH = 14;
+    let bsX = 0, bsY = 0, BS_COLS = 32, bsRows = 8, BS_CW = 12, BS_CH = 12, BS_GAP = 2;
+    let bsAlgX = 0, bsAlgY = 0, BS_SW = 3, BS_SH = 11, BS_SGAP = 3;
     let cmY = 0, CM_RH = 14, CM_CH = 12, CM_CW = 16, CM_GAP = 2, cmT0X = 0, cmT1X = 0;
 
     function computeLayout() {
@@ -697,9 +735,21 @@
         ssX = PAD; ssY = PAD + 20;
         dsX = PAD; dsY = ssY + ssRows * (SS_CH + SS_GAP) + 34;
         DS_CW = gridW / SS_CAP; DS_CH = 16;
+        // BitSet dirty-mask grid: BS_COLS bits per row, so one row == one 32-bit data word (the
+        // 3-level popcount summary story maps cleanly onto rows). Cell size capped so 8 rows stay
+        // compact and never crowd the CuckooMap region below.
+        BS_COLS = 32;
+        bsRows = Math.ceil(BS_NBITS / BS_COLS);
+        BS_GAP = 2;
+        BS_CW = Math.min(14, (gridW - (BS_COLS - 1) * BS_GAP) / BS_COLS);
+        BS_CH = BS_CW;
+        bsX = PAD; bsY = dsY + DS_CH + 40;
+        // set-algebra triptych: three full-width bit-strips (a, b, c = a OP b) below the grid.
+        bsAlgX = PAD; bsAlgY = bsY + bsRows * (BS_CH + BS_GAP) + 24;
+        BS_SW = gridW / BS_NBITS; BS_SH = 11; BS_SGAP = 3;
         // CuckooMap region: bottom of the stage, two tables of B buckets x 4 slots.
         const B = cmWorld.map._B;
-        cmY = dsY + DS_CH + 44;
+        cmY = bsAlgY + 3 * (BS_SH + BS_SGAP) + 40;
         const cmRegionH = STAGE_H - cmY - PAD;
         CM_RH = Math.max(6, cmRegionH / B);
         CM_CH = Math.max(4, CM_RH - 2);
@@ -730,8 +780,10 @@
     const dom = {
         allocBig: $('alloc-big'), ssSize: $('ss-size'), cmSize: $('cm-size'),
         cmLoad: $('cm-load'), fps: $('fps'), heap: $('heap'), modeTag: $('mode-tag'),
+        bsSize: $('bs-size'), bsFirst: $('bs-first'), bsAlg: $('bs-alg'),
     };
     let lastAlloc = -1, lastSsSize = -1, lastCmSize = -1, lastHeapTenths = -1;
+    let lastBsSize = -1, lastBsFirst = -2, lastBsAlgOp = -1, lastBsAlgSize = -1;
 
     // jank strip canvas
     const jankCanvas = $('jank-canvas');
@@ -744,6 +796,12 @@
         stepSparseWorld(ssWorld, ssTarget);
         stepCuckooWorld(cmWorld, cmTargetLoad);
         stepCuckooWorld(cmWorld, cmTargetLoad);
+        // BitSet dirty-mask: two O(1) set/unset ops, then the cycling bulk set-algebra (0 alloc).
+        stepBitSetWorld(bsWorld, bsTarget);
+        stepBitSetWorld(bsWorld, bsTarget);
+        if ((bsWorld.algebraFrame % BS_OP_PERIOD) === 0) bsWorld.algebraOp = (bsWorld.algebraOp + 1) & (BS_OPS - 1);
+        bsWorld.algebraFrame++;
+        bsWorld.algebraSize = bitAlgebra(bsWorld);
     }
 
     // The contrast: the naive path allocates one object per entity, every frame. This is the
@@ -753,7 +811,10 @@
 
     function stepSim() {
         liteStep();                       // structures advance either way (faithful visualization)
-        if (naive) naiveStep(allocState);  // extra per-entity garbage only on the naive path
+        if (naive) {
+            naiveStep(allocState);         // extra per-entity garbage only on the naive path
+            naiveBitScan(allocState, bsWorld); // the O(n) linear scan the BitSet summary refuses
+        }
     }
 
     // ---- draw --------------------------------------------------------------------------
@@ -786,6 +847,41 @@
             if (i < n) g.fillStyle = rgbaq(ACCENT_RGB, 0.82);
             else g.fillStyle = rgbaq(STALE_RGB, 0.10);
             g.fillRect(x, dsY, DS_CW - 1, DS_CH);
+        }
+
+        // --- BitSet dense dirty-mask grid (the SPARSE-vs-DENSE contrast to SparseSet above) ---
+        g.fillStyle = COL_DIM; g.fillText(BS_TITLE, bsX, bsY - 8);
+        const mask = bsWorld.mask;
+        const bsFirst = mask.firstSet(); // worst-case O(1) via the 3-level popcount summary
+        for (let k = 0; k < BS_NBITS; k++) {
+            const col = k % BS_COLS, row = (k / BS_COLS) | 0;
+            const x = bsX + col * (BS_CW + BS_GAP);
+            const y = bsY + row * (BS_CH + BS_GAP);
+            if (mask.test(k)) g.fillStyle = rgbaq(ACCENT_RGB, 0.92);
+            else g.fillStyle = rgbaq(STALE_RGB, 0.14);
+            g.fillRect(x, y, BS_CW, BS_CH);
+        }
+        // firstSet cursor: the lowest live bit the summary descent lands on, in worst-case O(1).
+        if (bsFirst >= 0) {
+            const fc = bsFirst % BS_COLS, fr = (bsFirst / BS_COLS) | 0;
+            g.strokeStyle = COL_AMBER; g.lineWidth = 2;
+            g.strokeRect(bsX + fc * (BS_CW + BS_GAP) - 1, bsY + fr * (BS_CH + BS_GAP) - 1, BS_CW + 2, BS_CH + 2);
+        }
+
+        // --- BitSet set-algebra triptych: a, b, and c = a OP b (bulk word ops, O(words)) ---
+        g.fillStyle = COL_DIM;
+        g.fillText(BS_ALG_TITLE, bsAlgX, bsAlgY - 8);
+        g.fillText(BS_OP_NAMES[bsWorld.algebraOp], bsAlgX + STAGE_W - PAD * 2 - 60, bsAlgY - 8);
+        const bsA = bsWorld.a, bsB = bsWorld.b, bsC = bsWorld.c;
+        const stripY0 = bsAlgY, stripY1 = bsAlgY + BS_SH + BS_SGAP, stripY2 = bsAlgY + 2 * (BS_SH + BS_SGAP);
+        for (let k = 0; k < BS_NBITS; k++) {
+            const x = bsAlgX + k * BS_SW;
+            g.fillStyle = bsA.test(k) ? rgbaq(ACCENT_RGB, 0.80) : rgbaq(STALE_RGB, 0.10);
+            g.fillRect(x, stripY0, BS_SW, BS_SH);
+            g.fillStyle = bsB.test(k) ? rgbaq(MAGENTA_RGB, 0.80) : rgbaq(STALE_RGB, 0.10);
+            g.fillRect(x, stripY1, BS_SW, BS_SH);
+            g.fillStyle = bsC.test(k) ? rgbaq('125,211,252', 0.90) : rgbaq(STALE_RGB, 0.10);
+            g.fillRect(x, stripY2, BS_SW, BS_SH);
         }
 
         // --- CuckooMap two tables (2 x B buckets x 4 slots) ---
@@ -853,6 +949,15 @@
             const load = cmWorld.map.load;
             dom.cmLoad.textContent = (Math.round(load * 100) / 100).toFixed(2);
         }
+        // BitSet telemetry (10Hz -- popcount + firstSet are cheap; still throttled off the mask).
+        const bsn = bsWorld.mask.popcount();
+        if (bsn !== lastBsSize) { lastBsSize = bsn; dom.bsSize.textContent = String(bsn); }
+        const bsf = bsWorld.mask.firstSet();
+        if (bsf !== lastBsFirst) { lastBsFirst = bsf; dom.bsFirst.textContent = String(bsf); }
+        if (bsWorld.algebraOp !== lastBsAlgOp || bsWorld.algebraSize !== lastBsAlgSize) {
+            lastBsAlgOp = bsWorld.algebraOp; lastBsAlgSize = bsWorld.algebraSize;
+            dom.bsAlg.textContent = BS_OP_NAMES[bsWorld.algebraOp] + ' -> ' + bsWorld.algebraSize;
+        }
         dom.fps.textContent = String(fpsValue);
         const m = mem();
         if (m) {
@@ -872,6 +977,9 @@
     let SL_WIN = 96;
     const SL_WAVELEN = 1024;
     let slWorld = createSlidingWorld(SL_WAVELEN, SL_WIN, 0x51ed270b);
+    // WindowFold(SUM) over the SAME window: the GENERAL rolling aggregate MonoDeque cannot do
+    // (min/max only). Its rolling mean = query()/size draws a cyan band tracking the waveform.
+    let wfWorld = createWindowFoldWorld(SL_WAVELEN, SL_WIN, 0x51ed270b);
     let naiveSl = false;
 
     // scene-02 stage canvas + plot geometry (recomputed on resize / window-size change ONLY)
@@ -879,7 +987,7 @@
     let slCtx = null, SL_W = 0, SL_H = 0;
     let slPlotX = 0, slPlotY = 0, slPlotW = 0, slPlotH = 0;
     const SL_VMIN = -1.25, SL_VMAX = 1.25; // fixed value axis (waveform range ~[-1, 1])
-    const SL_TITLE = 'waveform + sliding-window envelope   (accent band = MonoDeque min..max, amber = MinStack all-time max)';
+    const SL_TITLE = 'waveform + sliding-window envelope   (accent band = MonoDeque min..max, amber = MinStack all-time max, cyan = WindowFold rolling mean)';
 
     function slValY(v) {
         let t = (v - SL_VMIN) / (SL_VMAX - SL_VMIN);
@@ -904,7 +1012,11 @@
 
     function stepSliding() {
         frameSlidingExtremes(slWorld);
-        if (naiveSl) naiveRescan(allocState, slWorld); // the O(k) foil -- the ONLY allocating path
+        frameWindowFold(wfWorld); // GENERAL rolling SUM/mean band (worst-case O(1), 0 alloc)
+        if (naiveSl) {
+            naiveRescan(allocState, slWorld);       // the O(k) min/max rescan foil
+            naiveWindowRefold(allocState, wfWorld); // the O(W) full-window refold foil
+        }
     }
 
     function drawSliding() {
@@ -956,12 +1068,29 @@
             if (i === 0) g.moveTo(x, y); else g.lineTo(x, y);
         }
         g.strokeStyle = COL_AMBER; g.lineWidth = 1.5; g.stroke();
+
+        // WindowFold rolling-mean line (cyan): the GENERAL aggregate MonoDeque cannot draw.
+        // Its own rail may hold fewer/more slots than the envelope rail (its cap is pow2(W)); walk
+        // its OWN head/count so slot i lines up oldest -> newest with the same denom scale.
+        const wf = wfWorld;
+        const wn = wf.railCount;
+        if (wn > 0) {
+            const whead = wf.railHead, wmask = wf.railMask, wdenom = wf.railCap > 1 ? wf.railCap - 1 : 1;
+            g.beginPath();
+            for (let i = 0; i < wn; i++) {
+                const x = slPlotX + (i / wdenom) * slPlotW;
+                const y = slValY(wf.railMean[(whead + i) & wmask]);
+                if (i === 0) g.moveTo(x, y); else g.lineTo(x, y);
+            }
+            g.strokeStyle = COL_CYAN; g.lineWidth = 1.5; g.stroke();
+        }
     }
 
     // scene-02 telemetry DOM (cached once); text updated at ~7.5Hz off the frameN mask
     const sldom = {
         allocBig: $('sl-alloc-big'), wmin: $('sl-wmin'), wmax: $('sl-wmax'),
         life: $('sl-life'), rl: $('sl-rl'), fps: $('sl-fps'), heap: $('sl-heap'), modeTag: $('sl-mode-tag'),
+        wfsum: $('sl-wfsum'), wfmean: $('sl-wfmean'), wfop: $('sl-wfop'),
     };
     let slLastAlloc = -1, slLastRl = -1, slLastHeapTenths = -1;
 
@@ -975,6 +1104,11 @@
         sldom.wmin.textContent = (Math.round(out[1] * 100) / 100).toFixed(2);
         sldom.wmax.textContent = (Math.round(out[2] * 100) / 100).toFixed(2);
         sldom.life.textContent = (Math.round(out[3] * 100) / 100).toFixed(2);
+        // WindowFold rolling SUM + mean (query()/size) -- the GENERAL aggregate beat.
+        const wfout = wfWorld.out; // [sample, windowSum, windowMean]
+        sldom.wfsum.textContent = (Math.round(wfout[1] * 100) / 100).toFixed(2);
+        sldom.wfmean.textContent = (Math.round(wfout[2] * 100) / 100).toFixed(2);
+        sldom.wfop.textContent = wfWorld.fold.op + ' / size ' + wfWorld.fold.size;
         const size = slWorld.ringlog.size;
         if (size !== slLastRl) { slLastRl = size; sldom.rl.textContent = size + ' / ' + slWorld.ringlog.capacity; }
         sldom.fps.textContent = String(fpsValue);
@@ -1035,6 +1169,7 @@
         SL_WIN = +slWin.value;
         slWinV.textContent = String(SL_WIN);
         slWorld = createSlidingWorld(SL_WAVELEN, SL_WIN, 0x51ed270b);
+        wfWorld = createWindowFoldWorld(SL_WAVELEN, SL_WIN, 0x51ed270b);
         slLastRl = -1;
         computeSlidingLayout();
     });
@@ -1047,6 +1182,7 @@
     // ==================================================================================
     const TAU = Math.PI * 2;
     const cxWorld = createConnectWorld(); // defaults: 96 nodes, 2048 universe
+    const cxCoarse = createCoarseWorld(); // CoarseTimerWheel: the near-unbounded, non-cascading wheel
     let naiveCx = false;
 
     // palette of pre-built RGB triplets so island coloring never concatenates in the hot path
@@ -1054,23 +1190,35 @@
     const CX_HTW_TITLE = 'HierarchicalTimerWheel  -  Linux tvec dials (1x256 + 3x64), cascade DOWN on a 256-tick wrap';
     const CX_TW_TITLE = 'TimerWheel  -  single ring (no hierarchy)';
     const CX_ISL_TITLE = 'UnionFind  -  edge events merge islands   (bright = largest, dim hue = other components)';
+    const CX_CW_TITLE = 'CoarseTimerWheel  -  near-unbounded coarse buckets, NO cascade   (dot = timer by log2 ticks-to-fire; amber = peekNext; late <= gran(level)-1)';
+    // pre-built log2-horizon axis tick labels (no per-frame string concat)
+    const CX_CW_AXIS = ['1', '2^6', '2^12', '2^18', '2^24', '2^30'];
+    const CX_CW_AXIS_LOG = [0, 6, 12, 18, 24, 30]; // the log2 position each label sits at
+    const CX_CW_MAXLOG = 30; // full-scale log2 horizon (~2^30, the CoarseTimerWheel range ceiling)
 
     const cxCanvas = $('cx-canvas');
     let cxCtx = null, CX_W = 0, CX_H = 0;
     let cxDialCX = 0, cxDialCY = 0, CX_R = 0;
     let cxTwCX = 0, cxTwCY = 0, CX_TWR = 0;
     let cxGridX = 0, cxGridY = 0, CX_COLS = 24, cxRows = 4, CX_CW = 16, CX_CH = 16, CX_CGAP = 3;
+    // CoarseTimerWheel far-horizon track (a horizontal log2-time strip below the two dials)
+    let cxTrackX0 = 0, cxTrackX1 = 0, cxTrackY = 0, cxTrackH = 0;
 
     function computeConnectLayout() {
         const s = sizeCanvas(cxCanvas);
         cxCtx = s.ctx; CX_W = s.w; CX_H = s.h;
-        const topH = CX_H * 0.60;
-        CX_R = Math.max(40, Math.min(CX_W * 0.20, topH * 0.42));
+        const topH = CX_H * 0.46;
+        CX_R = Math.max(36, Math.min(CX_W * 0.18, topH * 0.46));
         cxDialCX = CX_W * 0.30; cxDialCY = PAD + 26 + topH * 0.5;
-        CX_TWR = Math.max(28, Math.min(CX_W * 0.15, topH * 0.30));
+        CX_TWR = Math.max(24, Math.min(CX_W * 0.14, topH * 0.36));
         cxTwCX = CX_W * 0.74; cxTwCY = PAD + 26 + topH * 0.5;
+        // far-horizon track: full-width log2-time strip between the dials and the island grid
+        cxTrackX0 = PAD + 66;                 // leave room for the level-gutter labels at the left
+        cxTrackX1 = CX_W - PAD - 8;
+        cxTrackY = PAD + 26 + topH + 22;
+        cxTrackH = CX_H * 0.16;
         // island grid strip along the bottom
-        cxGridY = PAD + 26 + topH + 24;
+        cxGridY = cxTrackY + cxTrackH + 26;
         const gridW = CX_W - PAD * 2;
         CX_COLS = 24;
         cxRows = Math.ceil(cxWorld.nodes / CX_COLS);
@@ -1093,9 +1241,10 @@
 
     function stepConnect() {
         frameConnect(cxWorld);
+        frameCoarseWorld(cxCoarse); // the third wheel: near-unbounded, non-cascading, approximate
         if (cxWorld.cascadeLevel > 0) { cxCascadePulse = CX_CASCADE_FRAMES; cxCascadeLvl = cxWorld.cascadeLevel; }
         if (cxCascadePulse > 0) cxCascadePulse--;
-        if (naiveCx) naiveConnectStep(allocState, cxWorld); // the ONLY allocating path
+        if (naiveCx) { naiveConnectStep(allocState, cxWorld); naiveCoarseScan(allocState, cxCoarse); } // the ONLY allocating paths
         // Keep the demo alive: re-singleton once everything has merged (O(n), zero-alloc, OFF the
         // measured kernel -- frameConnect itself never resets, so the honesty gate stays faithful).
         if (cxWorld.uf.count <= 1) cxWorld.uf.reset();
@@ -1155,6 +1304,9 @@
             g.beginPath(); g.arc(x, y, sl === tCursor ? 4 : 2.6, 0, TAU); g.fill();
         }
 
+        // --- CoarseTimerWheel far-horizon track ---
+        drawCoarseTrack(g);
+
         // --- UnionFind island grid ---
         g.fillStyle = COL_DIM; g.fillText(CX_ISL_TITLE, cxGridX, cxGridY - 8);
         const rootOf = cxWorld.rootOf, largest = cxWorld.largestRoot, nodes = cxWorld.nodes;
@@ -1169,12 +1321,62 @@
         }
     }
 
+    // Draw the CoarseTimerWheel far-horizon track: a log2-time strip. Each tracked timer is a dot at
+    // x = log2(ticks-to-fire) (so far-future timers sit far right, near 2^30, WAY past TW/HTW) and y
+    // by its level band; an amber vertical marker shows peekNext (the next due tick). Pure reads +
+    // Math, zero allocation (rgbaq is the built-once cache; no string concat, no ctx.save/restore).
+    function drawCoarseTrack(g) {
+        const x0 = cxTrackX0, x1 = cxTrackX1, y0 = cxTrackY, h = cxTrackH;
+        const w = x1 - x0;
+        g.fillStyle = COL_DIM; g.fillText(CX_CW_TITLE, PAD, y0 - 8);
+        // baseline + log2 axis ticks/labels
+        g.strokeStyle = rgbaq(STALE_RGB, 0.30); g.lineWidth = 1;
+        g.beginPath(); g.moveTo(x0, y0 + h); g.lineTo(x1, y0 + h); g.stroke();
+        g.fillStyle = COL_FAINT;
+        for (let a = 0; a < CX_CW_AXIS.length; a++) {
+            const lx = x0 + (CX_CW_AXIS_LOG[a] / CX_CW_MAXLOG) * w;
+            g.strokeStyle = rgbaq(STALE_RGB, 0.14);
+            g.beginPath(); g.moveTo(lx, y0); g.lineTo(lx, y0 + h); g.stroke();
+            g.fillText(CX_CW_AXIS[a], lx + 2, y0 + h + 12);
+        }
+        // level gutter labels (L0 top .. L8 bottom): map each slot's level to a y row
+        const now = cxCoarse.cw.now, track = cxCoarse.track;
+        const rowH = h / CW_LEVELS;
+        for (let n = 0; n < CW_LEVELS; n++) {
+            const ly = y0 + (n + 0.5) * rowH;
+            g.fillStyle = COL_FAINT;
+            g.fillText('L' + n, PAD, ly + 3);
+        }
+        // peekNext marker (the NOHZ next-due tick), amber vertical line
+        const nextDue = cxCoarse.out[0];
+        if (nextDue >= 0) {
+            const dtn = nextDue - now;
+            const lg = dtn > 0 ? Math.log2(dtn) : 0;
+            const mx = x0 + Math.max(0, Math.min(1, lg / CX_CW_MAXLOG)) * w;
+            g.strokeStyle = COL_AMBER; g.lineWidth = 1.5;
+            g.beginPath(); g.moveTo(mx, y0); g.lineTo(mx, y0 + h); g.stroke();
+        }
+        // one dot per tracked timer, x by log2(ticks-to-fire), y by level band
+        for (let t = 0; t < track; t++) {
+            const n = cxCoarse.level[t];
+            const dt = cxCoarse.fireAt[t] - now;
+            const lg = dt > 0 ? Math.log2(dt) : 0;
+            const px = x0 + Math.max(0, Math.min(1, lg / CX_CW_MAXLOG)) * w;
+            const py = y0 + (n + 0.5) * rowH;
+            const soon = cxCoarse.fireAt[t] === nextDue;
+            g.fillStyle = soon ? COL_AMBER : rgbaq(ACCENT_RGB, 0.85);
+            g.beginPath(); g.arc(px, py, soon ? 4 : 3, 0, TAU); g.fill();
+        }
+    }
+
     // scene-03 telemetry DOM (cached once); text updated at ~7.5Hz off the frameN mask
     const cxdom = {
         allocBig: $('cx-alloc-big'), count: $('cx-count'), island: $('cx-island'),
         htw: $('cx-htw'), cascade: $('cx-cascade'), fps: $('cx-fps'), heap: $('cx-heap'), modeTag: $('cx-mode-tag'),
+        cwLive: $('cx-cw-live'), cwNext: $('cx-cw-next'), cwLate: $('cx-cw-late'),
     };
     let cxLastAlloc = -1, cxLastCount = -1, cxLastIsland = -1, cxLastHtw = -1, cxLastCascade = -1, cxLastHeapTenths = -1;
+    let cxLastCwLive = -1, cxLastCwNext = -1, cxLastCwLate = -1;
 
     function updateConnectTelemetry() {
         if (allocState.allocCount !== cxLastAlloc) {
@@ -1190,6 +1392,14 @@
         if (h !== cxLastHtw) { cxLastHtw = h; cxdom.htw.textContent = String(h); }
         const cl = cxCascadePulse > 0 ? cxCascadeLvl : 0;
         if (cl !== cxLastCascade) { cxLastCascade = cl; cxdom.cascade.textContent = String(cl); }
+        // CoarseTimerWheel readouts (10Hz -- String() of a double is fine off the hot path)
+        const cwLive = cxCoarse.cw.size;
+        if (cwLive !== cxLastCwLive) { cxLastCwLive = cwLive; cxdom.cwLive.textContent = String(cwLive); }
+        const cwNext = cxCoarse.out[0];
+        if (cwNext !== cxLastCwNext) { cxLastCwNext = cwNext; cxdom.cwNext.textContent = cwNext < 0 ? '--' : String(cwNext); }
+        let cwLate = 0;
+        for (let t = 0; t < cxCoarse.track; t++) if (cxCoarse.lateness[t] > cwLate) cwLate = cxCoarse.lateness[t];
+        if (cwLate !== cxLastCwLate) { cxLastCwLate = cwLate; cxdom.cwLate.textContent = String(cwLate); }
         cxdom.fps.textContent = String(fpsValue);
         const m = mem();
         if (m) {
@@ -1253,8 +1463,12 @@
     // the library's own guard) -- zero allocation per frame.
     // ==================================================================================
     const spWorld = createSampleWorld(0x51ed270b); // frozen terrain + frontier + casino, built once
+    const spAliasWorld = createAliasWorld(0x51ed270b); // WEIGHTED-draw loot table (Vose), built once
     let naiveSp = false;
     let spRelaxBudget = SP_RELAX_BUDGET;
+    // peak target proportion (weightOf), computed ONCE, so the histogram scales to fill its band.
+    let spAliasPeak = 0.0001;
+    for (let i = 0; i < AT_OUTCOMES; i++) { const p = spAliasWorld.weights[i] / spAliasWorld.weightSum; if (p > spAliasPeak) spAliasPeak = p; }
 
     // pre-built RGB triplets so terrain/heat coloring never concatenates in the hot path
     const SP_HEAT_RGB = '245,185,66';   // amber  -- frontier / hardest terrain
@@ -1263,6 +1477,7 @@
     const SP_TERRAIN_TITLE = 'weighted terrain  -  BucketQueue Dijkstra wavefront   (accent = settled, amber = frontier)';
     const SP_BUCKET_TITLE = 'BucketQueue dials  -  monotone cursor never rewinds (buckets light as the frontier advances)';
     const SP_CASINO_TITLE = 'RandomSet chips  -  FreqO1 LFU heat   (bright = most-visited, ring = LFU victim)';
+    const SP_ALIAS_TITLE = 'AliasTable  -  WEIGHTED draw (Vose, O(1)) vs UNIFORM chips   (bar = empirical, cyan = weightOf target)';
 
     const spCanvas = $('sp-canvas');
     let spCtx = null, SP_W = 0, SP_H = 0;
@@ -1270,6 +1485,8 @@
     const SP_GAP = 3;
     let spCasX = 0, spCasY = 0, SP_CHIP = 16, SP_CHIP_COLS = 8;
     let spBucketX = 0, spBucketY = 0, SP_BUCKETS_SHOWN = 48, SP_BW = 8;
+    // AliasTable weighted-draw histogram band (right column, below the RandomSet chip grid)
+    let spAliasX = 0, spAliasY = 0, SP_ALIAS_W = 0, SP_ALIAS_H = 64, SP_ABW = 12, SP_ABGAP = 6;
 
     function computePriorityLayout() {
         const s = sizeCanvas(spCanvas);
@@ -1289,6 +1506,13 @@
         const casW = SP_W - spCasX - PAD;
         SP_CHIP_COLS = 8;
         SP_CHIP = Math.max(8, Math.min(28, (casW - (SP_CHIP_COLS - 1) * 5) / SP_CHIP_COLS));
+        // AliasTable weighted-draw histogram: right column, beneath the chip grid, same width band.
+        const chipRows = Math.ceil(SP_CHIPS / SP_CHIP_COLS);
+        spAliasX = spCasX;
+        spAliasY = spCasY + 12 + chipRows * (SP_CHIP + 5) + 34; // below the chips (+title gap)
+        SP_ALIAS_W = casW;
+        SP_ALIAS_H = Math.max(40, gridAreaH - (spAliasY - spCasY) - 8); // fill to the grid baseline
+        SP_ABW = Math.max(6, (SP_ALIAS_W - (AT_OUTCOMES - 1) * SP_ABGAP) / AT_OUTCOMES);
         // bucket strip (bottom, full width): a window of buckets around the cursor
         spBucketX = PAD;
         spBucketY = SP_H - bottomH + 30;
@@ -1307,7 +1531,11 @@
         // The kernel advances SP_RELAX_BUDGET settlements per frameSample; the slider drives extra
         // whole-frame advances per rAF tick to speed the wavefront (still zero-alloc each call).
         for (let b = 0; b < spRelaxBudget; b += SP_RELAX_BUDGET) frameSample(spWorld);
-        if (naiveSp) naiveSampleStep(allocState, spWorld); // the ONLY allocating path
+        frameAliasWorld(spAliasWorld); // WEIGHTED draws folded into the reused histogram (0 alloc)
+        if (naiveSp) {
+            naiveSampleStep(allocState, spWorld);        // the O(1)-relax foil (allocates / relax)
+            naiveAliasSample(allocState, spAliasWorld);  // the O(n) cumulative-scan draw foil (allocates)
+        }
     }
 
     function drawPriority(g) {
@@ -1358,6 +1586,27 @@
             g.fillRect(x, y, SP_CHIP, SP_CHIP);
             if (c === lfu) { g.strokeStyle = COL_AMBER; g.lineWidth = 2; g.strokeRect(x - 1, y - 1, SP_CHIP + 2, SP_CHIP + 2); }
         }
+
+        // --- AliasTable: the WEIGHTED-draw histogram converging to weightOf() (vs the chips' UNIFORM draw) ---
+        g.fillStyle = COL_DIM; g.fillText(SP_ALIAS_TITLE, spAliasX, spAliasY - 10);
+        const aw = spAliasWorld, tally = aw.tally, weights = aw.weights;
+        const total = aw.out[1] > 0 ? aw.out[1] : 1;   // total draws so far (a Float64 slot)
+        const wsum = aw.weightSum;
+        const scale = (SP_ALIAS_H * 0.92) / spAliasPeak; // fill the band to the peak target proportion
+        const baseY = spAliasY + SP_ALIAS_H;
+        g.strokeStyle = rgbaq(STALE_RGB, 0.4); g.lineWidth = 1;
+        g.beginPath(); g.moveTo(spAliasX, baseY + 0.5); g.lineTo(spAliasX + SP_ALIAS_W, baseY + 0.5); g.stroke();
+        for (let i = 0; i < AT_OUTCOMES; i++) {
+            const x = spAliasX + i * (SP_ABW + SP_ABGAP);
+            const emp = tally[i] / total;              // empirical draw probability
+            const tgt = weights[i] / wsum;             // target probability (the library's weightOf)
+            let bh = emp * scale; if (bh > SP_ALIAS_H) bh = SP_ALIAS_H; // empirical bar (clamped)
+            const th = tgt * scale;                    // target weight tick
+            g.fillStyle = i === aw.lastOutcome ? COL_AMBER : rgbaq(MAGENTA_RGB, 0.85);
+            g.fillRect(x, baseY - bh, SP_ABW, bh);
+            g.fillStyle = COL_CYAN;                     // the weight target the histogram converges to
+            g.fillRect(x, baseY - th - 1, SP_ABW, 2);
+        }
     }
 
     // scene-04 telemetry DOM (cached once); text updated at ~7.5Hz off the frameN mask
@@ -1365,9 +1614,11 @@
         allocBig: $('sp-alloc-big'), settled: $('sp-settled'), frontier: $('sp-frontier'),
         cursor: $('sp-cursor'), hard: $('sp-hard'), lfu: $('sp-lfu'), fps: $('sp-fps'),
         heap: $('sp-heap'), modeTag: $('sp-mode-tag'),
+        aliasLast: $('sp-alias-last'), aliasFit: $('sp-alias-fit'),
     };
     let spLastAlloc = -1, spLastSettled = -1, spLastFrontier = -1, spLastCursor = -1,
-        spLastHard = -1, spLastLfu = -2, spLastHeapTenths = -1;
+        spLastHard = -1, spLastLfu = -2, spLastHeapTenths = -1,
+        spLastAliasLast = -2, spLastAliasFitMilli = -1;
     let spFqMaxFreq = 1; // running max FreqO1 frequency, for chip heat normalization (draw-read)
 
     function updatePriorityTelemetry() {
@@ -1392,6 +1643,15 @@
         if (hard !== spLastHard) { spLastHard = hard; spdom.hard.textContent = String(hard); }
         const lfu = spWorld.lastLfu;
         if (lfu !== spLastLfu) { spLastLfu = lfu; spdom.lfu.textContent = lfu < 0 ? '--' : String(lfu); }
+        // AliasTable: last weighted outcome + histogram convergence (max |empirical - target|) at 10Hz
+        const aliasLast = spAliasWorld.lastOutcome;
+        if (aliasLast !== spLastAliasLast) { spLastAliasLast = aliasLast; spdom.aliasLast.textContent = aliasLast < 0 ? '--' : ('#' + aliasLast); }
+        const aw = spAliasWorld, at = aw.tally, aweights = aw.weights;
+        const atotal = aw.out[1] > 0 ? aw.out[1] : 1, awsum = aw.weightSum;
+        let fit = 0;
+        for (let i = 0; i < AT_OUTCOMES; i++) { const d = Math.abs(at[i] / atotal - aweights[i] / awsum); if (d > fit) fit = d; }
+        const fitMilli = (fit * 1000 + 0.5) | 0;
+        if (fitMilli !== spLastAliasFitMilli) { spLastAliasFitMilli = fitMilli; spdom.aliasFit.textContent = (fitMilli / 1000).toFixed(3); }
         spdom.fps.textContent = String(fpsValue);
         const m = mem();
         if (m) {
@@ -1409,7 +1669,7 @@
         naiveSp = on;
         spModeToggle.setAttribute('data-on', on ? 'true' : 'false');
         spModeToggle.setAttribute('aria-checked', on ? 'true' : 'false');
-        spModeLabel.textContent = on ? 'naive (allocates / relax)' : 'lite (0 alloc)';
+        spModeLabel.textContent = on ? 'naive (allocates / relax + draw)' : 'lite (0 alloc)';
         spdom.modeTag.textContent = on ? 'NAIVE' : 'LITE';
         spdom.modeTag.style.color = on ? '#e879a8' : '#9d7bff';
     }
@@ -1571,6 +1831,9 @@
 
     const load = $('load'), loadV = $('load-v');
     load.addEventListener('input', () => { cmTargetLoad = +load.value; loadV.textContent = (+load.value).toFixed(2); });
+
+    const bstgt = $('bstgt'), bstgtV = $('bstgt-v');
+    bstgt.addEventListener('input', () => { bsTarget = +bstgt.value; bstgtV.textContent = String(bsTarget); });
 
     // ---- keyboard ----------------------------------------------------------------------
     window.addEventListener('keydown', (e) => {

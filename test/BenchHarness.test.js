@@ -192,15 +192,16 @@ test('supportsKeyType: only int is true, string/object/bad inputs are false (nev
 
 test('supportsWorkload: churn is every mutable member (static SparseTable/AliasTable->false), ecs/cache SparseSet-only, unknown false', () => {
     // churn applies to every MUTABLE member; the STATIC build-once members (SparseTable,
-    // AliasTable -- no insert/delete, immutable after construction) read false -- the applicability
-    // bite behind D8 churn reading n/a for a static member.
-    const STATIC = new Set(['SparseTable', 'AliasTable']);
+    // AliasTable, RankSelect -- no insert/delete, immutable after construction) read false -- the
+    // applicability bite behind D8 churn reading n/a for a static member.
+    const STATIC = new Set(['SparseTable', 'AliasTable', 'RankSelect']);
     for (const member of SUBJECTS) {
         assert.equal(supportsWorkload(member, 'churn'), !STATIC.has(member),
             member + ' churn applicability');
     }
     assert.equal(supportsWorkload('SparseTable', 'churn'), false, 'SparseTable is static -> no churn');
     assert.equal(supportsWorkload('AliasTable', 'churn'), false, 'AliasTable is static -> no churn');
+    assert.equal(supportsWorkload('RankSelect', 'churn'), false, 'RankSelect is static -> no churn');
     assert.equal(supportsWorkload('SparseSet', 'ecs'), true);
     assert.equal(supportsWorkload('SparseSet', 'cache'), true);
     for (const member of ['RingDeque', 'UnionFind', 'MonoDeque']) {

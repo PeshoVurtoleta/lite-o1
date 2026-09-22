@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-Version: 1.7.0
+Version: 1.8.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -13,12 +13,12 @@ op is O(1) worst-case (or O(1)-amortized where stated) and allocates zero bytes
 after construction, and a shipped witness harness demonstrates the flat
 throughput curve against a built-in foil.
 
-v1.7.0 ships seventeen members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
+v1.8.0 ships eighteen members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
 RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap,
-SparseTable, BitSet, AliasTable, CoarseTimerWheel, and WindowFold. They share no mutable module
-state, so a bundler that imports one drops the others (tree-shakeable). 1.7.0 adds WindowFold (the
-seventeenth member; 1.6.0 added CoarseTimerWheel, 1.5.0 added AliasTable, 1.4.0 added BitSet, 1.3.0
-added SparseTable, 1.2.0 added CuckooMap, 1.1.0 added RingLog).
+SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, and RankSelect. They share no mutable
+module state, so a bundler that imports one drops the others (tree-shakeable). 1.8.0 adds RankSelect
+(the eighteenth member; 1.7.0 added WindowFold, 1.6.0 added CoarseTimerWheel, 1.5.0 added AliasTable,
+1.4.0 added BitSet, 1.3.0 added SparseTable, 1.2.0 added CuckooMap, 1.1.0 added RingLog).
 
 ## Exports (from the single main file O1.js)
 
@@ -108,7 +108,19 @@ added SparseTable, 1.2.0 added CuckooMap, 1.1.0 added RingLog).
   primitive (count/time/event windows). Fixed capacity (rounds up to a power of two), fail closed;
   query() never throws. The bitwise trio (AND/OR/XOR) is DEFERRED to a future int32-lane sibling
   WindowFoldInt32. For arbitrary-index / out-of-order range queries use @zakkster/lite-logn Fenwick.
-- `VERSION` -- string, '1.7.0'.
+- `RankSelect` -- class. A zero-GC, WORST-CASE O(1) STATIC succinct rank/select bitvector index
+  over a frozen bit pattern (cs-poppy: 512-bit basic blocks + a select sampling layer). Built from a
+  RAW WORD ARRAY (Array | numeric TypedArray) + an explicit nbits, COPIED into a private Uint32Array
+  (immutable, NOT a BitSet instance -- zero coupling). rank1(i) / rank0(i) count set / clear bits in
+  [0, i); select1(k) / select0(k) return the position of the k-th set / clear bit (0-indexed);
+  access(i) is the bit at i. All are worst-case O(1), 0 B/op (a fixed directory lookup + a bounded
+  <= 16-word block scan + a bounded in-word step). The O(n) build + the ~3.2% index space are a
+  DISCLOSED co-headline (the SparseTable / AliasTable static-member contract), EXCLUDED from the
+  per-op claim, so there is NO max-single-op line. size (popcount) + length (nbits) + indexBytes are
+  O(1) getters; forEach(fn) is the O(n) scan exception. Fail closed on nbits (typeof-safe, before any
+  alloc); queries never throw (bad i -> rank 0 / access undefined; bad/overflow k -> select -1).
+  @zakkster/lite-loglogn re-adopts it as its rank/select substrate.
+- `VERSION` -- string, '1.8.0'.
 
 ## SparseSet
 
@@ -1124,6 +1136,55 @@ only, amortized), MinStack (stack lifetime, no eviction), SparseTable (static bu
 XOR) is DEFERRED to a future int32-lane sibling WindowFoldInt32 (a Float64 aggregate lane cannot
 honestly carry 32-bit bitwise semantics); MINMAX / SUMSQ / COUNT / GCD are dropped (see ADR 0023).
 
+## RankSelect
+
+A zero-GC, WORST-CASE O(1) STATIC succinct rank/select bitvector index over a frozen bit pattern
+(cs-poppy -- Zhou/Andersen/Kaminsky, SEA 2013: 512-bit basic blocks + a select sampling layer).
+The eighteenth member and the succinct primitive the ecosystem was missing: rank1/select1 are the
+substrate of wavelet trees, succinct tries, monotone integer sets, and compressed suffix arrays.
+@zakkster/lite-loglogn re-adopts it as its rank/select substrate (never forks). It is the THIRD
+static build-once / immutable member (after SparseTable + AliasTable).
+
+Source: a RAW WORD ARRAY (a real Array or a numeric TypedArray, uint32 per element) + an explicit
+nbits. The first ceil(nbits/32) words are COPIED (coerced via >>> 0) into a private Uint32Array; bits
+at or above nbits are masked to 0. This is NOT a BitSet instance -- zero coupling to the mutable
+member (the SparseTable / AliasTable copy-not-reference discipline). Build-once, query-only: NO
+mutators (rebuild to change).
+
+Geometry (cs-poppy, ~3.2% index overhead, beating SDSL v5's 6.25%): L0 = absolute Float64
+super-block cumulative counts (2^32 bits/super; one super-block covers the <= 2^25-bit range, so L0
+is a single 0, present for design parity); L1 = per-lower-block (2048-bit) cumulative popcount
+(Uint32); L2 = per-lower-block packed relative counts (three 10-bit basic-block popcounts in one
+Uint32); L3 = the per-word popcount prefix computed on the fly by the bounded <= 16-word in-block
+scan (NOT a stored array -- that would be ~50% overhead). A select sample is stored every 8192 set
+bits (and every 8192 clear bits, for select0).
+
+Constructor: new RankSelect(source, nbits) -- nbits an integer in [1, 2^25]. Fail closed: a bad
+nbits (non-integer / 0 / > 2^25 / NaN / null / Symbol) throws [lite-o1] BEFORE any typed array is
+allocated (the typeof-safe Number.isInteger guard runs FIRST); then a non-Array / non-TypedArray
+source throws.
+
+- rank1(i) -> number        O(1) worst-case, 0 B/op. Set bits in [0, i). Bad i -> 0; i > length
+                            clamps to length (rank1(length) === size). NEVER throws.
+- rank0(i) -> number        O(1) worst-case, 0 B/op. Clear bits in [0, i) -- free (i - rank1(i)).
+- select1(k) -> number      O(1) worst-case, 0 B/op. Position of the k-th set bit (0-indexed) via
+                            the sample layer + a bounded in-block scan (NOT rank + binary search).
+                            Bad / overflow k (>= size) -> -1. NEVER throws.
+- select0(k) -> number      O(1) worst-case, 0 B/op. Position of the k-th clear bit -- free from the
+                            same directory (512*b - rank1) + a clear-bit sample layer. Bad k -> -1.
+- access(i) -> 0|1|undefined  O(1) worst-case, 0 B/op. The bit at i; undefined for a bad i.
+- size (getter)             Number of set bits (popcount, precomputed at build). O(1).
+- length (getter)           Number of bits (nbits). O(1).
+- indexBytes (getter)       The cs-poppy directory byte footprint (the disclosed ~3.2% overhead). O(1).
+- forEach(fn) -> void       O(nbits) alloc-free scan of set-bit indices ASCENDING; fn is (index, rs).
+- [Symbol.iterator]()       O(nbits) set-bit-index scan; ALLOCATES per protocol -- use forEach.
+
+Honesty contract (SparseTable ADR 0018 + AliasTable ADR 0020): the hot ops are TRUE worst-case O(1);
+the O(n) build + the ~3.2% index space are a DISCLOSED co-headline, EXCLUDED from the per-op claim,
+so there is NO max-single-op line (the flat rank line IS the worst-case claim; the witness foil is a
+naive O(words) popcount scan). Non-overlap: BitSet (ADR 0019) is the MUTABLE membership / flag
+structure with no rank/select; RankSelect is the IMMUTABLE succinct index over a frozen bit pattern.
+
 ## Design bounds
 
 - SparseSet valid key: integer in [0, universe).
@@ -1404,12 +1465,20 @@ honestly carry 32-bit bitwise semantics); MINMAX / SUMSQ / COUNT / GCD are dropp
   MAX-single-op line: schedule / cancel / advance(k) are WORST-CASE O(1) with NO cascade (a
   bitmap-validated advance touches <= 9 levels), so there is no amortized spike -- UNLIKE
   HierarchicalTimerWheel. A scanning-drain control (no bitmap) MISSES the flatness floor (fail-path).
+- RankSelect: nbits-sweep [1e3, 1e4, 1e5], WORST-CASE-O(1) STATIC rank1 QUERY (a fixed cs-poppy
+  directory lookup + a bounded <= 16-word in-block popcount scan, INDEPENDENT of nbits) vs a naive
+  O(words) popcount-scan foil (recompute rank by scanning every word before i). ops/ms is a rate
+  (query batch 5e5, foil batch 2e3). Gated over the steady window nbits >= 1e4 (the 1e3 point is a
+  pure-L1 micro-case shown but not gated). RankSelect flatness >= 0.70; naive foil flatness <= 0.55
+  (a TRUE O(words) foil, so it collapses -- like SparseTable's scan foil); RankSelect/naive ratio
+  >= 1.5x. NO MAX-single-op line: rank / select / access are WORST-CASE O(1), and the O(n) build +
+  the ~3.2% index space are the disclosed co-headline, not a per-op spike (the SparseTable precedent).
 
 ## Not yet shipped
 
-The public API grows one member per release. 1.7.0 adds WindowFold (the seventeenth member; 1.6.0
-added CoarseTimerWheel, 1.5.0 added AliasTable, 1.4.0 added BitSet, 1.3.0 added SparseTable, 1.2.0
-added CuckooMap, 1.1.0 added RingLog). The long-standing "fully unbounded / hashed timer wheel" roadmap item is now
+The public API grows one member per release. 1.8.0 adds RankSelect (the eighteenth member; 1.7.0
+added WindowFold, 1.6.0 added CoarseTimerWheel, 1.5.0 added AliasTable, 1.4.0 added BitSet, 1.3.0
+added SparseTable, 1.2.0 added CuckooMap, 1.1.0 added RingLog). The long-standing "fully unbounded / hashed timer wheel" roadmap item is now
 ANSWERED: CoarseTimerWheel is the honest near-unbounded wheel (approximate-fire, worst-case O(1),
 no cascade), and for EXACT far-future deadlines the right tool is a min-heap (@zakkster/lite-logn);
 the classic hashed-with-rounds wheel is REJECTED (expected-O(1) / worst-case-O(n), ADR 0022).

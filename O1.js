@@ -3,10 +3,10 @@
  * that doubles as a teachable textbook: each member solves a real problem AND
  * witnesses its constant on a host (the O(1) Witness -- see test/witness.mjs).
  *
- * v1.7.0 ships seventeen members -- SparseSet, RingDeque, UnionFind, MonoDeque,
+ * v1.8.0 ships eighteen members -- SparseSet, RingDeque, UnionFind, MonoDeque,
  * MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel,
- * RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, and WindowFold --
- * plus its `VERSION` const. The seventeen are independent (no shared mutable module state),
+ * RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, and RankSelect --
+ * plus its `VERSION` const. The eighteen are independent (no shared mutable module state),
  * so a bundler that imports one drops the others (`sideEffects: false`).
  *
  * The complexity class IS the product: every hot op below is O(1) worst-case and
@@ -19,7 +19,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.7.0';
+export const VERSION = '1.8.0';
 
 /** Largest universe the Uint32 substrate + the (k >>> 0) key check can honor. */
 const MAX_UNIVERSE = 0x100000000; // 2^32
@@ -5163,5 +5163,361 @@ export class WindowFold {
     /** @private */
     _seqOverflow() {
         throw new RangeError('[lite-o1] WindowFold position ceiling 2^53 reached; call clear() to reuse');
+    }
+}
+
+// ---- RankSelect internals (module-level, cold-shared, no mutable module state) ----
+
+/**
+ * Largest bit-capacity RankSelect admits. 2^25 = 33,554,432 bits (the BitSet BITSET_MAX_BITS
+ * precedent). The ceiling keeps EVERY cs-poppy directory index inside the SMI / uint32 range
+ * (so no boxing on the hot path): the data words W = 2^20, the basic-block index (512-bit
+ * blocks) = 2^16, the lower-block index (2048-bit blocks) = 2^14, and the absolute rank
+ * (<= 2^25) all stay below 2^31, so `i >>> 5`, `i >>> 9`, `i >>> 11`, and the packed 10-bit
+ * L2 counts stay SMI-safe. A single 2^32-bit super-block covers the whole range, so L0 is a
+ * single 0 (present for cs-poppy design parity + a future 64-bit RankSelect64). A TYPE bound
+ * (a fail-closed guard), not a size any host is obliged to allocate.
+ */
+const RANKSELECT_MAX_BITS = 0x2000000; // 2^25
+
+/** Trailing-zero count of a NONZERO int32 (design-parity twin of BitSet's _bitsetCtz32). */
+function _rsCtz32(x) {
+    // x & -x isolates the lowest set bit (works for a negative int32 top-bit too); clz32 of
+    // that lone bit gives 31 - its position, so 31 - clz32 is the trailing-zero count.
+    return 31 - Math.clz32(x & -x);
+}
+
+/** Population count of an int32, treated as 32 unsigned bits (twin of BitSet's _bitsetPopcount32). */
+function _rsPopcount32(x) {
+    x = x - ((x >>> 1) & 0x55555555);
+    x = (x & 0x33333333) + ((x >>> 2) & 0x33333333);
+    x = (x + (x >>> 4)) & 0x0f0f0f0f;
+    return (Math.imul(x, 0x01010101) >>> 24);
+}
+
+/**
+ * Position (0..31) of the r-th SET bit (0-indexed) in a NONZERO int32 word, given r <
+ * popcount(word). Clears the r lowest set bits (`x & (x - 1)` drops the lowest, bounded <= 31
+ * iterations -> worst-case O(1)) then ctz32 of the survivor. Pure, zero-alloc.
+ */
+function _rsSelectInWord(x, r) {
+    for (let t = 0; t < r; t++) x &= x - 1; // drop the r lowest set bits
+    return _rsCtz32(x);
+}
+
+/**
+ * RankSelect -- a zero-GC, WORST-CASE O(1), STATIC succinct rank/select bitvector index over a
+ * frozen bit pattern (cs-poppy: 512-bit basic blocks + a select sampling layer), the suite's
+ * succinct primitive for wavelet trees, succinct tries, monotone integer sets, compressed
+ * suffix arrays, and @zakkster/lite-loglogn's rank/select-backed structures. The eighteenth member.
+ *
+ * `rank1(i)` counts the set bits in [0, i); `select1(k)` returns the position of the k-th set
+ * bit (0-indexed). Both are TRUE WORST-CASE O(1): rank is a fixed directory lookup (L0 + L1 +
+ * L2) plus a bounded <= 16-word in-block popcount scan (the on-the-fly L3 per-word prefix);
+ * select jumps to a sampled basic block (a sample every 8192 set bits), advances basic-block
+ * by basic-block over the directory's O(1) per-block boundary rank (a bounded forward scan
+ * seeded by the sample -- NOT rank + binary search), then does a <= 16-word in-block scan + a
+ * <= 32-step in-word select. rank0 / select0 come FREE from the same directory (clear count =
+ * 512*b - rank1), select0 with its own 8192-clear-bit sample layer. access(i) is one word load.
+ *
+ * THE HONESTY CONTRACT (rides SparseTable ADR 0018 + AliasTable ADR 0020): the hot ops are
+ * TRUE WORST-CASE O(1), zero-alloc. The O(n) BUILD and the ~3.2% index SPACE (L1 + L2 + the
+ * select samples; ~3-6%, beating SDSL v5's 6.25%) are a DISCLOSED CO-HEADLINE, paid ONCE at
+ * construction, EXCLUDED from the per-op claim -- so there is NO max-single-op line (the flat
+ * rank line IS the worst-case claim; the witness foil is a naive O(words) popcount scan).
+ *
+ * NON-OVERLAP (settled by ADR 0024): BitSet is the MUTABLE membership / flag structure
+ * (test/set/clear/toggle + firstSet/nextSet, no rank/select). RankSelect is the IMMUTABLE
+ * succinct INDEX over a frozen bit pattern, so it takes a RAW WORD ARRAY + an explicit nbits
+ * (COPIED into a private Uint32Array), NOT a BitSet instance -- zero coupling to the mutable
+ * member (the SparseTable / AliasTable copy-not-reference discipline). Build-once, query-only:
+ * there are NO mutators (rebuild to change).
+ *
+ * Fail closed: the constructor throws [lite-o1] (BEFORE any store is allocated) on a
+ * non-integer / < 1 / > 2^25 / NaN / null / Symbol nbits (the typeof-safe Number.isInteger
+ * guard runs FIRST), then on a non-Array / non-TypedArray source. NEVER-throw QUERIES: rank1 /
+ * rank0 return 0 and access returns undefined on a bad i; select1 / select0 return -1 on a bad
+ * or overflow k (the family "queries never throw" law). null is not zero: the typeof guard runs
+ * FIRST so a Symbol / BigInt never reaches the coercing arithmetic.
+ */
+export class RankSelect {
+    /**
+     * @param {number[]|Uint32Array|Int32Array|Uint16Array|Int16Array|Uint8Array|Int8Array|Uint8ClampedArray|Float32Array|Float64Array}
+     *        source  the raw bit words (uint32 each); a real Array or a numeric TypedArray. The
+     *                first ceil(nbits/32) elements are COPIED (coerced via `>>> 0`) into a private
+     *                Uint32Array; bits at or above nbits are masked to 0. The index is immutable.
+     * @param {number} nbits  the number of bits; an integer in [1, 2^25]. Bits are [0, nbits).
+     */
+    constructor(source, nbits) {
+        // nbits FIRST, BEFORE any allocation: Number.isInteger never coerces (false on a Symbol /
+        // BigInt / NaN / null); String(nbits) in the cold message is Symbol / BigInt-safe. Thrown
+        // before any typed array exists, so a bad nbits leaves nothing half-built (the BitSet idiom).
+        if (!Number.isInteger(nbits) || nbits < 1 || nbits > RANKSELECT_MAX_BITS) {
+            throw new RangeError(
+                '[lite-o1] RankSelect nbits must be an integer in [1, 2^25], got ' + String(nbits));
+        }
+        // Source shape: a real Array or an ArrayBuffer view (numeric TypedArray). String(x) is
+        // Symbol / BigInt-safe. A DataView / BigInt typed array is admitted here but its elements
+        // coerce through `>>> 0` below (BigInt would throw a raw TypeError -- not a supported source).
+        if (source === null || typeof source !== 'object' ||
+            !(Array.isArray(source) || ArrayBuffer.isView(source))) {
+            throw new TypeError(
+                '[lite-o1] RankSelect source must be an Array or a numeric TypedArray, got ' + String(source));
+        }
+        const W = (nbits + 31) >>> 5;              // ceil(nbits / 32) data words
+        const words = new Uint32Array(W);
+        const copyLen = source.length < W ? source.length : W;
+        for (let i = 0; i < copyLen; i++) words[i] = source[i] >>> 0; // coerce each element to uint32
+        const rem = nbits & 31;                    // mask the final partial word: bits >= nbits are 0
+        if (rem !== 0) words[W - 1] = words[W - 1] & (((1 << rem) >>> 0) - 1);
+        this._nbits = nbits;
+        this._w = words;
+
+        // cs-poppy directory geometry.
+        const numBasic = (W + 15) >>> 4;           // ceil(W/16) 512-bit basic blocks = ceil(nbits/512)
+        const numLower = (numBasic + 3) >>> 2;      // ceil(numBasic/4) 2048-bit lower blocks
+        const numSuper = Math.max(1, Math.ceil(nbits / 4294967296)); // 2^32-bit super-blocks (== 1 here)
+        this._numBasic = numBasic;
+        // L0: absolute cumulative popcount at each super-block boundary (Float64). One super-block
+        // covers the whole <= 2^25-bit range, so _l0[0] === 0; present for cs-poppy design parity.
+        this._l0 = new Float64Array(numSuper);
+        // L1: per-lower-block cumulative popcount within the super-block (Uint32). +1 sentinel slot
+        // so rank1(nbits) at a lower-block boundary reads a valid entry (= size).
+        this._l1 = new Uint32Array(numLower + 1);
+        // L2: per-lower-block packed relative counts -- three 10-bit basic-block popcounts (the
+        // first three of the four 512-bit basic blocks) in one Uint32 (30 bits). +1 sentinel.
+        this._l2 = new Uint32Array(numLower + 1);
+
+        // Build L1 / L2 + size in one pass over the lower blocks (O(n), the disclosed co-headline).
+        let cum = 0;
+        for (let lb = 0; lb < numLower; lb++) {
+            this._l1[lb] = cum;                     // cumulative popcount up to this lower block's start
+            let c0 = 0, c1 = 0, c2 = 0;
+            for (let bb = 0; bb < 4; bb++) {
+                const block = lb * 4 + bb;
+                const ws = block << 4;              // first word of this basic block
+                const we = (ws + 16) < W ? (ws + 16) : W;
+                let bc = 0;
+                for (let w = ws; w < we; w++) bc += _rsPopcount32(words[w]);
+                if (bb === 0) c0 = bc; else if (bb === 1) c1 = bc; else if (bb === 2) c2 = bc;
+                cum += bc;
+            }
+            this._l2[lb] = (c0 | (c1 << 10) | (c2 << 20)) >>> 0;
+        }
+        this._l1[numLower] = cum;                   // sentinel: rank at the end of the last lower block
+        this._l2[numLower] = 0;
+        this._size = cum;                           // popcount, precomputed (the O(1) size getter)
+
+        // Select sampling layers: _sel1 stores the basic block containing the (s*8192)-th SET bit;
+        // _sel0 the basic block containing the (s*8192)-th CLEAR bit (clear counts derived from the
+        // SAME directory -- no separate rank0 directory). Padding bits are already masked to 0 above.
+        const size0 = nbits - cum;
+        const numSamples1 = cum > 0 ? (((cum - 1) >>> 13) + 1) : 0;
+        const numSamples0 = size0 > 0 ? (((size0 - 1) >>> 13) + 1) : 0;
+        this._sel1 = new Uint32Array(numSamples1 > 0 ? numSamples1 : 1);
+        this._sel0 = new Uint32Array(numSamples0 > 0 ? numSamples0 : 1);
+        let cum1 = 0, next1 = 0, cum0 = 0, next0 = 0;
+        for (let block = 0; block < numBasic; block++) {
+            const ws = block << 4;
+            const we = (ws + 16) < W ? (ws + 16) : W;
+            let bc = 0;
+            for (let w = ws; w < we; w++) bc += _rsPopcount32(words[w]);
+            const blockStart = block << 9;          // block * 512
+            const blockEnd = blockStart + 512;
+            const realBits = (blockEnd < nbits ? blockEnd : nbits) - blockStart; // real bits in this block
+            const clear = realBits - bc;
+            const end1 = cum1 + bc;
+            while (next1 < numSamples1 && (next1 << 13) < end1) this._sel1[next1++] = block;
+            cum1 = end1;
+            const end0 = cum0 + clear;
+            while (next0 < numSamples0 && (next0 << 13) < end0) this._sel0[next0++] = block;
+            cum0 = end0;
+        }
+    }
+
+    /** The number of bits (nbits); bits are [0, length). O(1). */
+    get length() { return this._nbits; }
+
+    /** The number of set bits (popcount, precomputed at build). O(1). */
+    get size() { return this._size; }
+
+    /** The cs-poppy directory byte footprint (the disclosed index overhead, ~3.2% of the data). O(1). */
+    get indexBytes() {
+        return this._l0.buffer.byteLength + this._l1.buffer.byteLength + this._l2.buffer.byteLength +
+            this._sel1.buffer.byteLength + this._sel0.buffer.byteLength;
+    }
+
+    /**
+     * The bit at index i (0 or 1). WORST-CASE O(1): one word load + one mask. Returns `undefined`
+     * for a bad i (non-number, non-uint32, or >= length) and NEVER throws (typeof FIRST so a
+     * Symbol / BigInt never reaches the coercing `>>>`).
+     * @param {number} i
+     * @returns {number|undefined}
+     */
+    access(i) {
+        if (typeof i !== 'number' || (i >>> 0) !== i || i >= this._nbits) return undefined;
+        return (this._w[i >>> 5] >>> (i & 31)) & 1;
+    }
+
+    /**
+     * The number of SET bits in [0, i) -- rank1. WORST-CASE O(1): the L0 + L1 + L2 directory lookup
+     * plus a bounded <= 16-word in-block popcount scan (the on-the-fly L3 per-word prefix) + one
+     * partial-word popcount, INDEPENDENT of nbits. Returns 0 for a bad i (non-integer, negative,
+     * NaN, null, Symbol) and clamps i > length to length (rank1(length) === size); NEVER throws
+     * (typeof FIRST so a Symbol / BigInt never coerces).
+     * @param {number} i  in [0, length]
+     * @returns {number}
+     */
+    rank1(i) {
+        if (typeof i !== 'number' || (i | 0) !== i || i < 0) return 0;
+        const nbits = this._nbits;
+        if (i >= nbits) i = nbits;              // clamp: rank1(length) === size
+        if (i === 0) return 0;
+        const w = this._w;
+        const word = i >>> 5;
+        const bitOff = i & 31;
+        const lower = i >>> 11;
+        let r = this._l0[0] + this._l1[lower];  // single super-block: _l0[0] === 0
+        const p = this._l2[lower];
+        const wl = (i >>> 9) & 3;               // which of the 4 basic blocks within the lower block
+        if (wl >= 1) r += p & 1023;
+        if (wl >= 2) r += (p >>> 10) & 1023;
+        if (wl >= 3) r += (p >>> 20) & 1023;
+        // On-the-fly L3: popcount the full words before `word` within its 512-bit basic block.
+        const blockStartWord = (i >>> 9) << 4;
+        for (let j = blockStartWord; j < word; j++) r += _rsPopcount32(w[j]);
+        if (bitOff !== 0) r += _rsPopcount32(w[word] & (((1 << bitOff) >>> 0) - 1));
+        return r;
+    }
+
+    /**
+     * The number of CLEAR bits in [0, i) -- rank0, FREE from the same directory (i - rank1(i)).
+     * WORST-CASE O(1). Same bad-i contract as rank1 (returns 0, never throws).
+     * @param {number} i  in [0, length]
+     * @returns {number}
+     */
+    rank0(i) {
+        if (typeof i !== 'number' || (i | 0) !== i || i < 0) return 0;
+        const nbits = this._nbits;
+        if (i >= nbits) i = nbits;
+        return i - this.rank1(i);
+    }
+
+    /**
+     * The position of the k-th SET bit (0-indexed) -- select1. WORST-CASE O(1) via the sampling
+     * layer: jump to the basic block sampled every 8192 set bits, advance basic-block by basic-block
+     * over the directory's O(1) per-block boundary rank (a bounded forward scan seeded by the sample,
+     * NOT rank + binary search), then a <= 16-word in-block scan + a <= 32-step in-word select.
+     * Returns -1 for a bad or overflow k (non-integer, negative, or >= size) and NEVER throws.
+     * @param {number} k  in [0, size)
+     * @returns {number} the position of the k-th set bit, or -1
+     */
+    select1(k) {
+        if (typeof k !== 'number' || (k | 0) !== k || k < 0 || k >= this._size) return -1;
+        const numBasic = this._numBasic;
+        let block = this._sel1[k >>> 13];       // sampled block for the (k>>>13)*8192-th set bit
+        while (block + 1 < numBasic && this._rankBB(block + 1) <= k) block++;
+        let rem = k - this._rankBB(block);      // 0-indexed within the target basic block
+        const w = this._w, W = w.length;
+        let wi = block << 4;
+        const end = (wi + 16) < W ? (wi + 16) : W;
+        for (; wi < end; wi++) {
+            const pc = _rsPopcount32(w[wi]);
+            if (rem < pc) return (wi << 5) + _rsSelectInWord(w[wi], rem);
+            rem -= pc;
+        }
+        return -1; // unreachable while the directory invariants hold
+    }
+
+    /**
+     * The position of the k-th CLEAR bit (0-indexed) -- select0, FREE from the same directory (a
+     * basic block's clear count is 512*b - rank1). WORST-CASE O(1) via the _sel0 sampling layer
+     * (a sample every 8192 clear bits). Padding bits in [length, ceil(length/32)*32) are masked to
+     * 0 at build and NEVER counted (the in-word scan caps at the real bit count). Returns -1 for a
+     * bad or overflow k (>= the clear-bit count) and NEVER throws.
+     * @param {number} k  in [0, length - size)
+     * @returns {number} the position of the k-th clear bit, or -1
+     */
+    select0(k) {
+        const size0 = this._nbits - this._size;
+        if (typeof k !== 'number' || (k | 0) !== k || k < 0 || k >= size0) return -1;
+        const numBasic = this._numBasic;
+        let block = this._sel0[k >>> 13];
+        while (block + 1 < numBasic && this._rank0BB(block + 1) <= k) block++;
+        let rem = k - this._rank0BB(block);     // 0-indexed clear bit within the target basic block
+        const w = this._w, W = w.length, nbits = this._nbits;
+        let wi = block << 4;
+        const end = (wi + 16) < W ? (wi + 16) : W;
+        for (; wi < end; wi++) {
+            const wordStart = wi << 5;
+            const realBits = (wordStart + 32 < nbits ? wordStart + 32 : nbits) - wordStart;
+            if (realBits <= 0) break;
+            const realMask = realBits >= 32 ? 0xFFFFFFFF : (((1 << realBits) >>> 0) - 1);
+            const clearInWord = realBits - _rsPopcount32(w[wi] & realMask);
+            if (rem < clearInWord) return wordStart + _rsSelectInWord((~w[wi]) & realMask, rem);
+            rem -= clearInWord;
+        }
+        return -1; // unreachable while the directory invariants hold
+    }
+
+    /**
+     * Iterate the SET-bit indices in ASCENDING order, alloc-free. O(nbits) -- the documented scan
+     * exception, EXCLUDED from the zero-alloc-per-op claims. A HOISTED callback keeps it
+     * allocation-free. Padding bits are 0, so they are never emitted.
+     * @param {(index:number, rankSelect:RankSelect)=>void} fn
+     */
+    forEach(fn) {
+        const w = this._w, W = w.length;
+        for (let wi = 0; wi < W; wi++) {
+            let x = w[wi];
+            const base = wi << 5;
+            while (x !== 0) {
+                fn(base + _rsCtz32(x), this);
+                x &= x - 1;
+            }
+        }
+    }
+
+    /**
+     * Iterate the SET-bit indices in ASCENDING order. O(nbits). The ONE documented per-protocol
+     * ALLOCATOR (a {value, done} per step) -- kept OUT of the zero-alloc claims (use forEach for
+     * the alloc-free scan).
+     */
+    *[Symbol.iterator]() {
+        const w = this._w, W = w.length;
+        for (let wi = 0; wi < W; wi++) {
+            let x = w[wi];
+            const base = wi << 5;
+            while (x !== 0) {
+                yield base + _rsCtz32(x);
+                x &= x - 1;
+            }
+        }
+    }
+
+    // ---- directory helpers (private; pure integer surgery, zero allocation, worst-case O(1)) ----
+
+    /**
+     * Absolute cumulative popcount at the START of basic block `block` (0 <= block <= numBasic).
+     * Composed O(1) from L0 + L1 + the packed L2 relative counts. @private
+     */
+    _rankBB(block) {
+        const lower = block >>> 2;
+        const wl = block & 3;
+        let r = this._l0[0] + this._l1[lower];
+        const p = this._l2[lower];
+        if (wl >= 1) r += p & 1023;
+        if (wl >= 2) r += (p >>> 10) & 1023;
+        if (wl >= 3) r += (p >>> 20) & 1023;
+        return r;
+    }
+
+    /**
+     * Absolute cumulative CLEAR count at the START of basic block `block` -- free from the rank
+     * directory (real bits before the block minus rank1 there). For block <= numBasic-1 the block
+     * start is < nbits, so the real-bit count is block*512. @private
+     */
+    _rank0BB(block) {
+        return (block << 9) - this._rankBB(block);
     }
 }

@@ -26,9 +26,12 @@ verbatim from RESEARCH.md so they are not a surprise at planning time.
 | --- | --- | --- | --- | --- |
 | **M14** | **BitSet** (multi-word dense bitset) | 1.4.0 | O(1) worst-case per-bit; O(1) firstSet/nextSet via summary; bulk ops O(words) disclosed | SHIPPED |
 | **M15** | **AliasTable** (Vose weighted sampling) | 1.5.0 | O(1) worst-case sample (after O(n) build) | SHIPPED |
-| **M16** | **CoarseTimerWheel** (near-unbounded approximate wheel) | 1.6.0 | O(1) worst-case, no cascade/no spike; approximate fire time < 12.5% disclosed | in progress (ROADMAP-M16.md, ADR 0022) |
-| **M17** | **WindowFold / DABA-Lite** (general sliding-window aggregation) | 1.7.0 | O(1) worst-case push/evict/query (DABA-Lite) | planned (section 7) |
-| **M18** | **Rank/Select bitvector** (cs-poppy class) | 1.8.0 | O(1) worst-case rank + O(1) select (after O(n) build) | planned (section 7) |
+| **M16** | **CoarseTimerWheel** (near-unbounded approximate wheel) | 1.6.0 | O(1) worst-case, no cascade/no spike; approximate fire time < 12.5% disclosed | SHIPPED (ADR 0022) |
+| **M17** | **WindowFold / DABA-Lite** (general sliding-window aggregation) | 1.7.0 | O(1) worst-case push/evict/query (DABA-Lite) | SHIPPED (ADR 0023) |
+| **M18** | **RankSelect bitvector** (cs-poppy class) | 1.8.0 | O(1) worst-case rank + O(1) select (after O(n) build) | SHIPPED (ADR 0024; awaiting publish) |
+| **M19** | **Elias-Fano** (succinct monotone-sequence codec) | 1.9.0 | O(1) access to a monotone int sequence, ~2+log2(U/n) bits/elem, on the M18 rank/select layer | FINISH seq (home call: o1 static vs lite-loglogn) |
+| **M20** | **Reservoir** (Algorithm R streaming sampler) | 1.10.0 | exact uniform k-sample from an UNBOUNDED stream, worst-case O(1)/item | FINISH seq |
+| **M21** | **WindowFoldInt32** (int32-lane WindowFold sibling) | 1.11.0 | bitwise AND/OR/XOR sliding-window folds; DABA-Lite core by design-parity | FINISH seq (lowest value; confirm worth doing) |
 
 M14 is the 14th member, M15 the 15th. Suggested order (RESEARCH.md): **BitSet
 first** (broadest reuse, easy win, mutable worst-case cohort), then **AliasTable**
@@ -697,18 +700,23 @@ independent of each other; suggested order WindowFold first (broadest reuse -- c
 audio / telemetry), then Rank/Select (which also unblocks a future Elias-Fano and is a
 substrate lite-loglogn re-adopts). Reorder freely.
 
-### Deferred beyond M18 (M19+ -- NEED A RESEARCH PASS, not yet scheduled)
+### Finishing lite-o1 -- the M19-M21 closing sequence (GREENLIT 2026-09-23)
 
-M18 (Rank/Select, 1.8.0) is the last NUMBERED milestone. The roster is not closed after
-it: three candidates are DEFERRED, each credible and zero-overlap but with no settled
-design, ADR, or milestone number yet. Each needs its own research brief + open-question
-resolution with the user before promotion to M19+. Full deferred entries (what is known +
-the open questions) are in `RESEARCH.md` section 4, "Deferred candidates beyond M18".
+Decision (2026-09-23): FINISH lite-o1 -- take the three remaining candidates to shipped so the
+package is CLOSED and fully developed, then freeze the roster (new work goes to the sibling
+`@zakkster/lite-sketch`, whose RESEARCH.md + ROADMAP.md are now drafted). Order below; each is a
+full pipeline session (planner -> settle -> coder -> reviewer -> qa) after 1.8.0 publishes. Detail
+in `RESEARCH.md` section 4, "Deferred candidates beyond M18".
 
-| Candidate | One-line | Depends on | Status |
-|-----------|----------|------------|--------|
-| **Elias-Fano** (succinct monotone-sequence codec) | O(1) access to a monotone int sequence in ~2 + log2(U/n) bits/elem, built on the M18 rank/select layer | M18 (Rank/Select) | deferred -- HOME call open (lite-o1 static vs lite-loglogn) |
-| **WindowFoldInt32** (int32-lane WindowFold sibling) | the bitwise AND/OR/XOR sliding-window folds a Float64 lane cannot honestly carry (ADR 0023 deferral) | M17 (shares the DABA-Lite core by design-parity) | deferred -- separate-class vs re-param call open |
-| **Reservoir sampler** (Algorithm R) | exact uniform k-sample from an UNBOUNDED stream, worst-case O(1)/item; distinct from RandomSet/AliasTable | none | deferred -- Algorithm R vs L call open |
+| # | Member | Ver | One-line | Depends on | SETTLE FIRST |
+|---|--------|-----|----------|------------|--------------|
+| **M19** | **Elias-Fano** (succinct monotone-sequence codec) | 1.9.0 | O(1) access to a monotone int sequence in ~2 + log2(U/n) bits/elem, on the M18 rank/select layer | M18 (RankSelect, shipped) | **THE HOME CALL** -- lite-o1 STATIC member (access() worst-case O(1) headline, successor a disclosed expected/O(log log U) co-headline) vs route to `@zakkster/lite-loglogn` (whose charter IS O(log log U), and which lists EliasFano Tier-2). If it routes out, M19 becomes a lite-loglogn session and lite-o1 finishes at M20/M21. Also: expose access() only (clean wc O(1)) vs also nextGEQ/successor (drags in the expected bound). |
+| **M20** | **Reservoir** (Algorithm R) | 1.10.0 | exact uniform k-sample from an UNBOUNDED stream, worst-case O(1)/item; distinct from RandomSet (live set) / AliasTable (static weights) | none | Algorithm R (per-item wc O(1) -- the honesty fit) vs Algorithm L (skip-based, EXPECTED -- likely REJECT); fixed k, Float64 lane, per-instance NR-LCG seed; surface offer()/sample()/forEach; weighted reservoir (A-Res) follow-on or out. |
+| **M21** | **WindowFoldInt32** (int32-lane WindowFold sibling) | 1.11.0 | bitwise AND/OR/XOR sliding-window folds a Float64 lane cannot honestly carry (ADR 0023 deferral) | M17 (DABA-Lite core, design-parity) | **CONFIRM WORTH DOING** -- the lowest-value of the three (near-clone of WindowFold with an Int32 lane). Separate class vs re-param; exact op set (AND/OR/XOR; int32 MIN/MAX here or on WindowFold's Float64?); int32 value contract. Could stay deferred if "closed" does not require it. |
+
+Suggested next session: **M19 Elias-Fano** (banks the fresh RankSelect context) -- but settle the HOME
+call first (it decides whether M19 is even a lite-o1 session). Then M20 Reservoir (clean, standalone),
+then M21 WindowFoldInt32 (only if you want the roster literally complete). ADRs 0025 (Elias-Fano),
+0026 (Reservoir), 0027 (WindowFoldInt32).
 
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
