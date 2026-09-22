@@ -48,7 +48,7 @@
  * metric are unchanged; only the measurement is made steadier.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel } from '../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold } from '../O1.js';
 
 const SIZES = [1e3, 1e4, 1e5, 1e6, 1e7];
 const BATCH = 1e6;
@@ -366,6 +366,49 @@ function buildNaiveWindowFoil(n) {
         let best = win[0];
         for (let j = 1; j < W; j++) if (win[j] < best) best = win[j]; // O(W) rescan
         SINK += best;
+    };
+    return { op };
+}
+
+// WindowFold: a sliding window of width W = n over the SUM monoid (DABA-Lite). Each op pushes one
+// value, evicts the oldest (the window slides by one, driving the de-amortized reverse/merge flip),
+// and reads the current aggregate with query(). push / evict / query are each WORST-CASE O(1)
+// (<= 2 combines), so the whole op streams FLAT as W grows -- there is NO O(W) refold and NO flip
+// spike (unlike the amortized two-stacks it de-amortizes).
+function buildWindowFold(n) {
+    const W = n;
+    const wf = new WindowFold(W + 1, 'SUM'); // cap rounds up above W -> never full
+    for (let k = 0; k < W; k++) wf.push((k * 2654435761) & 0x7fffffff); // pre-fill the whole window
+    let v = 0;
+    const op = () => {
+        v = (v * 1103515245 + 12345) & 0x7fffffff; // LCG value stream
+        wf.push(v % 1000000);
+        wf.evict();          // keep exactly W live -> the window slides by one
+        SINK += wf.query();  // O(1) worst-case aggregate read
+    };
+    return { op };
+}
+
+// Foil: a naive sliding-window SUM that REFOLDS the whole window each step. A Float64Array ring
+// holds the last W values; every op overwrites the oldest and then linearly folds all W to compute
+// the sum -- O(W) per element, so ops/ms collapses as W grows, the exact trap DABA-Lite kills. This
+// is a TRUE O(W) foil (a full factor of n lost per decade), so it collapses to the <= 0.55 floor.
+function buildWindowFoldRefoldFoil(n) {
+    const W = n;
+    const win = new Float64Array(W);
+    let v = 0;
+    for (let k = 0; k < W; k++) { // pre-fill so EVERY op refolds W elements from the first call
+        v = (v * 1103515245 + 12345) & 0x7fffffff;
+        win[k] = v % 1000000;
+    }
+    let head = 0;
+    const op = () => {
+        v = (v * 1103515245 + 12345) & 0x7fffffff;
+        win[head] = v % 1000000;
+        head = head + 1; if (head === W) head = 0;
+        let acc = 0;
+        for (let j = 0; j < W; j++) acc += win[j]; // O(W) refold
+        SINK += acc;
     };
     return { op };
 }
@@ -1907,5 +1950,71 @@ if (!cwAllOk) {
     if (!cwHeapOk) console.error('  violation 4-ary heap foil flatness ' + fmt(cwHeap.flatness) +
         ' not < CoarseWheel flatness ' + fmt(cw.flatness));
     if (!cwRatioOk) console.error('  violation min CoarseWheel ratio ' + fmt(cwRatio) + 'x < 1.50x');
+    process.exitCode = 1;
+}
+
+// ===========================================================================
+// WindowFold witness -- WORST-CASE-O(1) query (DABA-Lite) vs a naive O(W)-refold foil
+// ===========================================================================
+// A sliding window of width W = n over SUM. Each op pushes one value, evicts the oldest (slides the
+// window, driving the de-amortized flip), and reads the aggregate -- all WORST-CASE O(1), so it
+// streams FLAT. The foil refolds the whole window each query (O(W)), so it collapses. This is a TRUE
+// O(W) foil (a full factor of n lost per decade), so it reaches the <= 0.55 floor (like the
+// MonoDeque window foil). NO max-single-op line: push / evict / query are WORST-CASE O(1) -- the
+// flip is de-amortized to <= 2 combines per op, so there is NO O(W) evict spike to expose (UNLIKE
+// the amortized MonoDeque). The flat query line IS the worst-case claim; the O(W)-refold foil is the
+// honest 0.55-collapse rival (see decisions/0023).
+// The query op streams the window's Float64 column; at W=1e3 (8 KB) the whole working set is
+// L1-resident and turbo-spikes (the documented L1 micro-floor -- the SparseSet header + ADR 0004),
+// so ops/ms there measures cache turbo, not the constant. Gated over the STEADY window size >= 1e4
+// (the BitSet / CuckooMap / CoarseTimerWheel precedent); the 1e3 point is DISPLAYED, tagged, not
+// gated. The 0.70 flatness + 0.55 foil + 1.5x ratio floors are UNCHANGED -- only the gate DOMAIN is
+// pinned to where ops/ms isolates the constant.
+const WF_GATE_MIN = 1e4;
+const wfw = witness(buildWindowFold, MONO_SIZES, MONO_BATCH, REPS, WF_GATE_MIN);
+const wfFoil = witness(buildWindowFoldRefoldFoil, MONO_SIZES, NAIVE_WIN_BATCH, REPS, WF_GATE_MIN);
+
+console.log('');
+console.log('O(1) Witness -- WindowFold query (SUM, DABA-Lite) vs a naive window refold (rate ops/ms, median of ' +
+    REPS + ', gate size >= ' + nStr(WF_GATE_MIN) + ')');
+console.log('');
+console.log('  W         WindowFold ops/ms  naive ops/ms   ratio');
+console.log('  --------  ----------------   ------------   -----');
+let minWfRatio = Infinity;
+for (let i = 0; i < MONO_SIZES.length; i++) {
+    const a = wfw.rows[i].opsPerMs;
+    const b = wfFoil.rows[i].opsPerMs;
+    const ratio = b > 0 ? a / b : Infinity;
+    const gated = MONO_SIZES[i] >= WF_GATE_MIN;
+    if (gated && ratio < minWfRatio) minWfRatio = ratio; // ratio gate: steady window only
+    const tag = MONO_SIZES[i] < WF_GATE_MIN ? '   <- L1 turbo micro-case (shown, not gated)' : '';
+    console.log('  ' + nStr(MONO_SIZES[i]).padEnd(8) + '  ' +
+        fmt(a).padStart(16) + '   ' + fmt(b).padStart(12) + '   ' + fmt(ratio).padStart(5) + 'x' + tag);
+}
+
+console.log('');
+console.log('  WindowFold flatness (size >= ' + nStr(WF_GATE_MIN) + '): ' + fmt(wfw.flatness) + '   (gate >= 0.70)');
+console.log('  naive foil flatness (last/first): ' + fmt(wfFoil.flatness) + '   (gate <= 0.55 -- true O(W) collapse)');
+console.log('  min WindowFold/naive ratio:       ' + fmt(minWfRatio) + 'x  (gate >= 1.50x)');
+// NO MAX-single-op line here (unlike MonoDeque / BucketQueue / HierarchicalTimerWheel): WindowFold's
+// push / evict / query are WORST-CASE O(1) (the DABA-Lite flip is de-amortized to <= 2 combines per
+// op), so there is no amortized spike to expose; the flat query line IS the worst-case claim (the
+// O(W)-refold foil is the honest 0.55-collapse rival).
+
+const wfOk = wfw.flatness >= 0.70;
+const wfFoilOk = wfFoil.flatness <= 0.55;
+const wfRatioOk = minWfRatio >= 1.5;
+const wfAllOk = wfOk && wfFoilOk && wfRatioOk;
+
+console.log('');
+console.log('WITNESS WindowFold ' + (wfAllOk ? 'ok' : 'FAIL') +
+    ' wf.flatness=' + fmt(wfw.flatness) +
+    ' naive.flatness=' + fmt(wfFoil.flatness) +
+    ' minRatio=' + fmt(minWfRatio) + 'x');
+
+if (!wfAllOk) {
+    if (!wfOk) console.error('  violation WindowFold flatness ' + fmt(wfw.flatness) + ' < 0.70');
+    if (!wfFoilOk) console.error('  violation naive foil flatness ' + fmt(wfFoil.flatness) + ' > 0.55');
+    if (!wfRatioOk) console.error('  violation min WindowFold ratio ' + fmt(minWfRatio) + 'x < 1.50x');
     process.exitCode = 1;
 }

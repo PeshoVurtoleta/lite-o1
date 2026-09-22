@@ -39,7 +39,7 @@ async function main() {
     const { GcProfiler, checkNoGc, measureAllocs } =
         await import('@zakkster/lite-gc-profiler');
     const { createLeakTracker } = await import('@zakkster/lite-leak');
-    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel } = await import('../O1.js');
+    const { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold } = await import('../O1.js');
 
     const U = 1 << 16;      // universe 65536
     const CAP = 1 << 14;    // capacity 16384
@@ -249,6 +249,17 @@ async function main() {
             ctw.drainDue(noop);
             ctw.advance(1);
             tracker.track(ctw, noop, 'coarsetimerwheel', { audit: true });
+            // WindowFold owns only its two Float64Array columns (raw value + partial aggregate);
+            // nothing external to release. Its arrays hold numbers, so a reclaimed instance is the
+            // desired outcome, proven by size()->0. Exercise push (drives a de-amortized flip) /
+            // evict / query / forEach / clear before tracking.
+            const wf1 = new WindowFold(256, (i & 1) ? 'MIN' : 'PRODUCT');
+            for (let j = 0; j < 200; j++) wf1.push((i + j) % 17 + 1); // spans several flip cycles
+            wf1.evict();
+            wf1.query();
+            wf1.forEach(noop);
+            wf1.clear();
+            tracker.track(wf1, noop, 'windowfold', { audit: true });
         }
         return tracker.size();
     }
@@ -668,6 +679,27 @@ async function main() {
     const ctwAllocOk = ctwAllocBytes === 0;
     const ctwNoop = () => {};
 
+    // WindowFold hot path: a bounded resident sliding window (DABA-Lite) churned by push + evict +
+    // query each step. WF_W values are primed (< cap so never full); each step pushes one value,
+    // evicts one (the window slides by one, driving the de-amortized reverse/merge flip), and reads
+    // the current aggregate. Every op is <= 2 combines over two Float64Array columns -- zero JS
+    // allocation (the two typed columns recycle slots; there is no closure on the hot body).
+    const WF_CAP = 1 << 12;                 // 4096 slots (power of two)
+    const WF_W = 1 << 11;                   // 2048 resident elements, < cap so never full
+    const wf = new WindowFold(WF_CAP, 'SUM');
+    for (let k = 0; k < WF_W; k++) wf.push((k * 2654435761) & 0x7fffffff); // bounded resident window
+    let wfv = 0, wfSink = 0;
+    const wfStep = () => {
+        wfv = (wfv + 1) | 0;
+        wf.push(wfv);
+        wf.evict();
+        wfSink += wf.query() | 0;
+    };
+    const wfAllocRes = measureAllocs(wfStep, { iterations: 100000, batches: 8 });
+    const wfBpc = wfAllocRes.bytesPerCall === null ? 0 : wfAllocRes.bytesPerCall;
+    const wfAllocBytes = Math.max(0, Math.round(wfBpc));
+    const wfAllocOk = wfAllocBytes === 0;
+
     // "0 B/op" resolved at the sampling floor: heapUsed deltas are quantized and
     // noisy, so a truly non-allocating op reads a sub-byte figure (a lone blip
     // in one batch / iterations). Round to the nearest byte -- any per-op
@@ -697,6 +729,7 @@ async function main() {
         bitStep();
         aliasStep();
         ctwStep();
+        wfStep();
         if ((i & 8191) === 0) {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
         }
@@ -802,6 +835,17 @@ async function main() {
         // drain 1024 ticks: fires every timer at its rounded fire tick (never early, no cascade)
         for (let t = 0; t < 1024; t++) { ctw.drainDue(ctwNoop); ctw.advance(1); }
     }
+    // WindowFold fill (drives repeated de-amortized flips) + forEach (dense front->back scan) +
+    // query sweep + O(1) clear cycles -- exercises the reverse/merge state machine, the alloc-free
+    // scan, and clear (which resets positions + flip state, zeroes no store). clear() first so each
+    // cycle starts empty and the 512-element fill re-runs the flip lifecycle from scratch.
+    const wfCb = (v) => { SINK += v === v ? 1 : 0; };
+    for (let f = 0; f < 1024; f++) {
+        wf.clear();
+        for (let k = 0; k < 512; k++) wf.push((k * 2654435761) & 0x7fffffff);
+        wf.forEach(wfCb);
+        SINK += wf.query() | 0;
+    }
     // RingLog fill (past capacity -> real overwrite churn) + forEach scan + O(1) clear
     // cycles -- exercises the push-overwrite hot body, the alloc-free oldest->newest
     // scan, and clear. The 2*RL_CAP fill overwrites the whole buffer each cycle, so the
@@ -889,6 +933,10 @@ async function main() {
         for (let k = 0; k < CAP; k++) ctw.schedule(k, 0); // all due at tick 0 (L0 bucket 0)
         ctw.drainDue(ctwNoop);                            // drain bucket 0 -> size 0
         ctw.clear();                                      // O(1): resets scalars + the 18-word bitmap
+        wf.clear();
+        for (let k = 0; k < WF_CAP; k++) wf.push(k);   // fill to capacity (flip-heavy)
+        while (wf.size > 0) wf.evict();                // drain to empty (completes every flip)
+        wf.clear();                                      // O(1): resets positions + flip state, no store
         for (let k = 0; k < CAP; k++) ringLog.push(k); // fill to capacity (overwrites once full)
         ringLog.clear();                               // O(1): the reused buffer grows no store
         for (let k = 0; k < CUCK_W; k++) cuck.set(k, k); // fill under the ceiling (no re-seed)
@@ -905,7 +953,7 @@ async function main() {
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
         findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && monoAllocOk &&
         minAllocOk && randAllocOk && freqAllocOk && buckAllocOk && twAllocOk && htwAllocOk &&
-        ringLogAllocOk && cuckAllocOk && stAllocOk && bitAllocOk && bitHighAllocOk && bitOrAllocOk && bitRetOk && aliasAllocOk && ctwAllocOk && abOk;
+        ringLogAllocOk && cuckAllocOk && stAllocOk && bitAllocOk && bitHighAllocOk && bitOrAllocOk && bitRetOk && aliasAllocOk && ctwAllocOk && wfAllocOk && abOk;
 
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
@@ -925,10 +973,11 @@ async function main() {
         bitHighAllocBytes + ' B/op (BitSet firstSet/nextSet >=2^31 word) ' +
         bitOrAllocBytes + ' B/op (BitSet or) ' +
         aliasAllocBytes + ' B/op (AliasTable sample) ' +
-        ctwAllocBytes + ' B/op (CoarseTimerWheel)' +
+        ctwAllocBytes + ' B/op (CoarseTimerWheel) ' +
+        wfAllocBytes + ' B/op (WindowFold)' +
         ' | bitRetGrowth=' + bitRetGrowth + ' B' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
-        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' bsSink=' + bsSink + ' bhSink=' + bhSink + ' brSink=' + brSink + ' atSink=' + atSink + ' abGrowth=' + abDelta + ')');
+        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' bsSink=' + bsSink + ' bhSink=' + bhSink + ' brSink=' + brSink + ' atSink=' + atSink + ' wfSink=' + wfSink + ' abGrowth=' + abDelta + ')');
 
     if (!ok) {
         if (!trackedOk) console.error('  vacuous: tracker held ' + trackedMid + ' instances (expected > 0)');
@@ -956,6 +1005,7 @@ async function main() {
         if (!bitRetOk) console.error('  retain ' + bitRetGrowth + ' B heap growth over 2e6 BitSet firstSet calls (>= 2^31 word); limit ' + (1 << 20) + ' B -- a firstSet must retain nothing');
         if (!aliasAllocOk) console.error('  alloc ' + aliasAllocBytes + ' B/op AliasTable sample (raw bytesPerCall ' + aliasBpc + ')');
         if (!ctwAllocOk) console.error('  alloc ' + ctwAllocBytes + ' B/op CoarseTimerWheel (raw bytesPerCall ' + ctwBpc + ')');
+        if (!wfAllocOk) console.error('  alloc ' + wfAllocBytes + ' B/op WindowFold (raw bytesPerCall ' + wfBpc + ')');
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;
     }

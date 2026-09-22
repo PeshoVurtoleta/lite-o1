@@ -22,7 +22,7 @@
  */
 
 import { zgcSuite } from '@zakkster/lite-perf-gate';
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold } from '../../O1.js';
 
 const U = 1 << 16;      // universe 65536
 const CAP = 1 << 14;    // capacity 16384
@@ -1799,6 +1799,123 @@ const ctwForEachDrain = {
     statsOf(s) { return { grows: ctwGrows(s) }; },
 };
 
+// ===========================================================================
+// WindowFold scenarios -- TWO Float64Array columns (raw value + partial aggregate), a
+// WORST-CASE O(1) general FIFO sliding-window aggregator (DABA-Lite). push / evict / query are
+// each <= 2 combines over recycled typed slots -- no window-size branch, no closure, no coercion,
+// no heap double, no allocation. The de-amortized reverse/merge flip is pure scalar/typed-slot work.
+// ===========================================================================
+
+const WF_CAP = 1 << 14;   // capacity 16384 (power of two)
+const WF_W = 1 << 12;     // 4096 resident elements -> steady state, never full/empty
+
+/**
+ * The zero-alloc counter for WindowFold scenarios: the byte lengths of BOTH backing Float64Array
+ * columns (the raw-value column + the partial-aggregate column). Capacity is fixed at construction,
+ * so this NEVER grows -- the delta across the window must be 0 (the `wfGrows` 0-delta canary).
+ */
+function wfGrows(s) {
+    const w = s.wf;
+    return w._val.buffer.byteLength + w._agg.buffer.byteLength;
+}
+
+/**
+ * push-evict-query churn: a bounded resident window slid by one each op (push one, evict the oldest,
+ * read the aggregate). The slide drives the de-amortized reverse/merge flip -- so the measured window
+ * is dominated by REAL flip steps + the <= 2-combine query. size stays at WF_W (< cap), never
+ * full/empty, every op zero-alloc.
+ */
+const wfPushEvictQuery = {
+    name: 'WindowFold push-evict-query (slide by one)',
+    setup() {
+        const wf = new WindowFold(WF_CAP, 'SUM');
+        // Small values so the window SUM stays SMI (<= WF_W * 255 ~ 1.05M): a SUM aggregate that
+        // overflowed 2^31 would return a boxed HeapNumber, an allocation the reader -- not the
+        // structure -- causes. The gate proves push/evict/query allocate nothing; keep the
+        // arithmetic in the SMI lane so the reader adds none of its own (the SparseSet & MASK lesson).
+        for (let k = 0; k < WF_W; k++) wf.push(k & 0xff);
+        return { wf, v: 0, sink: 0 };
+    },
+    hot(s, n) {
+        const wf = s.wf;
+        let v = s.v | 0, sink = s.sink | 0;
+        for (let i = 0; i < n; i++) {
+            v = (v + 1) & 0xff;
+            wf.push(v);
+            wf.evict();
+            sink = (sink + wf.query()) | 0; // int32-wrapped: no promoted heap double
+        }
+        s.v = v | 0; s.sink = sink | 0;
+    },
+    statsOf(s) { return { grows: wfGrows(s) }; },
+};
+
+/**
+ * query-read: a primed resident window queried each op (the <= 2-combine aggregate read on a steady
+ * window). Proves query() itself allocates nothing and does no window-size work.
+ */
+const wfQueryRead = {
+    name: 'WindowFold query-read (steady window)',
+    setup() {
+        // MAX over SMI values -> the aggregate is a SMI; the reader int32-wraps the accumulator so
+        // neither query() nor the reader promotes a heap double.
+        const wf = new WindowFold(WF_CAP, 'MAX');
+        for (let k = 0; k < WF_W; k++) wf.push((k * 2654435761) & 0x7fffffff);
+        return { wf, sink: 0 };
+    },
+    hot(s, n) {
+        const wf = s.wf;
+        let sink = s.sink | 0;
+        for (let i = 0; i < n; i++) sink = (sink + wf.query()) | 0; // int32-wrapped read
+        s.sink = sink | 0;
+    },
+    statsOf(s) { return { grows: wfGrows(s) }; },
+};
+
+/**
+ * evict-refill: drive the window empty (each op pushes then, once full-ish, drains to empty and
+ * refills) so the flip completes over full fill/drain cycles. clear() resets positions + flip state
+ * the instant the window empties. Exercises the reverse/merge lifecycle end-to-end, zero-alloc.
+ */
+const wfEvictRefill = {
+    name: 'WindowFold evict-refill (fill then drain to empty)',
+    setup() {
+        const wf = new WindowFold(WF_CAP, 'MIN');
+        return { wf, v: 0 };
+    },
+    hot(s, n) {
+        const wf = s.wf;
+        let v = s.v | 0;
+        for (let i = 0; i < n; i++) {
+            if (wf.size >= WF_W) wf.evict();
+            else { v = (v + 1) | 0; wf.push(v); }
+        }
+        s.v = v | 0;
+    },
+    statsOf(s) { return { grows: wfGrows(s) }; },
+};
+
+/**
+ * WindowFold forEach-drain: a primed window scanned each op through a HOISTED module-scope callback
+ * (never re-created per op). Proves forEach itself (the alloc-free front->back scan; the ONE
+ * per-protocol allocator is [Symbol.iterator], gated separately) allocates nothing.
+ */
+let wfForEachAcc = 0;
+function wfForEachInto(v) { wfForEachAcc = (wfForEachAcc + (v | 0)) | 0; }
+const wfForEachDrain = {
+    name: 'WindowFold forEach-drain',
+    setup() {
+        const wf = new WindowFold(WF_CAP, 'PRODUCT');
+        for (let i = 0; i < 256; i++) wf.push(1 + (i % 5)); // bounded resident set to scan
+        return { wf };
+    },
+    hot(s, n) {
+        const wf = s.wf;
+        for (let i = 0; i < n; i++) wf.forEach(wfForEachInto);
+    },
+    statsOf(s) { return { grows: wfGrows(s) }; },
+};
+
 const scenarios = [
     addChurn, hasHit, deleteChurn, clearRefill, forEachDrain,
     ringFifo, ringLifo, ringInterleave,
@@ -1816,6 +1933,7 @@ const scenarios = [
     bsTestHit, bsSetChurn, bsUnsetChurn, bsFirstSet, bsNextSet, bsOrBulk,
     atSample, atForEachDrain,
     ctwScheduleChurn, ctwDrainAdvance, ctwCancelChurn, ctwAdvanceTick, ctwForEachDrain,
+    wfPushEvictQuery, wfQueryRead, wfEvictRefill, wfForEachDrain,
 ];
 
 /**
@@ -2184,6 +2302,32 @@ const atMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/**
+ * The WindowFold teeth: a per-op `[Symbol.iterator]` spread into a FRESH [] each op -- the generator
+ * + its per-step {value, done} wrappers + the array MUST trip the gate (scavenges scale with n),
+ * proving the instrument has teeth on the WindowFold surface too (its iterator is the ONE documented
+ * per-protocol allocator; forEach is the alloc-free scan). statsOf returns a constant so the failure
+ * is the allocation lanes, not a missing-counter artifact.
+ */
+const wfMustFailAlloc = {
+    name: 'WindowFold [Symbol.iterator] spread into fresh array (MUST allocate)',
+    setup() {
+        const wf = new WindowFold(256, 'SUM');
+        for (let i = 0; i < 64; i++) wf.push((i * 2654435761) & 0x7fffffff);
+        return { wf };
+    },
+    hot(s, n) {
+        const wf = s.wf;
+        let sink = 0;
+        for (let i = 0; i < n; i++) {
+            const arr = [...wf]; // fresh generator + array per op -> heap churn
+            sink += arr.length;
+        }
+        s.sink = sink;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -2193,5 +2337,5 @@ zgcSuite({
     counters: { grows: 0 },
     maxRetainedKB: 64,
     scenarios,
-    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc, twMustFailAlloc, htwMustFailAlloc, ringLogMustFailAlloc, cuckMustFailAlloc, stMustFailAlloc, bsMustFailAlloc, atMustFailAlloc],
+    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc, twMustFailAlloc, htwMustFailAlloc, ringLogMustFailAlloc, cuckMustFailAlloc, stMustFailAlloc, bsMustFailAlloc, atMustFailAlloc, wfMustFailAlloc],
 });

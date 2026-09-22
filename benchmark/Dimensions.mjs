@@ -17,7 +17,7 @@
 import {
     SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet,
     FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel,
-    RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel,
+    RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold,
 } from '../O1.js';
 import {
     prng, median, warm, gcNow, hasGc, percentile, collect, timeNsPerOp, foldHash,
@@ -158,6 +158,21 @@ export function makeSubject(member, n, rng) {
         return {
             obj: d,
             op: () => { const seq = d.push(nextVal()); d.evictOlderThan(seq - W); if (d.value() !== undefined) SINK++; },
+        };
+    }
+    if (member === 'WindowFold') {
+        // A sliding window of width W = n over SUM (DABA-Lite). Each op pushes one value, evicts the
+        // oldest (the window slides, driving the de-amortized reverse/merge flip), and reads the
+        // aggregate -- WORST-CASE O(1) (<= 2 combines). Small values keep the SUM in the SMI lane so
+        // the read folds into SINK without a promoted heap double.
+        const W = n;
+        const wf = new WindowFold(W + 1, 'SUM');
+        let v = 0;
+        const nextVal = () => { v = (v + 1) & 0xff; return v; };
+        for (let k = 0; k < W; k++) wf.push(nextVal());
+        return {
+            obj: wf,
+            op: () => { wf.push(nextVal()); wf.evict(); SINK = (SINK + wf.query()) | 0; },
         };
     }
     if (member === 'RingLog') {
@@ -626,6 +641,25 @@ export function makeBaseline(member, n) {
             },
         };
     }
+    if (member === 'WindowFold') {
+        // naive sliding-window SUM refold (O(W) per element): a Float64 ring overwritten in place,
+        // re-summed from scratch on every op -- the obvious approach before the DABA-Lite trick.
+        const W = n;
+        const win = new Float64Array(W);
+        let v = 0;
+        const nextVal = () => { v = (v + 1) & 0xff; return v; };
+        for (let k = 0; k < W; k++) win[k] = nextVal();
+        let head = 0;
+        return {
+            op: () => {
+                win[head] = nextVal();
+                head = head + 1; if (head === W) head = 0;
+                let acc = 0;
+                for (let j = 0; j < W; j++) acc += win[j]; // O(W) refold
+                SINK = (SINK + acc) | 0;
+            },
+        };
+    }
     if (member === 'RingLog') {
         // A never-evicting growing Array as a naive bounded log: keep pushing and shift() the
         // oldest off the front once it overflows capacity -- the O(n) shift is the price of not
@@ -783,6 +817,7 @@ export function makeStrongBaseline(member, n) {
 /** True iff a member's baseline op is O(n) (or O(log n)) per call (so it must be timed gently). */
 const LINEAR_BASELINE = {
     SparseSet: false, RingDeque: true, UnionFind: true, MonoDeque: true, MinStack: true, RandomSet: true,
+    WindowFold: true,    // naive-window refold foil is O(W) per element
     FreqO1: true,        // naive-freq foil is an O(n) LFU scan
     BucketQueue: true,   // binary-heap foil is O(log n) per op
     TimerWheel: true,    // naive-scan foil is an O(n) deadline scan
@@ -801,6 +836,7 @@ export function memberBytes(member, obj) {
     if (member === 'RingDeque') return obj._store.buffer.byteLength;
     if (member === 'UnionFind') return obj._parent.buffer.byteLength + obj._size.buffer.byteLength;
     if (member === 'MonoDeque') return obj._val.buffer.byteLength + obj._seq.buffer.byteLength;
+    if (member === 'WindowFold') return obj._val.buffer.byteLength + obj._agg.buffer.byteLength;
     if (member === 'MinStack') return obj._val.buffer.byteLength + obj._ext.buffer.byteLength;
     if (member === 'RandomSet') return obj._dense.buffer.byteLength + obj._sparse.buffer.byteLength;
     if (member === 'FreqO1') {
@@ -874,6 +910,7 @@ export function theoreticalMinPerLive(member) {
     if (member === 'RingDeque') return 8;  // one Float64 slot per live value
     if (member === 'UnionFind') return 8;  // parent + size Uint32 per element
     if (member === 'MonoDeque') return 16; // value + seq Float64 per entry
+    if (member === 'WindowFold') return 16; // value + agg Float64 per entry (the two DABA-Lite columns)
     if (member === 'MinStack') return 16;  // value + ext Float64 per element
     if (member === 'RandomSet') return 4;  // one Uint32 dense slot per live key
     // FreqO1: dense + freq + bkt + nk + pk = 5 Uint32 per live key (the intrusive bucket
@@ -1184,6 +1221,16 @@ function makeMixed(member, cap, rng) {
             if (d.value() !== undefined) SINK++;
         };
     }
+    if (member === 'WindowFold') {
+        // A sliding SUM window of width cap>>1: push one, evict oldest (drives the de-amortized
+        // flip), read the aggregate -- worst-case O(1), so cumulative ns/op stays flat over the trace.
+        const W = cap >> 1;
+        const wf = new WindowFold(cap, 'SUM');
+        let v = 0;
+        const nextVal = () => { v = (v + 1) & 0xff; return v; };
+        for (let k = 0; k < W; k++) wf.push(nextVal());
+        return () => { wf.push(nextVal()); wf.evict(); SINK = (SINK + wf.query()) | 0; };
+    }
     if (member === 'RingLog') {
         // A steady-full lossy ring: every push overwrites the oldest (worst-case O(1)) and
         // returns it; a rolling oldest/newest read keeps the snapshot surface exercised.
@@ -1344,6 +1391,12 @@ function fillMember(member, obj, count) {
         for (let k = 0; k < count; k++) { v = (v * 1103515245 + 12345) & 0x7fffffff; obj.push(v % 1000000); }
         return;
     }
+    if (member === 'WindowFold') {
+        obj.clear();
+        let v = 0;
+        for (let k = 0; k < count; k++) { v = (v + 1) & 0xff; obj.push(v); }
+        return;
+    }
     if (member === 'MinStack') {
         obj.clear();
         let v = 0;
@@ -1435,6 +1488,7 @@ export function D3(member, opts = {}) {
     else if (member === 'RingDeque') obj = new RingDeque(n);
     else if (member === 'UnionFind') obj = new UnionFind(n);
     else if (member === 'MonoDeque') obj = new MonoDeque(n, 'min');
+    else if (member === 'WindowFold') obj = new WindowFold(n, 'SUM');
     else if (member === 'MinStack') obj = new MinStack(n, 'min');
     else if (member === 'RandomSet') obj = new RandomSet(n, n, 0x9e3779b1);
     else if (member === 'FreqO1') obj = new FreqO1(n, n);
@@ -1891,6 +1945,16 @@ export function churnNs(member, n, seed) {
         const op = () => { const seq = d.push(nextVal()); d.evictOlderThan(seq - W); };
         return median(collect(op, 4000, 60));
     }
+    if (member === 'WindowFold') {
+        // Slide a SUM window by one each op (push + evict + query) -- real mutate churn.
+        const wf = new WindowFold(n, 'SUM');
+        const W = n >> 1;
+        let v = 0;
+        const nextVal = () => { v = (v + 1) & 0xff; return v; };
+        for (let k = 0; k < W; k++) wf.push(nextVal());
+        const op = () => { wf.push(nextVal()); wf.evict(); SINK = (SINK + wf.query()) | 0; };
+        return median(collect(op, 4000, 60));
+    }
     if (member === 'RingLog') {
         // Push-only churn (LOSSY: the ring overwrites the oldest -- there is no delete). At
         // steady full, every push is the worst-case-O(1) overwrite that returns the evicted.
@@ -2076,7 +2140,7 @@ export function traceHash(member, seed = DEFAULT_SEED, length = 100000) {
         member === 'CuckooMap' || member === 'SparseTable' || member === 'BitSet' ||
         member === 'AliasTable' || member === 'CoarseTimerWheel') mode = 0;
     else if (member === 'RingDeque' || member === 'MinStack') mode = 1;
-    else if (member === 'MonoDeque') mode = 2;
+    else if (member === 'MonoDeque' || member === 'WindowFold') mode = 2;
     else throw new Error('[bench] unhandled member: ' + member);
 
     const rng = prng(seed);

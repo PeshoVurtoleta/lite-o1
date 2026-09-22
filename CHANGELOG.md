@@ -8,6 +8,49 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.7.0] - 2026-09-22
+
+### Added
+
+- **`WindowFold` -- the seventeenth member: a zero-GC, WORST-CASE O(1) general sliding-window
+  aggregator (DABA-Lite).** Where `MonoDeque` keeps a sliding-window min / max in AMORTIZED O(1)
+  via a monotonic deque, `WindowFold` aggregates over ANY of four frozen associative operators in
+  TRUE worst-case O(1) -- the De-Amortized Banker's Aggregator (Tangwongsan / Hirzel, IBM
+  Research). `push(v)` / `evict()` / `query()` each do a bounded number of combines (no
+  window-size branch, no cascade, no closure on the hot path), so it prints NO max-single-op line
+  (the worst-case cohort, alongside `MinStack` / `RandomSet` / `RingLog` / `SparseTable` /
+  `AliasTable` / `CoarseTimerWheel`). The operator is a FROZEN enum selected at construction
+  (`SUM` / `MIN` / `MAX` / `PRODUCT`, identities `0` / `+Infinity` / `-Infinity` / `1`), driving a
+  ctor-cached `_op` int -- the `MonoDeque` frozen-`kind` discipline, since a caller lambda would
+  break the 0 B/op law. `query()` on an EMPTY window returns the operator's IDENTITY, never
+  `undefined`. Substrate is a numeric-only SoA ring (a `Float64Array` value lane + an aggregate
+  lane, head + count). It is a caller-driven PRIMITIVE, not a fixed-width policy (the `MonoDeque`
+  model: the deque owns the aggregate, the caller owns the window). Fail closed at construction and
+  on `push` (bad capacity / op, a non-clean value, or a FULL ring throws `[lite-o1]` typeof-first,
+  byte-identical no-op); queries never throw. Non-overlap: `MonoDeque` stays the min / max
+  amortized member; `WindowFold` is the general worst-case one (and also does min / max
+  worst-case). The bitwise associative operators (`AND` / `OR` / `XOR`) are DEFERRED to a future
+  int32-lane sibling, `WindowFoldInt32` -- a `Float64` value lane cannot honestly carry 32-bit
+  ops. See [`decisions/0023`](./decisions/0023-windowfold.md).
+- **`test/WindowFold.test.js`** -- full behavioral suite: a per-operator oracle (`query()` equals a
+  naive O(W) full window refold, EXACT, over large random `push` / `evict` traces), the
+  empty-window-returns-identity contract, fail-closed construction + `push`, and the queries-never-
+  throw contract.
+- Gate coverage extended for the seventeenth member: `test/torture.mjs` (retention -> `size() = 0`
+  plus a `0 B/op` hot-path phase on `push` / `evict` / `query`), `test/witness.mjs` (a flat
+  `WindowFold` query line vs a naive O(W)-window-refold foil that collapses -- flatness `1.04`,
+  foil `0.10`, ratio `>= 1810x`, NO max-single-op line), `test/perf/PerfGate.test.mjs` (four
+  zero-alloc scenarios + a MUST-allocate iterator-spread catch), and `benchmark/` (`SUBJECTS` -> 17,
+  a churn workload).
+
+### Changed
+
+- Roster is now SEVENTEEN members; `O1.js` header member-count + roster list + `VERSION` bumped to
+  `1.7.0`, with `package.json` (version + description + keywords) and `llms.txt` in sync. `O1.js` is
+  a PURE APPEND -- the prior sixteen member classes are byte-identical (only the header comment and
+  the `VERSION` const changed). README + GUIDE document the general-associative-window aggregation
+  leaf.
+
 ## [1.6.0] - 2026-09-22
 
 ### Added

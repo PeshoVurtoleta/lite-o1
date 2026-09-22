@@ -27,8 +27,8 @@ const litO1 = (e) => e instanceof Error && /^\[lite-o1]/.test(e.message);
 
 // --- version + surface -----------------------------------------------------
 
-test('VERSION is the frozen 1.6.0 string', () => {
-    assert.equal(VERSION, '1.6.0');
+test('VERSION is the frozen 1.7.0 string', () => {
+    assert.equal(VERSION, '1.7.0');
 });
 
 test('empty stack: size 0, capacity as constructed, kind frozen, pop/peek/extreme -> undefined', () => {

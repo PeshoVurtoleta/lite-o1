@@ -3,11 +3,11 @@
  * that doubles as a teachable textbook: each member solves a real problem AND
  * witnesses its constant on a host (the O(1) Witness -- see test/witness.mjs).
  *
- * v1.6.0 ships sixteen members -- SparseSet, RingDeque, UnionFind, MonoDeque,
+ * v1.7.0 ships seventeen members -- SparseSet, RingDeque, UnionFind, MonoDeque,
  * MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel,
- * RingLog, CuckooMap, SparseTable, BitSet, AliasTable, and CoarseTimerWheel -- plus its
- * `VERSION` const. The sixteen are independent (no shared mutable module state), so a
- * bundler that imports one drops the others (`sideEffects: false`).
+ * RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, and WindowFold --
+ * plus its `VERSION` const. The seventeen are independent (no shared mutable module state),
+ * so a bundler that imports one drops the others (`sideEffects: false`).
  *
  * The complexity class IS the product: every hot op below is O(1) worst-case and
  * allocates ZERO bytes after construction. The witness harness (never imported
@@ -19,7 +19,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.6.0';
+export const VERSION = '1.7.0';
 
 /** Largest universe the Uint32 substrate + the (k >>> 0) key check can honor. */
 const MAX_UNIVERSE = 0x100000000; // 2^32
@@ -4847,5 +4847,321 @@ export class CoarseTimerWheel {
     _advancing() {
         throw new RangeError('[lite-o1] CoarseTimerWheel advance() during an in-flight drain/advance; ' +
             'advance only between drains (would strand the un-fired due timers)');
+    }
+}
+
+/**
+ * WindowFold's FROZEN operator enum (names -> ints). EXACTLY four associative operators, each a
+ * monoid with a compile-time identity: SUM -> 0, MIN -> +Infinity, MAX -> -Infinity,
+ * PRODUCT -> 1. The ctor maps a name to its int, cached as `_op` to drive a switch-free combine
+ * (no per-op operator-string test, no lambda -- the MonoDeque frozen-`kind` pattern). The bitwise
+ * trio (AND / OR / XOR) is DEFERRED to a future int32-lane sibling `WindowFoldInt32` (a Float64
+ * aggregate lane cannot honestly carry 32-bit bitwise semantics); MINMAX / SUMSQ (extra lanes) /
+ * COUNT (a `size` read) / GCD (a per-combine loop, not O(1)) are DROPPED (see decisions/0023).
+ * A plain object is fine: the ctor validates via `typeof WINDOWFOLD_OPS[op] === 'number'`, so an
+ * inherited key ('constructor' etc.) reads as a function and is rejected fail-closed.
+ */
+const WINDOWFOLD_OPS = { SUM: 0, MIN: 1, MAX: 2, PRODUCT: 3 };
+
+/** Per-op identity, indexed by the frozen `_op` int. Returned verbatim by query() on an empty window. */
+const WINDOWFOLD_IDENT = [0, Infinity, -Infinity, 1];
+
+/** Largest element count a WindowFold ring can honor (2^31 slots per column; identical to MAX_CAPACITY). */
+const WINDOWFOLD_MAX_CAPACITY = 0x80000000; // 2^31
+
+/**
+ * WindowFold -- a zero-GC, WORST-CASE O(1) GENERAL FIFO sliding-window aggregator (DABA-Lite --
+ * the De-Amortized Banker's Aggregator, Tangwongsan/Hirzel/Schneider, IBM Research,
+ * arXiv:2009.13768) over TWO parallel `Float64Array` columns (raw value + partial aggregate) in
+ * one power-of-two ring. The seventeenth member.
+ *
+ * Where MonoDeque does sliding min/max in AMORTIZED O(1) via a monotonic deque, WindowFold folds
+ * ANY of FOUR frozen associative operators -- SUM, MIN, MAX, PRODUCT -- over the live window in
+ * TRUE WORST-CASE O(1): each push / evict / query does at most TWO `combine` calls, with NO branch
+ * on the window size, NO closure, and 0 B/op. SWAG (sliding-window aggregation) needs only a
+ * MONOID (an associative operator + an identity); the monotonic-deque discard trick is specific to
+ * order-dominating idempotent operators and does not generalize, so this is the GENERAL member
+ * (it also does min/max worst-case; MonoDeque stays the lower-constant amortized min/max specialist).
+ *
+ * MODEL (DABA-Lite -- a de-amortized banker's two-stacks). The window is two logical stacks over
+ * the ring at monotone logical positions [F, E): a FRONT region [F, s) holding SUFFIX aggregates
+ * (`_agg[i] = combine([i, s))`, so `_agg[F]` is the whole front aggregate) and a BACK region
+ * [s, E) folded into a single running accumulator `_bsum`. `query()` is
+ * `combine(_agg[F], _bsum)`. The classic two-stacks would FLIP (reverse the back into a fresh
+ * front) when the front empties -- an O(window) evict spike. DABA-Lite DE-AMORTIZES that flip into
+ * two phases spread ONE step per operation:
+ *   - REVERSE: rebuild the frozen back segment [s, e0) right-to-left into suffix aggregates
+ *     (one combine per push/evict), while new pushes accumulate into a fresh `_bsum`.
+ *   - MERGE: fold the old front's suffix aggregates into the new right boundary (one combine per
+ *     push/evict), so the two stacks become one.
+ * A flip is triggered as soon as `|back| >= |front|`, which bounds the frozen segment to the
+ * front's size so the reversal ALWAYS completes before the front drains (evict-only is the tightest
+ * case: `|back| == |front|` at trigger, one reverse step per evict, done exactly as the front
+ * empties). During a phase `query()` reads at most THREE stored aggregates (the old-front top, a
+ * frozen middle aggregate, and `_bsum`) -- still <= 2 combines. Because the flip is de-amortized,
+ * there is NO O(window) evict spike, so WindowFold prints NO max-single-op line (it joins MinStack /
+ * TimerWheel / SparseTable / BitSet / CoarseTimerWheel in the worst-case cohort). See decisions/0023.
+ *
+ * OPERATOR (frozen at construction, the MonoDeque `kind` pattern). `op` is one of the four names
+ * 'SUM' | 'MIN' | 'MAX' | 'PRODUCT', validated fail-closed and cached as the int `_op` (0..3) that
+ * drives a SWITCH-FREE combine (`_cmb` -- an int branch, no operator-string test, no lambda). The
+ * identity (0 / +Infinity / -Infinity / 1) is cached as `_ident` and returned verbatim by query()
+ * on an EMPTY window -- `null` is not zero: an empty SUM window IS 0, an empty MIN window IS
+ * +Infinity, never undefined.
+ *
+ * CALLER-DRIVEN PRIMITIVE (the MonoDeque style, not a fixed-width policy): `push(v)` appends the
+ * next value, `evict()` drops the oldest, `query()` reads the current window aggregate. The caller
+ * owns which elements are in the window (count-based, time-based, event-based).
+ *
+ * Numeric-only value policy IDENTICAL to RingDeque / MonoDeque: a pushed value must be
+ * `typeof 'number'` AND not NaN (`+/-Infinity` accepted); everything else is rejected fail-closed.
+ * The typeof guard runs FIRST so a Symbol / BigInt never reaches the arithmetic (`+`/`*`/template
+ * literals THROW on those); the cold `_bad` builder names the value via `String(v)`, Symbol-safe.
+ *
+ * Fail closed, mirroring the suite: `push` on a FULL ring throws `[lite-o1]` as a BYTE-IDENTICAL
+ * no-op (every guard precedes the first store); a non-clean value throws `[lite-o1]`; the monotone
+ * position counter is capped at 2^53 (the MonoDeque MAX_SEQ precedent) -- once `_E` would reach it
+ * push THROWS rather than lose integer precision (call clear() to reuse). `evict()` on an EMPTY
+ * window is a no-op (never throws). `query()` NEVER throws.
+ *
+ * `forEach(fn)` (front -> back, alloc-free, fn is (value, index, fold)) and `[Symbol.iterator]()`
+ * (front -> back, the ONE documented per-protocol allocator -- yields a `{value, done}` per step)
+ * are the O(k) scan exceptions, EXCLUDED from the zero-alloc-per-op claims, the witness, and the
+ * perf gate. Capacity ROUNDS UP to the next power of two (the RingDeque / MonoDeque ring precedent).
+ */
+export class WindowFold {
+    /**
+     * @param {number} capacity  max simultaneously-live elements; an integer in [1, 2^31],
+     *                           rounded UP to the next power of two.
+     * @param {'SUM'|'MIN'|'MAX'|'PRODUCT'} op  the frozen associative operator.
+     */
+    constructor(capacity, op) {
+        // typeof guard BEFORE any coercion (Number.isInteger never coerces; false on a Symbol /
+        // BigInt), and String(x) in the cold message is Symbol/BigInt-safe.
+        if (typeof capacity !== 'number' || !Number.isInteger(capacity) ||
+            capacity < 1 || capacity > WINDOWFOLD_MAX_CAPACITY) {
+            throw new RangeError(
+                '[lite-o1] WindowFold capacity must be an integer in [1, 2^31], got ' + String(capacity));
+        }
+        // op must be one of the four frozen names. `typeof WINDOWFOLD_OPS[op] === 'number'` rejects a
+        // non-string (undefined lookup) AND an inherited key ('constructor' -> a function), fail-closed.
+        const opId = typeof op === 'string' ? WINDOWFOLD_OPS[op] : undefined;
+        if (typeof opId !== 'number') {
+            throw new RangeError(
+                '[lite-o1] WindowFold op must be one of "SUM" | "MIN" | "MAX" | "PRODUCT", got ' + String(op));
+        }
+        const cap = _roundPow2(capacity);
+        this._val = new Float64Array(cap);   // raw pushed values (read by the reverse pass + scans)
+        this._agg = new Float64Array(cap);   // partial aggregates (suffix aggs in the front region)
+        this._cap = cap;                     // power-of-two capacity (rounded)
+        this._mask = cap - 1;                // wrap mask: (pos & MASK) is the physical slot
+        this._op = opId;                     // frozen operator int (0 SUM / 1 MIN / 2 MAX / 3 PRODUCT)
+        this._opName = op;                   // frozen operator name (for the `op` getter)
+        this._ident = WINDOWFOLD_IDENT[opId];// operator identity (empty-window query result)
+        // ---- DABA-Lite state (monotone logical positions; ring-indexed by & MASK) ----
+        this._F = 0;                         // front position (next to evict)
+        this._E = 0;                         // end position (next push slot); size = _E - _F
+        this._s = 0;                         // front/back split: front [F, s), back [s, E)
+        this._bsum = this._ident;            // running aggregate of the back region [s, E)
+        this._job = 0;                       // 0 idle, 1 reverse phase, 2 merge phase
+        // reverse-phase cursors
+        this._e0 = 0;                        // frozen back end at flip start
+        this._aggMid = this._ident;          // frozen aggregate of [s, e0) during reverse
+        this._c = 0;                         // reverse cursor (walks e0-1 down to s)
+        this._revAcc = this._ident;          // running suffix accumulator during reverse
+        // merge-phase cursors
+        this._m = 0;                         // old-front / new-front boundary
+        this._p = 0;                         // merge frontier (walks F up to m)
+        this._aggS2 = this._ident;           // frozen aggregate of [m, s) during merge
+    }
+
+    /** The frozen operator name, 'SUM' | 'MIN' | 'MAX' | 'PRODUCT'. O(1). */
+    get op() { return this._opName; }
+
+    /** Number of live elements in the window. O(1). */
+    get size() { return this._E - this._F; }
+
+    /** Max simultaneously-live elements (power-of-two, rounded up). O(1). */
+    get capacity() { return this._cap; }
+
+    /**
+     * The frozen operator's combine, driven by the ctor-cached `_op` int (switch-free: an int
+     * branch, no operator-string test, no lambda). Left(older) OP right(newer); associativity makes
+     * the fold order-independent. @private
+     */
+    _cmb(x, y) {
+        const op = this._op;
+        if (op === 0) return x + y;              // SUM
+        if (op === 1) return x < y ? x : y;      // MIN
+        if (op === 2) return x > y ? x : y;      // MAX
+        return x * y;                            // PRODUCT
+    }
+
+    /**
+     * The current window aggregate. O(1) WORST-CASE (<= 2 combines), zero-alloc. Returns the
+     * operator IDENTITY on an EMPTY window -- NEVER undefined, NEVER throws. During a de-amortized
+     * flip the window reads at most three stored aggregates (old-front top + a frozen middle + the
+     * back sum); idle / merge read `_agg[F]` (the whole front) + the back sum.
+     * @returns {number}
+     */
+    query() {
+        if (this._F === this._E) return this._ident;
+        const F = this._F;
+        if (this._job === 1) {
+            // reverse: front [F, s) is still a single suffix stack; + frozen mid + fresh back.
+            const f = F < this._s ? this._agg[F & this._mask] : this._ident;
+            return this._cmb(this._cmb(f, this._aggMid), this._bsum);
+        }
+        if (this._job === 2 && F === this._p) {
+            // merge not yet past F: agg[F] is still rel m -> fold in the frozen S2 aggregate.
+            const f = F < this._m ? this._agg[F & this._mask] : this._ident;
+            return this._cmb(this._cmb(f, this._aggS2), this._bsum);
+        }
+        // idle, or merge past F: agg[F] is rel s = the whole front aggregate.
+        const f = F < this._s ? this._agg[F & this._mask] : this._ident;
+        return this._cmb(f, this._bsum);
+    }
+
+    /**
+     * Append v as the newest window element (folded into the running back sum), then advance the
+     * de-amortized flip by one step. O(1) WORST-CASE (<= 2 combines), zero-alloc. Guard typeof FIRST
+     * so a Symbol / BigInt never reaches the arithmetic. Fails closed, ALL guards preceding every
+     * store (a byte-identical no-op on any reject): a non-clean value throws via _bad; a position
+     * counter that would reach 2^53 throws via _seqOverflow; a FULL ring throws via _full.
+     * @param {number} v  a clean number (not NaN; +/-Infinity accepted)
+     * @returns {WindowFold} this
+     */
+    push(v) {
+        if (typeof v !== 'number' || v !== v) return this._bad(v); // v !== v -> NaN
+        if (this._E >= MAX_SEQ) return this._seqOverflow();
+        if (this._E - this._F === this._cap) return this._full();
+        this._val[this._E & this._mask] = v;
+        this._bsum = this._cmb(this._bsum, v);
+        this._E++;
+        this._advance();
+        return this;
+    }
+
+    /**
+     * Drop the OLDEST window element (slide the front forward), then advance the de-amortized flip
+     * by one step. O(1) WORST-CASE, zero-alloc. An EMPTY window is a no-op (never throws).
+     * @returns {WindowFold} this
+     */
+    evict() {
+        if (this._F === this._E) return this;
+        this._F++;
+        this._advance();
+        return this;
+    }
+
+    /**
+     * Empty the window in O(1): resets the positions + running sum + flip state, touches NO store.
+     * The stale numbers are unreachable (reads are bounded by [F, E)) and retain no references, so
+     * there is nothing to zero (mirrors RingDeque / MonoDeque). After clear() the position counter
+     * restarts at 0.
+     */
+    clear() {
+        this._F = 0; this._E = 0; this._s = 0;
+        this._bsum = this._ident;
+        this._job = 0;
+        this._e0 = 0; this._aggMid = this._ident; this._c = 0; this._revAcc = this._ident;
+        this._m = 0; this._p = 0; this._aggS2 = this._ident;
+    }
+
+    /**
+     * One step of the de-amortized flip (called once per push / evict). Triggers a new flip when the
+     * back has caught the front, then does one REVERSE or MERGE combine. WORST-CASE O(1). @private
+     */
+    _advance() {
+        const mask = this._mask;
+        if (this._job === 0) {
+            // trigger a flip as soon as |back| >= |front| (bounds the reversal to the front's size).
+            const front = this._s - this._F;
+            const back = this._E - this._s;
+            if (back > 0 && back >= front) {
+                this._e0 = this._E;
+                this._aggMid = this._bsum;
+                this._bsum = this._ident;
+                this._c = this._e0 - 1;
+                this._revAcc = this._ident;
+                this._job = 1;
+            }
+        }
+        if (this._job === 1) {
+            // REVERSE: rebuild [s, e0) right-to-left into suffix aggregates, one element per step.
+            const c = this._c;
+            this._revAcc = this._cmb(this._val[c & mask], this._revAcc);
+            this._agg[c & mask] = this._revAcc;
+            this._c = c - 1;
+            if (this._c < this._s) this._finishReverse();
+        } else if (this._job === 2) {
+            // MERGE: fold the old front's aggregates into the new right boundary, one per step.
+            const p = this._p;
+            this._agg[p & mask] = this._cmb(this._agg[p & mask], this._aggS2);
+            this._p = p + 1;
+            if (this._p >= this._m) this._job = 0;
+        }
+        // an evict may have drained the old front while merging -> promote to a single stack.
+        if (this._job === 2 && this._F >= this._m) this._job = 0;
+    }
+
+    /**
+     * Reverse complete: the frozen [s, e0) segment is now a suffix stack rel e0. Promote the split
+     * (the old back becomes the new front's newer half), then start the MERGE phase unless the old
+     * front already drained (then it is already a single stack). @private
+     */
+    _finishReverse() {
+        this._m = this._s;
+        this._s = this._e0;
+        this._aggS2 = this._aggMid;
+        if (this._F < this._m) { this._job = 2; this._p = this._F; }
+        else this._job = 0;
+    }
+
+    /**
+     * Iterate live elements FRONT -> BACK (oldest -> newest), alloc-free. O(k) -- the documented
+     * exception, EXCLUDED from the zero-alloc-per-op claims. A HOISTED callback keeps it
+     * allocation-free. `index` is the position from the front (0 == oldest).
+     * @param {(value:number, index:number, fold:WindowFold)=>void} fn
+     */
+    forEach(fn) {
+        const val = this._val;
+        const mask = this._mask;
+        const F = this._F;
+        const count = this._E - F;
+        for (let i = 0; i < count; i++) fn(val[(F + i) & mask], i, this);
+    }
+
+    /**
+     * Iterate live element values FRONT -> BACK (oldest -> newest). O(k). The ONE documented
+     * per-protocol ALLOCATOR (a {value, done} per step) -- kept OUT of the zero-alloc claims (use
+     * forEach for the alloc-free scan).
+     */
+    *[Symbol.iterator]() {
+        const val = this._val;
+        const mask = this._mask;
+        const F = this._F;
+        const E = this._E;
+        for (let i = F; i < E; i++) yield val[i & mask];
+    }
+
+    // ---- cold path only: throw builders (string concat lives here, off the hot body) ----
+
+    /** @private */
+    _bad(v) {
+        // String(v) -- NOT '+ v' / a template literal: those THROW on a Symbol or BigInt, which
+        // would turn a fail-closed reject into a different crash.
+        throw new TypeError(
+            '[lite-o1] WindowFold value must be a number and not NaN, got ' + String(v));
+    }
+
+    /** @private */
+    _full() {
+        throw new RangeError('[lite-o1] WindowFold full (capacity ' + this._cap + ')');
+    }
+
+    /** @private */
+    _seqOverflow() {
+        throw new RangeError('[lite-o1] WindowFold position ceiling 2^53 reached; call clear() to reuse');
     }
 }

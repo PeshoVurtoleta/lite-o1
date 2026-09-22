@@ -914,3 +914,44 @@ export class CoarseTimerWheel {
     /** Iterate live timer ids in dense storage order. */
     [Symbol.iterator](): IterableIterator<number>;
 }
+
+/** WindowFold's frozen associative operator (a monoid): SUM (identity 0), MIN (+Infinity), MAX (-Infinity), PRODUCT (1). */
+export type WindowFoldOp = 'SUM' | 'MIN' | 'MAX' | 'PRODUCT';
+
+/**
+ * WindowFold -- a zero-GC, WORST-CASE O(1) general FIFO sliding-window aggregator (DABA-Lite) over
+ * TWO Float64Array columns. push / evict / query are each <= 2 combines, 0 B/op, no window-size
+ * branch. The operator is frozen at construction; query() on an empty window returns the operator
+ * identity (never undefined). Capacity rounds UP to the next power of two.
+ */
+export class WindowFold {
+    /** @param capacity max simultaneously-live elements (integer in [1, 2^31], rounded up to a power of two). @param op the frozen associative operator. */
+    constructor(capacity: number, op: WindowFoldOp);
+
+    /** The frozen operator name. O(1). */
+    readonly op: WindowFoldOp;
+
+    /** Number of live elements in the window. O(1). */
+    readonly size: number;
+
+    /** Max simultaneously-live elements (power-of-two, rounded up). O(1). */
+    readonly capacity: number;
+
+    /** The current window aggregate (worst-case O(1), <= 2 combines). Returns the operator identity on an empty window. Never throws. */
+    query(): number;
+
+    /** Append v as the newest element. Worst-case O(1). Throws [lite-o1] on a non-number / NaN value, when full, or on the 2^53 position ceiling. */
+    push(v: number): this;
+
+    /** Drop the oldest element. Worst-case O(1). An empty window is a no-op (never throws). */
+    evict(): this;
+
+    /** Empty the window in O(1) (resets positions + running sum + flip state; zeroes no store). */
+    clear(): void;
+
+    /** Iterate live elements front -> back (oldest -> newest), alloc-free. fn is (value, index, fold). */
+    forEach(fn: (value: number, index: number, fold: WindowFold) => void): void;
+
+    /** Iterate live element values front -> back (oldest -> newest). */
+    [Symbol.iterator](): IterableIterator<number>;
+}

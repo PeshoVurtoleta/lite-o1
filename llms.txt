@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-Version: 1.6.0
+Version: 1.7.0
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -13,12 +13,12 @@ op is O(1) worst-case (or O(1)-amortized where stated) and allocates zero bytes
 after construction, and a shipped witness harness demonstrates the flat
 throughput curve against a built-in foil.
 
-v1.6.0 ships sixteen members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
+v1.7.0 ships seventeen members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
 RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap,
-SparseTable, BitSet, AliasTable, and CoarseTimerWheel. They share no mutable module state, so a
-bundler that imports one drops the others (tree-shakeable). 1.6.0 adds CoarseTimerWheel (the
-sixteenth member; 1.5.0 added AliasTable, 1.4.0 added BitSet, 1.3.0 added SparseTable, 1.2.0 added
-CuckooMap, 1.1.0 added RingLog).
+SparseTable, BitSet, AliasTable, CoarseTimerWheel, and WindowFold. They share no mutable module
+state, so a bundler that imports one drops the others (tree-shakeable). 1.7.0 adds WindowFold (the
+seventeenth member; 1.6.0 added CoarseTimerWheel, 1.5.0 added AliasTable, 1.4.0 added BitSet, 1.3.0
+added SparseTable, 1.2.0 added CuckooMap, 1.1.0 added RingLog).
 
 ## Exports (from the single main file O1.js)
 
@@ -95,7 +95,20 @@ CuckooMap, 1.1.0 added RingLog).
   phase margin below the full 2^30 span). peekNext() (next due tick, NOHZ) + fireTimeOf(id)
   (the rounded fire tick) are O(1) queries. For EXACT far-future deadlines use a min-heap
   (@zakkster/lite-logn). NO payload storage. Fail closed on schedule/advance; queries never throw.
-- `VERSION` -- string, '1.6.0'.
+- `WindowFold` -- class. A zero-GC, WORST-CASE O(1) GENERAL FIFO sliding-window aggregator
+  (DABA-Lite -- the De-Amortized Banker's Aggregator, IBM Research) over TWO Float64Array columns.
+  push(v) / evict() / query() are each worst-case O(1) (<= 2 combines, NO window-size branch, NO
+  closure, 0 B/op) for ANY of FOUR frozen associative operators (a monoid): SUM (identity 0), MIN
+  (+Infinity), MAX (-Infinity), PRODUCT (1). The operator is frozen at construction (the MonoDeque
+  frozen-kind pattern -- a ctor-cached int drives a switch-free combine). query() on an EMPTY window
+  returns the operator IDENTITY (never undefined). The classic two-stacks would flip (reverse the
+  back into a fresh front) with an O(W) evict spike; DABA-Lite DE-AMORTIZES that flip one step per
+  op, so there is NO max-single-op line (the worst-case cohort). It is the GENERAL member and does
+  min/max worst-case; MonoDeque stays the lower-constant amortized min/max specialist. Caller-driven
+  primitive (count/time/event windows). Fixed capacity (rounds up to a power of two), fail closed;
+  query() never throws. The bitwise trio (AND/OR/XOR) is DEFERRED to a future int32-lane sibling
+  WindowFoldInt32. For arbitrary-index / out-of-order range queries use @zakkster/lite-logn Fenwick.
+- `VERSION` -- string, '1.7.0'.
 
 ## SparseSet
 
@@ -1061,6 +1074,56 @@ independent of n and the weight skew), so like SparseTable / BitSet it prints NO
 line -- the flat sample line IS the claim. The O(n) BUILD + 2n Float64/Uint32 SPACE are the honest
 co-headline (paid once at construction, EXCLUDED from the per-op claim, the SparseTable precedent).
 
+## WindowFold
+
+A zero-GC, WORST-CASE O(1) GENERAL FIFO sliding-window aggregator (DABA-Lite -- the De-Amortized
+Banker's Aggregator, Tangwongsan/Hirzel/Schneider, IBM Research, arXiv:2009.13768) over TWO
+Float64Array columns (raw value + partial aggregate) in one power-of-two ring. The seventeenth
+member and the GENERAL complement to MonoDeque: where MonoDeque does sliding min/max in AMORTIZED
+O(1) via a monotonic deque, WindowFold folds ANY of FOUR frozen associative operators over the live
+window in TRUE WORST-CASE O(1).
+
+Operator (frozen at construction, the MonoDeque kind pattern): one of the four names 'SUM' | 'MIN' |
+'MAX' | 'PRODUCT', cached as an int that drives a SWITCH-FREE combine (no operator-string test, no
+lambda on the hot path). Identities: SUM -> 0, MIN -> +Infinity, MAX -> -Infinity, PRODUCT -> 1 --
+returned verbatim by query() on an EMPTY window (null is not zero: an empty SUM window IS 0).
+
+Model (DABA-Lite -- a de-amortized banker's two-stacks): a FRONT region holds SUFFIX aggregates
+(so its head is the whole front aggregate) and a BACK region folds into one running accumulator;
+query() = combine(front, back). The classic two-stacks would FLIP (reverse the back into a fresh
+front when the front empties) with an O(W) evict spike; DABA-Lite DE-AMORTIZES that flip into a
+REVERSE phase then a MERGE phase, ONE combine per push/evict, so no single op does more than TWO
+combines and there is NO O(W) spike. It therefore prints NO max-single-op line (the worst-case
+cohort with MinStack / TimerWheel / SparseTable / BitSet / CoarseTimerWheel).
+
+Constructor: new WindowFold(capacity, op) -- capacity an integer in [1, 2^31], ROUNDED UP to the
+next power of two (the RingDeque / MonoDeque ring precedent); op one of the four frozen names.
+Fail closed: a bad capacity or a bad op (non-string, unknown name, or an inherited object key like
+'constructor') throws [lite-o1] BEFORE any store is allocated.
+
+- push(v) -> this           O(1) worst-case, 0 B/op. Append v as the newest element (folded into
+                            the running back sum) + one de-amortized flip step. typeof guard FIRST
+                            (a non-number / NaN throws; +/-Infinity accepted). A FULL ring throws
+                            [lite-o1] as a byte-identical no-op; the 2^53 position ceiling throws.
+- evict() -> this           O(1) worst-case, 0 B/op. Drop the OLDEST element + one flip step. An
+                            EMPTY window is a no-op (never throws).
+- query() -> number         O(1) worst-case (<= 2 combines), 0 B/op. The current window aggregate;
+                            the operator IDENTITY on an empty window. NEVER throws.
+- size (getter)             Number of live elements.
+- capacity (getter)         Max simultaneously-live elements (power-of-two, rounded up).
+- op (getter)               The frozen operator name ('SUM' | 'MIN' | 'MAX' | 'PRODUCT').
+- clear() -> void           O(1): resets positions + running sum + flip state; touches NO store.
+- forEach(fn) -> void       O(size) alloc-free scan FRONT -> BACK (oldest -> newest); fn is
+                            (value, index, fold).
+- [Symbol.iterator]()       O(size) scan, same order; ALLOCATES per protocol -- use forEach.
+
+Caller-driven primitive (the MonoDeque style, not a fixed-width policy): the caller owns which
+elements are in the window (count-based, time-based, event-based). Non-overlap: MonoDeque (min/max
+only, amortized), MinStack (stack lifetime, no eviction), SparseTable (static build-once), and
+@zakkster/lite-logn Fenwick (arbitrary-index mutable range, O(log n)). The bitwise trio (AND / OR /
+XOR) is DEFERRED to a future int32-lane sibling WindowFoldInt32 (a Float64 aggregate lane cannot
+honestly carry 32-bit bitwise semantics); MINMAX / SUMSQ / COUNT / GCD are dropped (see ADR 0023).
+
 ## Design bounds
 
 - SparseSet valid key: integer in [0, universe).
@@ -1344,9 +1407,9 @@ co-headline (paid once at construction, EXCLUDED from the per-op claim, the Spar
 
 ## Not yet shipped
 
-The public API grows one member per release. 1.6.0 adds CoarseTimerWheel (the sixteenth member;
-1.5.0 added AliasTable, 1.4.0 added BitSet, 1.3.0 added SparseTable, 1.2.0 added CuckooMap, 1.1.0
-added RingLog). The long-standing "fully unbounded / hashed timer wheel" roadmap item is now
+The public API grows one member per release. 1.7.0 adds WindowFold (the seventeenth member; 1.6.0
+added CoarseTimerWheel, 1.5.0 added AliasTable, 1.4.0 added BitSet, 1.3.0 added SparseTable, 1.2.0
+added CuckooMap, 1.1.0 added RingLog). The long-standing "fully unbounded / hashed timer wheel" roadmap item is now
 ANSWERED: CoarseTimerWheel is the honest near-unbounded wheel (approximate-fire, worst-case O(1),
 no cascade), and for EXACT far-future deadlines the right tool is a min-heap (@zakkster/lite-logn);
 the classic hashed-with-rounds wheel is REJECTED (expected-O(1) / worst-case-O(n), ADR 0022).
@@ -1367,8 +1430,12 @@ wheel; and CoarseTimerWheel holds integer timer IDS over [0, universe) filed aga
 [0, 62 x 2^24) -- a NON-CASCADING near-unbounded wheel with an APPROXIMATE (bounded, one-sided-
 late) fire time, NOT an exact one (for EXACT far-future deadlines reach for a min-heap in
 @zakkster/lite-logn; all three wheels schedule integer handles for object payloads, not payloads
-directly); and RingLog holds numbers only, a LOSSY rolling window you READ (keep the last N,
-overwrite-oldest) -- NOT a consumable queue (reach for RingDeque to drain / fail closed) --
+directly); WindowFold holds numbers only, a FIFO sliding-window aggregate over ONE frozen monoid
+(SUM / MIN / MAX / PRODUCT) -- a caller-driven push/evict/query primitive, NOT a keyed store (for
+arbitrary-index / out-of-order range queries reach for @zakkster/lite-logn Fenwick; the bitwise
+AND/OR/XOR variant is a future int32-lane WindowFoldInt32); and RingLog holds numbers only, a LOSSY
+rolling window you READ (keep the last N, overwrite-oldest) -- NOT a consumable queue (reach for
+RingDeque to drain / fail closed) --
 CuckooMap holds an exact integer-key -> number MAP over sparse / large safe-integer keys
 (|k| <= 2^53), O(capacity) space (NOT SparseSet's O(universe) dense set, NOT lite-filter's
 approximate membership; map object payloads to integer handles); and SparseTable holds a STATIC

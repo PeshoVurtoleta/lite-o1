@@ -5,7 +5,8 @@
  * fails `npm run test:types`. Not executed; only type-checked.
  */
 
-import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, BitSet, AliasTable, CoarseTimerWheel, VERSION } from '../../O1.js';
+import { SparseSet, RingDeque, UnionFind, MonoDeque, MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, BitSet, AliasTable, CoarseTimerWheel, WindowFold, VERSION } from '../../O1.js';
+import type { WindowFoldOp } from '../../O1.js';
 
 // VERSION is a string.
 const v: string = VERSION;
@@ -620,3 +621,47 @@ for (const id of ctw) { const idn: number = id; void idn; }
 new CoarseTimerWheel('1000');
 // @ts-expect-error -- schedule id/delay must be numbers.
 ctw.schedule('1', 100);
+
+// --- WindowFold ------------------------------------------------------------
+
+const wf: WindowFold = new WindowFold(1000, 'SUM');
+const wfMin: WindowFold = new WindowFold(256, 'MIN');
+const wfMax: WindowFold = new WindowFold(256, 'MAX');
+const wfProd: WindowFold = new WindowFold(256, 'PRODUCT');
+void wfMin; void wfMax; void wfProd;
+
+// op getter is the literal union; size / capacity are readonly numbers.
+const wfop: WindowFoldOp = wf.op;
+const wfsize: number = wf.size;
+const wfcap: number = wf.capacity;
+void wfop; void wfsize; void wfcap;
+
+// @ts-expect-error -- size is readonly.
+wf.size = 5;
+// @ts-expect-error -- op is readonly.
+wf.op = 'MIN';
+
+// push / evict -> this (chainable); query -> number.
+const wfpush: WindowFold = wf.push(3.5);
+const wfevict: WindowFold = wf.evict();
+const wfq: number = wf.query();
+void wfpush; void wfevict; void wfq;
+
+// forEach callback gets (value, index, fold).
+wf.forEach((value, index, fold) => {
+    const v: number = value;
+    const i: number = index;
+    const f: WindowFold = fold;
+    void v; void i; void f;
+});
+
+// clear -> void; iterable of numbers.
+wf.clear();
+for (const v of wf) { const vn: number = v; void vn; }
+
+// @ts-expect-error -- capacity must be a number.
+new WindowFold('1000', 'SUM');
+// @ts-expect-error -- op must be one of the four frozen names.
+new WindowFold(1000, 'XOR');
+// @ts-expect-error -- push value must be a number.
+wf.push('3');
