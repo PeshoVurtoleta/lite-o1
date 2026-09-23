@@ -719,4 +719,39 @@ M19 Elias-Fano (ADR 0025), M20 Reservoir (ADR 0026), and M21 WindowFoldUint32 (A
 SHIPPED. The public roster is frozen; new work moves to the @zakkster/lite-sketch approximate-summary
 sibling. (Any future lite-o1 member would be a deliberate re-opening, not a planned continuation.)
 
+---
+
+## 8. Post-close hardening -- M22 (1.11.1): the 2026-09-23 zero-GC audit close-out
+
+**Source.** A full adversarial audit (reviewer, read-only) of lite-o1 @ 1.11.0 run from the lite-hud
+session on 2026-09-23 against the bar "everything zero-GC, no allocations, fully developed". Details +
+the per-member inventory: `RESEARCH.md` section 12. **Verdict: APPROVED** -- this is a HARDENING
+milestone, NOT a roster re-opening. The roster stays CLOSED at twenty-one; no public API changes.
+
+Gate baseline at audit time (all green): `npm test` 763/763; `test:types` clean; `torture` ok (0 B/op
+on every member, gc major 0, bitRetGrowth 0 B); `witness` ok on every member; `test:perf` 101/101
+(incl. 19 MUST CATCH controls).
+
+| # | Finding | Sev | Work | SETTLE FIRST |
+|---|---------|-----|------|--------------|
+| **F1** | README headline drift: `README.md:3` (blockquote tagline) and `README.md:2028` ("What this is not") still say **v1.6.0 / sixteen members**; truth is 1.11.0 / twenty-one (README:20 is already correct) | minor (docs) | regenerate both from the README:20 roster; grep README/GUIDE/llms.txt for any other stale `1.6`/"sixteen" | none |
+| **F2** | `CuckooMap._reseed` allocates two `Float64Array(cnt)` snapshots (`O1.js:3424-3425`), reachable from hot `set()` (`O1.js:3248`) on a MaxLoop stall. Disclosed (`O1.js:3136-3138`, `3404-3418`) + functionally tested (`test/CuckooMap.test.js:250`), but EVERY zero-GC gate keeps the map at ~0.5 load so it never fires (`test/torture.mjs:559-563`, `:1099`; `PerfGate.test.mjs:1258-1269`; `Bench.test.mjs:634`) -- the "sole allocator" claim is ASSERTED, not GATED | minor (coverage) | (a) preallocate re-seed scratch at construction (`cap+1` x 2 Float64) and add a forced-MaxLoop 0 B/op torture + perf scenario; OR (b) keep the allocation and add a gated control that forces a re-seed and records its bounded, disclosed byte count | **(a) vs (b).** (a) ~doubles resident footprint (scratch ~0.9 x total vs keys+vals 2 x total) to remove an astronomically rare allocation; (b) keeps footprint and turns the disclosure into a witnessed number. LEAN (b). |
+| **F3** | `test/torture.mjs` has NO must-fail mode (no env/BREAK/controls path; no `torture:controls` script) -- the torture gate is not self-verifying (the perf gate is, via its 19 controls) | minor (harness) | add `torture:controls` (lite-lru pattern: an env var arms deliberately-allocating steps; the run MUST exit non-zero) + wire into `verify` | env var name (suite convention, e.g. `LITE_O1_TORTURE_BREAK=1`) |
+| **N1** | perf-gate `mustFail` covers 19/21 members: **RingDeque** and **CoarseTimerWheel** lack a positive control (`PerfGate.test.mjs:2744`) | nit | add `rdMustFailAlloc` + `ctwMustFailAlloc` | none |
+
+- GATE: `npm run verify` green incl. the new `torture:controls` (must fail as designed) and the F2
+  scenario; 21/21 members carry T + P + M coverage (RESEARCH.md 12.3 table all-yes, or F2 row marked
+  "gated control" under option b).
+- NON-GOALS: new members (see RESEARCH.md 12.5 -- proposals only, each a deliberate re-opening);
+  any change to hot-path source other than F2(a) if chosen.
+- DONE WHEN: F1-F3 + N1 closed, CHANGELOG 1.11.1, /release 1.11.1 clean, catalog card synced.
+
+### Consumer note (lite-hud, 2026-09-23)
+lite-hud v2.x (the suite's observability HUD) evaluated lite-o1 as an optional peer. OUTCOME:
+`WindowFold` / `WindowFoldUint32` / `MonoDeque` are the planned M4 (lite-hud 2.4.0) peers for O(1)
+rolling aggregates; `CuckooMap` was REJECTED for lite-hud's paired-span open pool (Float64 correlId
+keys, needs bounded oldest-first EVICTION, not a throw at the load ceiling) -> lite-hud inlines a
+design-parity pool; `BitSet` REJECTED as overkill for a few-word dirty-channel set (inline parity).
+None of this asks lite-o1 to change; it is recorded so the next session knows who consumes what.
+
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>

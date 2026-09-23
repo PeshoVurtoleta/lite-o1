@@ -701,9 +701,9 @@ test('adoption: D3 memberBytes is stable across 5 fill/clear cycles (no backing-
         'SparseTable of equal length must have equal backing bytes');
 });
 
-test('shipping discipline -- package.json.version is the 1.11.0 bump; benchmark/ stays repo-only', () => {
+test('shipping discipline -- package.json.version is the 1.11.1 bump; benchmark/ stays repo-only', () => {
     const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
-    assert.equal(pkg.version, '1.11.0', '1.11.0 appends WindowFoldUint32 (the twenty-first member)');
+    assert.equal(pkg.version, '1.11.1', '1.11.1 is the M22 zero-GC-audit hardening bump; roster stays at twenty-one');
     // benchmark/ must NOT be shipped (it is repo-only infra) even in a shipping session.
     assert.ok(!pkg.files.includes('benchmark'), 'benchmark/ must not appear in package.json files[]');
 });
@@ -1212,13 +1212,13 @@ test('#4 report: D6 + D8 render ADJACENT to the D2 witness plot; clear + per-op 
     assert.ok(html.includes('n/a'), 'inapplicable cells must render the n/a string');
 });
 
-test('#6 trinity + shipping surface: VERSION 1.11.0 across O1.js/package.json/llms.txt; benchmark/ not shipped', () => {
+test('#6 trinity + shipping surface: VERSION 1.11.1 across O1.js/package.json/llms.txt; benchmark/ not shipped', () => {
     const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
-    assert.equal(VERSION, '1.11.0', 'O1.js VERSION const');
-    assert.equal(pkg.version, '1.11.0', 'package.json version');
+    assert.equal(VERSION, '1.11.1', 'O1.js VERSION const');
+    assert.equal(pkg.version, '1.11.1', 'package.json version');
     const m = LLMS.match(/^Version:\s*(\S+)/m);
     assert.ok(m, 'llms.txt Version header present');
-    assert.equal(m[1], '1.11.0', 'llms.txt Version header');
+    assert.equal(m[1], '1.11.1', 'llms.txt Version header');
     assert.equal(VERSION, pkg.version, 'trinity string-equal (VERSION === package.json)');
     assert.equal(VERSION, m[1], 'trinity string-equal (VERSION === llms.txt)');
     // README + llms.txt are shipped; benchmark/ is repo-only.

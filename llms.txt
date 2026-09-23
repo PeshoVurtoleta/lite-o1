@@ -1,6 +1,6 @@
 # @zakkster/lite-o1
 
-Version: 1.11.0
+Version: 1.11.1
 License: MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
 Runtime dependencies: none. ESM only. ASCII-only source. sideEffects: false.
 Node: >= 18.
@@ -13,7 +13,7 @@ op is O(1) worst-case (or O(1)-amortized where stated) and allocates zero bytes
 after construction, and a shipped witness harness demonstrates the flat
 throughput curve against a built-in foil.
 
-v1.11.0 ships twenty-one members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
+v1.11.1 ships twenty-one members: SparseSet, RingDeque, UnionFind, MonoDeque, MinStack,
 RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel, RingLog, CuckooMap,
 SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano, Reservoir, and
 WindowFoldUint32. They share no mutable module state, so a bundler that imports one drops the others
@@ -168,7 +168,7 @@ RingLog).
   power of two), fail closed on a full push; the sibling of WindowFold's numeric SUM/MIN/MAX/PRODUCT
   aggregator. For numeric folds use WindowFold; for arbitrary-index / out-of-order range aggregation use
   @zakkster/lite-logn's Fenwick.
-- `VERSION` -- string, '1.11.0'.
+- `VERSION` -- string, '1.11.1'.
 
 ## SparseSet
 

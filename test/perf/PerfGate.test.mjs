@@ -2732,6 +2732,58 @@ const wfuMustFailAlloc = {
     statsOf() { return { grows: 0 }; },
 };
 
+/**
+ * The RingDeque teeth (N1): a per-op `[Symbol.iterator]` spread into a FRESH [] each op -- the
+ * generator + its per-step {value, done} wrappers + the array MUST trip the gate (scavenges scale
+ * with n), proving the instrument has teeth on the RingDeque surface too (its iterator is the ONE
+ * documented per-protocol allocator; forEach / the pop / peek ops are the alloc-free scans).
+ * statsOf returns a constant so the failure is the allocation lanes, not a missing-counter artifact.
+ */
+const rdMustFailAlloc = {
+    name: 'RingDeque [Symbol.iterator] spread into fresh array (MUST allocate)',
+    setup() {
+        const ring = new RingDeque(256);
+        for (let i = 0; i < 64; i++) ring.pushBack(i);
+        return { ring };
+    },
+    hot(s, n) {
+        const ring = s.ring;
+        let sink = 0;
+        for (let i = 0; i < n; i++) {
+            const arr = [...ring]; // fresh generator + array per op -> heap churn
+            sink += arr.length;
+        }
+        s.sink = sink;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
+/**
+ * The CoarseTimerWheel teeth (N1): a per-op `[Symbol.iterator]` spread into a FRESH [] each op --
+ * the generator + its per-step {value, done} wrappers + the array MUST trip the gate (scavenges
+ * scale with n), proving the instrument has teeth on the CoarseTimerWheel surface too (its iterator
+ * is the ONE documented per-protocol allocator; schedule / cancel / advance / drainDue are the
+ * alloc-free ops). statsOf returns a constant so the failure is the allocation lanes.
+ */
+const ctwMustFailAlloc = {
+    name: 'CoarseTimerWheel [Symbol.iterator] spread into fresh array (MUST allocate)',
+    setup() {
+        const ctw = new CoarseTimerWheel(256, 256);
+        for (let i = 0; i < 64; i++) ctw.schedule(i, i & 63);
+        return { ctw };
+    },
+    hot(s, n) {
+        const ctw = s.ctw;
+        let sink = 0;
+        for (let i = 0; i < n; i++) {
+            const arr = [...ctw]; // fresh generator + array per op -> heap churn
+            sink += arr.length;
+        }
+        s.sink = sink;
+    },
+    statsOf() { return { grows: 0 }; },
+};
+
 zgcSuite({
     N: 200000,
     k: 8,
@@ -2741,5 +2793,5 @@ zgcSuite({
     counters: { grows: 0 },
     maxRetainedKB: 64,
     scenarios,
-    mustFail: [mustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc, twMustFailAlloc, htwMustFailAlloc, ringLogMustFailAlloc, cuckMustFailAlloc, stMustFailAlloc, bsMustFailAlloc, atMustFailAlloc, wfMustFailAlloc, rsMustFailAlloc, efMustFailAlloc, rvMustFailAlloc, wfuMustFailAlloc],
+    mustFail: [mustFailAlloc, rdMustFailAlloc, ufMustFailAlloc, monoMustFailAlloc, minMustFailAlloc, randMustFailAlloc, freqMustFailAlloc, bqMustFailAlloc, twMustFailAlloc, htwMustFailAlloc, ringLogMustFailAlloc, cuckMustFailAlloc, stMustFailAlloc, bsMustFailAlloc, atMustFailAlloc, ctwMustFailAlloc, wfMustFailAlloc, rsMustFailAlloc, efMustFailAlloc, rvMustFailAlloc, wfuMustFailAlloc],
 });

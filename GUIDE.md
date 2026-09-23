@@ -1,7 +1,7 @@
 # lite-o1 -- which structure to pick (GUIDE)
 
 A repo-only decision guide for the O(1) family: which member, reach-for / avoid,
-and how to measure the constant yourself. At v1.11.0 the family is STABLE at twenty-one
+and how to measure the constant yourself. At v1.11.1 the family is STABLE at twenty-one
 members and this guide is complete for them -- still open (a new section lands with
 each future member), but no longer a skeleton. It is NOT an API encyclopedia (that
 is the README + `O1.d.ts`); it answers "which member, and is my constant real?"
@@ -724,7 +724,7 @@ cohort; the O(words) bulk ops are the honest co-headline).
 
 ---
 
-### AliasTable (v1.6.0)
+### AliasTable (v1.5.0)
 
 Static build-once Vose weighted sampler: build a table from a fixed weight vector ONCE (an
 O(n) precompute over two flat typed arrays `_prob` Float64 + `_alias` Uint32, plus an owned
@@ -763,7 +763,7 @@ cohort; the O(n) build + 2n typed-array space are the honest co-headline).
 
 ## Roadmap members (not yet shipped, planned)
 
-The public API is stable at v1.11.0's twenty-one members; these are planned, not shipped.
+The public API is stable at v1.11.1's twenty-one members; these are planned, not shipped.
 Placeholders so the decision axes are visible early; each fills in on release.
 
 - **SlotPool** -- free-list slot allocator with generational (ABA-safe) handles.

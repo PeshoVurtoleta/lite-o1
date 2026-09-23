@@ -3,7 +3,7 @@
  * that doubles as a teachable textbook: each member solves a real problem AND
  * witnesses its constant on a host (the O(1) Witness -- see test/witness.mjs).
  *
- * v1.11.0 ships twenty-one members -- SparseSet, RingDeque, UnionFind, MonoDeque,
+ * v1.11.1 ships twenty-one members -- SparseSet, RingDeque, UnionFind, MonoDeque,
  * MinStack, RandomSet, FreqO1, BucketQueue, TimerWheel, HierarchicalTimerWheel,
  * RingLog, CuckooMap, SparseTable, BitSet, AliasTable, CoarseTimerWheel, WindowFold, RankSelect, EliasFano, Reservoir, and WindowFoldUint32 --
  * plus its `VERSION` const. The twenty-one are independent (no shared mutable module state),
@@ -19,7 +19,7 @@
  */
 
 /** Package version. One of the three version sites (package.json / VERSION / llms.txt). */
-export const VERSION = '1.11.0';
+export const VERSION = '1.11.1';
 
 /** Largest universe the Uint32 substrate + the (k >>> 0) key check can honor. */
 const MAX_UNIVERSE = 0x100000000; // 2^32

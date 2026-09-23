@@ -55,8 +55,8 @@ const seed2Of = (seed) => fmix32((seed ^ 0x85ebca6b) | 0);
 
 // --- version + surface -----------------------------------------------------
 
-test('VERSION is the frozen 1.11.0 string', () => {
-    assert.equal(VERSION, '1.11.0');
+test('VERSION is the frozen 1.11.1 string', () => {
+    assert.equal(VERSION, '1.11.1');
 });
 
 test('empty map: size 0, capacity as rounded, all reads well-defined', () => {

@@ -8,6 +8,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 _Nothing yet._
 
+## [1.11.1] - 2026-09-23
+
+Post-close hardening (M22) -- the close-out of a 2026-09-23 adversarial zero-GC audit
+(verdict: APPROVED, no hot-path allocation / retention / fail-open / contract break).
+The twenty-one-member roster is UNCHANGED and CLOSED; there is NO public API or
+hot-path source change (`O1.js` member code is byte-identical). This release makes the
+zero-GC claims fully witnessed and the harness self-verifying.
+
+### Changed
+
+- **Documentation drift fixed (F1).** The `README.md` blockquote tagline and the "What
+  this is not" note still described **v1.6.0 / sixteen members**; both now describe
+  **v1.11.1 / twenty-one members** (the machine-readable version sites were already
+  correct). Corrected a stale `GUIDE.md` `AliasTable (v1.6.0)` header to `v1.5.0`.
+
+### Added
+
+- **CuckooMap re-seed allocation is now GATED (F2).** `_reseed` (the disclosed
+  max-single-op rebuild, the map's sole allocator) is reachable from `set()` only on an
+  astronomically rare MaxLoop stall that no zero-GC gate previously exercised. A new
+  torture control deterministically FORCES a re-seed and WITNESSES its bounded byte
+  count (measured `58960 B <= 2 x (cap+1) x 8`), turning the disclosure into a proven
+  number. The allocation itself is unchanged (kept, not eliminated).
+- **`torture:controls` -- the torture gate is now self-verifying (F3).** A new
+  `LITE_O1_TORTURE_BREAK=1` mode arms a deliberately-allocating step so the torture run
+  MUST exit non-zero; `test/controls.mjs` drives both arms and is wired into `verify`
+  (matching the perf gate, which already ships its controls).
+- **Two perf-gate `mustFail` controls added (N1).** `RingDeque` and `CoarseTimerWheel`
+  now carry a positive allocation control, so all twenty-one members have one.
+
 ## [1.11.0] - 2026-09-23
 
 ### Added

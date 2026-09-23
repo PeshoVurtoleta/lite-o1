@@ -46,6 +46,16 @@ async function main() {
     const CYCLES = 4096;    // retention churn
     const HOT = 2000000;    // steady-state ops
 
+    // ---- F3: the must-fail control arm -----------------------------------
+    // When LITE_O1_TORTURE_BREAK=1 is set (the suite convention; see
+    // test/controls.mjs + `npm run torture:controls`), the SparseSet phase-2a
+    // hot step INJECTS a retained per-op allocation into the witnessed loop. A
+    // healthy build allocates 0 B/op there, so the injected object trips the
+    // alloc gate, `ok` flips to false, and the run exits non-zero -- proving the
+    // torture gate is self-verifying (it can fail). UNSET, the run is unchanged.
+    const BREAK = process.env.LITE_O1_TORTURE_BREAK === '1';
+    const brkSink = []; // retains the injected allocations so the gate can see them
+
     const leaks = [];
     const warns = [];
     const tracker = createLeakTracker({
@@ -335,6 +345,7 @@ async function main() {
         inst.add(key);
         inst.has(key);
         inst.delete(key);
+        if (BREAK) brkSink.push({ v: key }); // F3: retained per-op alloc when armed
     };
     const allocRes = measureAllocs(step, { iterations: 100000, batches: 8 });
     const bpc = allocRes.bytesPerCall === null ? 0 : allocRes.bytesPerCall;
@@ -1113,11 +1124,77 @@ async function main() {
     const abDelta = abAfter - abBefore;
     const abOk = abDelta <= 0; // no growth (a negative delta is unrelated reclaim)
 
+    // ---- phase 2d: F2 -- CuckooMap forced re-seed control -----------------
+    // The re-seed (O1.js CuckooMap._reseed) is the map's ONLY reachable
+    // allocator: on a MaxLoop eviction stall it snapshots the live entries + the
+    // floating one into two `new Float64Array(cnt)` scratch arrays, tries fresh
+    // seeds, and rebuilds in place. Every zero-GC phase above keeps the map at
+    // ~0.5 load so this NEVER fires -- so "the re-seed is the sole allocator, and
+    // it is bounded" was ASSERTED, never measured. Here we FORCE a re-seed
+    // deterministically and MEASURE its allocation, asserting it is BOUNDED to
+    // the disclosed size (2 x cnt x 8 bytes, cnt = live + 1 <= cap + 1), NOT
+    // that it is 0.
+    //
+    // Deterministic trigger: a fixed capacity + a seed swept from 0 upward,
+    // inserting sequential integer keys 0,1,2,... . The cuckoo hashing is pure
+    // integer math, so the stall point is engine-independent. The FIRST
+    // (seed, trigger) whose eviction chain stalls before the load ceiling is
+    // used -- observed via the `seed` getter changing on the triggering set().
+    // If NO seed in the sweep forces a re-seed, rsReseedForced stays false and
+    // the gate FAILS (a finding, never a faked pass).
+    const RESEED_CAP = 2000; // usable capacity rounds up (>= this)
+    let rsReseedForced = false;
+    let rsReseedBytes = 0;   // bytes the forced re-seed actually allocated
+    let rsReseedBound = 0;   // disclosed maximum: 2 x (cap + 1) x 8
+    let rsReseedAllocs = 0;  // Float64Array allocations counted (expect 2)
+    let rsReseedIntegrity = false;
+    for (let seed = 0; seed < 4096 && !rsReseedForced; seed++) {
+        const probe = new CuckooMap(RESEED_CAP, seed);
+        const cap0 = probe.capacity;
+        let trig = -1;
+        const s0 = probe.seed;
+        for (let k = 0; k < cap0; k++) {
+            probe.set(k, k);
+            if (probe.seed !== s0) { trig = k; break; } // this insert re-seeded
+        }
+        if (trig < 0) continue; // no eviction stall for this seed
+        // Rebuild to JUST BEFORE the trigger, then instrument Float64Array so the
+        // scratch snapshots allocated inside _reseed are counted exactly. The
+        // re-seed scratch is transient (freed when _reseed returns), so a
+        // heapUsed-delta tool reads 0 -- instrumenting the constructor is the
+        // honest way to witness a bounded transient allocation.
+        const m = new CuckooMap(RESEED_CAP, seed);
+        for (let k = 0; k < trig; k++) m.set(k, k);
+        const sizeBefore = m.size;
+        const seedBefore = m.seed;
+        const RealF64 = globalThis.Float64Array;
+        let bytes = 0;
+        let allocs = 0;
+        class CountingF64 extends RealF64 {
+            constructor(...a) { super(...a); allocs++; bytes += this.byteLength; }
+        }
+        globalThis.Float64Array = CountingF64;
+        try { m.set(trig, trig); } finally { globalThis.Float64Array = RealF64; }
+        if (m.seed === seedBefore) continue; // did not actually re-seed; keep sweeping
+        let intact = m.size === sizeBefore + 1;
+        for (let k = 0; k <= trig && intact; k++) if (m.get(k) !== k) intact = false;
+        rsReseedForced = true;
+        rsReseedBytes = bytes;
+        rsReseedAllocs = allocs;
+        rsReseedBound = 2 * (cap0 + 1) * 8; // disclosed maximum
+        rsReseedIntegrity = intact;
+    }
+    // The forced re-seed MUST have fired (not faked), MUST have allocated (> 0 --
+    // it IS the sole allocator, we are witnessing it), MUST be bounded to the
+    // disclosed size, and MUST leave the map intact (every prior key + the new one).
+    const rsReseedOk = rsReseedForced && rsReseedBytes > 0 &&
+        rsReseedBytes <= rsReseedBound && rsReseedIntegrity;
+
     // ---- verdict + GATE line ----------------------------------------------
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
         findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && monoAllocOk &&
         minAllocOk && randAllocOk && freqAllocOk && buckAllocOk && twAllocOk && htwAllocOk &&
-        ringLogAllocOk && cuckAllocOk && stAllocOk && bitAllocOk && bitHighAllocOk && bitOrAllocOk && bitRetOk && aliasAllocOk && ctwAllocOk && wfAllocOk && rsRankAllocOk && rsSelAllocOk && efAccAllocOk && efNextAllocOk && rvAddAllocOk && rvGetAllocOk && wfuAllocOk && abOk;
+        ringLogAllocOk && cuckAllocOk && stAllocOk && bitAllocOk && bitHighAllocOk && bitOrAllocOk && bitRetOk && aliasAllocOk && ctwAllocOk && wfAllocOk && rsRankAllocOk && rsSelAllocOk && efAccAllocOk && efNextAllocOk && rvAddAllocOk && rvGetAllocOk && wfuAllocOk && rsReseedOk && abOk;
 
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
@@ -1146,6 +1223,7 @@ async function main() {
         rvAddAllocBytes + ' B/op (Reservoir add) ' +
         rvGetAllocBytes + ' B/op (Reservoir get) ' +
         wfuAllocBytes + ' B/op (WindowFoldUint32)' +
+        ' | reseed=' + rsReseedBytes + '/' + rsReseedBound + ' B allocs=' + rsReseedAllocs + ' (CuckooMap forced re-seed)' +
         ' | bitRetGrowth=' + bitRetGrowth + ' B' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
         ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' bsSink=' + bsSink + ' bhSink=' + bhSink + ' brSink=' + brSink + ' atSink=' + atSink + ' wfSink=' + wfSink + ' rsRankSink=' + rsRankSink + ' rsSelSink=' + rsSelSink + ' efAccSink=' + efAccSink + ' efNextSink=' + efNextSink + ' rvAddSink=' + rvAddSink + ' rvGetSink=' + rvGetSink + ' wfuSink=' + wfuSink + ' abGrowth=' + abDelta + ')');
@@ -1184,6 +1262,7 @@ async function main() {
         if (!rvAddAllocOk) console.error('  alloc ' + rvAddAllocBytes + ' B/op Reservoir add (raw bytesPerCall ' + rvAddBpc + ')');
         if (!rvGetAllocOk) console.error('  alloc ' + rvGetAllocBytes + ' B/op Reservoir get (raw bytesPerCall ' + rvGetBpc + ')');
         if (!wfuAllocOk) console.error('  alloc ' + wfuAllocBytes + ' B/op WindowFoldUint32 (raw bytesPerCall ' + wfuBpc + ')');
+        if (!rsReseedOk) console.error('  reseed forced=' + rsReseedForced + ' bytes=' + rsReseedBytes + ' bound=' + rsReseedBound + ' allocs=' + rsReseedAllocs + ' integrity=' + rsReseedIntegrity + ' -- the forced CuckooMap re-seed must fire, allocate > 0, stay bounded (<= 2 x (cap+1) x 8), and keep every key');
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;
     }

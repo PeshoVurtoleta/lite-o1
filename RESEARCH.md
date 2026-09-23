@@ -722,6 +722,97 @@ demo shows steady-state ops + the throughput witness.
 
 ---
 
+## 12. The 2026-09-23 zero-GC audit (post-close, v1.11.0)
+
+Run from the lite-hud session by an adversarial read-only reviewer against the maintainer's bar:
+"everything zero-GC, no allocations, fully developed". **Verdict: APPROVED.** No hot-path allocation,
+retention, fail-open path, or contract break in the shipped source. Work items -> ROADMAP.md section 8
+(M22, 1.11.1 hardening).
+
+### 12.1 Gate results at audit time
+`npm test` 763/763 pass; `npm run test:types` clean; `npm run torture` -> `gc major=0 ... alloc=0 B/op`
+on every member incl. BitSet firstSet/nextSet >= 2^31 word, RankSelect rank1/select1, EliasFano
+access/nextGEQ, Reservoir add/get, WindowFoldUint32; `bitRetGrowth=0 B | ok`. `npm run witness` ok on
+every member (e.g. RankSelect minRatio 10.13x, EliasFano 9.80x, WindowFoldUint32 219.64x).
+`npm run test:perf` 101/101 (per-member zero-GC scenarios + 19 MUST CATCH controls).
+
+### 12.2 Hot / cold / allocator inventory (all 21 members)
+One discipline throughout: typeof-first guards, cold `_`-prefixed throw builders using `String(x)`
+(Symbol/BigInt-safe), flat typed-array SoA, `& MASK` pow2 wrap, hoisted `forEach` callbacks, and
+`[Symbol.iterator]` as the single documented per-protocol allocator.
+
+| Member | HOT (0-alloc verified) | COLD / O(n) (disclosed) | Only allocators |
+|---|---|---|---|
+| SparseSet | add/has/delete/clear/forEach | -- | ctor, iterator |
+| RingDeque | push/pop/peek Front/Back, clear, forEach | -- | ctor, iterator |
+| UnionFind | find/union/connected/componentSize | reset, forEachRoots O(n) | ctor, roots(), iterator |
+| MonoDeque | push/evictOlderThan/value/frontSeq | -- | ctor, iterator (tuple) |
+| MinStack | push/pop/peek/extreme | -- | ctor, iterator |
+| RandomSet | add/has/delete/sample/removeRandom | -- | ctor, iterator |
+| FreqO1 | add/increment/peekMin/popMin/frequencyOf | -- | ctor, iterator |
+| BucketQueue | insert/decreaseKey/extractMin/peekMin/priorityOf | -- | ctor, iterator |
+| TimerWheel | schedule/cancel/drainDue/advance(1) | advance(k) O(k) | ctor, iterator |
+| HierarchicalTimerWheel | schedule/cancel/drainDue | advance amortized (cascade by index, 0-alloc) | ctor, iterator |
+| RingLog | push/get/oldest/newest/forEach | -- | ctor, iterator |
+| CuckooMap | get/has/delete (WC O(1)); set common path | re-seed O(cap) -- ALLOCATES (12.4 F2) | ctor, iterator, re-seed |
+| SparseTable | query/at | O(n log n) build | ctor, iterator |
+| BitSet | test/set/unset/toggle/firstSet/nextSet | and/or/xor/andNot/popcount/setAll O(words), 0-alloc | ctor, iterator |
+| AliasTable | sample/weightOf | O(n) build | ctor |
+| CoarseTimerWheel | schedule/cancel/drainDue/advance/peekNext/fireTimeOf | -- | ctor, iterator |
+| WindowFold | push/evict/query (WC O(1), de-amortized flip) | -- | ctor, iterator |
+| RankSelect | rank1/rank0/select1/select0/access | O(n) build | ctor, iterator |
+| EliasFano | access (WC O(1)); nextGEQ (O(1) typ / O(log n) WC, disclosed) | O(n) build | ctor, iterator |
+| Reservoir | add/get | -- | ctor, iterator |
+| WindowFoldUint32 | push/evict/query | -- | ctor, iterator |
+
+Hidden-allocation hunt (per-call closures, literals, spread/rest, `arguments`, boxed doubles,
+`Math.max(...)`, comparator closures, late field adds, try/catch in hot bodies): NONE in any shipped hot
+body. Notable: CuckooMap hashing forces cross-boundary values to SMI via `| 0` (`O1.js:3069-3098`);
+`advance(ticks = 1)` does not box; the only try/catch (HTW / CoarseTimerWheel drainDue/advance,
+`O1.js:2647`, `2682`, `4614`) wraps user-callback regions and torture confirms 0 B/op.
+
+### 12.3 Coverage matrix (T = torture 0 B/op, P = perf-gate scenario, M = perf-gate mustFail control)
+All 21 members: T yes, P yes. M yes on 19; **no M on RingDeque and CoarseTimerWheel** (N1).
+**CuckooMap re-seed: T no, P no, M no** (F2 -- the only reachable allocation, never gated).
+The torture gate itself has no must-fail mode (F3).
+
+### 12.4 Findings
+- **F1 (minor, docs)** -- README headline drift: `README.md:3` tagline + `README.md:2028` still v1.6.0 /
+  sixteen members (truth 1.11.0 / twenty-one; README:20 correct; all machine-readable version sites --
+  package.json / VERSION / llms.txt / CHANGELOG -- are correctly 1.11.0).
+- **F2 (minor, coverage + design call)** -- `CuckooMap._reseed` (`O1.js:3420-3451`) allocates
+  `new Float64Array(cnt)` x 2 at `O1.js:3424-3425`, reachable from `set()` (`O1.js:3248`) on a MaxLoop
+  stall. Not a common-path hole (update / empty-slot / bounded-eviction paths are 0-alloc and gated); it
+  is the disclosed max-single-op rebuild. Option (a): preallocated scratch -> 0-alloc re-seed, but ~doubles
+  resident footprint for an astronomically rare event. Option (b): keep it, add a gated control that forces
+  the re-seed and records its bounded byte count. LEAN (b) -- the disclosure becomes a witnessed number.
+  The total-failure path is already fail-closed (restores originals and throws, `O1.js:3441-3450`).
+- **F3 (minor, harness)** -- no `torture:controls`: if the alloc sampler broke and always reported 0, the
+  torture gate would still print ok. The perf gate is self-verifying (19 controls); torture is not.
+- **N1 (nit)** -- RingDeque + CoarseTimerWheel lack perf-gate mustFail controls (`PerfGate.test.mjs:2744`).
+- ASCII: `O1.js` has 0 non-ASCII bytes (uses `x` for multiplication; never needs the U+00D7 exception).
+
+Fail-closed: PASS -- typeof-first everywhere; null is not zero (CuckooMap emptiness via `_occ`;
+BucketQueue.priorityOf -> -1 for absent); NaN rejected via `v !== v`; WindowFoldUint32 rejects negatives
+and >= 2^32 with no coercion (`O1.js:6123`); every rejected write throws before the first store; 2^53
+counters (MonoDeque seq, wheel ticks, WindowFold positions, Reservoir seen) fail closed with `>=` guards;
+timer drainDue re-entrancy self-terminates. "Fully developed": PASS except F1 -- d.ts parity 22/22
+exports; version sync; files[] ships README, no demo/benchmark/decisions leak; sideEffects false; MIT
+(c) Zahary Shinikchiev; README blueprint spine complete and in order.
+
+### 12.5 Candidate members surfaced by the audit (PROPOSALS ONLY -- the roster is CLOSED)
+Each would be a DELIBERATE re-opening (ROADMAP section 7), needing the maintainer's call + a research
+pass + an ADR before any milestone number. Ranked by the auditor (opinion):
+1. **CuckooSet** -- exact membership over general safe-integer keys (CuckooMap minus the Float64 value
+   lane). Highest value / lowest overlap; same substrate. Check overlap with lite-filter (approximate)
+   and SparseSet (dense universe) first.
+2. **Static minimal perfect hash (build-once)** -- rides the static sub-family (decisions/0018); O(1)
+   general-key lookup on a frozen key set at lower space than CuckooMap.
+3. **Public SlotPool / NodePool** -- already RESOLVED REJECTED (ADR 0021; lite-arena owns it). Recorded
+   only so it is not re-proposed.
+4. **Approximate membership (counting Bloom / quotient)** -- belongs to `@zakkster/lite-filter`, which
+   ships CountingBloom and Quotient. NOT a lite-o1 candidate; recorded so it is not re-proposed.
+
 *This document consolidates the design identity, the throughput-witness anchor, the full candidate
 roster with its explicit boundary, reference implementations, and the demo direction for the lite-o1
 project. It is an internal research reference, modeled on lite-lru/RESEARCH.md.*
