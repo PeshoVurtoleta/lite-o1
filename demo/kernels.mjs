@@ -1472,10 +1472,10 @@ export function naiveReservoirStep(state, world) {
 
 // ---- Succinct static index world (Scene-04 static cameo: RankSelect + EliasFano over a FROZEN bitvector) ----
 // The static / immutable beat (DEMO.md section 3), the succinct siblings of SparseTable: build ONCE over a
-// FROZEN structure, then query forever in worst-case O(1). RankSelect answers rank1(i) (set bits before i)
+// FROZEN structure, then query forever (rank worst-case O(1); select worst-case O(log n), bounded). RankSelect answers rank1(i) (set bits before i)
 // and select1(k) (position of the k-th set bit) over a frozen "hard terrain" bitvector via the cs-poppy
-// 3-level directory -- WORST-CASE O(1), no O(n) scan. EliasFano is the succinct codec for the SORTED
-// hard-cell positions: access(i) (the i-th hard cell) is WORST-CASE O(1) (one select1 + one packed-low read)
+// 3-level directory -- no O(n) scan (rank WORST-CASE O(1); select bounded O(log n)). EliasFano is the succinct codec for the SORTED
+// hard-cell positions: access(i) (the i-th hard cell) is O(1) typical, worst-case O(log n) (one bounded select1 + one packed-low read)
 // at ~2 + ceil(log2(U/n)) bits/element, near the information-theoretic minimum. The O(n) BUILD + the succinct
 // SPACE are the disclosed one-time co-headlines (the SparseTable shape). The naive foil linear-scans the
 // whole bitvector for rank1 (O(n), allocating) -- the exact work the directory makes needless. This is the
@@ -1509,8 +1509,8 @@ export function createSuccinctWorld(seed) {
     for (let c = 0; c < cells; c++) {
         if (cost[c] >= SC_HARD) { words[c >>> 5] |= (1 << (c & 31)); hard[h++] = c; }
     }
-    const rs = new RankSelect(words, cells);  // worst-case O(1) rank1/select1/access (cs-poppy directory)
-    const ef = new EliasFano(hard);           // worst-case O(1) access over the sorted hard positions
+    const rs = new RankSelect(words, cells);  // worst-case O(1) rank1/access, bounded O(log n) select1 (cs-poppy directory)
+    const ef = new EliasFano(hard);           // O(1)-typical access (worst-case O(log n)) over the sorted hard positions
     return {
         rng, cost, cells, rs, ef, hardCount, words, hard,
         cursor: 0,
@@ -1535,9 +1535,9 @@ export function frameSuccinct(world) {
     let c = world.cursor + 1; if (c >= cells) c = 0; world.cursor = c;
     const r = rs.rank1(c);                        // hard cells before the cursor -- worst-case O(1)
     const k = r > 0 ? r - 1 : 0;
-    const sel = n > 0 ? rs.select1(k) : -1;       // position of the k-th hard cell -- worst-case O(1)
+    const sel = n > 0 ? rs.select1(k) : -1;       // position of the k-th hard cell -- bounded worst-case O(log n)
     const i = n > 0 ? (r % n) : 0;
-    const efv = n > 0 ? ef.access(i) : -1;        // the i-th hard cell via EliasFano -- worst-case O(1)
+    const efv = n > 0 ? ef.access(i) : -1;        // the i-th hard cell via EliasFano -- O(1) typical, worst-case O(log n)
     const bit = rs.access(c);                     // the bit at the cursor (0/1, or undefined past the end)
     world.out[0] = r; world.out[1] = sel; world.out[2] = efv;
     world.out[3] = bit === undefined ? -1 : bit;

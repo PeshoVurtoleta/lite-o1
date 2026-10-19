@@ -248,14 +248,14 @@ export const RATIONALE = {
         verdict: 'FAIR-ALREADY', strong: NA,
         why: 'the foil is an alloc-free O(words) popcount scan that recomputes rank by scanning every ' +
             'word before i -- the obvious approach before the cs-poppy directory, the honest rival, not ' +
-            'a strawman; RankSelect answers rank/select in worst-case O(1) after a disclosed O(n) build ' +
+            'a strawman; RankSelect answers rank in worst-case O(1) and select in bounded worst-case O(log n) after a disclosed O(n) build ' +
             '(~3.2% index overhead).',
     },
     EliasFano: {
         verdict: 'FAIR-ALREADY', strong: NA,
         why: 'the foil is a plain sorted Float64 array read by binary search (8 bytes/element, O(log n) ' +
             'access) -- the honest thing a dev reaches for before a succinct codec, not a strawman; ' +
-            'EliasFano gives worst-case-O(1) access in ~2 + log2(U/n) bits/element after a disclosed O(n) ' +
+            'EliasFano gives O(1)-typical (worst-case O(log n)) access in ~2 + log2(U/n) bits/element after a disclosed O(n) ' +
             'build (the succinct space is the disclosed co-headline).',
     },
     Reservoir: {
@@ -312,8 +312,8 @@ export const MEMBER_TAGS = {
     AliasTable: ['steady'],
     CoarseTimerWheel: ['steady'], // NON-cascading: no periodic structural spike (unlike HTW's 'cascade')
     WindowFold: ['steady'], // de-amortized: the flip is spread <= 2 combines/op, no periodic spike
-    RankSelect: ['steady'], // static build-once: rank/select are worst-case O(1), no periodic spike
-    EliasFano: ['steady'], // static build-once: access is worst-case O(1), no periodic spike
+    RankSelect: ['steady'], // static build-once: rank is worst-case O(1), select bounded O(log n), no periodic spike
+    EliasFano: ['steady'], // static build-once: access is O(1) typical / O(log n) worst, no periodic spike
     Reservoir: ['steady'], // Algorithm R: add is worst-case O(1) (one draw + one compare + one store), no periodic spike
     WindowFoldUint32: ['steady'], // de-amortized bitwise fold: <= 2 combines/op, no periodic spike (like WindowFold)
 };

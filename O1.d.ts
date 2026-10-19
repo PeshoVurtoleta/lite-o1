@@ -970,10 +970,11 @@ export type RankSelectSource =
     | Float64Array;
 
 /**
- * RankSelect -- a zero-GC, WORST-CASE O(1) STATIC succinct rank/select bitvector index over a frozen
+ * RankSelect -- a zero-GC STATIC succinct rank/select bitvector index over a frozen
  * bit pattern (cs-poppy: 512-bit basic blocks + a select sampling layer). Built from a RAW WORD ARRAY
  * + an explicit nbits (COPIED into a private Uint32Array; NOT a BitSet instance -- zero coupling).
- * rank1/rank0/select1/select0/access are worst-case O(1), 0 B/op; the O(n) build + the ~3.2% index
+ * rank1/rank0/access are worst-case O(1) and select1/select0 are worst-case O(log(nbits/2048)) (the
+ * select samples bracket an L1-directory search: linear scan when the bracket spans <= RANKSELECT_LINEAR_T (16, nominal) lower blocks, else binary search, <= 14 iterations at the 2^25 cap), all 0 B/op; the O(n) build + the ~3.2% index
  * space are a disclosed co-headline (no max-single-op line). Build-once, query-only: no mutators.
  */
 export class RankSelect {
@@ -998,10 +999,10 @@ export class RankSelect {
     /** Number of clear bits in [0, i) (i - rank1(i)). Worst-case O(1). Bad i -> 0. Never throws. */
     rank0(i: number): number;
 
-    /** Position of the k-th set bit (0-indexed). Worst-case O(1) via the sample layer. Bad / overflow k -> -1. Never throws. */
+    /** Position of the k-th set bit (0-indexed). Worst-case O(log(nbits/2048)) (sample-bracketed L1 search: linear if the bracket is <= RANKSELECT_LINEAR_T (16, nominal) blocks, else binary, <= 14 iterations at 2^25). Bad / overflow k -> -1. Never throws. */
     select1(k: number): number;
 
-    /** Position of the k-th clear bit (0-indexed). Worst-case O(1) via the clear-bit sample layer. Bad / overflow k -> -1. Never throws. */
+    /** Position of the k-th clear bit (0-indexed). Worst-case O(log(nbits/2048)) (clear-bit-sample-bracketed L1 search: linear if the bracket is <= RANKSELECT_LINEAR_T (16, nominal) blocks, else binary, <= 14 iterations at 2^25). Bad / overflow k -> -1. Never throws. */
     select0(k: number): number;
 
     /** Iterate set-bit indices in ascending order, alloc-free. O(nbits). fn is (index, rankSelect). */
@@ -1014,8 +1015,8 @@ export class RankSelect {
 /**
  * EliasFano -- a zero-GC, succinct STATIC encoding of a monotone non-decreasing integer sequence
  * (quasi-succinct, ~2 + ceil(log2(U/n)) bits/element), built on a composed RankSelect over the upper
- * bits. access(i) is WORST-CASE O(1); nextGEQ(x) is DATA-DEPENDENT -- O(1) TYPICAL on well-distributed
- * keys, O(log n) WORST-CASE on clustered keys (an in-bucket binary search after an O(1) select0 seek) --
+ * bits. access(i) is O(1) TYPICAL, worst-case O(log n) (one bounded select1); nextGEQ(x) is DATA-DEPENDENT -- O(1) TYPICAL on well-distributed
+ * keys, O(log n) WORST-CASE on clustered keys (an in-bucket binary search after two bounded select0 seeks) --
  * a third honesty category, neither clean "expected O(1)" nor worst-case O(1). The O(n) build + the
  * succinct space are a disclosed co-headline. Build-once, query-only: no mutators. Fail closed on an
  * unsorted / out-of-range source; queries never throw.
@@ -1039,7 +1040,7 @@ export class EliasFano {
     /** The total backing byte footprint (the packed low store + the composed RankSelect). O(1). */
     readonly sizeBytes: number;
 
-    /** The i-th value (ascending). WORST-CASE O(1). Returns undefined for a bad i. Never throws. */
+    /** The i-th value (ascending). O(1) typical, worst-case O(log n) via select1. Returns undefined for a bad i. Never throws. */
     access(i: number): number | undefined;
 
     /** The smallest stored value >= x (successor-or-equal). DATA-DEPENDENT: O(1) typical, O(log n) worst-case. Returns -1 when x > max or on a bad x. Never throws. */

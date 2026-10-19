@@ -228,11 +228,11 @@ landing through v1.9.0-v1.11.0). Every one now has a scene home:
   stream (one alloc per item) -- the exact memory the reservoir refuses -- so its counter
   climbs WITHOUT BOUND while the reservoir's memory stays pinned at k.
 - **RankSelect + EliasFano** (the SUCCINCT static cameo): the succinct siblings of
-  SparseTable -- build ONCE over a FROZEN structure, then query forever in worst-case
-  O(1). `RankSelect` answers `rank1(i)` (set bits before i) and `select1(k)` (position of
+  SparseTable -- build ONCE over a FROZEN structure, then query forever (rank/access worst-case
+  O(1); select worst-case O(log n), bounded). `RankSelect` answers `rank1(i)` (set bits before i) and `select1(k)` (position of
   the k-th set bit) over a frozen "hard terrain" bitvector via the cs-poppy 3-level
   directory; `EliasFano` is the succinct codec for the SORTED hard-cell positions, with
-  `access(i)` in worst-case O(1) at ~`2 + ceil(log2(U/n))` bits/element (near the
+  `access(i)` in O(1)-typical / worst-case O(log n) at ~`2 + ceil(log2(U/n))` bits/element (near the
   information-theoretic minimum). The band draws a scrolling window of the frozen
   bitvector: set bits (hard cells) light accent, the cursor bit is ringed amber (its
   `rank1`), the `select1` position is ringed cyan; the Truth Panel reads `rank1 @cursor`

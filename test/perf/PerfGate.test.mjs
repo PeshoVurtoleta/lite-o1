@@ -1918,8 +1918,8 @@ const wfForEachDrain = {
 
 // ===========================================================================
 // RankSelect scenarios -- a STATIC build-once cs-poppy index over a private Uint32Array data-word
-// column + the L0/L1/L2 rank directory + the two select sample arrays. rank1 / rank0 / select1 /
-// select0 / access are WORST-CASE O(1) zero-alloc (a fixed directory lookup + a bounded <= 16-word
+// column + the L0/L1/L2 rank directory + the two select sample arrays. rank1 / rank0 / access are
+// WORST-CASE O(1), select1 / select0 bounded worst-case O(log(nbits/2048)), all zero-alloc (a fixed directory lookup + a bounded <= 16-word
 // in-block popcount scan + a bounded in-word step). The O(n) BUILD + the ~3.2% index space are the
 // disclosed co-headline, done in setup() OUTSIDE the measured window. Static / immutable: the single
 // reused index is re-queried, never rebuilt.
@@ -1964,8 +1964,8 @@ const rsRank = {
 };
 
 /**
- * select: a prebuilt index; every op one select1 over a walking k (the worst-case-O(1) hot body via
- * the sample layer + a bounded in-block scan), int32-wrapped acc.
+ * select: a prebuilt index; every op one select1 over a walking k (the bounded worst-case-O(log(nbits/2048)) hot body:
+ * a sample-bracketed L1 search + a bounded in-block scan), int32-wrapped acc.
  */
 const rsSelect = {
     name: 'RankSelect select1 (walking k)',
@@ -2007,7 +2007,7 @@ const rsForEachDrain = {
 
 // ===========================================================================
 // EliasFano scenarios -- a STATIC build-once succinct codec (a packed low store + a composed
-// RankSelect over the upper bits), BUILT ONCE OUTSIDE the window. access(i) is WORST-CASE O(1)
+// RankSelect over the upper bits), BUILT ONCE OUTSIDE the window. access(i) is O(1)-typical / O(log n)-worst
 // (one select1 + one packed low read); nextGEQ(x) is O(1)-typical / O(log n)-worst; both zero-alloc.
 // The O(n) build + succinct space are the disclosed co-headline. Static / immutable: re-queried, never rebuilt.
 // ===========================================================================
@@ -2025,7 +2025,7 @@ function efBuild() {
     return { ef: new EliasFano(src), max: acc };
 }
 
-/** access: a prebuilt codec; every op one access over a walking index -- worst-case O(1), int32-wrapped acc. */
+/** access: a prebuilt codec; every op one access over a walking index -- O(1) typical / O(log n) worst, int32-wrapped acc. */
 const efAccess = {
     name: 'EliasFano access (walking index)',
     setup() { return { ef: efBuild().ef, key: 0, acc: 0 }; },

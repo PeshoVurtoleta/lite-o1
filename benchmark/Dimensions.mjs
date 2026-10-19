@@ -249,8 +249,8 @@ export function makeSubject(member, n, rng) {
     if (member === 'EliasFano') {
         // A STATIC build-once Elias-Fano codec (built here, OUTSIDE the timed op -- the O(n) build +
         // the succinct ~2+log2(U/n) bits/element are the disclosed co-headline, EXCLUDED from the
-        // per-op claim). The hot op is access over a walking index (worst-case O(1): one select1 + one
-        // bit-packed low read, independent of n). The decoded value folds into SINK.
+        // per-op claim). The hot op is access over a walking index (O(1) typical, worst-case O(log n): one bounded select1 + one
+        // bit-packed low read; on this dense monotone input the select1 bracket is tiny). The decoded value folds into SINK.
         const vals = new Float64Array(n);
         for (let k = 0; k < n; k++) vals[k] = k * 2; // monotone, U = 2n -> L = 1 (dense)
         const ef = new EliasFano(vals);

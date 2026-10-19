@@ -28,8 +28,8 @@ verbatim from RESEARCH.md so they are not a surprise at planning time.
 | **M15** | **AliasTable** (Vose weighted sampling) | 1.5.0 | O(1) worst-case sample (after O(n) build) | SHIPPED |
 | **M16** | **CoarseTimerWheel** (near-unbounded approximate wheel) | 1.6.0 | O(1) worst-case, no cascade/no spike; approximate fire time < 12.5% disclosed | SHIPPED (ADR 0022) |
 | **M17** | **WindowFold / DABA-Lite** (general sliding-window aggregation) | 1.7.0 | O(1) worst-case push/evict/query (DABA-Lite) | SHIPPED (ADR 0023) |
-| **M18** | **RankSelect bitvector** (cs-poppy class) | 1.8.0 | O(1) worst-case rank + O(1) select (after O(n) build) | SHIPPED (ADR 0024; awaiting publish) |
-| **M19** | **EliasFano** (succinct monotone-sequence codec) | 1.9.0 | O(1) worst-case access + data-dependent O(1)-typical/O(log n)-worst nextGEQ, ~2+log2(U/n) bits/elem, on the M18 rank/select layer | SHIPPED (ADR 0025; HOME resolved = lite-o1, lite-loglogn is DYNAMIC so it does not fit a static codec) |
+| **M18** | **RankSelect bitvector** (cs-poppy class) | 1.8.0 | O(1) worst-case rank + O(1) select (after O(n) build) (select bound: see 1.11.2 note) | SHIPPED (ADR 0024; awaiting publish) |
+| **M19** | **EliasFano** (succinct monotone-sequence codec) | 1.9.0 | O(1) worst-case access (select bound: see 1.11.2 note) + data-dependent O(1)-typical/O(log n)-worst nextGEQ, ~2+log2(U/n) bits/elem, on the M18 rank/select layer | SHIPPED (ADR 0025; HOME resolved = lite-o1, lite-loglogn is DYNAMIC so it does not fit a static codec) |
 | **M20** | **Reservoir** (Algorithm R streaming sampler) | 1.10.0 | exact uniform k-sample from an UNBOUNDED stream, worst-case O(1)/item | SHIPPED (ADR 0026; Algorithm R -- per-item worst-case O(1); L rejected as data-dependent; add()/get(), no sample(); clear() vs reset()) |
 | **M21** | **WindowFoldUint32** (bitwise/masking window engine) | 1.11.0 | bitwise OR/AND/XOR sliding-window folds over Uint32 masks; DABA-Lite core | SHIPPED (ADR 0027; renamed from WindowFoldInt32 -> Uint32 lane; strict uint32 fail-closed, never coerced; CLOSES lite-o1 at 21) |
 
@@ -753,5 +753,8 @@ rolling aggregates; `CuckooMap` was REJECTED for lite-hud's paired-span open poo
 keys, needs bounded oldest-first EVICTION, not a throw at the load ceiling) -> lite-hud inlines a
 design-parity pool; `BitSet` REJECTED as overkill for a few-word dirty-channel set (inline parity).
 None of this asks lite-o1 to change; it is recorded so the next session knows who consumes what.
+
+### 1.11.2 note (2026-10-19): RankSelect select-bound fix
+RankSelect select1/select0 were mislabelled worst-case O(1) (a linear block walk, O(nbits/512) on gappy vectors); 1.11.2 makes them a sample-bracketed hybrid linear / binary L1 search (worst-case O(log(nbits/2048)), <= 14 binary iterations at 2^25) and relabels EliasFano.access O(1)-typical / O(log n) worst. ADR 0024 call #4 amended; see decisions/0024 Amendment.
 
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>

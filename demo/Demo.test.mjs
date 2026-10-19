@@ -1190,7 +1190,7 @@ test('faithfulness: Reservoir fails closed on a bad k / seed / value (the fixed-
     assert.doesNotThrow(() => createReservoirWorld(RSV_K, 0xabc), 'the demo world must build a valid Reservoir');
 });
 
-// The static succinct cameo: RankSelect + EliasFano -- build-once, query-forever, worst-case O(1).
+// The static succinct cameo: RankSelect + EliasFano -- build-once, query-forever, bounded cost.
 
 test('faithfulness: RankSelect rank1/select1/access equal a brute scan over the frozen bitvector, every query', () => {
     const world = createSuccinctWorld(0x0a11ce);

@@ -8,7 +8,7 @@ lite-o1 ships RankSelect (ADR 0024) -- a zero-GC, worst-case-O(1) cs-poppy
 rank/select bitvector index over a frozen bit pattern. Elias-Fano encoding is the
 canonical succinct representation of a SORTED (monotone non-decreasing) integer
 sequence: it stores n values from [0, U) in ~2 + ceil(log2(U/n)) bits/element
-(near the information-theoretic minimum) with worst-case-O(1) random ACCESS to the
+(near the information-theoretic minimum) with worst-case-O(1) [superseded 1.11.2 -- see Amendment] random ACCESS to the
 i-th value, built directly ON TOP of a rank/select bitvector. There was no
 succinct-sequence member; a caller compressing a monotone list hand-rolled a
 delta+varint scheme with O(n) access, or paid 4-8 bytes/element for a raw array.
@@ -24,14 +24,14 @@ delta+varint scheme with O(n) access, or paid 4-8 bytes/element for a raw array.
      Tier-2" is stale and WRONG -- lite-loglogn does not list it; EliasFano's home
      was open, now RESOLVED here.
 
-2. **FRAMING = A / access-first.** `access(i)` (worst-case O(1)) is the headline; it
+2. **FRAMING = A / access-first.** `access(i)` (worst-case O(1)) [superseded 1.11.2 -- see Amendment] is the headline; it
    joins the worst-case cohort with NO max-single-op line (the flat access line IS
    the worst-case claim). The O(n) BUILD and the succinct SPACE
    (~2 + ceil(log2(U/n)) bits/element) are DISCLOSED CO-HEADLINES (ADR 0018
    static-member contract), paid once at construction, excluded from the per-op claim.
 
 3. **THE HONESTY LABELS (load-bearing).**
-   - `access(i)`: WORST-CASE O(1) -- one select1 (worst-case O(1)) + one bit-packed
+   - `access(i)`: WORST-CASE O(1) [superseded 1.11.2 -- see Amendment] -- one select1 (worst-case O(1)) + one bit-packed
      low read. Zero-alloc.
    - `nextGEQ(x)` (successor-or-equal): **DATA-DEPENDENT -- O(1) typical
      (well-distributed keys) / O(log n) WORST-CASE (clustered keys)**, a THIRD
@@ -66,7 +66,7 @@ startIdx = rank1(select0(hx-1)), endIdx = rank1(select0(hx)), binary-search
 ## Surface
 
 `new EliasFano(source)`. Getters: `length` / `size` (= n), `universe` (= U),
-`bitsPerElement`, `sizeBytes`. Hot: `access(i)` (worst-case O(1), undefined on bad i),
+`bitsPerElement`, `sizeBytes`. Hot: `access(i)` (worst-case O(1) [superseded 1.11.2 -- see Amendment], undefined on bad i),
 `nextGEQ(x)` (data-dependent, -1 when x > max). `forEach(fn)` alloc-free ascending
 decode; `[Symbol.iterator]()` ascending values (the one per-protocol allocator).
 Build-once/immutable: NO mutators.
@@ -80,9 +80,18 @@ primitive). They can be added later on the identical substrate at the same bound
 
 ## Consequences
 
-The suite gains the succinct monotone-sequence codec: worst-case-O(1) access, 0 B/op
+The suite gains the succinct monotone-sequence codec: worst-case-O(1) [superseded 1.11.2 -- see Amendment] access, 0 B/op
 on access and nextGEQ hot bodies, ~2 + ceil(log2(U/n)) bits/element, on the M18
 RankSelect. `forEach` / `[Symbol.iterator]` are EXCLUDED from the zero-alloc / witness
 / perf claims (the container-family convention).
+
+## Amendment (1.11.2, 2026-10-19)
+
+The honesty labels in call 3 rested on RankSelect select being worst-case O(1); it was not (ADR 0024
+Amendment: select was O(nbits/512) on a gappy upper bitvector, measured 8,234 `_rankBB` calls (8,238 directory reads) with a 2^22
+zero-run). Corrected labels: `access(i)` is O(1) typical, worst-case O(log n) via the now-bounded
+select1 (hybrid linear / binary L1 search, <= 14 binary iterations at the 2^25 cap); it no longer joins the strict
+worst-case-O(1) cohort. `nextGEQ`'s select0 seek is likewise bounded O(log n), not O(1), so its
+data-dependent label stands (O(1) typical / O(log n) worst). The original text above is history.
 
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>

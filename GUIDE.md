@@ -25,7 +25,7 @@ flatness floor for YOUR workload -- run `npm run witness` and read the shape.
 
 ASCII, routes on the discriminating questions. Every leaf is one of the twenty-one
 members; `(wc)` = worst-case O(1), `(am)` = amortized O(1), and EliasFano is the one
-DATA-DEPENDENT member (wc access, O(1)-typical / O(log n)-worst nextGEQ).
+DATA-DEPENDENT member (O(1)-typical / O(log n)-worst access and nextGEQ).
 
 ```
 START -- what is the SHAPE of your workload?
@@ -61,10 +61,10 @@ START -- what is the SHAPE of your workload?
 |   build ONCE and never mutate (static range-min/max query)? -> SparseTable (wc query)
 |
 +-- rank1(i) (how many set bits BEFORE i) / select1(k) (position of the k-th set
-|   bit) over a FIXED bitvector you build ONCE (succinct positional index)? -> RankSelect (wc query)
+|   bit) over a FIXED bitvector you build ONCE (succinct positional index)? -> RankSelect (wc rank/access; bounded O(log n) select)
 |
 +-- The i-th value, or the successor (smallest value >= x), of a SORTED integer
-|   sequence you build ONCE, in near-optimal (succinct) space? -> EliasFano (wc access; O(1) typical / O(log n) worst nextGEQ)
+|   sequence you build ONCE, in near-optimal (succinct) space? -> EliasFano (O(1) typical / O(log n) worst access and nextGEQ)
 |
 +-- Draw a random outcome by WEIGHT (a discrete distribution: loot table,
 |   weighted load-balance), built ONCE from fixed weights? -> AliasTable (wc sample)
@@ -96,9 +96,10 @@ line the witness prints, and the per-member "avoid it when" notes below. (Cuckoo
 lookup -- get / has / delete -- is worst-case O(1), a hard <= 8-slot probe; only its `set`
 is amortized, wearing the in-place re-seed spike. SparseTable's QUERY is worst-case O(1); its
 one-time O(n log n) BUILD is a disclosed co-headline paid at construction, not a per-op spike.)
-EliasFano is the one DATA-DEPENDENT member: its `access` is worst-case O(1), but `nextGEQ` is
-O(1) typical / O(log n) worst-case (an in-bucket binary search that only bites on clustered keys) --
-keep it off a strict-worst-case path if you call `nextGEQ` on adversarial data; `access` is always O(1).
+EliasFano is the one DATA-DEPENDENT member: its `access` is O(1) typical but worst-case O(log n)
+(it rides RankSelect's bounded `select1`), and `nextGEQ` is O(1) typical / O(log n) worst-case (two bounded
+`select0` seeks + an in-bucket binary search that only bites on clustered keys) -- keep it off a strict
+worst-case-O(1) path on adversarial data; `access` is no longer "always O(1)".
 
 ## Which member? (picker table)
 
@@ -124,8 +125,8 @@ One row per member; pick by the left column, confirm with the discriminator.
 | timers over a NEAR-UNBOUNDED horizon, hard per-tick budget, approximate fire OK | CoarseTimerWheel  | worst-case  | Linux-4.8 NON-cascading coarse-bucket wheel; O(1) schedule/cancel/advance/drainDue, NO spike; APPROXIMATE bounded-late fire (< 12.5%, L0 exact) is the co-headline |
 | the SUM/MIN/MAX/PRODUCT aggregate of a SLIDING WINDOW, hard per-op budget | WindowFold             | worst-case  | GENERAL FIFO monoid aggregator (DABA-Lite); O(1) push/evict/query (<= 2 combines), NO flip spike; the general complement to MonoDeque's amortized min/max |
 | the bitwise OR/AND/XOR of a SLIDING WINDOW of 32-bit MASKS (flags/permissions) | WindowFoldUint32       | worst-case  | the BITWISE/MASKING window engine; DABA-Lite over TWO Uint32 lanes, O(1) push/evict/query (single ALU \|/&/^), NO flip spike; a Float64 lane can't honestly carry 32-bit ops so it is a separate typed member; strict uint32 (fail closed, never coerced) |
-| rank1(i) / select1(k) over a FIXED bitvector (succinct positional index)     | RankSelect             | worst-case  | STATIC build-once cs-poppy directory; O(1) rank/select/access over a frozen bitvector, ~3-6% index co-headline; the positional index BitSet stops short of |
-| the i-th value / successor of a SORTED integer set in near-optimal space     | EliasFano              | wc access / data-dep nextGEQ | STATIC build-once succinct codec (~2+log2(U/n) bits/elem) on a composed RankSelect; access O(1), nextGEQ O(1) typical / O(log n) worst; the compressed-monotone-sequence primitive |
+| rank1(i) / select1(k) over a FIXED bitvector (succinct positional index)     | RankSelect             | wc rank/access, bounded select | STATIC build-once cs-poppy directory; O(1) rank/access, bounded O(log(nbits/2048)) select (hybrid linear/binary L1 search, <= 14 binary iterations at 2^25) over a frozen bitvector, ~3-6% index co-headline; the positional index BitSet stops short of |
+| the i-th value / successor of a SORTED integer set in near-optimal space     | EliasFano              | data-dep access / nextGEQ | STATIC build-once succinct codec (~2+log2(U/n) bits/elem) on a composed RankSelect; access and nextGEQ O(1) typical / O(log n) worst; the compressed-monotone-sequence primitive |
 | a UNIFORM sample of k items from an UNBOUNDED stream, in FIXED memory        | Reservoir              | worst-case  | Vitter's Algorithm R; O(1)/item add keeps a uniform k-sample without storing the stream; the streaming complement to RandomSet (materialized) and AliasTable (weighted) |
 
 ---

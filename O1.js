@@ -9,11 +9,12 @@
  * plus its `VERSION` const. The twenty-one are independent (no shared mutable module state),
  * so a bundler that imports one drops the others (`sideEffects: false`).
  *
- * The complexity class IS the product: every hot op below is O(1) worst-case and
- * allocates ZERO bytes after construction. The witness harness (never imported
- * here) empirically witnesses the throughput staying FLAT from n=1e3 to n=1e7 while
- * a native Set (or Array.prototype.shift) decays -- that flat line is the constant
- * made visible, an observation on a host, not a deduction.
+ * The complexity class IS the product: every hot op below allocates ZERO bytes after
+ * construction, and every one is O(1) worst-case except the disclosed logarithmic ops,
+ * labeled at their member (RankSelect select1 / select0, EliasFano access / nextGEQ).
+ * The witness harness (never imported here) empirically witnesses the throughput
+ * staying FLAT from n=1e3 to n=1e7 while a native Set (or Array.prototype.shift) decays
+ * -- that flat line is the constant made visible, an observation on a host, not a deduction.
  *
  * @license MIT
  */
@@ -5180,6 +5181,17 @@ export class WindowFold {
  */
 const RANKSELECT_MAX_BITS = 0x2000000; // 2^25
 
+/**
+ * select1 / select0 hybrid cut-over: when the sample bracket [lo, hi] spans <= this many lower
+ * blocks, the L1 search is a forward linear scan from lo (sequential reads, no mispredicted
+ * halving); wider brackets use the upper-mid binary search. Worst case per select:
+ * max(RANKSELECT_LINEAR_T, ceil(log2 numLower)) L1 search reads (+ the l1 / l2 reads at the
+ * landing block) + <= 3 L2 steps. The value 16 is NOMINAL: a PRELIMINARY interleaved A/B over T
+ * in {0, 8, 16, 32} (2026-10-19, load ~3.8) was inconclusive within a ~7% noise floor; a
+ * quiet-host re-run decides it.
+ */
+const RANKSELECT_LINEAR_T = 16;
+
 /** Trailing-zero count of a NONZERO int32 (design-parity twin of BitSet's _bitsetCtz32). */
 function _rsCtz32(x) {
     // x & -x isolates the lowest set bit (works for a negative int32 top-bit too); clz32 of
@@ -5206,25 +5218,34 @@ function _rsSelectInWord(x, r) {
 }
 
 /**
- * RankSelect -- a zero-GC, WORST-CASE O(1), STATIC succinct rank/select bitvector index over a
- * frozen bit pattern (cs-poppy: 512-bit basic blocks + a select sampling layer), the suite's
- * succinct primitive for wavelet trees, succinct tries, monotone integer sets, compressed
- * suffix arrays, and @zakkster/lite-loglogn's rank/select-backed structures. The eighteenth member.
+ * RankSelect -- a zero-GC, STATIC succinct rank/select bitvector index over a frozen bit pattern
+ * (rank WORST-CASE O(1), select WORST-CASE O(log(nbits/2048)); cs-poppy: 512-bit basic blocks +
+ * a select sampling layer), the suite's succinct primitive for wavelet trees, succinct tries,
+ * monotone integer sets, compressed suffix arrays, and @zakkster/lite-loglogn's rank/select-backed
+ * structures. The eighteenth member.
  *
  * `rank1(i)` counts the set bits in [0, i); `select1(k)` returns the position of the k-th set
- * bit (0-indexed). Both are TRUE WORST-CASE O(1): rank is a fixed directory lookup (L0 + L1 +
- * L2) plus a bounded <= 16-word in-block popcount scan (the on-the-fly L3 per-word prefix);
- * select jumps to a sampled basic block (a sample every 8192 set bits), advances basic-block
- * by basic-block over the directory's O(1) per-block boundary rank (a bounded forward scan
- * seeded by the sample -- NOT rank + binary search), then does a <= 16-word in-block scan + a
- * <= 32-step in-word select. rank0 / select0 come FREE from the same directory (clear count =
- * 512*b - rank1), select0 with its own 8192-clear-bit sample layer. access(i) is one word load.
+ * bit (0-indexed). rank is TRUE WORST-CASE O(1): a fixed directory lookup (L0 + L1 + L2) plus a
+ * bounded <= 16-word in-block popcount scan (the on-the-fly L3 per-word prefix). select is
+ * WORST-CASE O(log(nbits/2048)): the select samples (one every 8192 set bits) bracket a search
+ * over the L1 lower-block cumulative counts -- a forward linear scan when the bracket spans
+ * <= RANKSELECT_LINEAR_T lower blocks (16, nominal), else a binary search (<= 14 iterations at
+ * the 2^25 cap), so <= max(T, ceil(log2 numLower)) = 16 L1 search reads (+ the l1 / l2 reads at
+ * the landing block) -- then <= 3 L2 steps pick the basic block, then a <= 16-word in-block scan
+ * + a <= 32-step in-word select. (The former linear basic-block walk from the sample was
+ * UNBOUNDED: 65,536 `_rankBB` calls (131,072 directory reads) for select1(1) on a 2^25-bit
+ * vector holding only bits 0 and 2^25-1.)
+ * rank0 / select0 come FREE from the same directory (clear count = 512*b - rank1), select0
+ * with its own 8192-clear-bit sample layer. access(i) is one word load, WORST-CASE O(1).
  *
- * THE HONESTY CONTRACT (rides SparseTable ADR 0018 + AliasTable ADR 0020): the hot ops are
- * TRUE WORST-CASE O(1), zero-alloc. The O(n) BUILD and the ~3.2% index SPACE (L1 + L2 + the
- * select samples; ~3-6%, beating SDSL v5's 6.25%) are a DISCLOSED CO-HEADLINE, paid ONCE at
- * construction, EXCLUDED from the per-op claim -- so there is NO max-single-op line (the flat
- * rank line IS the worst-case claim; the witness foil is a naive O(words) popcount scan).
+ * THE HONESTY CONTRACT (rides SparseTable ADR 0018 + AliasTable ADR 0020): rank1 / rank0 /
+ * access are TRUE WORST-CASE O(1); select1 / select0 are WORST-CASE O(log(nbits/2048)) (a
+ * disclosed logarithm, capped at <= 16 L1 search reads at the 2^25 cap, + the l1 / l2 reads at
+ * the landing block); all zero-alloc. The
+ * O(n) BUILD and the ~3.2% index SPACE (L1 + L2 + the select samples; ~3-6%, beating SDSL v5's
+ * 6.25%) are a DISCLOSED CO-HEADLINE, paid ONCE at construction, EXCLUDED from the per-op claim
+ * -- so there is NO max-single-op line (the flat rank line IS the worst-case claim; the witness
+ * foil is a naive O(words) popcount scan).
  *
  * NON-OVERLAP (settled by ADR 0024): BitSet is the MUTABLE membership / flag structure
  * (test/set/clear/toggle + firstSet/nextSet, no rank/select). RankSelect is the IMMUTABLE
@@ -5277,7 +5298,6 @@ export class RankSelect {
         const numBasic = (W + 15) >>> 4;           // ceil(W/16) 512-bit basic blocks = ceil(nbits/512)
         const numLower = (numBasic + 3) >>> 2;      // ceil(numBasic/4) 2048-bit lower blocks
         const numSuper = Math.max(1, Math.ceil(nbits / 4294967296)); // 2^32-bit super-blocks (== 1 here)
-        this._numBasic = numBasic;
         // L0: absolute cumulative popcount at each super-block boundary (Float64). One super-block
         // covers the whole <= 2^25-bit range, so _l0[0] === 0; present for cs-poppy design parity.
         this._l0 = new Float64Array(numSuper);
@@ -5404,20 +5424,47 @@ export class RankSelect {
     }
 
     /**
-     * The position of the k-th SET bit (0-indexed) -- select1. WORST-CASE O(1) via the sampling
-     * layer: jump to the basic block sampled every 8192 set bits, advance basic-block by basic-block
-     * over the directory's O(1) per-block boundary rank (a bounded forward scan seeded by the sample,
-     * NOT rank + binary search), then a <= 16-word in-block scan + a <= 32-step in-word select.
+     * The position of the k-th SET bit (0-indexed) -- select1. WORST-CASE O(log(nbits/2048)): the
+     * samples (one every 8192 set bits) bracket a search over the L1 lower-block cumulative counts
+     * (linear when the bracket spans <= RANKSELECT_LINEAR_T lower blocks, else binary; <= 16 L1
+     * search reads at the 2^25 cap, + the l1 / l2 reads at the landing block), then <= 3 L2 steps
+     * + a <= 16-word in-block scan + a <= 32-step in-word select. Zero-alloc.
      * Returns -1 for a bad or overflow k (non-integer, negative, or >= size) and NEVER throws.
      * @param {number} k  in [0, size)
      * @returns {number} the position of the k-th set bit, or -1
      */
     select1(k) {
         if (typeof k !== 'number' || (k | 0) !== k || k < 0 || k >= this._size) return -1;
-        const numBasic = this._numBasic;
-        let block = this._sel1[k >>> 13];       // sampled block for the (k>>>13)*8192-th set bit
-        while (block + 1 < numBasic && this._rankBB(block + 1) <= k) block++;
-        let rem = k - this._rankBB(block);      // 0-indexed within the target basic block
+        // Sample-bracketed L1 search: lo = the lower block holding set bit #(s*8192), so
+        // _l1[lo] <= k; hi = the lower block holding set bit #((s+1)*8192) (> k), else the last
+        // lower block. Find the LARGEST lb in [lo, hi] with _l1[lb] <= k (_l1 is non-decreasing;
+        // k < size = _l1[numLower], so lb < numLower). Narrow bracket (<= RANKSELECT_LINEAR_T):
+        // forward linear scan; wide: upper-mid binary search (<= 14 iterations at the 2^25 cap).
+        const l1 = this._l1, sel = this._sel1;
+        const s = k >>> 13;
+        let lo = sel[s] >>> 2;
+        let hi = (s + 1 < sel.length) ? (sel[s + 1] >>> 2) : (l1.length - 2);
+        if (hi - lo <= RANKSELECT_LINEAR_T) {
+            while (lo < hi && l1[lo + 1] <= k) lo++;
+        } else {
+            while (lo < hi) {
+                const mid = (lo + hi + 1) >>> 1;
+                if (l1[mid] <= k) lo = mid; else hi = mid - 1;
+            }
+        }
+        // <= 3 L2 steps inside lower block lo (single super-block: _l0[0] === 0).
+        let r = l1[lo];
+        const p = this._l2[lo];
+        let block = lo << 2;
+        let c = p & 1023;
+        if (k >= r + c) {
+            r += c; block++; c = (p >>> 10) & 1023;
+            if (k >= r + c) {
+                r += c; block++; c = (p >>> 20) & 1023;
+                if (k >= r + c) { r += c; block++; }
+            }
+        }
+        let rem = k - r;                        // 0-indexed within the target basic block
         const w = this._w, W = w.length;
         let wi = block << 4;
         const end = (wi + 16) < W ? (wi + 16) : W;
@@ -5431,20 +5478,47 @@ export class RankSelect {
 
     /**
      * The position of the k-th CLEAR bit (0-indexed) -- select0, FREE from the same directory (a
-     * basic block's clear count is 512*b - rank1). WORST-CASE O(1) via the _sel0 sampling layer
-     * (a sample every 8192 clear bits). Padding bits in [length, ceil(length/32)*32) are masked to
-     * 0 at build and NEVER counted (the in-word scan caps at the real bit count). Returns -1 for a
-     * bad or overflow k (>= the clear-bit count) and NEVER throws.
+     * basic block's clear count is 512*b - rank1). WORST-CASE O(log(nbits/2048)): the _sel0
+     * samples (one every 8192 clear bits) bracket a search over the L1 lower-block clear counts
+     * (linear when the bracket spans <= RANKSELECT_LINEAR_T lower blocks, else binary; <= 16 L1
+     * search reads at the 2^25 cap, + the l1 / l2 reads at the landing block), then <= 3 L2 steps
+     * + a <= 16-word in-block scan. Zero-alloc. Padding bits in [length, ceil(length/32)*32) are
+     * masked to 0 at build and NEVER counted (the in-word scan caps at the real bit count). Returns
+     * -1 for a bad or overflow k (>= the clear-bit count) and NEVER throws.
      * @param {number} k  in [0, length - size)
      * @returns {number} the position of the k-th clear bit, or -1
      */
     select0(k) {
         const size0 = this._nbits - this._size;
         if (typeof k !== 'number' || (k | 0) !== k || k < 0 || k >= size0) return -1;
-        const numBasic = this._numBasic;
-        let block = this._sel0[k >>> 13];
-        while (block + 1 < numBasic && this._rank0BB(block + 1) <= k) block++;
-        let rem = k - this._rank0BB(block);     // 0-indexed clear bit within the target basic block
+        // Same hybrid search over the CLEAR count at each lower-block start, (lb << 11) - _l1[lb]
+        // (exact for lb <= numLower-1, whose start is < nbits), bracketed by the _sel0 samples.
+        const l1 = this._l1, sel = this._sel0;
+        const s = k >>> 13;
+        let lo = sel[s] >>> 2;
+        let hi = (s + 1 < sel.length) ? (sel[s + 1] >>> 2) : (l1.length - 2);
+        if (hi - lo <= RANKSELECT_LINEAR_T) {
+            while (lo < hi && ((lo + 1) << 11) - l1[lo + 1] <= k) lo++;
+        } else {
+            while (lo < hi) {
+                const mid = (lo + hi + 1) >>> 1;
+                if ((mid << 11) - l1[mid] <= k) lo = mid; else hi = mid - 1;
+            }
+        }
+        // <= 3 L2 steps; per-basic-block clear = 512 - c (safe for a partial last block: the
+        // target lies inside it, so k < z + realClear <= z + 512 - c).
+        let z = (lo << 11) - l1[lo];
+        const p = this._l2[lo];
+        let block = lo << 2;
+        let c = 512 - (p & 1023);
+        if (k >= z + c) {
+            z += c; block++; c = 512 - ((p >>> 10) & 1023);
+            if (k >= z + c) {
+                z += c; block++; c = 512 - ((p >>> 20) & 1023);
+                if (k >= z + c) { z += c; block++; }
+            }
+        }
+        let rem = k - z;                        // 0-indexed clear bit within the target basic block
         const w = this._w, W = w.length, nbits = this._nbits;
         let wi = block << 4;
         const end = (wi + 16) < W ? (wi + 16) : W;
@@ -5494,32 +5568,6 @@ export class RankSelect {
             }
         }
     }
-
-    // ---- directory helpers (private; pure integer surgery, zero allocation, worst-case O(1)) ----
-
-    /**
-     * Absolute cumulative popcount at the START of basic block `block` (0 <= block <= numBasic).
-     * Composed O(1) from L0 + L1 + the packed L2 relative counts. @private
-     */
-    _rankBB(block) {
-        const lower = block >>> 2;
-        const wl = block & 3;
-        let r = this._l0[0] + this._l1[lower];
-        const p = this._l2[lower];
-        if (wl >= 1) r += p & 1023;
-        if (wl >= 2) r += (p >>> 10) & 1023;
-        if (wl >= 3) r += (p >>> 20) & 1023;
-        return r;
-    }
-
-    /**
-     * Absolute cumulative CLEAR count at the START of basic block `block` -- free from the rank
-     * directory (real bits before the block minus rank1 there). For block <= numBasic-1 the block
-     * start is < nbits, so the real-bit count is block*512. @private
-     */
-    _rank0BB(block) {
-        return (block << 9) - this._rankBB(block);
-    }
 }
 
 /** Largest element COUNT (n) an EliasFano may hold; keeps every index SMI-safe (the upper
@@ -5533,7 +5581,7 @@ const EF_MAX_U = 0x1000000000000; // 2^48
 const EF_MAX_L = 31;
 
 /**
- * EliasFano -- a zero-GC, WORST-CASE-O(1)-access, STATIC build-once SUCCINCT codec for a SORTED
+ * EliasFano -- a zero-GC, O(1)-TYPICAL-access, STATIC build-once SUCCINCT codec for a SORTED
  * (monotone non-decreasing) integer sequence, the nineteenth member. It stores n values from
  * [0, U) in ~2 + ceil(log2(U/n)) bits/element (near the information-theoretic minimum), built ON
  * TOP of the M18 RankSelect (COMPOSED, never forked): the upper bits (value >> L) are a unary-gap
@@ -5541,13 +5589,15 @@ const EF_MAX_L = 31;
  * bit-packed into a flat Uint32Array.
  *
  * THE HONESTY CONTRACT (rides SparseTable ADR 0018 / RankSelect ADR 0024; ADR 0025):
- *   - `access(i)` is TRUE WORST-CASE O(1): one select1 (worst-case O(1)) + one bit-packed low read
- *     -- (select1(i) - i) * 2^L | low(i), zero-alloc. The flat access line IS the worst-case claim,
- *     so there is NO max-single-op line.
+ *   - `access(i)` is WORST-CASE O(log n), O(1) TYPICAL: one select1 (worst-case
+ *     O(log(nbits/2048)), a sample-bracketed L1 search that resolves in O(1) steps when the
+ *     upper bitvector is well-distributed) + one bit-packed low read -- (select1(i) - i) * 2^L |
+ *     low(i), zero-alloc. The access line is the TYPICAL claim, not a worst-case bound.
  *   - `nextGEQ(x)` (successor-or-equal) is DATA-DEPENDENT: O(1) TYPICAL on well-distributed keys
- *     (buckets average ~1 element at L), O(log n) WORST-CASE on clustered keys (a bounded in-bucket
- *     binary search after an O(1) select0 seek). It is NOT a clean "expected O(1)" and NOT
- *     "worst-case O(1)" -- a third honesty category, disclosed as such. Zero-alloc.
+ *     (buckets average ~1 element at L), O(log n) WORST-CASE on clustered keys (two select0 bucket
+ *     seeks, each worst-case O(log(nbits/2048)), + a bounded in-bucket binary search). It is NOT
+ *     a clean "expected O(1)" and NOT "worst-case O(1)" -- a third honesty category, disclosed as
+ *     such. Zero-alloc.
  *   - The O(n) BUILD and the succinct SPACE are DISCLOSED CO-HEADLINES, paid ONCE at construction.
  *
  * Fail closed: `new EliasFano(source)` REQUIRES a SORTED numeric Array / TypedArray (U is inferred
@@ -5670,9 +5720,10 @@ export class EliasFano {
     }
 
     /**
-     * The i-th value (ascending). WORST-CASE O(1): one select1 (worst-case O(1)) + one bit-packed
-     * low read -- (select1(i) - i) * 2^L + low(i). Returns `undefined` for a bad i (non-number,
-     * non-uint32, or >= length) and NEVER throws (typeof FIRST so a Symbol / BigInt never coerces).
+     * The i-th value (ascending). WORST-CASE O(log n), O(1) TYPICAL: one select1 (worst-case
+     * O(log(nbits/2048))) + one bit-packed low read -- (select1(i) - i) * 2^L + low(i). Returns
+     * `undefined` for a bad i (non-number, non-uint32, or >= length) and NEVER throws (typeof FIRST
+     * so a Symbol / BigInt never coerces).
      * @param {number} i
      * @returns {number|undefined}
      */
@@ -5683,9 +5734,10 @@ export class EliasFano {
 
     /**
      * The smallest stored value >= x (successor-or-equal). DATA-DEPENDENT: O(1) TYPICAL on
-     * well-distributed keys, O(log n) WORST-CASE on clustered keys -- an O(1) select0 bucket seek
-     * plus a BOUNDED in-bucket binary search over the low bits. Returns -1 when x > max (or the
-     * sequence is empty), and NEVER throws (typeof FIRST; a bad x -> -1).
+     * well-distributed keys, O(log n) WORST-CASE on clustered keys -- two select0 bucket seeks
+     * (each worst-case O(log(nbits/2048))) plus a BOUNDED in-bucket binary search over the low
+     * bits. Returns -1 when x > max (or the sequence is empty), and NEVER throws (typeof FIRST; a
+     * bad x -> -1).
      * @param {number} x
      * @returns {number} the smallest value >= x, or -1
      */

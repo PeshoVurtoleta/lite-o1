@@ -568,7 +568,7 @@
                         <code>RandomSet</code>'s UNIFORM chip draw; its histogram converges to the
                         target weights. A <code>Reservoir</code> (Vitter R) draws a uniform sample
                         of a fast UNBOUNDED stream in FIXED memory k, and a <code>RankSelect</code> +
-                        <code>EliasFano</code> succinct index answers O(1) rank/select/access over a
+                        <code>EliasFano</code> succinct index answers rank/select/access (O(1) rank, bounded O(log n) select) over a
                         FROZEN bitvector. The <code>naive</code> path <code>new</code>s one object per
                         edge relaxation, rebuilds an O(n) cumulative array per weighted draw, BUFFERS
                         the whole stream, and linear-scans the bitvector -- watch the counter climb.

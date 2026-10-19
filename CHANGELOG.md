@@ -6,7 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+- **RankSelect `select1` / `select0` worst case was O(nbits/512), not O(1).** The documented
+  "worst-case O(1)" select advanced basic-block by basic-block from the sample, and that forward
+  scan is bounded only by the GAP between samples. Measured on 1.11.1: `select1(1)` on a 2^25-bit
+  vector with only bits 0 and 2^25-1 set made 65,536 `_rankBB` calls (33 on a 50%-density vector);
+  `EliasFano.nextGEQ` made 8,234 `_rankBB` calls over a 2^22 zero-run (deterministic counts; directory reads below). `select1` / `select0` are now
+  worst-case O(log(nbits/2048)): the select samples bracket a search over the L1 directory -- a
+  forward linear scan when the bracket spans <= RANKSELECT_LINEAR_T lower blocks (16, nominal),
+  else a binary search (<= 14 iterations at the 2^25 cap); <= 16 L1 reads + <= 3 L2 steps + the
+  same <= 16-word in-block scan. Results are bit-identical, `indexBytes` is unchanged, still 0 B/op.
+  Measured 2026-10-19 (PRELIMINARY: host load ~3.8, Node v26.8.2, darwin arm64, K=21 interleaved
+  rounds). Directory reads on the 2^25 gappy vector: 131,072 -> 16 (select1(1) and select0(1)).
+  Worst on a 50%-density vector (stride 997): 66 -> 10. EliasFano clustered (8.4M-bit upper
+  bitvector): nextGEQ 8,238 -> 22 reads, access 36 -> 13. Parity: 86,936,691 select calls
+  bit-identical to 1.11.1, including invalid k. Timing, REPORTED tier only (PRELIMINARY): gappy
+  select1 52,286 -> ~28 ns/op, gappy select0 65,104 -> ~32 ns/op; 1.4x-1.8x faster on the dense select1 cells than
+  1.11.1 (d=0.5 select1 85.9 -> 48.1 ns/op). The A/B over T in {0, 8, 16, 32} was inconclusive
+  within a ~7% noise floor; T=16 is nominal, re-run on a quiet host.
+  `EliasFano.access` (select1) and `nextGEQ` (select0 seek) inherit the bound. `rank1` / `rank0`
+  / `RankSelect.access` stay worst-case O(1).
+- Docs relabelled honestly: select is worst-case O(log n) bounded; `EliasFano.access` is
+  O(1)-typical / worst-case O(log n) and no longer joins the strict worst-case-O(1) cohort
+  (README, llms.txt, GUIDE, O1.d.ts, DEMO, benchmark/witness comments). ADR 0024 call #4 is
+  amended (superseded) and ADR 0025 notes the access label; regression test
+  `test/RankSelectBound.test.js`.
 
 ## [1.11.1] - 2026-09-23
 

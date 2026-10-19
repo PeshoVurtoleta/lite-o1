@@ -759,9 +759,10 @@ async function main() {
 
     // RankSelect hot path: a STATIC build-once cs-poppy index, BUILT ONCE OUTSIDE the measured window
     // (the O(n) build + the ~3.2% index space are the disclosed co-headline, EXCLUDED from the per-op
-    // claim). Two measured hot loops -- rank1 over a walking i, and select1 over a walking k -- both
-    // worst-case O(1), zero-alloc (a fixed directory lookup + a bounded <= 16-word block scan; the
-    // immutable typed columns are slots, never a JS allocation). Both returns fold into int32 sinks so
+    // claim). Measured hot loops -- rank1 over a walking i (worst-case O(1)), select1 over a walking k
+    // (worst-case O(log(nbits/2048))), and a gappy select lane that forces the BINARY branch -- all
+    // zero-alloc (directory lookups + a bounded <= 16-word block scan; the immutable typed columns
+    // are slots, never a JS allocation). Both returns fold into int32 sinks so
     // V8 cannot elide them and no heap double is promoted (all values are SMI ints).
     const RS_BITS = 1 << 20;               // 1,048,576 bits (many lower blocks -> the directory is real)
     const rsWordsHot = new Uint32Array(RS_BITS >>> 5);
@@ -781,17 +782,47 @@ async function main() {
     let rsSelKey = 0, rsSelSink = 0;
     const rsSelStep = () => {
         rsSelKey = (rsSelKey + 1) % rsSize;
-        rsSelSink = (rsSelSink + rankSelect.select1(rsSelKey)) | 0; // O(1) worst-case select via the sample layer
+        // select1: sample-bracketed hybrid linear/binary L1 search, worst-case O(log(nbits/2048)).
+        rsSelSink = (rsSelSink + rankSelect.select1(rsSelKey)) | 0;
     };
     const rsSelAllocRes = measureAllocs(rsSelStep, { iterations: 100000, batches: 8 });
     const rsSelBpc = rsSelAllocRes.bytesPerCall === null ? 0 : rsSelAllocRes.bytesPerCall;
     const rsSelAllocBytes = Math.max(0, Math.round(rsSelBpc));
     const rsSelAllocOk = rsSelAllocBytes === 0;
 
+    // RankSelect select gappy (binary branch): the dense lane above only ever lands in the LINEAR
+    // branch (a sample bracket spans ~1 lower block). Here a 2^25-bit vector with only bits {0,
+    // 2^25-1} set (and its dual, all ones except those two bits) has ONE sample per side, so the
+    // bracket is [0, numLower-1] = 16383 lower blocks, far past the linear cut-over -> the upper-mid
+    // binary search runs on EVERY call. Both built ONCE, outside the measured loop.
+    const RS_GAP_BITS = 1 << 25;
+    const rsGapWords = new Uint32Array(RS_GAP_BITS >>> 5);
+    rsGapWords[0] = 1; rsGapWords[rsGapWords.length - 1] = 0x80000000;
+    const rsGap1 = new RankSelect(rsGapWords, RS_GAP_BITS);
+    rsGapWords.fill(0xFFFFFFFF); rsGapWords[0] = 0xFFFFFFFE; rsGapWords[rsGapWords.length - 1] = 0x7FFFFFFF;
+    const rsGap0 = new RankSelect(rsGapWords, RS_GAP_BITS); // the source is COPIED, so reuse is safe
+    // Fail closed if the geometry ever stops forcing the binary branch: one sample each and a
+    // bracket wider than the largest linear cut-over candidate (32), plus the exact answers.
+    const rsGapBracket1 = (rsGap1._l1.length - 2) - (rsGap1._sel1[0] >>> 2);
+    const rsGapBracket0 = (rsGap0._l1.length - 2) - (rsGap0._sel0[0] >>> 2);
+    const rsGapBranchOk = rsGap1._sel1.length === 1 && rsGap0._sel0.length === 1 &&
+        rsGapBracket1 > 32 && rsGapBracket0 > 32 &&
+        rsGap1.select1(0) === 0 && rsGap1.select1(1) === RS_GAP_BITS - 1 &&
+        rsGap0.select0(0) === 0 && rsGap0.select0(1) === RS_GAP_BITS - 1;
+    let rsGapKey = 0, rsGapSink = 0;
+    const rsGapStep = () => {
+        rsGapKey = (rsGapKey + 1) | 0;
+        rsGapSink = (rsGapSink + rsGap1.select1(rsGapKey & 1) + rsGap0.select0(rsGapKey & 1)) | 0;
+    };
+    const rsGapAllocRes = measureAllocs(rsGapStep, { iterations: 100000, batches: 8 });
+    const rsGapBpc = rsGapAllocRes.bytesPerCall === null ? 0 : rsGapAllocRes.bytesPerCall;
+    const rsGapAllocBytes = Math.max(0, Math.round(rsGapBpc));
+    const rsGapAllocOk = rsGapAllocBytes === 0 && rsGapBranchOk;
+
     // EliasFano hot path: a STATIC build-once succinct codec, BUILT ONCE OUTSIDE the measured window
-    // (the O(n) build + succinct space are the disclosed co-headline). access(i) is worst-case O(1)
-    // (one select1 + one packed low read), zero-alloc; nextGEQ(x) is O(1)-typical / O(log n)-worst,
-    // zero-alloc. Both returns fold into int32 sinks so V8 cannot elide them.
+    // (the O(n) build + succinct space are the disclosed co-headline). access(i) is O(1)-typical /
+    // O(log n)-worst (one select1 + one packed low read), zero-alloc; nextGEQ(x) is O(1)-typical /
+    // O(log n)-worst, zero-alloc. Both returns fold into int32 sinks so V8 cannot elide them.
     const EF_N = 1 << 18;                   // 262,144 sorted values; avg gap ~8 -> L = 3 (real low bits)
     const efHotSrc = new Float64Array(EF_N);
     let efHotAcc = 0;
@@ -801,7 +832,7 @@ async function main() {
     let efAccKey = 0, efAccSink = 0;
     const efAccStep = () => {
         efAccKey = (efAccKey + 1) & (EF_N - 1);
-        efAccSink = (efAccSink + efHot.access(efAccKey)) | 0; // O(1) worst-case access
+        efAccSink = (efAccSink + efHot.access(efAccKey)) | 0; // O(1)-typical / O(log n)-worst access
     };
     const efAccAllocRes = measureAllocs(efAccStep, { iterations: 100000, batches: 8 });
     const efAccBpc = efAccAllocRes.bytesPerCall === null ? 0 : efAccAllocRes.bytesPerCall;
@@ -898,6 +929,7 @@ async function main() {
         wfStep();
         rsRankStep();
         rsSelStep();
+        rsGapStep();
         if ((i & 8191) === 0) {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
         }
@@ -1194,7 +1226,7 @@ async function main() {
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
         findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && monoAllocOk &&
         minAllocOk && randAllocOk && freqAllocOk && buckAllocOk && twAllocOk && htwAllocOk &&
-        ringLogAllocOk && cuckAllocOk && stAllocOk && bitAllocOk && bitHighAllocOk && bitOrAllocOk && bitRetOk && aliasAllocOk && ctwAllocOk && wfAllocOk && rsRankAllocOk && rsSelAllocOk && efAccAllocOk && efNextAllocOk && rvAddAllocOk && rvGetAllocOk && wfuAllocOk && rsReseedOk && abOk;
+        ringLogAllocOk && cuckAllocOk && stAllocOk && bitAllocOk && bitHighAllocOk && bitOrAllocOk && bitRetOk && aliasAllocOk && ctwAllocOk && wfAllocOk && rsRankAllocOk && rsSelAllocOk && rsGapAllocOk && efAccAllocOk && efNextAllocOk && rvAddAllocOk && rvGetAllocOk && wfuAllocOk && rsReseedOk && abOk;
 
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
@@ -1218,6 +1250,7 @@ async function main() {
         wfAllocBytes + ' B/op (WindowFold) ' +
         rsRankAllocBytes + ' B/op (RankSelect rank1) ' +
         rsSelAllocBytes + ' B/op (RankSelect select1) ' +
+        rsGapAllocBytes + ' B/op (RankSelect select gappy (binary branch)) ' +
         efAccAllocBytes + ' B/op (EliasFano access) ' +
         efNextAllocBytes + ' B/op (EliasFano nextGEQ) ' +
         rvAddAllocBytes + ' B/op (Reservoir add) ' +
@@ -1226,7 +1259,7 @@ async function main() {
         ' | reseed=' + rsReseedBytes + '/' + rsReseedBound + ' B allocs=' + rsReseedAllocs + ' (CuckooMap forced re-seed)' +
         ' | bitRetGrowth=' + bitRetGrowth + ' B' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
-        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' bsSink=' + bsSink + ' bhSink=' + bhSink + ' brSink=' + brSink + ' atSink=' + atSink + ' wfSink=' + wfSink + ' rsRankSink=' + rsRankSink + ' rsSelSink=' + rsSelSink + ' efAccSink=' + efAccSink + ' efNextSink=' + efNextSink + ' rvAddSink=' + rvAddSink + ' rvGetSink=' + rvGetSink + ' wfuSink=' + wfuSink + ' abGrowth=' + abDelta + ')');
+        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' bsSink=' + bsSink + ' bhSink=' + bhSink + ' brSink=' + brSink + ' atSink=' + atSink + ' wfSink=' + wfSink + ' rsRankSink=' + rsRankSink + ' rsSelSink=' + rsSelSink + ' rsGapSink=' + rsGapSink + ' efAccSink=' + efAccSink + ' efNextSink=' + efNextSink + ' rvAddSink=' + rvAddSink + ' rvGetSink=' + rvGetSink + ' wfuSink=' + wfuSink + ' abGrowth=' + abDelta + ')');
 
     if (!ok) {
         if (!trackedOk) console.error('  vacuous: tracker held ' + trackedMid + ' instances (expected > 0)');
@@ -1257,6 +1290,7 @@ async function main() {
         if (!wfAllocOk) console.error('  alloc ' + wfAllocBytes + ' B/op WindowFold (raw bytesPerCall ' + wfBpc + ')');
         if (!rsRankAllocOk) console.error('  alloc ' + rsRankAllocBytes + ' B/op RankSelect rank1 (raw bytesPerCall ' + rsRankBpc + ')');
         if (!rsSelAllocOk) console.error('  alloc ' + rsSelAllocBytes + ' B/op RankSelect select1 (raw bytesPerCall ' + rsSelBpc + ')');
+        if (!rsGapAllocOk) console.error('  alloc ' + rsGapAllocBytes + ' B/op RankSelect select gappy (binary branch) (raw bytesPerCall ' + rsGapBpc + ') branchOk=' + rsGapBranchOk + ' bracket1=' + rsGapBracket1 + ' bracket0=' + rsGapBracket0);
         if (!efAccAllocOk) console.error('  alloc ' + efAccAllocBytes + ' B/op EliasFano access (raw bytesPerCall ' + efAccBpc + ')');
         if (!efNextAllocOk) console.error('  alloc ' + efNextAllocBytes + ' B/op EliasFano nextGEQ (raw bytesPerCall ' + efNextBpc + ')');
         if (!rvAddAllocOk) console.error('  alloc ' + rvAddAllocBytes + ' B/op Reservoir add (raw bytesPerCall ' + rvAddBpc + ')');

@@ -110,13 +110,16 @@ RingLog).
   primitive (count/time/event windows). Fixed capacity (rounds up to a power of two), fail closed;
   query() never throws. The bitwise trio (AND/OR/XOR) is DEFERRED to a future int32-lane sibling
   WindowFoldInt32. For arbitrary-index / out-of-order range queries use @zakkster/lite-logn Fenwick.
-- `RankSelect` -- class. A zero-GC, WORST-CASE O(1) STATIC succinct rank/select bitvector index
+- `RankSelect` -- class. A zero-GC STATIC succinct rank/select bitvector index
   over a frozen bit pattern (cs-poppy: 512-bit basic blocks + a select sampling layer). Built from a
   RAW WORD ARRAY (Array | numeric TypedArray) + an explicit nbits, COPIED into a private Uint32Array
   (immutable, NOT a BitSet instance -- zero coupling). rank1(i) / rank0(i) count set / clear bits in
   [0, i); select1(k) / select0(k) return the position of the k-th set / clear bit (0-indexed);
-  access(i) is the bit at i. All are worst-case O(1), 0 B/op (a fixed directory lookup + a bounded
-  <= 16-word block scan + a bounded in-word step). The O(n) build + the ~3.2% index space are a
+  access(i) is the bit at i. rank1/rank0/access are worst-case O(1), 0 B/op (a fixed directory lookup
+  + a bounded <= 16-word block scan); select1/select0 are worst-case O(log(nbits/2048)), 0 B/op (the
+  select samples bracket a search over the L1 directory: a forward linear scan when the bracket spans
+  <= RANKSELECT_LINEAR_T lower blocks (16, nominal), else a binary search, <= 14 iterations at the 2^25
+  cap; <= 16 L1 reads + <= 3 L2 steps + the same <= 16-word scan + a bounded in-word step). The O(n) build + the ~3.2% index space are a
   DISCLOSED co-headline (the SparseTable / AliasTable static-member contract), EXCLUDED from the
   per-op claim, so there is NO max-single-op line. size (popcount) + length (nbits) + indexBytes are
   O(1) getters; forEach(fn) is the O(n) scan exception. Fail closed on nbits (typeof-safe, before any
@@ -125,12 +128,12 @@ RingLog).
 - `EliasFano` -- class. A zero-GC, succinct STATIC encoding of a monotone non-decreasing integer
   sequence (quasi-succinct, ~2 + ceil(log2(U/n)) bits/element), built on a COMPOSED RankSelect over
   the upper bits. Build once from a SORTED numeric Array | TypedArray (U inferred as max + 1; the
-  values are ENCODED, not referenced). access(i) is the i-th value in WORST-CASE O(1) (one select1 +
-  one packed low read); nextGEQ(x) is the smallest value >= x and is DATA-DEPENDENT -- O(1) TYPICAL
-  on well-distributed keys, O(log n) WORST-CASE on clustered keys (an in-bucket binary search after an
-  O(1) select0 seek), a third honesty category (neither clean "expected O(1)" nor worst-case O(1)).
-  The O(n) build + the succinct space are a DISCLOSED co-headline; access joins the worst-case cohort
-  (NO max-single-op line). length / size (= n) / universe (= U) / bitsPerElement / sizeBytes are O(1)
+  values are ENCODED, not referenced). access(i) is the i-th value in O(1) TYPICAL / worst-case O(log n)
+  (one bounded select1 + one packed low read); nextGEQ(x) is the smallest value >= x and is DATA-DEPENDENT -- O(1) TYPICAL
+  on well-distributed keys, O(log n) WORST-CASE on clustered keys (an in-bucket binary search after
+  two bounded select0 seeks), a third honesty category (neither clean "expected O(1)" nor worst-case O(1)).
+  The O(n) build + the succinct space are a DISCLOSED co-headline; access does not join the strict
+  worst-case-O(1) cohort (O(1) typical / O(log n) worst; still NO max-single-op line). length / size (= n) / universe (= U) / bitsPerElement / sizeBytes are O(1)
   getters; forEach(fn) is the O(n) decode exception. Build-once, query-only: NO mutators. Fail closed
   on an unsorted / out-of-range source (typeof-first, before any alloc); queries never throw (bad i ->
   access undefined; x > max or bad x -> nextGEQ -1). Elias-Fano's sub-log successor is a DEFERRED
@@ -1186,7 +1189,8 @@ honestly carry 32-bit bitwise semantics); MINMAX / SUMSQ / COUNT / GCD are dropp
 
 ## RankSelect
 
-A zero-GC, WORST-CASE O(1) STATIC succinct rank/select bitvector index over a frozen bit pattern
+A zero-GC STATIC succinct rank/select bitvector index over a frozen bit pattern (rank/access
+worst-case O(1); select worst-case O(log(nbits/2048)), bounded)
 (cs-poppy -- Zhou/Andersen/Kaminsky, SEA 2013: 512-bit basic blocks + a select sampling layer).
 The eighteenth member and the succinct primitive the ecosystem was missing: rank1/select1 are the
 substrate of wavelet trees, succinct tries, monotone integer sets, and compressed suffix arrays.
@@ -1215,11 +1219,16 @@ source throws.
 - rank1(i) -> number        O(1) worst-case, 0 B/op. Set bits in [0, i). Bad i -> 0; i > length
                             clamps to length (rank1(length) === size). NEVER throws.
 - rank0(i) -> number        O(1) worst-case, 0 B/op. Clear bits in [0, i) -- free (i - rank1(i)).
-- select1(k) -> number      O(1) worst-case, 0 B/op. Position of the k-th set bit (0-indexed) via
-                            the sample layer + a bounded in-block scan (NOT rank + binary search).
+- select1(k) -> number      O(log(nbits/2048)) worst-case, 0 B/op. Position of the k-th set bit
+                            (0-indexed): the select samples bracket a search over the L1
+                            directory: linear scan if the bracket spans <= RANKSELECT_LINEAR_T (16,
+                            nominal) lower blocks, else binary search (<= 14 iterations at 2^25);
+                            <= 16 L1 reads + <= 3 L2 steps + a <= 16-word scan.
+                            (1.11.1 and earlier walked blocks linearly: O(nbits/512); fixed 1.11.2.)
                             Bad / overflow k (>= size) -> -1. NEVER throws.
-- select0(k) -> number      O(1) worst-case, 0 B/op. Position of the k-th clear bit -- free from the
-                            same directory (512*b - rank1) + a clear-bit sample layer. Bad k -> -1.
+- select0(k) -> number      O(log(nbits/2048)) worst-case, 0 B/op. Position of the k-th clear bit --
+                            free from the same directory (512*b - rank1), same bounded search over
+                            the clear-bit sample bracket. Bad k -> -1.
 - access(i) -> 0|1|undefined  O(1) worst-case, 0 B/op. The bit at i; undefined for a bad i.
 - size (getter)             Number of set bits (popcount, precomputed at build). O(1).
 - length (getter)           Number of bits (nbits). O(1).
@@ -1250,11 +1259,11 @@ structure with no rank/select; RankSelect is the IMMUTABLE succinct index over a
 
 Query surface:
 
-- access(i) -> number|undefined  The i-th value (ascending). WORST-CASE O(1): (select1(i) - i)*2^L +
-                                 low(i). A bad i is undefined, NEVER throws.
+- access(i) -> number|undefined  The i-th value (ascending). O(1) typical, worst-case O(log n) (one
+                                 bounded select1): (select1(i) - i)*2^L + low(i). A bad i is undefined, NEVER throws.
 - nextGEQ(x) -> number           The smallest stored value >= x (successor-or-equal). DATA-DEPENDENT:
                                  O(1) TYPICAL on well-distributed keys, O(log n) WORST-CASE on clustered
-                                 keys (a select0 bucket seek in O(1) + a bounded in-bucket binary search
+                                 keys (two bounded select0 bucket seeks + a bounded in-bucket binary search
                                  over the low bits). Returns -1 when x > max or on a bad x. NEVER throws.
 - forEach(fn) -> void            O(n) alloc-free ascending decode; fn is (value, eliasFano).
 - [Symbol.iterator]()            O(n) ascending values (ALLOCATES per protocol -- use forEach alloc-free).
@@ -1263,7 +1272,8 @@ Query surface:
 - bitsPerElement (getter)        The average encoded bits per element (the succinct co-headline).
 - sizeBytes (getter)             The total backing footprint (packed low store + the composed RankSelect).
 
-Honesty contract: access is WORST-CASE O(1) (joins the worst-case cohort, NO max-single-op line); the
+Honesty contract: access is O(1) typical / worst-case O(log n) via select1 (it does NOT join the strict
+worst-case-O(1) cohort; still NO max-single-op line); the
 O(n) build + the succinct space are DISCLOSED co-headlines paid once (SparseTable ADR 0018 precedent).
 nextGEQ is the family's first DATA-DEPENDENT op: O(1) typical / O(log n) worst -- labeled as such, never
 sold as a clean expected-O(1) (ADR 0025). Build-once / immutable: NO mutators (rebuild to change).
@@ -1655,7 +1665,7 @@ one. For arbitrary-index / out-of-order range aggregation use @zakkster/lite-log
   (query batch 5e5, foil batch 2e3). Gated over the steady window nbits >= 1e4 (the 1e3 point is a
   pure-L1 micro-case shown but not gated). RankSelect flatness >= 0.70; naive foil flatness <= 0.55
   (a TRUE O(words) foil, so it collapses -- like SparseTable's scan foil); RankSelect/naive ratio
-  >= 1.5x. NO MAX-single-op line: rank / select / access are WORST-CASE O(1), and the O(n) build +
+  >= 1.5x. NO MAX-single-op line: rank / access are WORST-CASE O(1) and select is bounded worst-case O(log(nbits/2048)) (only rank1 is timed here), and the O(n) build +
   the ~3.2% index space are the disclosed co-headline, not a per-op spike (the SparseTable precedent).
 
 ## Not yet shipped

@@ -1,4 +1,4 @@
-# 0024 -- RankSelect: a zero-GC, worst-case-O(1) cs-poppy rank/select bitvector index (the succinct primitive)
+# 0024 -- RankSelect: a zero-GC, worst-case-O(1) cs-poppy rank/select bitvector index (the succinct primitive) (select: see Amendment)
 
 Status: accepted (v1.8.0)
 
@@ -19,7 +19,7 @@ A 2026-09-22 research pass (ROADMAP section 8, RESEARCH.md) settled the shape on
 SEA 2013): a two-level cumulative rank directory over 512-bit basic blocks plus a select
 sampling layer, ~3-6% index overhead (beating SDSL v5's 6.25% rank_support_v5), with a
 worst-case-O(1) rank and a genuine O(1) select (a sampling layer + a bounded in-block
-scan, NOT rank + binary search).
+scan, NOT rank + binary search) [select claim superseded: see Amendment, 1.11.2].
 
 ## The settled calls (LOCKED by the user 2026-09-22)
 
@@ -52,7 +52,7 @@ scan, NOT rank + binary search).
    - REJECTED: 256-bit or 1024-bit basic blocks (256 doubles the L1/L2 directory; 1024
      widens the in-block scan past the poppy sweet spot).
 
-4. **select: a GENUINE O(1) SAMPLING LAYER (NOT rank + binary search).** `_sel1` stores, for
+4. **[SUPERSEDED in 1.11.2 -- see Amendment] select: a GENUINE O(1) SAMPLING LAYER (NOT rank + binary search).** `_sel1` stores, for
    each 8192-set-bit milestone, the BASIC BLOCK index containing that milestone's set bit.
    select1(k) jumps to `_sel1[k >>> 13]`, advances basic-block by basic-block using the rank
    directory's O(1) per-block boundary rank until it lands in the target block (a bounded
@@ -83,7 +83,7 @@ scan, NOT rank + binary search).
 ## The honesty contract (rides SparseTable ADR 0018 + AliasTable ADR 0020)
 
 RankSelect is the suite's THIRD static build-once / immutable member. `rank1` / `rank0` /
-`select1` / `select0` / `access` are the hot ops and each is TRUE WORST-CASE O(1), zero-alloc
+`select1` / `select0` / `access` are the hot ops and each is TRUE WORST-CASE O(1) (select: superseded, see Amendment), zero-alloc
 (a fixed directory lookup + a bounded <= 16-word block scan + a bounded in-word step,
 INDEPENDENT of nbits). The O(n) BUILD and the ~3.2% index SPACE are a DISCLOSED CO-HEADLINE
 (the SparseTable O(n log n) build / AliasTable O(n) build precedent): paid ONCE at
@@ -114,7 +114,7 @@ throw" law; typeof guard FIRST so a Symbol / BigInt never coerces).
 
 ## Consequences
 
-- The suite gains the succinct rank/select primitive: worst-case O(1) rank/select/access,
+- The suite gains the succinct rank/select primitive: worst-case O(1) rank/select/access (select: see Amendment),
   0 B/op, ~3.2% index overhead, no spike. It is the substrate for wavelet trees, succinct
   tries, monotone integer sets, and lite-loglogn's rank/select-backed structures.
 - `forEach(fn)` (ascending set-bit scan, alloc-free) and `[Symbol.iterator]()` (the ONE
@@ -122,5 +122,39 @@ throw" law; typeof guard FIRST so a Symbol / BigInt never coerces).
   as the container family.
 - A future `RankSelect64` (true 64-bit L0 super-blocks past 2^25 bits) is recorded as
   possible future work, NOT implemented now; the 2^25 ceiling keeps every index SMI-safe.
+
+## Amendment (1.11.2, 2026-10-19)
+
+**Call #4 is SUPERSEDED.** The original text above is kept untouched as history.
+
+- **The false premise.** Call #4 said the forward basic-block scan seeded by the select sample
+  is "bounded" and therefore O(1). It is bounded only by the GAP between consecutive samples
+  (8192 set bits can span the whole vector), so a gappy vector costs O(nbits/512) directory
+  probes per select. Measured on 1.11.1: `select1(1)` on a 2^25-bit vector with only bits 0 and
+  2^25-1 set made 65,536 `_rankBB` calls (33 on a 50%-density vector);
+  `EliasFano.nextGEQ` over a 2^22 zero-run made 8,234 `_rankBB` calls (8,238 directory reads). The "worst-case O(1)" select label was false.
+- **Maintainer decision (2026-10-19): binary search, then a HYBRID follow-up.** `select1` /
+  `select0` now search the L1 lower-block cumulative counts inside the bracket given by two
+  adjacent select samples (the actual cs-poppy design). The maintainer's follow-up choice made it
+  a hybrid: a forward linear scan when the bracket spans <= RANKSELECT_LINEAR_T lower blocks (16,
+  nominal) because linear is expected to be faster on short brackets (nominal; the A/B below was inconclusive), else a binary search because it bounds the
+  long ones. Then take <= 3 L2 steps and the unchanged <= 16-word in-block
+  scan + in-word select. REJECTED: true-O(1) dense/sparse sampling (extra sample tiers) -- it
+  would cost index space and break the ~3.2% index headline. No new arrays; `indexBytes` unchanged;
+  results bit-identical; 0 B/op.
+- **The new bound.** select is worst-case O(log(nbits/2048)): <= 16 L1 reads (linear branch) or
+  <= 14 binary iterations at the 2^25 cap, + <= 3 L2 steps + a <= 16-word scan. `rank1` / `rank0` / `access` stay worst-case O(1).
+- **Measured 2026-10-19 (PRELIMINARY: host load ~3.8, Node v26.8.2, darwin arm64, K=21
+  interleaved rounds).** Directory reads on the 2^25 gappy vector: 131,072 -> 16 (select1(1) and
+  select0(1)). Worst on a 50%-density vector (stride 997): 66 -> 10. EliasFano clustered (8.4M-bit
+  upper bitvector): nextGEQ 8,238 -> 22 reads, access 36 -> 13. Parity: 86,936,691 select calls
+  bit-identical to 1.11.1, including invalid k. Timing (REPORTED tier only, PRELIMINARY): gappy
+  select1 52,286 -> ~28 ns/op, gappy select0 65,104 -> ~32 ns/op; 1.4x-1.8x faster on the dense select1 cells than
+  1.11.1 (d=0.5 select1 85.9 -> 48.1 ns/op). The A/B over T in {0, 8, 16, 32} was inconclusive
+  within a ~7% noise floor; T=16 is nominal, re-run on a quiet host.
+- **Pin.** `test/RankSelectBound.test.js` (probe-count bound on gappy vectors; fails on 1.11.1).
+- **Honesty contract consequence.** RankSelect is no longer "every hot op worst-case O(1)": rank /
+  access are; select is bounded worst-case O(log n). Still no max-single-op line.
+  See ADR 0025 Amendment for EliasFano.
 
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>

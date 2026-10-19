@@ -2110,8 +2110,9 @@ console.log('');
 console.log('  RankSelect flatness (nbits >= ' + nStr(RS_GATE_MIN) + '): ' + fmt(rsw.flatness) + '   (gate >= 0.70)');
 console.log('  naive foil flatness (last/first): ' + fmt(rsFoil.flatness) + '   (gate <= 0.55 -- true O(words) collapse)');
 console.log('  min RankSelect/naive ratio:       ' + fmt(rsRatio) + 'x  (gate >= 1.50x)');
-// NO MAX-single-op line here (unlike the amortized cohort): RankSelect's rank / select / access are
-// WORST-CASE O(1) (a fixed directory lookup + a bounded <= 16-word block scan, INDEPENDENT of nbits),
+// NO MAX-single-op line here (unlike the amortized cohort): RankSelect's rank / access are
+// WORST-CASE O(1) (a fixed directory lookup + a bounded <= 16-word block scan, INDEPENDENT of nbits);
+// select is bounded worst-case O(log(nbits/2048)) (hybrid linear / binary L1 search, <= 14 binary iterations at 2^25; not timed here),
 // never a run and never a cascade. The O(n) BUILD + the ~3.2% index SPACE are the disclosed
 // co-headline (paid once at construction), not a per-op spike. The flat rank line IS the worst-case
 // claim (the O(words) scan foil is the honest 0.55-collapse rival; see decisions/0024).
@@ -2138,11 +2139,11 @@ if (!rsAllOk) {
 // EliasFano witness -- STATIC succinct nextGEQ (successor) vs a naive O(n)
 // linear-scan successor over the same sorted set.
 // ===========================================================================
-// EliasFano stores n sorted integers in ~2 + log2(U/n) bits each. access(i) is worst-case O(1) but is
+// EliasFano stores n sorted integers in ~2 + log2(U/n) bits each. access(i) is O(1) typical (worst-case O(log n) via select1) but is
 // NOT witnessed here -- a plain sorted array also accesses in O(1), so there is no collapsing foil for
 // it (access's flatness + 0-alloc are proven by the torture gate + decisions/0025). The witnessed op
 // is nextGEQ (successor-or-equal): DATA-DEPENDENT -- O(1) TYPICAL on well-distributed keys (buckets
-// average ~1 element at L, a select0 seek + a ~1-element in-bucket step), degrading to O(log n)
+// average ~1 element at L, a bounded select0 seek + a ~1-element in-bucket step), degrading to O(log n)
 // WORST-CASE only on clustered keys (disclosed, NOT gated -- decisions/0025). Here the keys are
 // UNIFORMLY spread, so nextGEQ is O(1) and FLAT, while the foil recomputes the successor by a naive
 // O(n) linear scan from the front, collapsing as n grows. Gated over n >= 1e4.
@@ -2213,7 +2214,7 @@ console.log('');
 console.log('  EliasFano nextGEQ flatness (n >= ' + nStr(EF_GATE_MIN) + '): ' + fmt(efw.flatness) + '   (gate >= 0.70, UNIFORM keys)');
 console.log('  naive foil flatness (last/first): ' + fmt(efFoil.flatness) + '   (gate <= 0.55 -- true O(n) collapse)');
 console.log('  min EliasFano/naive ratio:        ' + fmt(efRatio) + 'x  (gate >= 1.50x)');
-// access(i) is WORST-CASE O(1) (one select1 + one packed low read) -- proven flat + 0-alloc by the
+// access(i) is O(1) typical, worst-case O(log n) (one bounded select1 + one packed low read) -- proven flat + 0-alloc by the
 // torture gate, not witnessed here (a plain sorted array also accesses in O(1), no collapsing foil).
 // nextGEQ is the family's DATA-DEPENDENT op: O(1) TYPICAL (witnessed flat here on uniform keys),
 // O(log n) WORST-CASE on clustered keys (disclosed, decisions/0025) -- NOT an amortized spike, so
