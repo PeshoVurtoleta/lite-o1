@@ -88,8 +88,8 @@ RankSelect. `forEach` / `[Symbol.iterator]` are EXCLUDED from the zero-alloc / w
 ## Amendment (1.11.2, 2026-10-19)
 
 The honesty labels in call 3 rested on RankSelect select being worst-case O(1); it was not (ADR 0024
-Amendment: select was O(nbits/512) on a gappy upper bitvector, measured 8,234 `_rankBB` calls (8,238 directory reads) with a 2^22
-zero-run). Corrected labels: `access(i)` is O(1) typical, worst-case O(log n) via the now-bounded
+Amendment: select was O(nbits/512) on a gappy upper bitvector; `nextGEQ` measured 8,238 directory
+(L1 + L2) reads over a ~2^22 zero-run, 22 after the fix; `access` 36 -> 13). Corrected labels: `access(i)` is O(1) typical, worst-case O(log n) via the now-bounded
 select1 (hybrid linear / binary L1 search, <= 14 binary iterations at the 2^25 cap); it no longer joins the strict
 worst-case-O(1) cohort. `nextGEQ`'s select0 seek is likewise bounded O(log n), not O(1), so its
 data-dependent label stands (O(1) typical / O(log n) worst). The original text above is history.

@@ -817,7 +817,7 @@ async function main() {
     const rsGapAllocRes = measureAllocs(rsGapStep, { iterations: 100000, batches: 8 });
     const rsGapBpc = rsGapAllocRes.bytesPerCall === null ? 0 : rsGapAllocRes.bytesPerCall;
     const rsGapAllocBytes = Math.max(0, Math.round(rsGapBpc));
-    const rsGapAllocOk = rsGapAllocBytes === 0 && rsGapBranchOk;
+    const rsGapAllocOk = rsGapAllocRes.bytesPerCall !== null && rsGapAllocBytes === 0 && rsGapBranchOk;
 
     // EliasFano hot path: a STATIC build-once succinct codec, BUILT ONCE OUTSIDE the measured window
     // (the O(n) build + succinct space are the disclosed co-headline). access(i) is O(1)-typical /
@@ -1290,7 +1290,7 @@ async function main() {
         if (!wfAllocOk) console.error('  alloc ' + wfAllocBytes + ' B/op WindowFold (raw bytesPerCall ' + wfBpc + ')');
         if (!rsRankAllocOk) console.error('  alloc ' + rsRankAllocBytes + ' B/op RankSelect rank1 (raw bytesPerCall ' + rsRankBpc + ')');
         if (!rsSelAllocOk) console.error('  alloc ' + rsSelAllocBytes + ' B/op RankSelect select1 (raw bytesPerCall ' + rsSelBpc + ')');
-        if (!rsGapAllocOk) console.error('  alloc ' + rsGapAllocBytes + ' B/op RankSelect select gappy (binary branch) (raw bytesPerCall ' + rsGapBpc + ') branchOk=' + rsGapBranchOk + ' bracket1=' + rsGapBracket1 + ' bracket0=' + rsGapBracket0);
+        if (!rsGapAllocOk) console.error('  alloc ' + rsGapAllocBytes + ' B/op RankSelect select gappy (binary branch) (raw bytesPerCall ' + rsGapAllocRes.bytesPerCall + ') branchOk=' + rsGapBranchOk + ' bracket1=' + rsGapBracket1 + ' bracket0=' + rsGapBracket0);
         if (!efAccAllocOk) console.error('  alloc ' + efAccAllocBytes + ' B/op EliasFano access (raw bytesPerCall ' + efAccBpc + ')');
         if (!efNextAllocOk) console.error('  alloc ' + efNextAllocBytes + ' B/op EliasFano nextGEQ (raw bytesPerCall ' + efNextBpc + ')');
         if (!rvAddAllocOk) console.error('  alloc ' + rvAddAllocBytes + ' B/op Reservoir add (raw bytesPerCall ' + rvAddBpc + ')');

@@ -130,9 +130,10 @@ throw" law; typeof guard FIRST so a Symbol / BigInt never coerces).
 - **The false premise.** Call #4 said the forward basic-block scan seeded by the select sample
   is "bounded" and therefore O(1). It is bounded only by the GAP between consecutive samples
   (8192 set bits can span the whole vector), so a gappy vector costs O(nbits/512) directory
-  probes per select. Measured on 1.11.1: `select1(1)` on a 2^25-bit vector with only bits 0 and
-  2^25-1 set made 65,536 `_rankBB` calls (33 on a 50%-density vector);
-  `EliasFano.nextGEQ` over a 2^22 zero-run made 8,234 `_rankBB` calls (8,238 directory reads). The "worst-case O(1)" select label was false.
+  probes per select. Measured on 1.11.1, in directory reads (L1 + L2 entries read per call;
+  deterministic counts; one `_rankBB` call = 2 reads): `select1(1)` on a 2^25-bit vector with
+  only bits 0 and 2^25-1 set read 131,072 (66 on a 50%-density vector); `EliasFano.nextGEQ` over
+  a ~2^22 zero-run read 8,238. The "worst-case O(1)" select label was false.
 - **Maintainer decision (2026-10-19): binary search, then a HYBRID follow-up.** `select1` /
   `select0` now search the L1 lower-block cumulative counts inside the bracket given by two
   adjacent select samples (the actual cs-poppy design). The maintainer's follow-up choice made it
@@ -146,8 +147,9 @@ throw" law; typeof guard FIRST so a Symbol / BigInt never coerces).
   <= 14 binary iterations at the 2^25 cap, + <= 3 L2 steps + a <= 16-word scan. `rank1` / `rank0` / `access` stay worst-case O(1).
 - **Measured 2026-10-19 (PRELIMINARY: host load ~3.8, Node v26.8.2, darwin arm64, K=21
   interleaved rounds).** Directory reads on the 2^25 gappy vector: 131,072 -> 16 (select1(1) and
-  select0(1)). Worst on a 50%-density vector (stride 997): 66 -> 10. EliasFano clustered (8.4M-bit
-  upper bitvector): nextGEQ 8,238 -> 22 reads, access 36 -> 13. Parity: 86,936,691 select calls
+  select0(1)). Worst on a 50%-density vector (stride 997): 66 -> 10. EliasFano clustered (n =
+  2^22: values 0..2^21-1 then 2^30..2^30+2^21-1, an 8,396,800-bit upper bitvector; worst over
+  the probed indices / targets): nextGEQ 8,238 -> 22 directory reads, access 36 -> 13. Parity: 86,936,691 select calls
   bit-identical to 1.11.1, including invalid k. Timing (REPORTED tier only, PRELIMINARY): gappy
   select1 52,286 -> ~28 ns/op, gappy select0 65,104 -> ~32 ns/op; 1.4x-1.8x faster on the dense select1 cells than
   1.11.1 (d=0.5 select1 85.9 -> 48.1 ns/op). The A/B over T in {0, 8, 16, 32} was inconclusive
