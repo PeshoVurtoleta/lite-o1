@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [1.11.2] - 2026-10-19
+
+Patch: RankSelect select bound. No API change; the roster stays at twenty-one; `indexBytes`
+unchanged, still 0 B/op.
+
 ### Fixed
 - **RankSelect `select1` / `select0` worst case was O(nbits/512), not O(1).** The documented
   "worst-case O(1)" select advanced basic-block by basic-block from the sample, and that forward
