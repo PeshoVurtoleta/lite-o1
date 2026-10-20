@@ -92,7 +92,7 @@ RingLog).
   max-single-op line (it touches <= 9 levels/buckets, independent of live count and delay
   magnitude), via a per-bucket occupancy BITMAP (18 x Uint32) find-first-set. A far-future
   timer sits in a coarse bucket and fires IN PLACE. The trade is PRECISION for range: a timer
-  fires LATE by at most gran(level) - 1 (<= 12.5% relative, ONE-SIDED never early; L0 EXACT) --
+  fires LATE by at most gran(level) - 1 (< 8/62 ~= 12.9% relative, ONE-SIDED never early; L0 EXACT) --
   the disclosed co-headline. Near-unbounded delay in [0, 62 x 2^24) (~0.97 x 2^30; the Linux
   phase margin below the full 2^30 span). peekNext() (next due tick, NOHZ) + fireTimeOf(id)
   (the rounded fire tick) are O(1) queries. For EXACT far-future deadlines use a min-heap
@@ -760,7 +760,7 @@ one drainDue-callback exception -- it throws [lite-o1] (schedule / cancel / clea
   (cascade spike); CoarseTimerWheel is near-unbounded + APPROXIMATE + worst-case with NO
   cascade and NO max-single-op line. A far-future timer sits in a COARSE bucket and fires IN
   PLACE -- never cascaded, never re-filed. HEADLINE TRADE: precision for range -- a timer fires
-  LATE by at most gran(level) - 1 (<= 12.5% relative error, ONE-SIDED never early; L0 EXACT).
+  LATE by at most gran(level) - 1 (< 8/62 ~= 12.9% relative error, ONE-SIDED never early; L0 EXACT).
   For EXACT far-future deadlines use a min-heap (@zakkster/lite-logn); the classic
   hashed-with-rounds wheel is REJECTED (expected-O(1) / worst-case-O(n), see ADR 0022).
 - universe: exclusive id ceiling; integer in [1, 2^32]. Ids are integers in [0, universe).
@@ -1513,7 +1513,7 @@ one. For arbitrary-index / out-of-order range aggregation use @zakkster/lite-log
   64 buckets, shift 3n, gran 8^n): schedule rounds the deadline UP to the finest level whose
   granule-delta is <= 63 and files it there; the timer fires IN PLACE (never cascaded). APPROXIMATE
   fire -- the disclosed co-headline: fire >= now + delay ALWAYS (never early), LATE by at most
-  gran(level) - 1 (<= 12.5% relative error, ONE-SIDED; L0 EXACT). DRAIN-BEFORE-ADVANCE -- advance()
+  gran(level) - 1 (< 8/62 ~= 12.9% relative error, ONE-SIDED; L0 EXACT). DRAIN-BEFORE-ADVANCE -- advance()
   refuses to skip a due bucket (throws fail-closed), validated by the per-bucket occupancy BITMAP
   (18 x Uint32), so advance is WORST-CASE O(1) for ANY k with NO cascade and NO max-single-op line.
   Space O(capacity + 577 + 18). Fail closed on the mutators schedule / advance (throws [lite-o1]; a

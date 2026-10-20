@@ -8,7 +8,11 @@
  *      forEach / [Symbol.iterator] + the size / capacity / universe / now / maxDelay getters.
  *   2. APPROXIMATION (the headline): over a sweep of now x delays, now+delay <= fire <=
  *      now+delay + 8^level - 1 -- NEVER early; delay < 64 fires EXACT; max relative error
- *      <= 0.125. A tolerance-0 CONTROL that MUST fail proves the approximation is real.
+ *      < 8/62 = 4/31 (~12.9%, NOT 12.5%: a level n >= 1 is entered by delays as small as
+ *      62 x 8^(n-1) + 2), proven by an exhaustive (now, delay) sweep, a deterministic
+ *      full-range sample, and the analytic worst case at every level (tight). A tolerance-0
+ *      CONTROL that MUST fail proves the approximation is real; a doc-truth check keeps the
+ *      shipped docs off the old 12.5% claim.
  *   3. No-cascade worst-case O(1): max-tick / median-tick ratio stays bounded over many ticks
  *      with timers across all 9 levels (a scanning-drain contrast misses flatness).
  *   4. Family contract: bad id / delay >= MAX_DELAY / full / undrained-advance / mid-drain
@@ -20,11 +24,16 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { CoarseTimerWheel, VERSION } from '../O1.js';
 
 const litO1 = (e) => e instanceof Error && /^\[lite-o1]/.test(e.message);
 const MAX_DELAY = 0x3E000000;              // 62 * 2^24 = 1,040,187,392
 const GRAN = [1, 8, 64, 512, 4096, 32768, 262144, 2097152, 16777216]; // 8^n, n=0..8
+// Documented worst-case relative fire error: late / delay < 8/62 = 4/31 (~12.9%). Level n >= 1 is
+// entered once level n-1's granule-delta exceeds 63, i.e. by delays >= 62 x GRAN[n-1] + 2, and is
+// late by at most GRAN[n] - 1 = 8 x GRAN[n-1] - 1, so late / delay <= (8g - 1) / (62g + 2) < 8/62.
+const REL_BOUND = 4 / 31;
 
 // The level a (now, delay) pair actually lands in, via the SAME round-up-then-verify escalation
 // the class uses -- an INDEPENDENT oracle (a mis-selection fires outside the level's bound).
@@ -79,7 +88,7 @@ test('constructor fails closed on a bad universe / capacity', () => {
 // 2. APPROXIMATION -- the headline assertion (never-early + bounded + L0 exact)
 // ---------------------------------------------------------------------------
 
-test('APPROXIMATION: now+delay <= fire <= now+delay + gran(level)-1, NEVER early, delay<64 EXACT, err<=0.125', () => {
+test('APPROXIMATION: now+delay <= fire <= now+delay + gran(level)-1, NEVER early, delay<64 EXACT, err<4/31', () => {
     const delays = [0, 1, 2, 7, 8, 31, 63, 64, 65, 100, 200, 511, 512, 513, 1000, 4095, 4096,
         5000, 32767, 32768, 50000, 262143, 262144, 1e6, 5e6, 3e7, 2e8, MAX_DELAY - 1];
     let maxRelErr = 0;
@@ -105,8 +114,106 @@ test('APPROXIMATION: now+delay <= fire <= now+delay + gran(level)-1, NEVER early
             w.cancel(id);
         }
     }
-    assert.ok(maxRelErr <= 0.125, `max relative fire error ${maxRelErr} must be <= 0.125`);
+    assert.ok(maxRelErr < REL_BOUND, `max relative fire error ${maxRelErr} must be < 4/31`);
     assert.ok(sawStrictlyLate, 'at least one coarse timer must fire strictly late (approximation is real)');
+});
+
+// Shared brute-force check: schedule (id 0) at the wheel's current `now`, read the fire tick,
+// cancel. Returns late / delay; throws on an early fire or a late past the level's granularity.
+function probe(w, d) {
+    const now = w.now;
+    w.schedule(0, d);
+    const fire = w.fireTimeOf(0);
+    w.cancel(0);
+    const late = fire - (now + d);
+    if (!(late >= 0)) assert.fail(`EARLY now=${now} d=${d} fire=${fire}`);
+    const g = GRAN[levelOf(now, d)];
+    if (late > g - 1) assert.fail(`late past gran-1 now=${now} d=${d} late=${late} g=${g}`);
+    const rel = late / d;
+    if (!(rel < REL_BOUND)) assert.fail(`relative error ${rel} >= 4/31 at now=${now} d=${d} late=${late}`);
+    return rel;
+}
+
+test('RELATIVE BOUND (exhaustive): every now in [0, 1024) x delay in [1, 33000) is never early and late/delay < 4/31', () => {
+    // 1024 = 2 x GRAN[3], so every clock phase of L0..L3 is covered, and delay < 33000 spans
+    // L0..L4 (L3 is first entered at 62 x 64 + 2 = 3970, L4 at 62 x 512 + 2 = 31746). The L3 worst
+    // case (now 127, delay 3970, late 511 = 12.8715%) and the L4 worst case (now 1023, delay
+    // 31746, late 4095 = 12.8993%) both lie inside the sweep.
+    const w = new CoarseTimerWheel(1, 1);
+    let worst = 0;
+    let worstNow = -1;
+    let worstD = -1;
+    for (let now = 0; now < 1024; now++) {
+        for (let d = 1; d < 33000; d++) {
+            const rel = probe(w, d);
+            if (rel > worst) { worst = rel; worstNow = now; worstD = d; }
+        }
+        w.advance(1); // empty wheel -> legal
+    }
+    assert.equal(w.size, 0);
+    // Teeth: the sweep EXCEEDS the old documented 12.5% bound, so a "<= 0.125" claim fails here.
+    assert.ok(worst > 0.125, `worst ${worst} must exceed the old (wrong) 12.5% claim`);
+    assert.equal(worst, 4095 / 31746, 'the L4 worst case is exactly 4095 / 31746');
+    assert.equal(worstNow, 1023);
+    assert.equal(worstD, 31746);
+});
+
+test('RELATIVE BOUND (full range): a deterministic sample over every level and clock phase stays < 4/31', () => {
+    // LCG-driven (now, delay) pairs: the clock jumps by a random amount (empty wheel -> advance
+    // is legal and O(1)), the delay is log-uniform over [1, MAX_DELAY) so every level 0..8 is hit.
+    const w = new CoarseTimerWheel(1, 1);
+    // Two INDEPENDENT LCG streams (different seeds + multipliers): one for the clock jump, one for
+    // the delay, so the (now, delay) pairs are not a single-stream lattice.
+    let s = 0x9E3779B9 >>> 0;
+    let t = 0x85EBCA6B >>> 0;
+    const rndJump = () => (s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296;
+    const rndDelay = () => (t = (Math.imul(t, 22695477) + 1) >>> 0) / 4294967296;
+    const seen = new Uint8Array(9);
+    for (let i = 0; i < 200000; i++) {
+        w.advance(Math.floor(rndJump() * 70000000));
+        let d = Math.floor(Math.exp(rndDelay() * Math.log(MAX_DELAY)));
+        if (d < 1) d = 1;
+        if (d >= MAX_DELAY) d = MAX_DELAY - 1;
+        seen[levelOf(w.now, d)] = 1;
+        probe(w, d);
+    }
+    for (let n = 0; n < 9; n++) assert.equal(seen[n], 1, `level ${n} must be sampled`);
+});
+
+test('RELATIVE BOUND is TIGHT at every level: now = 2g-1, delay = 62g+2 (g = 8^(n-1)) fires exactly 8g-1 late', () => {
+    let prev = 0;
+    for (let n = 1; n < 9; n++) {
+        const g = GRAN[n - 1];
+        const now = 2 * g - 1;
+        const d = 62 * g + 2;
+        const w = new CoarseTimerWheel(1, 1);
+        w.advance(now);
+        assert.equal(levelOf(now, d), n, `delay ${d} at now ${now} enters level ${n}`);
+        w.schedule(0, d);
+        const late = w.fireTimeOf(0) - (now + d);
+        assert.equal(late, GRAN[n] - 1, `level ${n}: late is the full gran - 1`);
+        const rel = late / d;
+        assert.equal(rel, (8 * g - 1) / (62 * g + 2));
+        assert.ok(rel < REL_BOUND, `level ${n}: ${rel} < 4/31`);
+        assert.ok(rel >= prev, 'the worst case rises toward 4/31 with the level');
+        prev = rel;
+        // One tick less of delay drops back to level n-1 (the entry threshold is exact).
+        assert.equal(levelOf(now, d - 1), n - 1, `delay ${d - 1} at now ${now} stays at level ${n - 1}`);
+    }
+    assert.ok(prev > 0.129 && prev < REL_BOUND, `L8 worst ${prev} is in (0.129, 4/31)`);
+});
+
+test('doc truth: no shipped doc claims the old 12.5% CoarseTimerWheel bound', () => {
+    // CHANGELOG is excluded: its released entries are history and its [Unreleased] Fixed entry
+    // quotes the old claim on purpose. The list is package.json files[] (+ GUIDE.md).
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+    const files = pkg.files.filter((f) => f !== 'CHANGELOG.md' && f !== 'LICENSE').concat('GUIDE.md');
+    assert.ok(files.includes('README.md') && files.includes('llms.txt'), 'files[] must list the docs');
+    for (const f of files) {
+        const text = readFileSync(new URL('../' + f, import.meta.url), 'utf8');
+        assert.doesNotMatch(text, /(?:<=?|at most|up to|under|below|within)\s*`?12\.5\s*%|1\/8\s*=\s*12\.5|<=?\s*0\.125\b/,
+            `${f} still claims a 12.5% bound`);
+    }
 });
 
 test('tolerance-0 CONTROL: a coarse (level >= 1) timer is STRICTLY late, so a zero-tolerance assert FAILS', () => {

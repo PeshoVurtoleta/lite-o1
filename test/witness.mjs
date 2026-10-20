@@ -1931,7 +1931,7 @@ console.log('  min CoarseWheel/heap ratio:        ' + fmt(cwRatio) + 'x  (gate >
 // NO MAX-single-op line: schedule / cancel / advance(k) / drainDue are WORST-CASE O(1) with NO
 // cascade (a bitmap-validated advance touches <= 9 levels, independent of n and delay magnitude),
 // so there is no amortized spike to expose -- UNLIKE HierarchicalTimerWheel. The disclosed
-// co-headline is the APPROXIMATE fire (bounded, one-sided-late, <= 12.5%; L0 exact), not a per-op
+// co-headline is the APPROXIMATE fire (bounded, one-sided-late, < 8/62 ~= 12.9%; L0 exact), not a per-op
 // spike. The flat tick line IS the worst-case claim (the O(log n) 4-ary heap is the fair rival).
 
 const cwOk = cw.flatness >= 0.70;

@@ -6,7 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+- **CoarseTimerWheel relative fire error was documented as `<= 12.5%`; the true bound is
+  `< 8/62 = 4/31 (~12.9%)`.** `schedule()` picks the finest level n whose granule-delta
+  `ceil(deadline / g_n) - floor(now / g_n)` is `<= 63`, so level n >= 1 is entered by delays as
+  small as `62 x g_{n-1} + 2`, not `64 x g_{n-1}`. Worst case per level: `now = 2 x g_{n-1} - 1`,
+  `delay = 62 x g_{n-1} + 2` fires exactly `g_n - 1` late, e.g. 12.8715% at L3 (now 127, delay
+  3970, late 511) and 12.9032% at L8. A 12.5% bound would need a delta of 64-65 on 64 buckets
+  (aliasing the current or next bucket, which could fire up to 64 granules early), so the code
+  is unchanged and the docs are corrected: O1.js, O1.d.ts, README, llms.txt, GUIDE, ADR 0022
+  (amended). The absolute bound `now + delay <= fire <= now + delay + gran(level) - 1` (never
+  early, delays < 64 always exact) was already correct. The old approximation test's sparse
+  delay list never hit a worst case, which is why it passed with `<= 0.125`. New tests: an
+  exhaustive `(now, delay)` sweep (now in [0, 1024), delay in [1, 33000)), a deterministic
+  200,000-pair sample over every level, the analytic worst case at every level 1..8 (tight), and
+  a doc-truth check that no shipped doc (package.json `files[]` + GUIDE) still claims 12.5%.
 
 ## [1.11.2] - 2026-10-19
 

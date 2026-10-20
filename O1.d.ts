@@ -855,7 +855,7 @@ export class AliasTable {
  * with an APPROXIMATE (bounded, one-sided-LATE) fire time -- the Linux-4.8 coarse-bucket model
  * (9 levels x 64 buckets, per-level clock shift 3n, granularity 8^n). A far-future timer sits
  * in a coarse bucket and fires IN PLACE (never cascaded). The trade is PRECISION for range: a
- * timer fires LATE by at most gran(level) - 1 (<= 12.5% relative error, ONE-SIDED never early;
+ * timer fires LATE by at most gran(level) - 1 (< 8/62 ~= 12.9% relative error, ONE-SIDED never early;
  * L0 is EXACT). Delay range [0, 62 x 2^24) (~0.97 x 2^30; the Linux phase margin below the full
  * 2^30 span). schedule / cancel / advance(k) are worst-case O(1) (a per-bucket occupancy bitmap
  * find-first-set) with NO cascade and NO max-single-op line; drainDue is O(due + levels),
