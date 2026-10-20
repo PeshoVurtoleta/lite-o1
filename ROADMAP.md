@@ -757,4 +757,95 @@ None of this asks lite-o1 to change; it is recorded so the next session knows wh
 ### 1.11.2 note (2026-10-19): RankSelect select-bound fix
 RankSelect select1/select0 were mislabelled worst-case O(1) (a linear block walk, O(nbits/512) on gappy vectors); 1.11.2 makes them a sample-bracketed hybrid linear / binary L1 search (worst-case O(log(nbits/2048)), <= 14 binary iterations at 2^25) and relabels EliasFano.access O(1)-typical / O(log n) worst. ADR 0024 call #4 amended; see decisions/0024 Amendment.
 
+---
+
+## 9. Research intake (2026-10-18) -- clear() patches + cache-tier disclosure  [PROPOSED, not scheduled]
+
+**Sequencing (maintainer, 2026-10-18):** the lite-signal 1.6.0 release has the highest priority.
+Nothing here starts before it ships. Suite-wide order: `../Research/SUMMARY.md` section 1.
+
+**Sources:** `../Research/RESEARCH_EPOCH_O1.md` sections 2.4 and 3.5, and `../Research/SUMMARY.md`
+items #7, #8 and #9. These are PATCH-level changes: the roster stays CLOSED at twenty-one, with no
+new members and no public API change. Every speed figure in the sources is REPORTED from another
+host (260 MB L3). None enters README, GUIDE, llms.txt or CHANGELOG until a run from this cycle
+reproduces it under `quiet-lock.mjs`.
+
+| id | item | where (checked 2026-10-18 at 1.11.1) | size | SETTLE FIRST |
+| --- | --- | --- | --- | --- |
+| **P1** | CuckooMap stamped clear: O(capacity) -> O(1) | `O1.js:3165` (`_occ = new Uint8Array(total)`), `:3326` (`clear() { this._occ.fill(0); ... }`) | tiny | the hot-path cost of `_stamp[i] === _epoch` against `_occ[i] === 1` (A/B, STATISTICAL tier) |
+| **P2** | BitSet summary-guided clear: O(W) -> O(non-empty words + summary) | `O1.js:3827-3833` (`clear()` fills `_w`, `_s1`, `_s2`, `_s3`) | tiny | none |
+| **P3** | Cache-tier disclosure curve: random-key ns/op per member and size, labelled by memory tier | witness output + benchmark v3 tier labels | small | the wording change for "witnesses its constant" in README / GUIDE |
+
+### P1 -- CuckooMap stamped clear
+
+- How:
+  - replace `_occ` with `Uint32Array _stamp` and a `_epoch` field (starts at 1);
+  - a slot is occupied iff `_stamp[i] === _epoch`, and `set` writes `_stamp[i] = _epoch`;
+  - `clear()` is `_epoch++`, and the `_epoch === 0` wrap refills `_stamp` once per 2^32 clears;
+  - the same pattern as lite-lru ADR 0029, copied by design parity, not imported.
+- Price: +3 B per slot (Uint8 -> Uint32). Reads compare against a field instead of a constant.
+- Fix the comment at `O1.js:3322-3325`: its "emptiness must be signalled per slot -> O(capacity)"
+  argument stops being true.
+- Gates:
+  - parity of every op against `git show HEAD:O1.js` on a differential fuzz that interleaves `clear()`;
+  - a forced-wrap test (`_epoch` set near 2^32 through a test hook) must keep cleared slots empty, with
+    a must-fail control that drops the wrap refill;
+  - torture 0 B/op unchanged;
+  - an O(1) `clear()` witness, plus the existing set / get / has witnesses unchanged.
+
+### P2 -- BitSet summary-guided clear
+
+- How: walk `_s1` and zero only the data words whose summary bit is set, then the `_s1` words whose
+  `_s2` bit is set, and so on up. `test` / `set` / `unset` are untouched.
+- Gates:
+  - a differential test against `fill(0)` after random set / unset sequences (an empty set, a full
+    set, one bit in the last word);
+  - a must-fail control that skips one summary level and leaves a stale bit;
+  - torture 0 B/op unchanged.
+- Do P1 and P2 in ONE burst (one coder batch on `O1.js`, one review round).
+
+### P3 -- cache-tier disclosure curve
+
+- Why: the witnesses walk keys sequentially, so the prefetcher hides misses. With random keys,
+  SparseSet `has()` got ~17x slower from 1e4 to 1e7 entries in the source run (REPORTED). The O(1)
+  claim is about operation count, not wall time across memory tiers, and the docs should say so.
+- What: a REPORTED-tier curve (never a flatness gate) with provenance (date, CPU, L2 / L3, Node,
+  load). It runs under `quiet-lock.mjs`; a noisy host is PRELIMINARY.
+- The same idea is planned in lite-lru (`../LiteLru/ROADMAP.md` section 8, R2) and lite-logn
+  (`../LiteLogN/ROADMAP.md` section 11, C4). The three can run in parallel sessions.
+
+---
+
+## 10. Research intake (2026-10-20) -- BitSet's summary beyond lite-o1  [PROPOSED, not scheduled]
+
+**Source:** `../Research/BITWISE_RESEARCH.md` section 10 (a maintainer Q&A after 1.11.2). The
+roster stays CLOSED at twenty-one. The only lite-o1 item below is a DECISION; everything else
+lands in sibling packages.
+
+| id | item | home | status |
+| --- | --- | --- | --- |
+| **Q1** | BitSet `firstClear()` / `nextClear(from)`: a second "word not full" summary per level, so the lowest free slot above 1,024 is bounded | lite-o1 BitSet (an API addition to a closed member), OR a sibling | **maintainer decision; hold for a consumer** |
+| -- | RoaringSet with a summary pyramid at both levels | lite-loglogn (`../LiteLogLogN/ROADMAP.md` section 10) | queued there |
+| -- | per-value summary index, Morton dirty bitset, 32-way min pyramid | BITWISE 10.2 H / I / J | hold, no consumer |
+
+### Q1 -- BitSet clear-bit search
+
+- **Why it comes up:** FastBit1024 `acquire()` already returns the lowest free slot up to
+  1,024. BitSet (up to 2^25) only finds SET bits. Nothing in the suite finds the lowest free
+  slot above 1,024 in bounded time.
+- **Cost:** three more summary arrays (`_c1` / `_c2` / `_c3`, the "not full" mirror of `_s1` to
+  `_s3`), and an extra summary update on every `set` / `unset` / bulk op. That taxes every user
+  of the hot path, including those who never search for clear bits. Alternative: an opt-in
+  constructor flag.
+- **Before deciding:** name a consumer. It needs more than 1,024 slots AND a reason to want the
+  LOWEST free one (deterministic compact ids for rollback / netcode, ECS entity ids, GPU slots).
+  Check LiteEcs, LiteObjectPool and LiteSoaParticleEngine. If order does not matter, a free-list
+  stack already gives O(1).
+- **If built:** the bound is O(1) only because the 2^25 cap fixes three levels. State that, as
+  the firstSet docs do. Must-fail control: a not-full summary left stale after `unset` / `or` /
+  `clear` must make `firstClear` return a set bit, or -1 while a clear bit exists. Revert-check
+  against `git show HEAD:O1.js`.
+- **Interacts with P2** (summary-guided clear, section 9): both touch BitSet's summary upkeep. Do
+  them in one burst or in strict order, never in parallel.
+
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>

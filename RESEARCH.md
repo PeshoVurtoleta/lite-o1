@@ -813,6 +813,32 @@ pass + an ADR before any milestone number. Ranked by the auditor (opinion):
 4. **Approximate membership (counting Bloom / quotient)** -- belongs to `@zakkster/lite-filter`, which
    ships CountingBloom and Quotient. NOT a lite-o1 candidate; recorded so it is not re-proposed.
 
+## 13. BitSet's summary as a general pattern (addendum 2026-10-20)
+
+The full record is `../Research/BITWISE_RESEARCH.md` section 10; the decision is
+`ROADMAP.md` section 10 (Q1). What belongs HERE is why BitSet's design generalizes, and where it
+stops.
+
+- **The pattern.** BitSet's `_s1` / `_s2` / `_s3` levels each hold one bit per child: "this
+  child is non-empty". That is an OR over the children, and it is exact. The same holds for any
+  EXISTENTIAL question: "not full" (lowest free slot), "holds value c" (a per-value index), "below
+  a FIXED threshold".
+- **Where it stops.**
+  - AND across two sets: the AND of the summaries is only a superset, so the walk is no longer
+    bounded.
+  - An arbitrary query threshold: needs min / max per block, so up to 32 compares per level.
+  - Strings: no exact bit-level test. That is Bloom-filter territory (lite-filter).
+- **The label.** BitSet's firstSet / nextSet are O(1) because the 2^25 cap fixes three levels.
+  A structure that keeps the pattern but lifts the cap is O(log_32 U), and is labelled that way.
+  1.11.2 relabelled RankSelect select from "worst-case O(1)" to bounded O(log(nbits/2048)) for the
+  same reason: the cost grew with the universe (see the `sampled-scan-not-o1` lesson).
+- **Who carries it forward:**
+  - lite-fastbit32 FastBit1024 (1,024 bits, `acquire` = lowest free);
+  - lite-loglogn RoaringSet (queued: a summary over chunk keys AND inside bitmap containers);
+  - possibly BitSet itself, via Q1.
+
+---
+
 *This document consolidates the design identity, the throughput-witness anchor, the full candidate
 roster with its explicit boundary, reference implementations, and the demo direction for the lite-o1
 project. It is an internal research reference, modeled on lite-lru/RESEARCH.md.*
