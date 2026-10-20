@@ -52,6 +52,30 @@ let drainAcc = 0;
 function drainInto(k) { drainAcc = (drainAcc + k) | 0; }
 
 /**
+ * F1 -- warm a scenario's hot() to steady optimized code INSIDE its own setup(), before the
+ * state is returned. lite-perf-gate's meterOnce warms only hot(state, min(iters, 20000)): that
+ * first call is OSR'd mid-loop before the post-loop code has any feedback, so every later call
+ * re-enters the cached OSR code and deopts at the loop exit ("Insufficient type feedback for
+ * binary operation"); gc2() then drops the OSR code, and the measured call starts unoptimized
+ * and boxes ~0.1-0.6 MB INSIDE the window until it re-tiers (--trace-gc, 3 runs, 2026-10-19,
+ * 0.1 MB precision) -- the gate trips once that plus
+ * background crosses young-gen capacity (--max-semi-space-size=4). A few LONG warm calls only
+ * repeat that OSR + deopt. Many SHORT calls run the post-loop in the interpreter first and tier
+ * hot() up by call count to non-OSR code, which survives gc2(). 1280 x 1024 = 1.31M ops (> 2^20)
+ * also reaches HierarchicalTimerWheel's first level-3 cascade (now = 2^20) and RankSelect's
+ * whole k range (~2^19) here, not in the window (the 8N window still crosses one level-3 cascade,
+ * at now = 2^21, so cascade coverage is kept -- do not "fix" that). Only state-safe scenarios call it: the warm
+ * leaves the steady regime the scenario documents (read-only loops; churn that keeps its window;
+ * 4096-op fill/drain cycles that complete, 1.31M = 320 x 4096). Never called from a mustFail.
+ */
+const WARM_CALLS = 1280;
+const WARM_OPS = 1 << 10;
+function warmHot(hot, s) {
+    for (let c = 0; c < WARM_CALLS; c++) hot(s, WARM_OPS);
+    return s;
+}
+
+/**
  * add-churn: fresh keys at capacity. add is fail-closed past capacity, so we clear()
  * (O(1), zero-alloc) the instant the set is full and keep refilling -- the set never
  * exceeds CAP and every op is a real add.
@@ -350,7 +374,7 @@ function monoFill(kind) {
  */
 const monoPushChurn = {
     name: 'MonoDeque push-churn (slide by one)',
-    setup() { return { mono: monoFill('min'), v: 0 }; },
+    setup() { return warmHot(monoPushChurn.hot, { mono: monoFill('min'), v: 0 }); },
     hot(s, n) {
         const mono = s.mono;
         let v = s.v | 0;
@@ -392,7 +416,7 @@ const monoEvict = {
 /** value-read: a primed window; every op a front-only value() + frontSeq() read, int32 acc. */
 const monoValueRead = {
     name: 'MonoDeque value + frontSeq read',
-    setup() { return { mono: monoFill('max'), acc: 0 }; },
+    setup() { return warmHot(monoValueRead.hot, { mono: monoFill('max'), acc: 0 }); },
     hot(s, n) {
         const mono = s.mono;
         let acc = s.acc | 0;
@@ -436,7 +460,7 @@ function minFill(kind) {
  */
 const minPushChurn = {
     name: 'MinStack push-churn (push + pop)',
-    setup() { return { min: minFill('min'), v: 0 }; },
+    setup() { return warmHot(minPushChurn.hot, { min: minFill('min'), v: 0 }); },
     hot(s, n) {
         const min = s.min;
         let v = s.v | 0;
@@ -458,7 +482,7 @@ const minPushChurn = {
  */
 const minPopDrain = {
     name: 'MinStack pop-drain (bulk fill then drain)',
-    setup() { return { min: new MinStack(MIN_CAP, 'min'), v: 0 }; },
+    setup() { return warmHot(minPopDrain.hot, { min: new MinStack(MIN_CAP, 'min'), v: 0 }); },
     hot(s, n) {
         const min = s.min;
         let v = s.v | 0;
@@ -479,7 +503,7 @@ const minPopDrain = {
 /** extreme-read: a primed stack; every op a front-only extreme() + peek() read, int32 acc. */
 const minExtremeRead = {
     name: 'MinStack extreme + peek read',
-    setup() { return { min: minFill('max'), acc: 0 }; },
+    setup() { return warmHot(minExtremeRead.hot, { min: minFill('max'), acc: 0 }); },
     hot(s, n) {
         const min = s.min;
         let acc = s.acc | 0;
@@ -659,7 +683,7 @@ function freqFill() {
  */
 const freqIncrementChurn = {
     name: 'FreqO1 increment-churn',
-    setup() { return { freq: freqFill(), v: 0 }; },
+    setup() { return warmHot(freqIncrementChurn.hot, { freq: freqFill(), v: 0 }); },
     hot(s, n) {
         const freq = s.freq;
         let v = s.v | 0;
@@ -681,7 +705,7 @@ const freqIncrementChurn = {
  */
 const freqPopMinDrain = {
     name: 'FreqO1 popMin-drain (bulk fill then drain)',
-    setup() { return { freq: new FreqO1(FREQ_U, FREQ_CAP), v: 0 }; },
+    setup() { return warmHot(freqPopMinDrain.hot, { freq: new FreqO1(FREQ_U, FREQ_CAP), v: 0 }); },
     hot(s, n) {
         const freq = s.freq;
         let v = s.v | 0;
@@ -1055,7 +1079,7 @@ const htwDrainCascade = {
     setup() {
         const htw = new HierarchicalTimerWheel(HTW_U, HTW_CAP);
         for (let k = 0; k < HTW_W; k++) htw.schedule(k, k & (HTW_SPREAD - 1)); // spread across level 0 + level 1
-        return { htw, rearm: (id, wheel) => { wheel.schedule(id, HTW_REARM); } };
+        return warmHot(htwDrainCascade.hot, { htw, rearm: (id, wheel) => { wheel.schedule(id, HTW_REARM); } });
     },
     hot(s, n) {
         const w = s.htw;
@@ -1124,7 +1148,7 @@ const htwForEachDrain = {
     setup() {
         const htw = new HierarchicalTimerWheel(HTW_U, HTW_CAP);
         for (let i = 0; i < 256; i++) htw.schedule(i, i & (HTW_SPREAD - 1)); // bounded resident set to scan
-        return { htw };
+        return warmHot(htwForEachDrain.hot, { htw });
     },
     hot(s, n) {
         const w = s.htw;
@@ -1192,7 +1216,7 @@ const ringLogFillChurn = {
  */
 const ringLogOverwriteChurn = {
     name: 'RingLog steady-overwrite-churn (full: push overwrites + returns evicted)',
-    setup() { return { rl: ringLogFull(), v: 0, acc: 0 }; },
+    setup() { return warmHot(ringLogOverwriteChurn.hot, { rl: ringLogFull(), v: 0, acc: 0 }); },
     hot(s, n) {
         const rl = s.rl;
         let v = s.v | 0;
@@ -1861,7 +1885,7 @@ const wfQueryRead = {
         // neither query() nor the reader promotes a heap double.
         const wf = new WindowFold(WF_CAP, 'MAX');
         for (let k = 0; k < WF_W; k++) wf.push((k * 2654435761) & 0x7fffffff);
-        return { wf, sink: 0 };
+        return warmHot(wfQueryRead.hot, { wf, sink: 0 });
     },
     hot(s, n) {
         const wf = s.wf;
@@ -1969,7 +1993,7 @@ const rsRank = {
  */
 const rsSelect = {
     name: 'RankSelect select1 (walking k)',
-    setup() { const rs = rsBuild(); return { rs, size: rs.size, k: 0, acc: 0 }; },
+    setup() { const rs = rsBuild(); return warmHot(rsSelect.hot, { rs, size: rs.size, k: 0, acc: 0 }); },
     hot(s, n) {
         const rs = s.rs;
         const size = s.size;
@@ -2182,7 +2206,7 @@ const wfuQueryRead = {
     setup() {
         const wf = new WindowFoldUint32(WFU_CAP, 'AND');
         for (let k = 0; k < WFU_W; k++) wf.push((k * 2654435761) >>> 0 & 0xffff);
-        return { wf, sink: 0 };
+        return warmHot(wfuQueryRead.hot, { wf, sink: 0 });
     },
     hot(s, n) {
         const wf = s.wf;

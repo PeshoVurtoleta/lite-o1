@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [1.11.3] - 2026-10-20
+
+Patch: documentation truth for CoarseTimerWheel's relative fire-error bound. No code change
+(O1.js differs from 1.11.2 only in comments and the VERSION const); the roster stays at twenty-one.
+
 ### Fixed
 - **CoarseTimerWheel relative fire error was documented as `<= 12.5%`; the true bound is
   `< 8/62 = 4/31 (~12.9%)`.** `schedule()` picks the finest level n whose granule-delta
@@ -21,6 +28,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   exhaustive `(now, delay)` sweep (now in [0, 1024), delay in [1, 33000)), a deterministic
   200,000-pair sample over every level, the analytic worst case at every level 1..8 (tight), and
   a doc-truth check that no shipped doc (package.json `files[]` + GUIDE) still claims 12.5%.
+
+### Internal
+
+- **Perf-gate warm-up flake fixed (test-only, repo-only file).** `test/perf/PerfGate.test.mjs`
+  flaked 102/103 (WindowFoldUint32 query-read: 1 scavenge at 8N). Cause: lite-perf-gate warms
+  only `hot(state, min(iters, 20000))`. `hot()` is OSR'd mid-loop, the post-loop code deopts for
+  missing type feedback, and `gc2()` drops the OSR code, so the measured window started
+  unoptimized and boxed ~0.1-0.6 MB. A new `warmHot()` helper runs 1280 short `hot()` calls of
+  1024 ops each inside the `setup()` of 13 state-safe scenarios. Those windows went from
+  0.2-0.6 MB to 0.0 MB (`--trace-gc`, 3 runs each, before and after). No gate threshold, `N`,
+  `k`, `hot()` body or must-fail control changed. Injected per-op allocations in
+  `WindowFoldUint32.query`, `MinStack.extreme`, `HierarchicalTimerWheel.advance` and
+  `MinStack.pop` are still caught.
 
 ## [1.11.2] - 2026-10-19
 

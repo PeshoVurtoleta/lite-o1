@@ -16,8 +16,8 @@ import { RankSelect, VERSION } from '../O1.js';
 
 const litO1 = (e) => e instanceof Error && /^\[lite-o1]/.test(e.message);
 
-test('VERSION is the frozen 1.11.2 string', () => {
-    assert.equal(VERSION, '1.11.2');
+test('VERSION is the frozen 1.11.3 string', () => {
+    assert.equal(VERSION, '1.11.3');
 });
 
 // A deterministic Numerical-Recipes LCG (never Math.random -- reproducible vectors).
