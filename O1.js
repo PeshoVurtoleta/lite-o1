@@ -4392,11 +4392,16 @@ function _cwFirstSetGE(lo, hi, start) {
  * the suite's witnessed-flat identity (see decisions/0022).
  *
  * GEOMETRY: 9 levels x 64 buckets, per-level clock shift 3n (granularity g_n = 8^n): L0 = 1
- * (EXACT), L1 = 8, ..., L8 = 2^24. A level n is reached only by delays >= 8 x g_n, so the
- * worst-case relative error is (g_n - 1) / (8 x g_n) < 1/8 = 12.5% -- one-sided (late),
- * matching Linux; L0 is exact. Horizon MAX_DELAY = 62 x 2^24 (~0.97 x 2^30); the tick clock
- * is capped at 2^53. The horizon is a phase margin below the full 2^30 L8 span so the top
- * level never overflows its 64 buckets (see the COARSEWHEEL_MAX_DELAY note).
+ * (EXACT), L1 = 8, ..., L8 = 2^24. A level n >= 1 is reached only when level n-1's granule-delta
+ * exceeds 63, i.e. by delays >= 62 x g_{n-1} + 2 (NOT 64 x g_{n-1}: the 63-granule window can
+ * open one tick before a granule boundary), so the worst-case relative error is
+ * (g_n - 1) / (62 x g_{n-1} + 2) < 8/62 = 4/31 (~12.9%) -- one-sided (late); L0 is exact. The
+ * bound is tight: now = 2 x g_{n-1} - 1, delay = 62 x g_{n-1} + 2 is exactly g_n - 1 late
+ * (12.9032% at L8). Only 64 buckets per level are available, so a 12.5% bound (delta 64-65)
+ * would alias the current or next bucket and could fire up to 64 granules EARLY. Horizon
+ * MAX_DELAY = 62 x 2^24 (~0.97 x 2^30); the tick clock is capped at 2^53. The horizon is a
+ * phase margin below the full 2^30 L8 span so the top level never overflows its 64 buckets
+ * (see the COARSEWHEEL_MAX_DELAY note).
  *
  * FIRE-TIME BOUND (strict, one-sided, never-early -- round-up-then-verify select). schedule
  * ROUNDS the deadline (now + delay) UP to the finest level granularity whose granule-delta

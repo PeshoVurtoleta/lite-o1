@@ -49,9 +49,15 @@ That is a new concession -- every prior member is exact -- so it is a docs HEADL
    so escalation never falls off L8 and drain / peekNext / advance stay pure-bitmap worst-case
    O(1) (no `_fireAt` bucket scan). This is exactly Linux 4.8's `WHEEL_TIMEOUT_MAX = CUTOFF -
    LVL_GRAN(top)` -- it subtracts a coarse-granule phase margin from the full span for the same
-   reason. A level n is reached only by delays >= 8 x gran(n) (the prior level covers up to
-   64 x gran(n-1) = 8 x gran(n)), so the worst-case relative error is (gran(n) - 1) /
-   (8 x gran(n)) < 1/8 = **12.5%**, matching Linux. L0 is exact.
+   reason. A level n >= 1 is reached when level n-1's granule-delta exceeds 63, i.e. by delays
+   >= 62 x gran(n-1) + 2 (the 63-granule window can open one tick before a granule boundary),
+   so the worst-case relative error is (gran(n) - 1) / (62 x gran(n-1) + 2) < 8/62 = 4/31
+   (**~12.9%**). L0 is exact. *Amended 2026-10-20:* this record originally said "reached only
+   by delays >= 8 x gran(n)" and "< 1/8 = 12.5%, matching Linux"; that was wrong for this
+   select. The bound is tight: now = 2 x gran(n-1) - 1, delay = 62 x gran(n-1) + 2 fires exactly
+   gran(n) - 1 late (12.8715% at L3, 12.9032% at L8). Restoring 12.5% would need level n-1 to
+   accept a delta of 64-65 > 63, which aliases the current or next bucket and can fire up to 64
+   granules EARLY, so the bound was corrected in the docs and the code is unchanged.
 
 3. **FIRE-TIME BOUND: strict, one-sided, never-early -- via round-up-then-verify select.** A
    timer scheduled at delay d fires at a tick in `[expected_bucket_start, expected_bucket_start
@@ -94,7 +100,7 @@ levels/buckets (<= 9) independent of n and of the delay. Because there is NO cas
 is NO O(levels+bucket) spike, so -- unlike HierarchicalTimerWheel -- CoarseTimerWheel prints
 **NO max-single-op line** (it joins TimerWheel / SparseTable / BitSet in the worst-case
 cohort). The disclosed co-headline is NOT a build cost or a space cost but the bounded
-**fire-time error** (<= 12.5%, one-sided-late, L0 exact).
+**fire-time error** (< 8/62 ~= 12.9%, one-sided-late, L0 exact).
 
 ## Layout
 
