@@ -764,12 +764,369 @@ cohort; the O(n) build + 2n typed-array space are the honest co-headline).
 
 ## Roadmap members (not yet shipped, planned)
 
-The public API is stable at v1.11.3's twenty-one members; these are planned, not shipped.
-Placeholders so the decision axes are visible early; each fills in on release.
+None. The roster is CLOSED at v1.11.3's twenty-one members. SlotPool, the last placeholder
+here, is NOT a lite-o1 member: a free-list slot allocator with generational (ABA-safe)
+handles is owned by `@zakkster/lite-arena` (a component-free `Arena` is exactly that pool),
+see [`decisions/0021`](./decisions/0021-slotpool-rejected.md). The last recipe below shows
+how to use it.
 
-- **SlotPool** -- free-list slot allocator with generational (ABA-safe) handles.
-  Reach for it as the SoA substrate; reconcile against `@zakkster/lite-arena`
-  before picking one.
+---
+
+## Recipes (composing lite-o1 with sibling packages)
+
+Recipes are code you copy into YOUR project. They are not members: lite-o1 itself stays
+zero-dependency, so it never imports a sibling, and a recipe that does lives in your code.
+Each recipe below was checked once, as written, against the source of lite-o1 1.11.3,
+lite-fastbit32 1.5.0 and lite-arena 1.10.0, including bad-input and stale-handle cases.
+That check is not a gate in this repo: re-check a recipe when a sibling it uses changes.
+
+### First: do you need a wheel at all? (deadline on read)
+
+A wheel earns its place when expiry must DO something at the moment it happens: return a
+slot to a pool, despawn an entity, fire an event, or keep a count / flag word / BitSet exact
+so a mask query stays one AND. If all you ever ask is "is it still on?", store a deadline
+and compare on read. That needs no `tick()`, no drain contract, no delay ceiling, and it
+works with real time (`performance.now()`) as well as ticks:
+
+```js
+export class DeadlineFlags {
+    constructor(n) {
+        this._until = new Float64Array(n).fill(-Infinity); // -Infinity = never set
+    }
+
+    _check(bit) {
+        // A typed array silently DROPS a store to a bad index (40, -1, 1.5): fail closed instead.
+        if (typeof bit !== 'number' || (bit >>> 0) !== bit || bit >= this._until.length) {
+            throw new RangeError('DeadlineFlags: bad bit: ' + String(bit));
+        }
+    }
+
+    /** On until `now + ttl` (exclusive). A NaN deadline reads as off, never as on. */
+    set(bit, now, ttl) {
+        this._check(bit);
+        // typeof, not coercion: '1000' + 50 is '100050', and null + 50 is 50.
+        if (typeof now !== 'number' || typeof ttl !== 'number') {
+            throw new RangeError('DeadlineFlags: now and ttl must be numbers');
+        }
+        this._until[bit] = now + ttl;
+        return this;
+    }
+    clear(bit) { this._check(bit); this._until[bit] = -Infinity; return this; }
+
+    /** Bad bit or non-number now -> false (null < deadline would read as ON). */
+    has(bit, now) {
+        return typeof bit === 'number' && typeof now === 'number' &&
+            now < (this._until[bit] ?? -Infinity);
+    }
+}
+```
+
+What it costs instead:
+
+- **Nothing happens at expiry.** An expired entry stays until someone reads it; there is no
+  callback and no reclaim, so it cannot drive a pool or an event.
+- **Counts and masks are per-entry.** "How many are on?" or "are bits A, B and C all on?" is
+  one compare per entry, O(n) or O(bits in the mask), not one popcount or one AND.
+- **Pick it for**: cooldowns, buffs, invulnerability windows and rate-limit stamps that are
+  only checked when they matter. Pick a wheel (below) for everything in the first sentence
+  of this section.
+
+For delays past a wheel's `slots`, use `HierarchicalTimerWheel` (exact fire, delay < 2^26,
+amortized O(1) with a periodic cascade) or `CoarseTimerWheel` (approximate fire, near-unbounded
+horizon). For exact fire at any horizon, key `@zakkster/lite-logn`'s indexed `BinaryHeap` by
+deadline (push / pop / remove / changeKey all O(log n)); it is a heap, not a ready-made timer
+queue.
+
+### Expiring flags (TimerWheel + lite-fastbit32's FastBit32)
+
+Up to 32 flags, each with its own time-to-live: a buff, a cooldown, an "invulnerable for
+N frames" bit. The timer id IS the bit index, and a bit is set in the word if and only if
+its timer is pending.
+
+```js
+import { TimerWheel } from '@zakkster/lite-o1';
+import { FastBit32 } from '@zakkster/lite-fastbit32';
+
+export class TimedFlags {
+    constructor(slots = 64) {
+        this._wheel = new TimerWheel(32, slots);  // timer id = bit index, so universe = 32
+        this._bits = new FastBit32();             // mirror: bit set <=> wheel.has(bit)
+        this._expire = (bit) => { this._bits.remove(bit); }; // made once, not per tick
+    }
+
+    /** Set `bit` until it expires `delay` ticks from now (0 = cleared by the next tick()). */
+    set(bit, delay) {
+        // Check delay BEFORE cancel: a throw after cancel would strand the bit in the word.
+        if (typeof delay !== 'number' || (delay >>> 0) !== delay || delay >= this._wheel.slots) {
+            throw new RangeError('TimedFlags: bad delay: ' + String(delay));
+        }
+        this._wheel.cancel(bit);          // reschedule = cancel + schedule
+        this._wheel.schedule(bit, delay); // throws on bit > 31 before the word is touched
+        this._bits.add(bit);              // only reached with a validated bit
+        return this;
+    }
+
+    /** Clear `bit` now. A bad or unset bit is a no-op that returns false. */
+    clear(bit) {
+        if (!this._wheel.cancel(bit)) return false;
+        this._bits.remove(bit);
+        return true;
+    }
+
+    has(bit) { return this._wheel.has(bit); }           // bad bit -> false, never aliases
+    hasAll(mask) { return this._bits.hasAll(mask); }    // whole-mask queries: one AND
+    hasAny(mask) { return this._bits.hasAny(mask); }
+    get value() { return this._bits.value; }
+    get size() { return this._wheel.size; }
+
+    /** One tick: expire what is due, then step the clock. */
+    tick() {
+        this._wheel.drainDue(this._expire);
+        this._wheel.advance(1);
+    }
+
+    reset() { this._wheel.clear(); this._bits.clear(); }
+}
+```
+
+What makes it correct (each line is a bug an obvious version has):
+
+- **One timer per BIT, not per owner.** Key the timers by an owner id over one shared
+  word and every flag shares one timer: setting flag B reschedules flag A, and when it
+  fires, one callback has to clear the whole word.
+- **`schedule` before `add`.** FastBit32 does not range-check: `add(40)` computes
+  `1 << 40`, which is `1 << 8`, and silently sets bit 8. The wheel's universe of 32 rejects
+  bit 40 first, so the word is never touched. For the same reason `has` and `clear` go
+  through the wheel (`has(40)` is `false`, `clear(40)` is a no-op), and only whole-mask
+  queries read the word.
+- **The expiry callback is made once**, in the constructor. `drainDue(id => ...)` inside
+  `tick()` allocates a closure every tick.
+- **`tick()` is drain, then `advance(1)`.** `advance(n)` throws if it would pass a slot that
+  still holds a timer (drain-before-advance), so to step `n` ticks, call `tick()` `n` times.
+- **Timing.** A flag set with delay `d` reads `has() === true` for the next `d` ticks and
+  is cleared by the `(d + 1)`-th `tick()`. `delay` is an integer in `[0, slots - 1]`; the
+  wheel rounds `slots` up to a power of two (read it back from `wheel.slots`).
+- **Named flags.** Resolve a `BitMapper` name once at setup
+  (`const BURNING = names.get('burning')`) and pass the number; `get` is a `Map` lookup that
+  throws on an unknown name.
+- **No mirror class needed.** `TimerWheel` already answers `has(id)`, `size` and
+  `forEach(fn)` over the live timers.
+
+### Expiring flags per owner (TimerWheel + a Uint32Array)
+
+The same idea for many entities, 32 flags each: timer id `owner * 32 + bit`, one 32-bit
+word per owner.
+
+```js
+import { TimerWheel } from '@zakkster/lite-o1';
+
+function badArg(name, v) {
+    throw new RangeError('TimedOwnerFlags: bad ' + name + ': ' + String(v));
+}
+
+export class TimedOwnerFlags {
+    constructor(owners, slots = 64, capacity = owners * 32) {
+        this._words = new Uint32Array(owners);             // one 32-flag word per owner
+        this._wheel = new TimerWheel(owners * 32, slots, capacity); // id = owner * 32 + bit
+        this._expire = (id) => { this._words[id >>> 5] &= ~(1 << (id & 31)); };
+    }
+
+    set(owner, bit, delay) {
+        // Validate BOTH halves: owner * 32 + 40 is a valid id -- bit 8 of the NEXT owner.
+        if (typeof bit !== 'number' || (bit >>> 0) !== bit || bit > 31) badArg('bit', bit);
+        if (typeof owner !== 'number' || (owner >>> 0) !== owner) badArg('owner', owner);
+        if (typeof delay !== 'number' || (delay >>> 0) !== delay || delay >= this._wheel.slots) badArg('delay', delay);
+        const id = owner * 32 + bit;
+        this._wheel.cancel(id);
+        this._wheel.schedule(id, delay);   // throws on owner >= owners or a full wheel, before the word is touched
+        this._words[owner] |= 1 << bit;
+        return this;
+    }
+
+    clear(owner, bit) {
+        if (typeof bit !== 'number' || (bit >>> 0) !== bit || bit > 31) return false;
+        if (typeof owner !== 'number' || (owner >>> 0) !== owner) return false;
+        const id = owner * 32 + bit;
+        if (!this._wheel.cancel(id)) return false;
+        this._words[owner] &= ~(1 << bit);
+        return true;
+    }
+
+    /** The owner's flag word (unsigned); 0 for an owner out of range. */
+    word(owner) { return typeof owner === 'number' ? this._words[owner] ?? 0 : 0; }
+
+    tick() {
+        this._wheel.drainDue(this._expire);
+        this._wheel.advance(1);
+    }
+
+    reset() { this._wheel.clear(); this._words.fill(0); }
+}
+```
+
+- **Validate the bit AND the owner yourself.** Here the wheel cannot do it: `owner * 32 + 40`
+  is a legal id (bit 8 of the next owner), and so is `1.5 * 32 + 0`. Only the combined id's
+  upper bound is the wheel's to check.
+- **Validate the delay before `cancel`** (both flag recipes). A reschedule cancels first; if
+  `schedule` then threw on a bad delay, the bit would stay set with no timer to clear it.
+- **Size it.** The wheel keeps one `Uint32Array` entry per possible id (`owners * 32`), plus
+  four per unit of `capacity` (the most timers live at once), all allocated up front. Pass
+  a smaller `capacity` when only a few flags are ever live at once.
+
+### Expiring flags at any width (TimerWheel + BitSet, lite-o1 only)
+
+One flag per entity, for thousands of entities: "stunned", "recently hit", "dirty". Same
+idea, timer id = bit index, but both pieces are lite-o1 members, so there is no sibling
+import, and BitSet range-checks every index itself.
+
+```js
+import { TimerWheel, BitSet } from '@zakkster/lite-o1';
+
+export class TimedBitSet {
+    constructor(nbits, slots = 64, capacity = nbits) {
+        this._bits = new BitSet(nbits);                    // bit set <=> wheel.has(bit)
+        this._wheel = new TimerWheel(nbits, slots, capacity); // same index range as the BitSet
+        this._expire = (bit) => { this._bits.unset(bit); };
+    }
+
+    /** Set `bit` until it expires `delay` ticks from now (0 = cleared by the next tick()). */
+    set(bit, delay) {
+        // Check delay BEFORE cancel: a throw after cancel would strand the bit.
+        if (typeof delay !== 'number' || (delay >>> 0) !== delay || delay >= this._wheel.slots) {
+            throw new RangeError('TimedBitSet: bad delay: ' + String(delay));
+        }
+        this._wheel.cancel(bit);
+        this._wheel.schedule(bit, delay); // throws on bit >= nbits or a full wheel
+        this._bits.set(bit);              // same range check as the wheel: cannot throw here
+        return this;
+    }
+
+    /** Clear `bit` now. A bad or unset bit is a no-op that returns false. */
+    clear(bit) {
+        if (!this._wheel.cancel(bit)) return false;
+        this._bits.unset(bit);
+        return true;
+    }
+
+    has(bit) { return this._bits.test(bit); }      // bad bit -> false
+    firstSet() { return this._bits.firstSet(); }   // -1 when none
+    nextSet(from) { return this._bits.nextSet(from); }
+    /** fn(bit) per live flag, ascending. Not BitSet.forEach: that passes the BitSet as arg 2. */
+    forEach(fn) {
+        const b = this._bits;
+        for (let i = b.firstSet(); i !== -1; i = b.nextSet(i + 1)) fn(i);
+    }
+    get size() { return this._wheel.size; }        // O(1); BitSet.popcount() is O(words)
+
+    /** out = (live flags) AND other. `out` and `other` are BitSets of the same nbits. */
+    intersectInto(out, other) {
+        const n = this._bits.capacity;
+        // Check everything BEFORE writing `out`, so a bad call leaves it untouched.
+        if (!(out instanceof BitSet) || !(other instanceof BitSet) ||
+            out.capacity !== n || other.capacity !== n) {
+            throw new RangeError('TimedBitSet: intersectInto needs two BitSets of capacity ' + n);
+        }
+        if (out === other) return out.and(this._bits); // aliased: clear() would wipe `other`
+        return out.clear().or(this._bits).and(other);
+    }
+
+    tick() {
+        this._wheel.drainDue(this._expire);
+        this._wheel.advance(1);
+    }
+
+    reset() { this._wheel.clear(); this._bits.clear(); }
+}
+```
+
+- **Never hand out the inner BitSet.** Its `and` / `or` / `clear` work in place, so a caller
+  holding it could clear a bit whose timer is still pending, or set one with no timer.
+  Combine through `intersectInto(out, other)` instead, into a scratch BitSet you reuse:
+  `stunned.intersectInto(scratch, visible)` gives "stunned AND visible" with no allocation.
+- **Cost.** Per-bit `set` / `clear` / `has` stay O(1); `tick()` is O(1) plus O(1) per bit
+  expiring on it (`drainDue` is O(due)). `intersectInto` is
+  O(nbits / 32) (BitSet's bulk ops scan the words); `forEach` is O(set bits).
+- **Size it.** The wheel's sparse column is one `Uint32Array` entry per bit, plus four per
+  unit of `capacity`; the BitSet is about one bit per bit. Lower `capacity` when only a few
+  flags are live at once.
+
+### A pool whose slots expire (TimerWheel + lite-arena's Arena)
+
+A fixed pool of slots that return themselves after a time-to-live: projectiles, pooled
+effects, leases. Do NOT build this on plain slot indexes (for example lite-fastbit32's
+`FastBit1024` `acquire` / `release`): once slot 5 expires and is handed out again, a caller
+still holding the old `5` releases the NEW occupant. lite-arena's handles carry a
+generation, so a stale handle is refused.
+
+```js
+import { TimerWheel } from '@zakkster/lite-o1';
+import { Arena } from '@zakkster/lite-arena';
+
+export class TimedPool {
+    constructor(capacity, slots = 128) {
+        this._arena = new Arena(capacity);                 // generational handles
+        this._wheel = new TimerWheel(capacity, slots);     // timer id = slot index
+        this._handleOf = new Int32Array(capacity);         // Int32: handles can be negative
+        this._mask = this._arena.indexMask;
+        this._expire = (i) => { this._arena.despawn(this._handleOf[i]); };
+    }
+
+    /** A live handle that despawns itself `delay` ticks from now, or -1 when no slot is free. */
+    acquire(delay) {
+        // Validate BEFORE spawn so a bad delay cannot leak a live slot with no timer.
+        if (typeof delay !== 'number' || (delay >>> 0) !== delay || delay >= this._wheel.slots) {
+            throw new RangeError('TimedPool: delay out of range [0, ' + (this._wheel.slots - 1) + ']: ' + String(delay));
+        }
+        if (this._arena.remainingCapacity() === 0) return -1;
+        const h = this._arena.spawn();
+        const i = h & this._mask;
+        this._handleOf[i] = h;
+        this._wheel.schedule(i, delay);
+        return h;
+    }
+
+    /** Early release. A stale handle (already expired, slot reused) returns false and touches nothing. */
+    release(h) {
+        if (typeof h !== 'number' || (h | 0) !== h) return false; // no coercion to a live handle
+        if (!this._arena.isAlive(h)) return false;
+        this._wheel.cancel(h & this._mask);
+        return this._arena.despawn(h);
+    }
+
+    isAlive(h) { return typeof h === 'number' && (h | 0) === h && this._arena.isAlive(h); }
+    get size() { return this._arena.activeCount; }
+
+    tick() {
+        this._wheel.drainDue(this._expire);
+        this._wheel.advance(1);
+    }
+
+    /** Empty the pool. Drop every handle you hold first: clear() re-issues old generations,
+     *  so a pre-clear handle can alias a later acquire (lite-arena ADR 0004). */
+    clear() { this._wheel.clear(); this._arena.clear(); }
+}
+```
+
+- **The timer id is the slot index** (`handle & arena.indexMask`), and `_handleOf` maps it
+  back to the live handle. It is an `Int32Array` because a handle whose generation is 2048
+  or more is negative: lite-arena keeps handles signed int32 (its `spawn()` explains why
+  it never returns `>>> 0` handles).
+- **`release` checks `isAlive` first and cancels the timer**, so an early release can never
+  be followed by a second despawn when the timer would have fired.
+- **`-1` means full.** It is never a valid handle (its index part, `0xFFFFF`, is never
+  issued).
+- **The generation budget is finite.** Each slot has 4095 lifetimes and is then RETIRED
+  for good (lite-arena's fail-closed rollover, its ADR 0001), so the pool as a whole has
+  `capacity x 4095` acquires. A TTL pool churns, and lite-arena reuses the most recently
+  freed slot first, so the same few slots take most of the churn: watch
+  `arena.retiredCount`, and `clear()` the pool between levels or sessions (it revives every
+  retired slot). Once every slot has retired, `acquire` returns `-1` even with nothing live.
+  Drop every held handle at `clear()`: a handle kept across it can alias a new occupant.
+- **Handles are checked as exact int32 numbers.** `isAlive` and `release` reject a string,
+  a fraction or `h + 2**32` instead of letting the `&` / `>>>` in lite-arena coerce them
+  into a live handle.
+- **Components make expiry heavier.** If you register components on the arena, `despawn`
+  (and so each expiry) is O(registered components), not O(1).
 
 ---
 
