@@ -848,4 +848,62 @@ lands in sibling packages.
 - **Interacts with P2** (summary-guided clear, section 9): both touch BitSet's summary upkeep. Do
   them in one burst or in strict order, never in parallel.
 
+---
+
+## 11. Research intake (2026-11-01) -- BitSet borrows from FastBit1024 / StratifiedBitset  [PROPOSED, not scheduled]
+
+**Source:** a maintainer-supplied outside review, checked against `O1.js` at 1.11.3 and
+`../LiteFastBit32/FastBit32.js` (verification notes: `../LiteLogLogN/RESEARCH.md` section 15). The
+roster stays CLOSED at twenty-one. P4-P6 are internal (no new API); Q2 is an API addition, so it is
+a decision. Sequencing as section 9 (lite-signal 1.6.0 first).
+
+| id | item | where (checked 2026-11-01 at 1.11.3) | size | SETTLE FIRST |
+| --- | --- | --- | --- | --- |
+| **P4** | `_s4` root scalar over `_s3` (FastBit1024 `_active` parity) | `_firstWordFrom` top loop `O1.js:4055`; `_markNonEmpty` / `_markEmpty` `:3993-4024`; `_rebuildSummary` `:4071` | tiny | none |
+| **P5** | O(1) `size` via an `_n` counter (FastBit1024 `_n` parity) | `get size()` `:3766`; `set` / `unset` / `toggle` `:3789-3857`; bulk ops `:3893-3943` | small | the `set` hot-path cost (A/B, STATISTICAL tier) |
+| **P6** | summary-guided bulk ops: `and` / `andNot` walk this set's non-empty words, `or` / `xor` walk the other's, summaries patched incrementally | `:3893-3943`, `_rebuildSummary` `:4071` | medium | worth it only for sparse operands; same worst case |
+| **Q2** | `lastSet()` / `prevSet(from)`: the mirror of firstSet / nextSet (FastBit32 `prevSetBit` parity) | new methods | small | **maintainer decision** (API addition to a closed member; no hot-path tax) |
+
+### P4 -- a one-word root over `_s3`
+
+- What it fixes: `_firstWordFrom` scans the remaining `_s3` words in a loop. Counted from the code,
+  worst-case `nextSet` reads <= 38 typed-array words today and <= 9 with `_s4` (one field read
+  replaces the loop). Only for nbits > 2^20: below that `_s3` is one word and the loop never runs.
+  The worst-case O(1) claim already holds; this is a constant factor. (The outside claim "35 -> 4"
+  was wrong.)
+- Upkeep: one more propagation step in `_markNonEmpty` / `_markEmpty` (only when an `_s3` word
+  flips), one more line in `_rebuildSummary` and `clear()`. Update the firstSet / nextSet JSDoc
+  ("a fixed <= 32-word top scan" -> a 4-level descent).
+- Gates: differential vs `git show HEAD:O1.js` at nbits in {2^20, 2^20 + 1, 2^25}; a must-fail
+  control that leaves `_s4` stale after `unset`; torture 0 B/op unchanged; a deterministic read
+  count if the witness can carry one.
+
+### P5 -- O(1) size
+
+- `set` / `unset` already branch on a real change, so `_n++` / `_n--` goes inside that branch;
+  `toggle` adds or subtracts by the new bit; `clear()` sets 0; the bulk ops recount inside the loop
+  they already run. `size` becomes O(1); `popcount()` stays as the O(words) cross-check.
+- Gates: `size === popcount()` after every step of a fuzz that mixes single-bit and bulk ops, with a
+  must-fail control that skips the update in `toggle`; the `set` A/B under `quiet-lock`.
+
+### P6 -- summary-guided bulk ops
+
+- Bound: O(non-empty words of the driving operand + summary), worst case still O(words). Pays off
+  for sparse sets; dense sets gain nothing and lose the flat loop's simplicity.
+- Risk: a stale summary after a bulk op silently corrupts `firstSet` -- the reason the summary is
+  rebuilt today. Gate: differential vs the current flat implementation on random, empty, full and
+  one-bit operands, with a must-fail control that skips one patch.
+- Do P2, P4, P5 and P6 in ONE burst (they all touch summary upkeep), never in parallel with Q1.
+
+### Q2 -- reverse cursor
+
+- `lastSet()` / `prevSet(from)` with the same bounded descent (after P4: <= 9 reads). Returns -1 on
+  a bad / absent index and never throws (the query contract). No upkeep cost. Name a consumer, or
+  accept it for symmetry.
+
+**Rejected:** a facade that swaps BitSet <-> lite-loglogn StratifiedBitset by density (both
+preallocate O(nbits / 32), so a swap saves nothing and allocates after construction).
+**Elsewhere:** the PagedBitset hybrid (StratifiedBitset directory + pooled FastBit1024 pages) is
+lite-loglogn's (`../LiteLogLogN/ROADMAP.md` section 10, D-R5).
+
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
