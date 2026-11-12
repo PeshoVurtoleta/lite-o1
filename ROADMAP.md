@@ -907,3 +907,50 @@ preallocate O(nbits / 32), so a swap saves nothing and allocates after construct
 lite-loglogn's (`../LiteLogLogN/ROADMAP.md` section 10, D-R5).
 
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>
+
+## LiteBisect adoption lead (note added 2026-11-12 from the LiteBisect orchestrator; a LEAD, not a plan)
+
+`@zakkster/lite-bisect` (../LiteBisect) ships per-type sorted-array search kernels for Float64Array,
+Float32Array, Uint32Array, Uint16Array and Int32Array, each called as `(a, lo, hi, x)` on a sub-range:
+lowerBound / upperBound in a branchless and a branchy form, lowerBoundHint (gallops from the previous
+answer; coherent query streams only), segment (upper - 1), nearest (tie -> lower index), and cold
+assertRange / assertSorted. Status: 1.0.0 NOT released yet (its P3: the STATISTICAL A/B and a week of
+green nightly CI come first). Inventory and plan: ../LiteBisect/ROADMAP.md sections 2 and 8 (P2 adoption).
+
+Sites here (LiteBisect inventory 2026-11-10; re-checked 2026-11-12):
+- RankSelect (O1.js:5455): upper bound on a Uint32Array, with a linear scan in front for hi - lo <= 16.
+  Fit: upperBoundBranchlessU32. LiteBisect dropped its own linear front (its R-1 measured the length
+  switch SLOWER at n = 1..8); drop this one only after this package's own A/B.
+- O1.js:5508: a computed key. No fit.
+- EliasFano.nextGEQ (O1.js:5767): reads through `_readLow(i)`, not a plain array. No fit (LiteBisect R-6).
+
+Rules if this is ever picked up:
+- Adoption is this package's own reviewed change, with its own A/B that times the consumer, not the
+  search alone (LiteBisect LEDGER law 1). Start only after lite-bisect 1.0 is on npm.
+- Suite law: zero runtime deps. Using lite-bisect at runtime needs a maintainer decision first
+  (peerDependency, or a copied kernel pinned by sha); ask before adding it.
+- A site whose result feeds a write (splice / copyWithin) stays branchy unless measured: LiteBisect's
+  P3 A/B read branchless SLOWER there (PRELIMINARY: one Apple M4 Pro, claims review pending).
+- LiteBisect's speed evidence covers n <= 65,536 Float64 (powers of two); larger arrays are unmeasured.
+
+## BitSet counting forms and clear-bit search (note added 2026-11-12 from the lite-fastbit32 orchestrator; a LEAD, not a plan)
+
+Source: a maintainer-supplied "bit-hack families" list, triaged against the suite's three bitsets on 2026-11-12.
+BitSet (checked at HEAD eaa46e3, `O1.js:3739`) has `test / set / unset / toggle`, `firstSet / nextSet`, in-place
+`and / or / xor / andNot`, `popcount`, `setAll`, `clear` and `forEach`.
+
+- **Q3 (candidate): counting forms without a result set.** `intersects(other)` / `intersectionSize(other)` /
+  `unionSize(other)` / `differenceSize(other)` plus the symmetric-difference count. Today a count means `and()`
+  into a copy, which allocates or destroys an operand. BitSet's own use list names permission bitmaps, where
+  "any overlap?" / "how many shared?" are the usual questions. Cost: O(words), 0 B/op, capacity-match-or-throw
+  like the bulk ops. Use lite-loglogn RoaringSet's names (FastBit1024 already does).
+  - Name Q-XSZ, cross-package: `symmetricDifferenceSize` vs `xorSize`. Rule it ONCE with lite-loglogn RoaringSet R2
+    and the lite-fastbit32 1.8.0 intake; both ROADMAPs carry the same note.
+- **Q4 (candidate, consumer-gated): `firstClear()` / `nextClear(from)`** (java.util.BitSet `nextClearBit`).
+  Without it BitSet cannot hand out free slots. O(1) like `nextSet` needs a second summary of the words that are
+  not full (FastBit1024 keeps `_full` for this), so every `set` / `unset` pays more upkeep. That is a design
+  change: only with a named slot-allocator consumer.
+- **Not for BitSet:** rank / select (kept in the frozen `RankSelect` by design, zero coupling), PEXT / PDEP,
+  Morton, SWAR word functions, and a multi-word `findClearRun(k)`. lite-fastbit32 verified only the one-word
+  kernel; a run that crosses words needs a carry between neighbour words, which is not designed.
+- Sequencing: as section 9 / section 11; Q3 sits with P4-P6 (they touch the same bulk-op loops).
