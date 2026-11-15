@@ -954,3 +954,36 @@ BitSet (checked at HEAD eaa46e3, `O1.js:3739`) has `test / set / unset / toggle`
   Morton, SWAR word functions, and a multi-word `findClearRun(k)`. lite-fastbit32 verified only the one-word
   kernel; a run that crosses words needs a carry between neighbour words, which is not designed.
 - Sequencing: as section 9 / section 11; Q3 sits with P4-P6 (they touch the same bulk-op loops).
+
+## RingLog / RingDeque bulk ops (note added 2026-11-15 from the lite-ring-buffer orchestrator; a LEAD, not a plan)
+
+Source: lite-ring-buffer 1.3.0-1.5.0 shipped `copyTo` (0 B at every size), `pushBatch` and `copyLast` / `copyLastFast`
+over the same head + count, power-of-two-mask ring layout. Checked at HEAD (2026-11-15): `RingDeque` (`O1.js:212`)
+and `RingLog` (`O1.js:2932`) have no bulk op; reads are single-value plus `forEach` / the iterator (RingDeque has no
+`get(i)`). Both store ONE Float64Array (lite-ring-buffer stores Float32).
+
+- **RingLog (candidate):** `copyTo(dst, off?)` (oldest-first snapshot into a reused Float32Array / Float64Array, 0 B)
+  and `copyLast(dst, off, n)` (the newest n; "keep the last N" is RingLog's whole use). `pushBatch(src, off?, n?)` is
+  weaker here: `push` rejects NaN (`O1.js:2973`), so a batch must validate every element BEFORE the first store
+  (fail closed, nothing written), which rules out jumping straight to an intrinsic `set` and shrinks the gain over a
+  push loop; and `push` returns the evicted value (the rolling-aggregate hook), which a batch that returns a count
+  cannot give. Measure before proposing it.
+- **RingDeque (candidate):** `copyTo` (front-to-back snapshot), `pushBackBatch` (all-or-nothing is natural: check
+  `count + n <= capacity` up front, then write), and a bulk `popFront` into a buffer ("drain n" = copy + head advance;
+  a deque IS a queue, unlike lite-ring-buffer, which refuses queue semantics). A bulk `pushFront` has no named use.
+- **Claim tier:** every bulk op is O(n). Disclose it as a co-headline like BitSet's O(words) bulk ops; it is not the
+  member's O(1) claim. 0 B/op is gated in torture as usual.
+
+Lessons to carry (lite-ring-buffer LEDGER, read it before the planner pass):
+- A hot body under ~460 B of bytecode with cold paths split into helpers, and the caller's CUMULATIVE inlining budget
+  (~767 B on Node v26.8.2 / V8 14.6): copyLast(count) ran 1.17x / 1.52x slower than copyTo only because its chain
+  was 791 B (LEDGER A15, D13 -- time the consumer, not the bodies).
+- One store site per element family: a shared site goes megamorphic past 4 `dst` hidden classes and boxes every
+  non-integer (B8). A `subarray` view costs 104 B; each intrinsic `buffer` getter read ~4-5 ns.
+- A `dst` / `src` that shares the ring's ArrayBuffer must throw (RangeError, nothing written); 1.2.1 corrupted a
+  wrapped ring silently. Read storage identity every call (A12).
+- With Float64 storage the `set` fast path fits a Float64 src / dst; Float32 needs the per-family loop.
+- Run the FULL shipped suite on every research variant (D14).
+
+Rules if this is ever picked up: new public surface, so a research burst + ruled PROPOSAL first (orchestrator rules).
+RingDeque and RingLog are a teaching pair: keep their bulk surfaces symmetric where the policies allow.
