@@ -842,3 +842,162 @@ stops.
 *This document consolidates the design identity, the throughput-witness anchor, the full candidate
 roster with its explicit boundary, reference implementations, and the demo direction for the lite-o1
 project. It is an internal research reference, modeled on lite-lru/RESEARCH.md.*
+
+---
+
+## 14. Hacker's Delight intake for BitSet (2026-11-12) -- two leads, both UNMEASURED
+
+Source: Hacker's Delight (Warren, 2nd ed. 2012) via cp-algorithms "Bit manipulation" and the Go port
+https://github.com/nikolaydubina/go-hackers-delight (MIT, one file per book section, active 2026-11; checked 2026-11-12). Teaching write-up:
+`../../Learning/Bitwise.md` PART 15. Every formula named below was checked against a naive per-bit
+oracle (2,000,000 random int32 + edge words, Node 26.8.2, 0 mismatches). Nothing here is timed, nothing
+shipped changes, and none of it is a PROPOSAL.
+
+Already on record elsewhere (not repeated): no `prevSet` / `lastSet`, `size` is a full popcount, bulk ops
+rebuild the whole summary (lite-loglogn RESEARCH 15).
+
+- **L1 `forEach` re-enters `nextSet` once per set bit.** `forEach` is
+  `for (i = firstSet(); i !== -1; i = nextSet(i + 1))` (O1.js:3974-3976). Each step repeats `nextSet`'s
+  input guard, rebuilds the `0xFFFFFFFF << (from & 31)` mask and re-reads the word. The Bitwise.md 12.2 loop
+  stays inside the word and touches the summary only to find the next non-empty word:
+
+  ```
+  w = words[iw]
+  while (w !== 0) { fn((iw << 5) + ctz(w)); w &= w - 1 }
+  ```
+
+  The same applies to `[Symbol.iterator]`.
+  - Hypothesis: fewer operations per set bit on dense words.
+  - Risks: a callback that mutates the set mid-scan (today it sees each step's live state; a word-local copy
+    would not), and the HOISTED-callback zero-alloc contract.
+  - STATISTICAL claim: interleaved A/B with an A/A and a must-fail control, at densities 1%, 50% and 99%.
+- **L2 `rank(i)` / `select(k)` port.** FastBit32 already has a verified word `rank` and `select` (a 5-step
+  popcount descent). On BitSet, `rank` is O(words) without a directory; lite-o1 RankSelect is the directory.
+  A port is a feature decision (consumer-gated, like FastBit1024's tier-2 parity), not a speedup.
+- **A carry-save array popcount does not fit `size`.** It would speed an O(words) popcount, but keeping an
+  incremental count (FastBit1024 keeps `_n`) makes `size` O(1). That is the fix the earlier review points at.
+- **The Go port's own benchmarks agree with Bitwise.md 12.10.** On its arm64 run, the plain or built-in
+  version beat the book's trick for leading zeros and for division by small constants. A book trick is a
+  candidate for a measurement, not a speedup.
+
+---
+
+## 15. Bitcoin Core bitset.h intake for BitSet (2026-11-12) -- gaps in the fuzz, three read-only relations
+
+Source: Bitcoin Core `src/util/bitset.h` (528 lines) and `src/test/fuzz/bitset.cpp` (318 lines), MIT, read from
+bitcoin/bitcoin master on 2026-11-12. (The link offered was kerrigan-network/kerrigan, a Dash-derived coin: it has
+NO bitset.h -- 404, and no match in its 4,875-file tree. The description fits Bitcoin Core's cluster-mempool
+bitset.) Nothing here is timed; nothing shipped changes; none of it is a PROPOSAL.
+
+Design and method notes: lite-loglogn RESEARCH 20 (lead CIDF).
+
+- **The current BitSet fuzz (test/BitSet.test.js:214) is narrower than the method there.**
+  - It uses ONE live set, three mutators (set / unset / toggle) and N = 4096, a multiple of 32, so the partly
+    used last word is never fuzzed.
+  - It checks popcount + firstSet only every 8,192 ops (firstSet via `Math.min(...oracle)`), then one final walk.
+  - `nextSet(from)` from arbitrary points, `setAll`, `clear` and the bulk ops are NOT in the stream. The bulk
+    ops are tested separately on random pairs, so a summary rebuilt by `and` and then mutated by `unset` is
+    never exercised in sequence.
+  - Aliasing (`a.and(a)`, `a.xor(a)`) is not tested. By reading, `and` / `or` / `xor` / `andNot` loop
+    `w[i] op= o[i]` and then rebuild, so self-aliasing looks safe. Pin it with a test anyway.
+- **Three read-only relations BitSet lacks:** `isSubsetOf(other)`, `intersects(other)`, `equals(other)`. Today a
+  caller must copy and run a mutating bulk op.
+  - All three exit early.
+  - With the summary they can beat Bitcoin's linear scan: `intersects` can AND the top summary words first and
+    descend only where both sides are non-empty.
+  - FastBit32 has the one-word forms (`isSubsetOf`, `hasAll`, `hasAny`).
+  - Consumer-gated, like the rest of the tier-2 parity list.
+- **The iterator corroborates section 14 L1.** Bitcoin's iterator stays inside the word (`v &= v - 1`, then
+  ctz) and touches the next word only when this one is exhausted: the same shape as the `forEach` lead. This is
+  corroboration, not a measurement.
+
+---
+
+## 16. lite-fastbit32 1.6.x intake for BitSet (2026-11-12) -- four API leads, two test leads, all UNMEASURED
+
+Source: `../LiteFastBit32` at 1.6.1 plus its `[Unreleased]` (CHANGELOG `[1.6.0]` / `[1.6.1]`, FastBit32.js,
+RESEARCH sections 20-22), read 2026-11-12. Already on record and not repeated here: ROADMAP section 10 Q1
+(`firstClear` / `nextClear`), section 11 P4-P6 + Q2 (`_s4` root, O(1) `size`, summary-guided bulk ops,
+`lastSet` / `prevSet`), sections 14 L1-L2 and 15 above. Nothing here is timed, nothing shipped changes, and
+none of it is a PROPOSAL: leads 16.1-16.4 add public API to a closed member, so each needs a research burst
+and a ruled PROPOSAL before any planner pass; 16.5-16.6 are test-only.
+
+- **16.1 Counted relations: `intersectionSize` / `unionSize` / `differenceSize` (FastBit1024 1.6.0).**
+  - Today a BitSet caller copies into a scratch set (`scratch.clear().or(a)`, see 16.2), runs a mutating `and` /
+    `or` / `andNot`, then `popcount()`: four O(words) passes plus two summary rebuilds.
+  - A read-only count is one pass. `intersectionSize` can also skip every word whose summary bit is empty on
+    either side.
+  - It answers section 15's `intersects(other)` as a count > 0, but without its early exit (`intersects` stops at
+    the first common bit), so it does not replace it: FastBit1024 keeps both (`hasAny` exits early,
+    `intersectionSize` walks every common non-empty word; its CHANGELOG `[1.6.0]`: "`hasAny` is RoaringSet's
+    `intersects`, no alias").
+  - Consumers: ECS query overlap counts, Jaccard similarity.
+- **16.2 `copy(other)` / `clone()` (FastBit1024 1.6.0).**
+  - BitSet has no copy; the workaround is `out.clear().or(src)` (as in GUIDE's `TimedBitSet.intersectInto`),
+    which is two passes and a full summary rebuild.
+  - A real `copy` is one `TypedArray.prototype.set` per array (`_w`, `_s1`, `_s2`, `_s3`) and needs no
+    rebuild; with `_nbits` those are all the state BitSet keeps (O1.js:3755-3759). If ROADMAP section 11 P4 /
+    P5 land, it also copies the `_s4` root and the `_n` count. `clone()` is the COLD allocating form.
+  - Same capacity-match-or-throw contract as the bulk ops (`_matchOrThrow`, O1.js:4089).
+- **16.3 `addRange(lo, hi)` / `removeRange(lo, hi)`, half-open (FastBit1024 1.6.0).**
+  - BitSet can only fill or empty everything (`setAll` / `clear`). A range fill is two edge masks plus
+    full-word stores in between.
+  - The summary changes only where a word flips: `addRange` can only mark words non-empty, and
+    `removeRange` can only mark them empty (every interior word that held a bit, plus an edge word that ends
+    at 0).
+  - Consumers: reserving an id block, marking a window. Not on any lite-o1 list before this.
+- **16.4 `saveInto(out, offset)` / `loadFrom(src, offset)` / `imageLength` (FastBit1024 1.6.0).**
+  - A snapshot into a caller-owned `Int32Array`: save games, worker hand-off, lite-signal's coming
+    `snapshot` / `restore` (unverified as a consumer: its values are held by reference, so the fit would be a
+    caller-side copy).
+  - `loadFrom` must validate the whole image before its first write, including stray bits past `nbits` in the
+    last word, and then rebuild the summary.
+  - Open format question for the PROPOSAL: match FastBit1024's image layout, so each loads the other's (at
+    `nbits <= 1024`), or keep a BitSet-only layout. Matching couples two packages to one format, by copy
+    (zero-deps law), never by import. FastBit1024's header keeps the capacity in bits 0..10 and accepts
+    1..1024 only (FastBit32.js:554-558, :948-949), so above 1024 bits BitSet needs a second header form
+    either way.
+- **16.5 Test lead: a pointer-compressed (`d8`) zero-GC lane.**
+  - lite-o1's 0 B/op gates run on Node only. lite-fastbit32's FB64-PC burst (its RESEARCH 20.1) found one
+    allocation that shows up only on a pointer-compressed engine (Chrome / Electron): FastBit64's bare
+    `#lo; #hi;` fields started as undefined, generalized to Tagged, and boxed every store of an int32 outside
+    [-2^30, 2^30) (11-24 scavenges per 1e6 ops on d8 in TurboFan, 0 on Node; REPORTED, its RESEARCH 20.1).
+    `#lo = 0; #hi = 0;` makes them Double fields, written in place; `../LiteFastBit32/test/torture/d8-fb64.mjs`
+    now gates it (CHANGELOG `[Unreleased]`, FB64-PC). `d8-loadfrom.mjs` found nothing in FastBit1024 (already
+    Smi-first; 0 per 1e6), and at its old 1e5 window could not see one box per load. Its source rule since
+    then: every numeric field starts as a Smi. What still boxes there, by design: an out-of-Smi int32 passed
+    to, or returned from, a non-inlined call.
+  - Candidates here, none bare (each is assigned in its constructor):
+    - CuckooMap `_seed` / `_seed2` are int32 (`| 0`, O1.js:3185-3186) and are passed as an ARGUMENT to the
+      module-level `_cuHash` by `_h1` / `_h2` (:3205, :3208): the call-boundary class above. They are Smis on
+      Node, but on a 31-bit-Smi engine half of all int32 values are not, and the comment at :3172-3173 ("a
+      tagged SMI, never a boxed HeapNumber") holds only for 32-bit Smis. The strongest candidate.
+    - RandomSet, AliasTable and Reservoir keep their RNG word as a uint32 in a plain field (`this._s = seed >>> 0`,
+      O1.js:1021, :4236, :5896; AliasTable and Reservoir also `_seed`, :4235, :5895). The default seed
+      `0x9e3779b1` is above 2^31, a non-Smi on every engine, so Node's torture lanes already drive these fields
+      with non-Smi values (test/torture.mjs:436, :708, :857, at 0 B/op). Only the [2^30, 2^31) band is new on a
+      pointer-compressed engine.
+  - Whether any of these allocates under pointer compression is UNMEASURED. The lane would answer it; port
+    the harness shape from lite-fastbit32, do not assume its result.
+- **16.6 Test lead: a CIDF lane for BitSet, with FastBit1024 as a second implementation (lead CIDF: lite-loglogn
+  RESEARCH 20, adopted by lite-fastbit32 RESEARCH 22).**
+  - The oracle is CIDF's plain reference (a Uint8Array of bits). One seeded op stream runs through the reference
+    and `BitSet(n)` at every n, and through `FastBit1024(n)` at n in {1, 31, 32, 33, 1023, 1024}. Compare every
+    inspector after every op while n <= 256; above that, a rotating subset each op and everything every K ops
+    (CIDF's rule): test / firstSet / nextSet / popcount, plus prevSet once Q2 lands. FastBit1024 names them
+    has / lowest / nextSetBit / size / prevSetBit, and its domains differ (`has` throws on a bad index where
+    `test` returns false; `nextSetBit` takes 0..capacity), so it is fed in-domain arguments only.
+  - FastBit1024 has no in-place `and` / `or` / `xor` / `andNot`, so after each bulk op it is reloaded from the
+    reference (`clear` + `add` per bit), never from BitSet (a reload from BitSet agrees with the bug).
+  - What it adds over today: the op-stream fuzz (test/BitSet.test.js:214) runs only at N = 4096, so the partly
+    used last word is covered only by fixed tests (:47 at N = 100, :125 at n in {1, 31, 32, 33, 70, 256}, :176
+    at N = 777), never inside a sequence. It also puts bulk ops and single-bit edits in one stream, the gap
+    section 15 names.
+  - Limit: at n <= 1024 BitSet has <= 32 data words, so `_s1`, `_s2` and `_s3` are one word each
+    (O1.js:3751-3754) and no summary climb in `_firstWordFrom` (:4033-4062) is reachable. Reference-only sizes
+    must reach them: n = 1025 (the `_s2` climb), 32769 (`_s3`), 2^20 + 1 (the top loop).
+  - lite-fastbit32 becomes a devDependency only (zero runtime deps unchanged).
+
+Not useful for lite-o1: SharedArrayBuffer acceptance, `FastBit64` itself (BitSet covers any width up to 2^25),
+`BitMapper`, and the bit tricks in lite-fastbit32 RESEARCH 21 (its verdict: nothing to change; the unused
+`x & (x + 1)` belongs to lite-logn's Fenwick tree).

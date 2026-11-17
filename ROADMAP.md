@@ -2,8 +2,8 @@
 
 Two BRIEF sessions extending `@zakkster/lite-o1` from thirteen members to fifteen
 (BitSet 1.4.0, AliasTable 1.5.0 -- **both SHIPPED**), then a post-1.5 continuation
-(M16-M18) from a second research sweep -- see **section 7** and the companion briefs
-`ROADMAP-M16.md` (CoarseTimerWheel, in progress). Modeled on `../BLUEPRINT_ROADMAP.md`
+(M16-M18) from a second research sweep -- see **section 7** (M16 CoarseTimerWheel SHIPPED in
+1.6.0; its settled calls are in `decisions/0022-coarsetimerwheel.md`). Modeled on `../BLUEPRINT_ROADMAP.md`
 (the ecosystem's session-brief blueprint). Sourced from the 2026-09-22 RESEARCH.md
 audits that REOPENED the post-1.0 queue.
 
@@ -26,7 +26,7 @@ verbatim from RESEARCH.md so they are not a surprise at planning time.
 | --- | --- | --- | --- | --- |
 | **M14** | **BitSet** (multi-word dense bitset) | 1.4.0 | O(1) worst-case per-bit; O(1) firstSet/nextSet via summary; bulk ops O(words) disclosed | SHIPPED |
 | **M15** | **AliasTable** (Vose weighted sampling) | 1.5.0 | O(1) worst-case sample (after O(n) build) | SHIPPED |
-| **M16** | **CoarseTimerWheel** (near-unbounded approximate wheel) | 1.6.0 | O(1) worst-case, no cascade/no spike; approximate fire time < 12.5% disclosed | SHIPPED (ADR 0022) |
+| **M16** | **CoarseTimerWheel** (near-unbounded approximate wheel) | 1.6.0 | O(1) worst-case, no cascade/no spike; approximate fire time < 8/62 (~12.9%) disclosed | SHIPPED (ADR 0022) |
 | **M17** | **WindowFold / DABA-Lite** (general sliding-window aggregation) | 1.7.0 | O(1) worst-case push/evict/query (DABA-Lite) | SHIPPED (ADR 0023) |
 | **M18** | **RankSelect bitvector** (cs-poppy class) | 1.8.0 | O(1) worst-case rank + O(1) select (after O(n) build) (select bound: see 1.11.2 note) | SHIPPED (ADR 0024; awaiting publish) |
 | **M19** | **EliasFano** (succinct monotone-sequence codec) | 1.9.0 | O(1) worst-case access (select bound: see 1.11.2 note) + data-dependent O(1)-typical/O(log n)-worst nextGEQ, ~2+log2(U/n) bits/elem, on the M18 rank/select layer | SHIPPED (ADR 0025; HOME resolved = lite-o1, lite-loglogn is DYNAMIC so it does not fit a static codec) |
@@ -542,13 +542,13 @@ BEFORE code, `/release` gate + card sync after. Each is a full pipeline session.
   family already owns these). **Frequency/cardinality sketches (HLL/Count-Min/...) ->
   the proposed `@zakkster/lite-sketch` sibling.** Neither is lite-o1's niche.
 
-### M16 -- CoarseTimerWheel (1.6.0) -- IN PROGRESS
+### M16 -- CoarseTimerWheel (1.6.0) -- SHIPPED (ADR 0022)
 
-Full brief in `ROADMAP-M16.md`; settled calls in `decisions/0022-coarsetimerwheel.md`.
+Settled calls in `decisions/0022-coarsetimerwheel.md`.
 The near-unbounded THIRD timing wheel: Linux-4.8-style non-cascading coarse-bucket
 wheel, worst-case O(1) with NO cascade spike (NO max-single-op line -- the honest
 difference from HierarchicalTimerWheel). Trade is PRECISION not complexity: approximate
-fire time, bounded one-sided-late (< 12.5%, L0 exact) -- the disclosed co-headline. 9
+fire time, bounded one-sided-late (< 8/62 (~12.9%), L0 exact; corrected in 1.11.3) -- the disclosed co-headline. 9
 levels x 64 buckets, MAX_DELAY = 62 x 2^24 (~0.97 x 2^30, the Linux WHEEL_TIMEOUT_MAX
 phase margin), strict never-early round-up-then-verify select, 18-word non-empty-bucket
 bitmap, exposes `peekNext()` + `fireTimeOf()`.
@@ -695,7 +695,7 @@ DONE WHEN
 
 ### Order (M16 -> M17 -> M18)
 
-M16 (CoarseTimerWheel) is in flight. M17 (WindowFold) and M18 (Rank/Select) are
+M16 (CoarseTimerWheel) SHIPPED in 1.6.0. M17 (WindowFold) and M18 (Rank/Select) are
 independent of each other; suggested order WindowFold first (broadest reuse -- charts /
 audio / telemetry), then Rank/Select (which also unblocks a future Elias-Fano and is a
 substrate lite-loglogn re-adopts). Reorder freely.
@@ -802,7 +802,8 @@ reproduces it under `quiet-lock.mjs`.
     set, one bit in the last word);
   - a must-fail control that skips one summary level and leaves a stale bit;
   - torture 0 B/op unchanged.
-- Do P1 and P2 in ONE burst (one coder batch on `O1.js`, one review round).
+- Burst placement (maintainer ruling D2, 2026-11-18): P2 runs with P4-P6 in ONE BitSet-internals
+  burst (section 11), since all four touch summary upkeep. P1 runs alone.
 
 ### P3 -- cache-tier disclosure curve
 

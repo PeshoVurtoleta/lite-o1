@@ -2,12 +2,16 @@
 
 A repo-only decision guide for the O(1) family: which member, reach-for / avoid,
 and how to measure the constant yourself. At v1.11.3 the family is STABLE at twenty-one
-members and this guide is complete for them -- still open (a new section lands with
-each future member), but no longer a skeleton. It is NOT an API encyclopedia (that
-is the README + `O1.d.ts`); it answers "which member, and is my constant real?"
+members. The flowchart and the picker table cover all twenty-one; the per-member
+reach-for / avoid sections cover the first fifteen (SparseSet v0.1.0 through AliasTable
+v1.5.0). CoarseTimerWheel, WindowFold, RankSelect, EliasFano, Reservoir and
+WindowFoldUint32 have no member section yet: for them, read the README and `O1.d.ts`.
+It is NOT an API encyclopedia (that is the README + `O1.d.ts`); it answers "which
+member, and is my constant real?"
 
 Scope discipline (mirrors lite-lru's GUIDE): a decision flowchart + a picker table
-up top, then reach-for / avoid + measure-it per member. No re-documenting signatures.
+up top, then reach-for / avoid + measure-it per member (fifteen so far; see above). No
+re-documenting signatures.
 
 ---
 
@@ -187,8 +191,8 @@ Fixed-capacity double-ended queue of NUMBERS over one circular `Float64Array`
   `@zakkster/lite-arena`.
 - You cannot bound the capacity and need it to grow -- RingDeque fails closed on a
   full push (it does not resize). If you genuinely want "keep the last N, drop the
-  oldest", that overwrite-oldest (RingLog) preset is a deferred future variant,
-  not the current default.
+  oldest", use RingLog (v1.1.0): it overwrites the oldest entry on a full push
+  instead of failing.
 - You want NaN to be a storable value -- it is rejected (a NaN reaching the queue
   is treated as a bug); `+/-Infinity` are accepted.
 
@@ -470,8 +474,10 @@ what removes the amortized asterisk (no cursor, no O(gap) worst case).
 **Avoid it when:**
 
 - Your delays are UNBOUNDED, far in the future, or of unknown horizon -- the ring is
-  `slots` slots (space O(slots)); a delay `>= slots` throws. Reach for a hierarchical /
-  hashed wheel (a deferred future member) or a binary-heap timer queue for a wide horizon.
+  `slots` slots (space O(slots)); a delay `>= slots` throws. Reach for
+  HierarchicalTimerWheel (exact, delay < 2^26, amortized cascade spike), CoarseTimerWheel
+  (near-unbounded, worst-case O(1), fires late by < 8/62 ~= 12.9%), or a binary-heap timer
+  queue for a wide horizon.
 - You need SUB-TICK or floating-point deadlines -- a wheel is integer-tick; quantize to a
   tick, or use a heap keyed by a float deadline.
 - You cannot follow the drain-before-advance discipline (drain the due slot before you
@@ -518,8 +524,9 @@ horizon outruns a single rotation but is still bounded.
 - Your horizon fits ONE rotation of a simple wheel -- reach for TimerWheel, which is
   WORST-CASE O(1) with NO cascade spike and a smaller 16 B/live footprint (vs 24 B/live
   here -- the Float64 `expiry` is the price of cascading).
-- Your delays are UNBOUNDED / of unknown horizon -- a delay `>= 2^26` throws; reach for a
-  fully-hashed/unbounded wheel (a deferred future member) or a heap.
+- Your delays are UNBOUNDED / of unknown horizon -- a delay `>= 2^26` throws; reach for
+  CoarseTimerWheel (delay < 62 x 2^24, APPROXIMATE fire, late by < 8/62 ~= 12.9%) or,
+  for exact deadlines past that, a heap.
 - You cannot tolerate ANY per-op spike (a hard-real-time deadline on the WORST single tick)
   -- the cascade tick is O(bucket); use TimerWheel (worst-case O(1)) if the horizon fits.
 - You need sub-tick / float deadlines, or ids are strings / objects / sparse over a huge
