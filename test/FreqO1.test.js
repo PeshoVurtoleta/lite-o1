@@ -41,8 +41,8 @@ function crossCheckOk(f) {
 
 // --- version + surface -----------------------------------------------------
 
-test('VERSION is the frozen 1.12.0 string', () => {
-    assert.equal(VERSION, '1.12.0');
+test('VERSION is the frozen 1.12.1 string', () => {
+    assert.equal(VERSION, '1.12.1');
 });
 
 test('empty structure: getters + peekMin/popMin/frequencyOf are well-defined', () => {

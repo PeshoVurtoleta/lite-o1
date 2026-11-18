@@ -46,8 +46,8 @@ function levelOf(now, delay) {
     return 8;
 }
 
-test('VERSION is the frozen 1.12.0 string', () => {
-    assert.equal(VERSION, '1.12.0');
+test('VERSION is the frozen 1.12.1 string', () => {
+    assert.equal(VERSION, '1.12.1');
 });
 
 // ---------------------------------------------------------------------------

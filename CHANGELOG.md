@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.12.1] - 2026-11-18
+
+Patch: `WindowFold.query()` no longer boxes a HeapNumber per call (the only `O1.js` code change since 1.12.0).
+It carries the test and tooling work since 1.12.0: the BitSet differential lane and gap pins, the torture
+scavenge lane and d8 lane, and the `npm run budget` bytecode gate. Public API unchanged; the roster stays at
+twenty-one.
+
 ### Fixed
 
 - `WindowFold.query()` no longer boxes a HeapNumber per call (A6). The rare-branch `this._cmb(...)` calls
@@ -28,17 +35,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   each one is listed in `limits.json` `dropped`. New `test/Budget.test.js` (24, canned tool output, no spawn) pins
   the fail-closed classifier, the runner exit code, the control predicates and the mutant inserter.
 - `test/budget/limits.json` `WindowFold.query` raised 242 -> 305 bytes on purpose (the inlined combine, +63 B); a
-  304 limit reads OVER (must-fail check). `npm test`: 880 tests (was 853 before the budget tests, 877 before the
-  A6 parity tests).
+  304 limit reads OVER (must-fail check). `npm test`: 893 tests (was 853 before the budget tests, 877 before the
+  A6 parity tests, 880 before the A6 qa tests).
 
 ### Tests
 
-- `npm test`: 835 tests (was 800); test-only, `O1.js` unchanged (no behavior change, no API change). New
-  `test/BitSetCidf.test.js` (27) is the CIDF differential lane: a plain Uint8Array reference oracle vs BitSet at
-  17 sizes {1, 2, 31, 32, 33, 63, 64, 65, 100, 255, 256, 257, 1023, 1024, 1025, 32769, 1048577} over 49,780 seeded
-  ops (key and op from independent seeded streams), single-bit edits, setAll / clear and the four bulk ops in one
-  stream incl. self-aliased bulk ops, with FastBit1024 (`@zakkster/lite-fastbit32`) as a second implementation at
-  n in {1, 31, 32, 33, 1023, 1024}, reloaded from the reference after each bulk op on A. Reference-only sizes 1025 /
+- `npm test`: 835 tests (was 800); the A3 BitSet work is test-only (no `O1.js` change). New
+  `test/BitSetCidf.test.js` (27) is the CIDF differential lane: a plain Uint8Array reference oracle vs BitSet at 17
+  sizes {1, 2, 31, 32, 33, 63, 64, 65, 100, 255, 256, 257, 1023, 1024, 1025, 32769, 1048577} over 49,780 seeded ops
+  (key and op from independent seeded streams), single-bit edits, setAll / clear and the four bulk ops in one
+  stream incl. self-aliased bulk ops, with FastBit1024 (`@zakkster/lite-fastbit32`) as a second implementation at n
+  in {1, 31, 32, 33, 1023, 1024}, reloaded from the reference after each bulk op on A. Reference-only sizes 1025 /
   32769 / 2^20+1 reach the `_s2` / `_s3` / top-loop summary climbs (asserted coverage floors). 9 must-fail controls
   (7 BitSet subclass mutants M1-M7 + 2 FastBit1024-side F1-F2); the summary-level mutants are pinned to the first
   size that can reach them and clean one size below.
@@ -62,6 +69,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - New `test/WindowFoldQueryParity.test.js` (3): live `query()` vs the pre-A6 reference body (8a710fdb),
   `Object.is` on every step, 768,000 queries, 0 mismatches; digests and branch counts pinned to the before
   build; 3 must-fail mutants.
+- New `test/WindowFoldA6Qa.test.js` (13, written by qa from the A6 assertions): position counters started just
+  below 2^30 / 2^31-1 / 2^31 / 2^32-1 / 2^32 and run across them, checked against an unshifted twin and the pre-A6
+  query body; the 2^53 position ceiling; fill and MIN / MAX integer-value boundaries against a left-fold oracle, -0
+  sequences and SUM / PRODUCT integer values against the pre-A6 body; clear and re-entrant push + query inside
+  `forEach`; one megamorphic call site over 6 receiver classes; lite-leak tracker `size()` back to 0 after the
+  WindowFold cycles and at run end, with a must-fail control.
 - torture: `maxPauseMs` is REPORTED, not gated (maintainer ruling 2026-11-18: a wall-clock pause on a shared
   host is a timing); `maxMajor: 0` stays gated. New control arms for `LITE_O1_TORTURE_BREAK`: `scav`,
   `null-bpc`, `major` and `d8` must fail; `pause` must still exit 0 (a forged 50 ms pause does NOT fail the run).

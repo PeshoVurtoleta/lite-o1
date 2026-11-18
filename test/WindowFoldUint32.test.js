@@ -38,8 +38,8 @@ function naive(op, a) {
 
 // --- version + surface -----------------------------------------------------
 
-test('VERSION is the frozen 1.12.0 string', () => {
-    assert.equal(VERSION, '1.12.0');
+test('VERSION is the frozen 1.12.1 string', () => {
+    assert.equal(VERSION, '1.12.1');
 });
 
 test('capacity rounds UP to a power of two; op / size getters', () => {

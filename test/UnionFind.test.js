@@ -24,8 +24,8 @@ const litO1 = (e) => e instanceof Error && /^\[lite-o1]/.test(e.message);
 
 // --- version + surface -----------------------------------------------------
 
-test('VERSION is the frozen 1.12.0 string', () => {
-    assert.equal(VERSION, '1.12.0');
+test('VERSION is the frozen 1.12.1 string', () => {
+    assert.equal(VERSION, '1.12.1');
 });
 
 test('fresh UnionFind: every element is its own singleton, count === n', () => {
