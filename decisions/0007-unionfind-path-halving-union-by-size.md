@@ -95,7 +95,7 @@ the live component count is `count`.
   merge-only boundary on its own terms; union-by-size + path halving is what makes
   the v0.3.0 contract this clean while still serving `componentSize` for free.
 
-## Amendment (2026-11-18, planned 1.12.0): queries return sentinels
+## Amendment (2026-11-18, 1.12.0): queries return sentinels
 
 The ceiling text above stands. What changed is the bad-element contract of the three
 QUERIES, to follow the sibling-query convention (booleans -> `false`, ids -> `-1`,

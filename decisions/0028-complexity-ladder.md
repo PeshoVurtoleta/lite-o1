@@ -78,7 +78,7 @@ The question: is either one a rung of its own (a package, or a label distinct fr
    `componentSize` throw on a bad id, unlike every other lite-o1 query. The maintainer decided
    (2026-10-20) to make them match their siblings with a non-throwing sentinel. That change is
    its own MINOR burst (planned as 1.12.0), not part of this ADR.
-   _Note (2026-11-18): that change landed in [Unreleased] -> 1.12.0; see the amendment in
+   _Note (2026-11-18): that change landed in 1.12.0; see the amendment in
    [`0007`](./0007-unionfind-path-halving-union-by-size.md)._
 
 ## Consequences

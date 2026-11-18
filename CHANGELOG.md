@@ -6,9 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [1.12.0] - 2026-11-18
+
+Minor: UnionFind's three queries return sentinels on a bad element instead of throwing. `union` and
+every valid-element result are unchanged; the roster stays at twenty-one.
+
 ### Changed
 
-- **UnionFind: the three queries no longer throw on a bad element (MINOR, planned 1.12.0).**
+- **UnionFind: the three queries no longer throw on a bad element (MINOR).**
   `find(x)` returns `-1`, `componentSize(x)` returns `0`, and `connected(a, b)` returns `false` if either
   element is bad (two bad elements are never connected). This follows the sibling convention (booleans -> `false`;
   id / position numbers where `0` is legal -> `-1`; counts -> `0`). A bad element is anything that is not a

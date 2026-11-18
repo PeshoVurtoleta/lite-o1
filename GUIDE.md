@@ -1,7 +1,7 @@
 # lite-o1 -- which structure to pick (GUIDE)
 
 A repo-only decision guide for the O(1) family: which member, reach-for / avoid,
-and how to measure the constant yourself. At v1.11.3 the family is STABLE at twenty-one
+and how to measure the constant yourself. At v1.12.0 the family is STABLE at twenty-one
 members. The flowchart and the picker table cover all twenty-one; the per-member
 reach-for / avoid sections cover the first fifteen (SparseSet v0.1.0 through AliasTable
 v1.5.0). CoarseTimerWheel, WindowFold, RankSelect, EliasFano, Reservoir and
@@ -771,7 +771,7 @@ cohort; the O(n) build + 2n typed-array space are the honest co-headline).
 
 ## Roadmap members (not yet shipped, planned)
 
-None. The roster is CLOSED at v1.11.3's twenty-one members. SlotPool, the last placeholder
+None. The roster is CLOSED at v1.12.0's twenty-one members. SlotPool, the last placeholder
 here, is NOT a lite-o1 member: a free-list slot allocator with generational (ABA-safe)
 handles is owned by `@zakkster/lite-arena` (a component-free `Arena` is exactly that pool),
 see [`decisions/0021`](./decisions/0021-slotpool-rejected.md). The last recipe below shows

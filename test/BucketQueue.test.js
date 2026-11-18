@@ -54,8 +54,8 @@ function snapshot(q) {
 
 // --- version + surface -----------------------------------------------------
 
-test('VERSION is the frozen 1.11.3 string', () => {
-    assert.equal(VERSION, '1.11.3');
+test('VERSION is the frozen 1.12.0 string', () => {
+    assert.equal(VERSION, '1.12.0');
 });
 
 test('empty queue: getters + peekMin/extractMin/priorityOf/has are well-defined', () => {
