@@ -900,6 +900,8 @@ Design and method notes: lite-loglogn RESEARCH 20 (lead CIDF).
     never exercised in sequence.
   - Aliasing (`a.and(a)`, `a.xor(a)`) is not tested. By reading, `and` / `or` / `xor` / `andNot` loop
     `w[i] op= o[i]` and then rebuild, so self-aliasing looks safe. Pin it with a test anyway.
+  - Landed: A3 (2026-11-18, test-only, uncommitted at writing) -- test/BitSetGaps.test.js, plus the stream gaps in
+    test/BitSetCidf.test.js; see CHANGELOG [Unreleased].
 - **Three read-only relations BitSet lacks:** `isSubsetOf(other)`, `intersects(other)`, `equals(other)`. Today a
   caller must copy and run a mutating bulk op.
   - All three exit early.
@@ -997,6 +999,7 @@ and a ruled PROPOSAL before any planner pass; 16.5-16.6 are test-only.
     (O1.js:3751-3754) and no summary climb in `_firstWordFrom` (:4033-4062) is reachable. Reference-only sizes
     must reach them: n = 1025 (the `_s2` climb), 32769 (`_s3`), 2^20 + 1 (the top loop).
   - lite-fastbit32 becomes a devDependency only (zero runtime deps unchanged).
+  - Landed: A3 (2026-11-18, test-only, uncommitted at writing) -- test/BitSetCidf.test.js; see CHANGELOG [Unreleased].
 
 Not useful for lite-o1: SharedArrayBuffer acceptance, `FastBit64` itself (BitSet covers any width up to 2^25),
 `BitMapper`, and the bit tricks in lite-fastbit32 RESEARCH 21 (its verdict: nothing to change; the unused

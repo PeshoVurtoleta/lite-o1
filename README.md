@@ -1898,10 +1898,10 @@ WindowFoldUint32 is the BITWISE / MASKING window engine -- the sibling `WindowFo
 
 ## Testing
 
-**800 deterministic `node:test` cases**, plus a torture gate, a hard perf gate, and the O(1) witness gate.
+**835 deterministic `node:test` cases**, plus a torture gate, a hard perf gate, and the O(1) witness gate.
 
 ```bash
-npm test           # 800 node:test cases (contract + boundary + differential fuzz)
+npm test           # 835 node:test cases (contract + boundary + differential fuzz)
 npm run test:types # tsc --noEmit against O1.d.ts
 npm run torture    # @zakkster/lite-leak + lite-gc-profiler: 0 B/op + leak-free
 npm run witness    # the O(1) throughput-invariance harness + foils + flatness gate

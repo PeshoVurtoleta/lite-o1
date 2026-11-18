@@ -6,7 +6,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-_Nothing yet._
+### Tests
+
+- `npm test`: 835 tests (was 800); test-only, `O1.js` unchanged (no behavior change, no API change). New
+  `test/BitSetCidf.test.js` (27) is the CIDF differential lane: a plain Uint8Array reference oracle vs BitSet at
+  17 sizes {1, 2, 31, 32, 33, 63, 64, 65, 100, 255, 256, 257, 1023, 1024, 1025, 32769, 1048577} over 49,780 seeded
+  ops (key and op from independent seeded streams), single-bit edits, setAll / clear and the four bulk ops in one
+  stream incl. self-aliased bulk ops, with FastBit1024 (`@zakkster/lite-fastbit32`) as a second implementation at
+  n in {1, 31, 32, 33, 1023, 1024}, reloaded from the reference after each bulk op on A. Reference-only sizes 1025 /
+  32769 / 2^20+1 reach the `_s2` / `_s3` / top-loop summary climbs (asserted coverage floors). 9 must-fail controls
+  (7 BitSet subclass mutants M1-M7 + 2 FastBit1024-side F1-F2); the summary-level mutants are pinned to the first
+  size that can reach them and clean one size below.
+- New `test/BitSetGaps.test.js` (8) pins the RESEARCH section 15 gaps against an independent boolean-Array oracle:
+  self-aliasing `a.and(a)` / `a.or(a)` / `a.xor(a)` / `a.andNot(a)`, `nextSet` from every point (n <= 1025;
+  every word boundary +/- 1 at 32769), the partly used last word inside an op stream, and bulk op then single-bit
+  edits; 4 must-fail subclass controls (H1-H4).
+- devDependency added: `@zakkster/lite-fastbit32` `^1.6.1` (`dependencies` stays empty; `files[]` unchanged).
 
 ## [1.12.0] - 2026-11-18
 

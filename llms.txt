@@ -1532,7 +1532,7 @@ one. For arbitrary-index / out-of-order range aggregation use @zakkster/lite-log
 
 ## Scripts
 
-- npm test           -- 800 node:test cases (contract + boundary + differential fuzz).
+- npm test           -- 835 node:test cases (contract + boundary + differential fuzz).
 - npm run test:types -- tsc --noEmit against O1.d.ts.
 - npm run torture    -- lite-leak + lite-gc-profiler: 0 B/op, 0 major GC, leak-free.
 - npm run witness    -- O(1) throughput-invariance harness + foils + flatness gate.
