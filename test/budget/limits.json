@@ -18,7 +18,7 @@
     "BitSet": { "test": 68, "unset": 122, "toggle": 123, "clear": 71, "firstSet": 53, "nextSet": 148, "or": 71, "popcount": 53, "forEach": 46, "_markNonEmpty": 140, "_markEmpty": 153, "_firstWordFrom": 427, "_rebuildSummary": 244, "_matchOrThrow": 36, "_bitsetCtz32": 29, "_bitsetPopcount32": 95, "and": 71 },
     "AliasTable": { "sample": 129, "weightOf": 50, "forEach": 48, "clear": 11 },
     "CoarseTimerWheel": { "schedule": 390, "cancel": 86, "peekNext": 10, "fireTimeOf": 87, "drainDue": 148, "advance": 138, "has": 71, "clear": 29, "forEach": 53, "_peekNextTick": 222, "_linkTail": 180, "_drainBucket": 253, "_removeNode": 368, "_cwFirstSetGE": 98 },
-    "WindowFold": { "push": 149, "evict": 40, "query": 242, "clear": 74, "forEach": 73, "_cmb": 70, "_advance": 340, "_finishReverse": 62 },
+    "WindowFold": { "push": 149, "evict": 40, "query": 305, "clear": 74, "forEach": 73, "_cmb": 70, "_advance": 340, "_finishReverse": 62 },
     "RankSelect": { "access": 58, "rank1": 293, "rank0": 61, "select1": 467, "select0": 632, "forEach": 82, "_rsCtz32": 29, "_rsPopcount32": 95, "_rsSelectInWord": 40 },
     "EliasFano": { "access": 43, "nextGEQ": 286, "forEach": 42, "_valueAt": 44, "_readLow": 93 },
     "Reservoir": { "add": 181, "clear": 7, "forEach": 69, "reset": 15 },

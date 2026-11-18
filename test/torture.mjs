@@ -75,7 +75,9 @@ async function main() {
     // `node --expose-gc ... test/torture.mjs --scav-child`: the scavenge-count child (S2),
     // spawned by this same file; it runs only the allocLane steps (phase 2a-scav).
     const SCAV_CHILD = process.argv.includes('--scav-child');
-    const SCAV_FLAGS = ['--expose-gc', '--min-semi-space-size=1', '--max-semi-space-size=1'];
+    // --no-concurrent-recompilation (A6-2): TurboFan compiles on the main thread, so every lane's tier-up
+    // lands at the same call count run to run (a background compile finishing mid-window shifts counts).
+    const SCAV_FLAGS = ['--expose-gc', '--min-semi-space-size=1', '--max-semi-space-size=1', '--no-concurrent-recompilation'];
     const SCAV_WARM_CALLS = 200;   // warm-up: 200 drive calls ...
     const SCAV_WARM_OPS = 1000;    // ... x 1000 steps each (tier-up before the window)
     const SCAV_WINDOW_X = 10;      // window = 10 x the lane's measureAllocs iterations
@@ -818,6 +820,23 @@ async function main() {
     };
     const wfAllocRes = allocLane('WindowFold', wfStep, 100000);
 
+    // WindowFold MIN over FRACTIONAL values (A6): the aggregate is never a Smi, so a query whose
+    // return merges with a non-inlined _cmb call boxes a HeapNumber on every op (the A6-WF engine
+    // bug read ~15 minor GCs / 1e6-call window here under the scav child's megamorphic driver).
+    // Values, the counter and the sink all live in typed slots (a closure-context double boxes).
+    const wfMin = new WindowFold(WF_CAP, 'MIN');
+    for (let k = 0; k < WF_W; k++) wfMin.push(k + 0.5); // bounded resident window, fractional
+    const wfMinI = new Int32Array(1);
+    wfMinI[0] = WF_W;
+    const wfMinSinkF = new Float64Array(1);
+    const wfMinStep = () => {
+        wfMinI[0] = (wfMinI[0] + 1) | 0;
+        wfMin.push(wfMinI[0] + 0.5);
+        wfMin.evict();
+        wfMinSinkF[0] += wfMin.query();
+    };
+    const wfMinAllocRes = allocLane('WindowFoldMinFrac', wfMinStep, 100000);
+
     // RankSelect hot path: a STATIC build-once cs-poppy index, BUILT ONCE OUTSIDE the measured window
     // (the O(n) build + the ~3.2% index space are the disclosed co-headline, EXCLUDED from the per-op
     // claim). Measured hot loops -- rank1 over a walking i (worst-case O(1)), select1 over a walking k
@@ -1330,14 +1349,14 @@ async function main() {
     // SCAV_KNOWN (S6): a lane that reads > SCAV_LIMIT on UNMODIFIED library code is a possible
     // library / engine bug -- never patched here, never a raised limit. It ships REPORTED with its
     // KNOWN brief id (printed on stdout + stderr every run) until the engine unit closes it.
+    // A6 closed A6-WF (WindowFold.query inline combine): the 'WindowFold' (SUM) lane is gated again.
     const SCAV_KNOWN = {
-        // WindowFold: push + evict + query on one 'SUM' instance boxes ~1 HeapNumber per op once the
-        // aggregate leaves the Smi range (15 / 1e6-call window after a 2e6-call warm-up, 109 / 8e6;
-        // a standalone single-'SUM'-instance script reads 0 with a monomorphic driver and 15 / 1e6
-        // with a megamorphic one (step compiled as its own unit); the child runs no other
-        // WindowFold (phase 1 skipped); the old single 2e5-warm window read 2 (pre-steady-state)).
-        // Harness sink boxes already removed. Not gated until the engine brief resolves it.
-        'WindowFold': 'A6-WF',
+        // WindowFoldMinFrac: the step inlines evict + query; push (149 B + its own opt code's ~550 B
+        // inlined) is over the 920 B cumulative budget, so it stays a real call, and a fractional MIN
+        // push boxes at the call (the double argument) + inside push (the MIN select merges the tagged
+        // argument with the double field). 30-31 / 1e6 on 30cffa45, 45-46 on 8a710fdb (+ the query box).
+        // A push-side library unit, not this harness: REPORTED until A7-WFP closes it.
+        'WindowFoldMinFrac': 'A7-WFP',
     };
     const { spawnSync } = await import('node:child_process');
     const { fileURLToPath } = await import('node:url');
@@ -1407,14 +1426,14 @@ async function main() {
     }
 
     // ---- verdict + GATE line ----------------------------------------------
-    let lanesOk = LANES.length === 28;
+    let lanesOk = LANES.length === 29;
     let laneGate = '';
     for (let li = 0; li < LANES.length; li++) {
         const l = LANES[li];
         if (!l.ok) lanesOk = false;
         laneGate += (li === 0 ? '' : ' ') + (l.bytes === null ? 'null' : l.bytes) + ' B/op (' + l.name + ')';
     }
-    if (LANES.length !== 28) console.error('  alloc lane count ' + LANES.length + ' (expected 28)');
+    if (LANES.length !== 29) console.error('  alloc lane count ' + LANES.length + ' (expected 29)');
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
         findings.length === 0 && lanesOk && scavOk && ufBadBranchOk && rsGapBranchOk && bitRetOk && rsReseedOk && abOk;
 
@@ -1428,7 +1447,7 @@ async function main() {
         ' | reseed=' + rsReseedBytes + '/' + rsReseedBound + ' B allocs=' + rsReseedAllocs + ' (CuckooMap forced re-seed)' +
         ' | bitRetGrowth=' + bitRetGrowth + ' B' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
-        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' bsSink=' + bsSink + ' bhSink=' + bhSink + ' brSink=' + brSink + ' atSink=' + atSink + ' wfSink=' + wfSinkF[0] + ' rsRankSink=' + rsRankSink + ' rsSelSink=' + rsSelSink + ' rsGapSink=' + rsGapSink + ' efAccSink=' + efAccSink + ' efNextSink=' + efNextSink + ' rvAddSink=' + rvAddSink + ' rvGetSink=' + rvGetSink + ' wfuSink=' + wfuSink + ' ufBadHit=' + ufBadHit + ' ufBadMiss=' + ufBadMiss + ' abGrowth=' + abDelta + ')');
+        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' bsSink=' + bsSink + ' bhSink=' + bhSink + ' brSink=' + brSink + ' atSink=' + atSink + ' wfSink=' + wfSinkF[0] + ' wfMinSink=' + wfMinSinkF[0] + ' rsRankSink=' + rsRankSink + ' rsSelSink=' + rsSelSink + ' rsGapSink=' + rsGapSink + ' efAccSink=' + efAccSink + ' efNextSink=' + efNextSink + ' rvAddSink=' + rvAddSink + ' rvGetSink=' + rvGetSink + ' wfuSink=' + wfuSink + ' ufBadHit=' + ufBadHit + ' ufBadMiss=' + ufBadMiss + ' abGrowth=' + abDelta + ')');
 
     if (!ok) {
         if (!trackedOk) console.error('  vacuous: tracker held ' + trackedMid + ' instances (expected > 0)');

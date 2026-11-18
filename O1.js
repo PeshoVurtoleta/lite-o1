@@ -5017,24 +5017,29 @@ export class WindowFold {
      * operator IDENTITY on an EMPTY window -- NEVER undefined, NEVER throws. During a de-amortized
      * flip the window reads at most three stored aggregates (old-front top + a frozen middle + the
      * back sum); idle / merge read `_agg[F]` (the whole front) + the back sum.
+     * Why the combine is inline, not `_cmb`: the rare reverse / merge `_cmb` calls fall below V8's
+     * min_inlining_frequency, stay real calls, and their boxed double return merged into the idle return.
+     * Residual: a non-Smi result still boxes once per call when query() itself is not inlined.
      * @returns {number}
      */
     query() {
         if (this._F === this._E) return this._ident;
         const F = this._F;
-        if (this._job === 1) {
-            // reverse: front [F, s) is still a single suffix stack; + frozen mid + fresh back.
-            const f = F < this._s ? this._agg[F & this._mask] : this._ident;
-            return this._cmb(this._cmb(f, this._aggMid), this._bsum);
+        const op = this._op;
+        const job = this._job;
+        let x;
+        if (job === 1 || (job === 2 && F === this._p)) {
+            // reverse: front [F, s) + frozen mid; merge not yet past F: agg[F] rel m + frozen S2.
+            const one = job === 1;
+            x = F < (one ? this._s : this._m) ? this._agg[F & this._mask] : this._ident;
+            const y = one ? this._aggMid : this._aggS2;
+            x = op === 0 ? x + y : op === 1 ? (x < y ? x : y) : op === 2 ? (x > y ? x : y) : x * y;
+        } else {
+            // idle, or merge past F: agg[F] is rel s = the whole front aggregate.
+            x = F < this._s ? this._agg[F & this._mask] : this._ident;
         }
-        if (this._job === 2 && F === this._p) {
-            // merge not yet past F: agg[F] is still rel m -> fold in the frozen S2 aggregate.
-            const f = F < this._m ? this._agg[F & this._mask] : this._ident;
-            return this._cmb(this._cmb(f, this._aggS2), this._bsum);
-        }
-        // idle, or merge past F: agg[F] is rel s = the whole front aggregate.
-        const f = F < this._s ? this._agg[F & this._mask] : this._ident;
-        return this._cmb(f, this._bsum);
+        const y = this._bsum;
+        return op === 0 ? x + y : op === 1 ? (x < y ? x : y) : op === 2 ? (x > y ? x : y) : x * y;
     }
 
     /**
