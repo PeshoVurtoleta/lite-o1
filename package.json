@@ -31,6 +31,7 @@
     "torture:d8": "node test/d8/lane.mjs",
     "witness": "node test/witness.mjs",
     "test:perf": "node --expose-gc --max-semi-space-size=4 --test test/perf/PerfGate.test.mjs",
+    "budget": "node test/budget/run.mjs",
     "bench": "node benchmark/Bench.mjs",
     "bench:report": "node benchmark/Bench.mjs && node benchmark/Report.mjs",
     "demo": "node --expose-gc --test demo/Demo.test.mjs",
@@ -179,6 +180,7 @@
     "@zakkster/lite-gc-profiler": "^1.16.0",
     "@zakkster/lite-leak": "^1.10.0",
     "@zakkster/lite-perf-gate": "^1.4.2",
+    "@zakkster/lite-utils": "^1.0.0",
     "esbuild": "^0.28.2",
     "typescript": "^7.0.2"
   },

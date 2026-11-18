@@ -1898,7 +1898,7 @@ WindowFoldUint32 is the BITWISE / MASKING window engine -- the sibling `WindowFo
 
 ## Testing
 
-**853 deterministic `node:test` cases**, plus a torture gate, a hard perf gate, and the O(1) witness gate.
+**877 deterministic `node:test` cases**, plus a torture gate, a hard perf gate, and the O(1) witness gate.
 
 ```bash
 npm test           # node:test cases (contract + boundary + differential fuzz)
@@ -1910,7 +1910,35 @@ npm run witness    # the O(1) throughput-invariance harness + foils + flatness g
 npm run test:perf  # @zakkster/lite-perf-gate: hard zero-alloc scavenge-scaling gate
 npm run verify     # the publish gate, in order: test, test:types, torture, torture:controls,
                    #   torture:d8, witness, test:perf
+npm run budget     # bytecode-length gate per member (node v26.8.2 only; NOT part of verify)
 ```
+
+`budget` runs `bytecode-budget` from the devDependency `@zakkster/lite-utils` on one driver per member
+(`test/budget/<Member>.mjs`) against the maxima in `test/budget/limits.json`. The gated methods are each member's
+per-op methods that the perf gate and torture lanes call, plus the private helpers on their success path. Each
+maximum is that method's bytecode length on node v26.8.2, measured with no headroom. Bytecode length does not
+depend on timing, so the gate is DETERMINISTIC, but only on that node: any other node ends `NO-VERDICT`. That is
+why it sits outside `verify`.
+
+Exit codes:
+- 0: every member is WITHIN, and every control held (with `--gate-only`, the gate alone passed);
+- 1: a length is OVER, or a control failed;
+- 2: `NO-VERDICT`, which never counts as a pass.
+
+After the gate, the controls must fail on purpose:
+- a mutant copy of `O1.js` with one extra statement in each member's first gated method must read OVER;
+- every limit lowered by one byte must read OVER;
+- a wrong `--node-version` must read `NO-VERDICT`.
+
+The limit-minus-one control turns every limit into an exact pin. A method that gets SHORTER also fails the run,
+until its limit is re-measured. The `o1` sha in `limits.json` records the build the limits were measured on; nothing checks it.
+
+Two flags help when iterating: `--gate-only` skips the controls, and `node test/budget/run.mjs --report`
+re-measures every length. Methods named `get` or `set` are not gated, because node compiles functions with those
+names itself and the tool cannot tell the two apart. Those methods are listed under `dropped` in `limits.json`.
+
+The same devDependency also provides `deopt-diff`, `ic-diff`, `inlining-budget-diff` and `allocation-diff`. Those
+are REPORTED-tier tools: engine changes run them before vs after as evidence, and they gate nothing.
 
 `torture` gates two allocation terms: retained bytes per op (0 B/op, with a fail-closed verdict -- a null /
 non-finite measurement, an unsettled run, or fewer than 2 of 8 measured batches fails) and transient allocation,

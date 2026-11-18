@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Tooling
+
+- devDependency added: `@zakkster/lite-utils` `^1.0.0` (`dependencies` stays empty; `files[]` unchanged). New
+  `npm run budget` (not in `verify`): a bytecode-length gate per member that runs `bytecode-budget` on 21 drivers
+  (`test/budget/`) against the maxima in `test/budget/limits.json`. The maxima were measured on node v26.8.2
+  with no headroom; any other node gives `NO-VERDICT` (exit 2), which never counts as a pass. Must-fail controls:
+  a one-statement mutant per member reads OVER, every limit minus one byte reads OVER, and a wrong node version
+  reads `NO-VERDICT`. Methods named `get` / `set` are not gated (node compiles same-name functions itself), and
+  each one is listed in `limits.json` `dropped`. New `test/Budget.test.js` (24, canned tool output, no spawn) pins
+  the fail-closed classifier, the runner exit code, the control predicates and the mutant inserter. `npm test`:
+  877 tests (was 853).
+
 ### Tests
 
 - `npm test`: 835 tests (was 800); test-only, `O1.js` unchanged (no behavior change, no API change). New

@@ -1,0 +1,33 @@
+{
+  "node": "v26.8.2",
+  "o1": "8a710fdb",
+  "members": {
+    "SparseSet": { "add": 151, "has": 71, "delete": 123, "clear": 7, "forEach": 39 },
+    "RingDeque": { "pushFront": 96, "pushBack": 95, "popFront": 59, "popBack": 53, "peekFront": 27, "peekBack": 46, "clear": 12, "forEach": 67 },
+    "UnionFind": { "find": 78, "union": 188, "connected": 33, "componentSize": 32, "reset": 54, "forEachRoots": 50 },
+    "MonoDeque": { "push": 239, "evictOlderThan": 101, "value": 27, "frontSeq": 27, "clear": 17, "forEach": 78 },
+    "MinStack": { "push": 159, "pop": 37, "peek": 28, "extreme": 28, "clear": 7, "forEach": 58 },
+    "RandomSet": { "add": 151, "has": 71, "delete": 123, "sample": 83, "removeRandom": 135, "clear": 7, "forEach": 39 },
+    "FreqO1": { "add": 122, "increment": 576, "has": 71, "frequencyOf": 86, "peekMin": 35, "popMin": 363, "clear": 23, "forEach": 53, "_insertOne": 243, "_allocBucket": 122 },
+    "BucketQueue": { "insert": 185, "decreaseKey": 415, "has": 71, "priorityOf": 88, "peekMin": 96, "extractMin": 343, "clear": 12, "forEach": 53, "_insertOne": 192 },
+    "TimerWheel": { "schedule": 164, "cancel": 86, "drainDue": 235, "advance": 234, "has": 71, "clear": 12, "forEach": 53, "_scheduleOne": 211, "_removeNode": 288 },
+    "HierarchicalTimerWheel": { "schedule": 264, "cancel": 86, "drainDue": 277, "advance": 350, "has": 71, "clear": 12, "forEach": 53, "_fileByDelta": 111, "_linkTail": 147, "_cascade": 137, "_removeNode": 307 },
+    "RingLog": { "push": 131, "oldest": 27, "newest": 46, "clear": 12, "forEach": 67 },
+    "CuckooMap": { "has": 292, "delete": 198, "clear": 24, "forEach": 68, "_h1": 22, "_h2": 22, "_evict": 231, "_cuHash": 103, "_cuFmix32": 70 },
+    "SparseTable": { "query": 188, "at": 50, "forEach": 48 },
+    "BitSet": { "test": 68, "unset": 122, "toggle": 123, "clear": 71, "firstSet": 53, "nextSet": 148, "or": 71, "popcount": 53, "forEach": 46, "_markNonEmpty": 140, "_markEmpty": 153, "_firstWordFrom": 427, "_rebuildSummary": 244, "_matchOrThrow": 36, "_bitsetCtz32": 29, "_bitsetPopcount32": 95, "and": 71 },
+    "AliasTable": { "sample": 129, "weightOf": 50, "forEach": 48, "clear": 11 },
+    "CoarseTimerWheel": { "schedule": 390, "cancel": 86, "peekNext": 10, "fireTimeOf": 87, "drainDue": 148, "advance": 138, "has": 71, "clear": 29, "forEach": 53, "_peekNextTick": 222, "_linkTail": 180, "_drainBucket": 253, "_removeNode": 368, "_cwFirstSetGE": 98 },
+    "WindowFold": { "push": 149, "evict": 40, "query": 242, "clear": 74, "forEach": 73, "_cmb": 70, "_advance": 340, "_finishReverse": 62 },
+    "RankSelect": { "access": 58, "rank1": 293, "rank0": 61, "select1": 467, "select0": 632, "forEach": 82, "_rsCtz32": 29, "_rsPopcount32": 95, "_rsSelectInWord": 40 },
+    "EliasFano": { "access": 43, "nextGEQ": 286, "forEach": 42, "_valueAt": 44, "_readLow": 93 },
+    "Reservoir": { "add": 181, "clear": 7, "forEach": 69, "reset": 15 },
+    "WindowFoldUint32": { "push": 155, "evict": 40, "query": 251, "clear": 74, "forEach": 73, "_cmb": 47, "_advance": 340, "_finishReverse": 62 }
+  },
+  "dropped": {
+    "RingLog": { "get": "node itself compiles a function named 'get' (bytecode-budget NO-VERDICT: lengths cannot be told from the driver's)" },
+    "CuckooMap": { "set": "node itself compiles a function named 'set' (bytecode-budget NO-VERDICT)", "get": "node itself compiles a function named 'get' (bytecode-budget NO-VERDICT)" },
+    "BitSet": { "set": "node itself compiles a function named 'set' (bytecode-budget NO-VERDICT)" },
+    "Reservoir": { "get": "node itself compiles a function named 'get' (bytecode-budget NO-VERDICT)" }
+  }
+}
