@@ -132,4 +132,23 @@ frozen name -> int enum) and `WINDOWFOLD_MAX_CAPACITY` (2^31, the ring ceiling).
 - **Bitwise AND / OR / XOR on the Float64 lane** -- dishonest (Float64 cannot carry 32-bit
   bitwise semantics); deferred to the int32-lane `WindowFoldInt32` sibling.
 
+## Amendment 2026-11-18 (A6)
+
+- `query()` inlines the combine (`op === 0 ? x + y : ...`) instead of calling `this._cmb`;
+  `_cmb` stays for `push` / `_advance`. The public API and every result are unchanged (parity
+  test, 768,000 queries, 0 mismatches).
+- Mechanism: the rare-branch `_cmb` calls in `query()` (reverse job, merge job) run below V8's
+  min_inlining_frequency, stay real calls and return a boxed double; that merged with the idle
+  path at the return, so the idle result boxed too. Measured (node v26.8.2): SUM lane 2 and 15
+  minor GCs per 1e6 calls before, 0 and 0 after in 3 of 3 runs.
+- Rejected (v3): inline the combine everywhere and delete `_cmb`. `_advance` would grow past
+  the single-function inline limit (465 > 460 bytes of bytecode).
+- Residual: when `query()` itself is not inlined into its caller, its non-Smi return is boxed
+  once per call (a call-boundary property). `query()` is 305 B of bytecode (was 242) and uses
+  more of a caller's cumulative inlining budget; the budget limit was raised 242 -> 305 on
+  purpose.
+- Gate: the torture scav lane for WindowFold (SUM) is gated again; the MIN-fractional lane
+  WindowFoldMinFrac is REPORTED (KNOWN A7-WFP, push-side). The deopt-diff run gave no verdict
+  and is REPORTED only: no deopt claim is made.
+
 MIT (c) Zahary Shinikchiev <shinikchiev@yahoo.com>

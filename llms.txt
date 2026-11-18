@@ -1170,10 +1170,14 @@ Fail closed: a bad capacity or a bad op (non-string, unknown name, or an inherit
                             the running back sum) + one de-amortized flip step. typeof guard FIRST
                             (a non-number / NaN throws; +/-Infinity accepted). A FULL ring throws
                             [lite-o1] as a byte-identical no-op; the 2^53 position ceiling throws.
+                            KNOWN A7-WFP (REPORTED): a MIN push of fractional values that V8 leaves
+                            as a real call boxes, at the call and inside push.
 - evict() -> this           O(1) worst-case, 0 B/op. Drop the OLDEST element + one flip step. An
                             EMPTY window is a no-op (never throws).
-- query() -> number         O(1) worst-case (<= 2 combines), 0 B/op. The current window aggregate;
-                            the operator IDENTITY on an empty window. NEVER throws.
+- query() -> number         O(1) worst-case (<= 2 combines), 0 B/op retained. The current window
+                            aggregate; the operator IDENTITY on an empty window. NEVER throws. A
+                            query() that V8 does not inline into its caller boxes its non-Smi
+                            return once per call (a call-boundary property).
 - size (getter)             Number of live elements.
 - capacity (getter)         Max simultaneously-live elements (power-of-two, rounded up).
 - op (getter)               The frozen operator name ('SUM' | 'MIN' | 'MAX' | 'PRODUCT').
@@ -1532,11 +1536,11 @@ one. For arbitrary-index / out-of-order range aggregation use @zakkster/lite-log
 
 ## Scripts
 
-- npm test           -- 877 node:test cases (contract + boundary + differential fuzz).
+- npm test           -- 880 node:test cases (contract + boundary + differential fuzz).
 - npm run test:types -- tsc --noEmit against O1.d.ts.
 - npm run torture    -- lite-leak + lite-gc-profiler: 0 B/op, 0 major GC, leak-free, plus a
-                        scavenge-count lane (max of two windows <= 2 minor GCs; WindowFold
-                        REPORTED, KNOWN A6-WF). maxPauseMs is REPORTED, not gated.
+                        scavenge-count lane (max of two windows <= 2 minor GCs; WindowFoldMinFrac
+                        REPORTED, KNOWN A7-WFP). maxPauseMs is REPORTED, not gated.
 - npm run torture:controls -- control arms: each torture gate is proven able to fail.
 - npm run torture:d8 -- pointer-compressed d8 scavenge lane (D8 SKIP, exit 0, without one).
 - npm run witness    -- O(1) throughput-invariance harness + foils + flatness gate.

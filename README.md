@@ -1811,9 +1811,9 @@ CoarseTimerWheel is the honest Linux-4.8 non-cascading design: a far-future time
 
 | Operation                    | Steady-state allocations |
 | ---------------------------- | ------------------------ |
-| `push(v)`                    | **0** (fold into the running back sum + one de-amortized flip step, <= 2 combines) |
+| `push(v)`                    | **0** retained (fold into the running back sum + one de-amortized flip step, <= 2 combines). Open, KNOWN A7-WFP (REPORTED, not gated): a MIN `push` of fractional values that V8 leaves as a real call boxes, at the call and inside `push` (30-31 minor GCs per 1e6 calls in the WindowFoldMinFrac lane, node v26.8.2) |
 | `evict()`                    | **0** (advance the front + one de-amortized flip step) |
-| `query()`                    | **0** (<= 2 combines over stored aggregates; the operator identity on an empty window) |
+| `query()`                    | **0** retained; 0 minor GCs per 1e6 calls in the gated scav lane (<= 2 combines over stored aggregates, the combine inlined in `query()`; the operator identity on an empty window). Residual: a `query()` that V8 does not inline into its caller boxes its non-Smi return once per call (a call-boundary property) |
 | `clear()`                    | **0** (resets positions + running sum + flip state; touches no store) |
 | `forEach(fn)`                | **0** (front -> back scan; HOIST the callback) |
 | `new WindowFold(cap, op)`    | once, at construction (the two Float64 columns) |
@@ -1898,7 +1898,7 @@ WindowFoldUint32 is the BITWISE / MASKING window engine -- the sibling `WindowFo
 
 ## Testing
 
-**877 deterministic `node:test` cases**, plus a torture gate, a hard perf gate, and the O(1) witness gate.
+**880 deterministic `node:test` cases**, plus a torture gate, a hard perf gate, and the O(1) witness gate.
 
 ```bash
 npm test           # node:test cases (contract + boundary + differential fuzz)
@@ -1943,8 +1943,10 @@ are REPORTED-tier tools: engine changes run them before vs after as evidence, an
 `torture` gates two allocation terms: retained bytes per op (0 B/op, with a fail-closed verdict -- a null /
 non-finite measurement, an unsettled run, or fewer than 2 of 8 measured batches fails) and transient allocation,
 counted as minor GCs in a `--scav-child` process with a 1 MB semi-space (the max over two back-to-back windows
-must be `<= 2`, with a box control that must read `>= 2`; WindowFold's count is REPORTED, not gated -- KNOWN
-A6-WF, an open engine item). `maxMajor: 0` is gated; `maxPauseMs` is measured and REPORTED, not gated.
+must be `<= 2`, with a box control that must read `>= 2`; 29 lanes; WindowFold's SUM lane is gated again after
+A6 and read 0 and 0 in 3 of 3 runs on node v26.8.2; the WindowFoldMinFrac lane (MIN over fractional values)
+is REPORTED, KNOWN A7-WFP, a push-side box and an open engine item; the scav child runs with
+`--no-concurrent-recompilation`). `maxMajor: 0` is gated; `maxPauseMs` is measured and REPORTED, not gated.
 `torture:d8` repeats the scavenge idea on a pointer-compressed d8 for five inlined windows (CuckooMap at a Smi
 and a non-Smi seed, RandomSet, AliasTable, Reservoir: `<= 2` per 1e6 calls); the `--no-turbo-inlining` window
 counts are REPORTED. `LITE_O1_D8` overrides the d8 path (default `~/.jsvu/engines/v8/d8`); with no

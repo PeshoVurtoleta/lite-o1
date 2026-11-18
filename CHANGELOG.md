@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- `WindowFold.query()` no longer boxes a HeapNumber per call (A6). The rare-branch `this._cmb(...)` calls
+  (reverse and merge jobs) sit below V8's min_inlining_frequency, stay real calls and return a boxed double;
+  that merged with the idle path at `query()`'s return, so the idle result boxed too. The combine is now inlined
+  in `query()` only (`_cmb` stays for `push` / `_advance`). Measured on node v26.8.2: the SUM lane read 2 and 15
+  minor GCs per 1e6 calls (two windows) before, 0 and 0 in 3 of 3 round-2 torture runs after, and the burst-close
+  verify scav max read 0. Public API and results are unchanged: the new parity test compares 768,000
+  queries against the pre-A6 reference body (8a710fdb) with 0 mismatches. Residual: a `query()` that is not
+  inlined into its caller boxes its non-Smi return once per call.
+
 ### Tooling
 
 - devDependency added: `@zakkster/lite-utils` `^1.0.0` (`dependencies` stays empty; `files[]` unchanged). New
@@ -15,8 +26,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a one-statement mutant per member reads OVER, every limit minus one byte reads OVER, and a wrong node version
   reads `NO-VERDICT`. Methods named `get` / `set` are not gated (node compiles same-name functions itself), and
   each one is listed in `limits.json` `dropped`. New `test/Budget.test.js` (24, canned tool output, no spawn) pins
-  the fail-closed classifier, the runner exit code, the control predicates and the mutant inserter. `npm test`:
-  877 tests (was 853).
+  the fail-closed classifier, the runner exit code, the control predicates and the mutant inserter.
+- `test/budget/limits.json` `WindowFold.query` raised 242 -> 305 bytes on purpose (the inlined combine, +63 B); a
+  304 limit reads OVER (must-fail check). `npm test`: 880 tests (was 853 before the budget tests, 877 before the
+  A6 parity tests).
 
 ### Tests
 
@@ -40,9 +53,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   run, and the failing lane prints its `measuredBatches`.
 - torture `--scav-child` scavenge lane: a child process with a 1 MB semi-space counts minor GCs; the gate is the
   MAX over TWO back-to-back windows `<= 2` minor GCs, with a box control that must read `>= 2`. It catches
-  transient per-op allocation that the retained-bytes term cannot see. WindowFold's scav term is REPORTED, not
-  gated (KNOWN A6-WF: about 15-16 minor GCs per 1e6 calls at steady state with a megamorphic driver; an open
-  engine item).
+  transient per-op allocation that the retained-bytes term cannot see. WindowFold (SUM) is gated; the new lane
+  WindowFoldMinFrac (MIN, fractional values) is REPORTED (KNOWN A7-WFP: 30-31 minor GCs per 1e6 calls on the
+  new build, 45-46 on the before build, because `push()` stays a real call in that driver and boxes; an open
+  engine item). 29 lanes (was 28). The child runs with `--no-concurrent-recompilation` (5 of 202 after-build probe
+  processes read non-zero under concurrent TurboFan at load1 >= 12).
+  Teeth: the new torture.mjs against the before-A6 `O1.js` exits 1 naming WindowFold.
+- New `test/WindowFoldQueryParity.test.js` (3): live `query()` vs the pre-A6 reference body (8a710fdb),
+  `Object.is` on every step, 768,000 queries, 0 mismatches; digests and branch counts pinned to the before
+  build; 3 must-fail mutants.
 - torture: `maxPauseMs` is REPORTED, not gated (maintainer ruling 2026-11-18: a wall-clock pause on a shared
   host is a timing); `maxMajor: 0` stays gated. New control arms for `LITE_O1_TORTURE_BREAK`: `scav`,
   `null-bpc`, `major` and `d8` must fail; `pause` must still exit 0 (a forged 50 ms pause does NOT fail the run).
