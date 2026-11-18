@@ -111,7 +111,7 @@ negotiable per session; it is the frame both briefs live inside.
    `/release <semver>` gate + card sync after, same as members 1-13.
 
 The budget frontmatter is IDENTICAL in both briefs and never moves:
-`gc_maxMajor: 0`, `gc_maxPauseMs: 2`, `alloc_bytes_per_op: 0`, `leak_cycles: 4096`.
+`gc_maxMajor: 0`, `gc_maxPauseMs: 2` (superseded by the D8 ruling 2026-11-18: the pause is measured and REPORTED, no bound), `alloc_bytes_per_op: 0`, `leak_cycles: 4096`.
 lite-o1 has exactly one identity -- zero allocation and a witnessed flat constant
 -- and neither number changes for a new member.
 
@@ -196,7 +196,7 @@ Add the member to the import and to two phases: (1) RETENTION -- churn instances
 through `createLeakTracker`, `gc`, assert `tracker.size() -> 0` (a bitset / alias
 table owns only its typed arrays, nothing external, so reclamation is the desired
 outcome); (2) HOT PATH -- `measureAllocs` / `checkNoGc` over the steady op at
-`maxMajor: 0`, `maxPauseMs <= 2`, `0 B/op`, and an `arrayBuffers` delta of 0
+`maxMajor: 0`, `maxPauseMs` REPORTED (not gated; D8 ruling 2026-11-18), `0 B/op`, and an `arrayBuffers` delta of 0
 across fill/reset cycles (no store is reallocated). BitSet's bulk ops are O(words)
 but STILL 0 B/op -- they write into existing words, allocating nothing; torture
 must prove that, since "O(words)" is a time claim, not an allocation one.
@@ -263,7 +263,7 @@ status: planned
 member_index: 14
 cohort: worst-case            # no max-single-op line
 gc_maxMajor: 0
-gc_maxPauseMs: 2
+gc_maxPauseMs: 2            # superseded 2026-11-18 (D8): REPORTED, no bound
 alloc_bytes_per_op: 0
 leak_cycles: 4096
 peers: ["@zakkster/lite-gc-profiler", "@zakkster/lite-leak", "@zakkster/lite-perf-gate"]
@@ -382,7 +382,7 @@ status: planned
 member_index: 15
 cohort: worst-case-static     # no max-single-op line; O(n) build is a disclosed co-headline
 gc_maxMajor: 0
-gc_maxPauseMs: 2
+gc_maxPauseMs: 2            # superseded 2026-11-18 (D8): REPORTED, no bound
 alloc_bytes_per_op: 0
 leak_cycles: 4096
 peers: ["@zakkster/lite-gc-profiler", "@zakkster/lite-leak", "@zakkster/lite-perf-gate"]

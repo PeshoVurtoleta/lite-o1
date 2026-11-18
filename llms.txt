@@ -1532,12 +1532,17 @@ one. For arbitrary-index / out-of-order range aggregation use @zakkster/lite-log
 
 ## Scripts
 
-- npm test           -- 835 node:test cases (contract + boundary + differential fuzz).
+- npm test           -- 853 node:test cases (contract + boundary + differential fuzz).
 - npm run test:types -- tsc --noEmit against O1.d.ts.
-- npm run torture    -- lite-leak + lite-gc-profiler: 0 B/op, 0 major GC, leak-free.
+- npm run torture    -- lite-leak + lite-gc-profiler: 0 B/op, 0 major GC, leak-free, plus a
+                        scavenge-count lane (max of two windows <= 2 minor GCs; WindowFold
+                        REPORTED, KNOWN A6-WF). maxPauseMs is REPORTED, not gated.
+- npm run torture:controls -- control arms: each torture gate is proven able to fail.
+- npm run torture:d8 -- pointer-compressed d8 scavenge lane (D8 SKIP, exit 0, without one).
 - npm run witness    -- O(1) throughput-invariance harness + foils + flatness gate.
 - npm run test:perf  -- lite-perf-gate hard zero-alloc scavenge-scaling gate.
-- npm run verify     -- all five gates (publish gate).
+- npm run verify     -- the publish gate: test, test:types, torture, torture:controls,
+                        torture:d8, witness, test:perf.
 
 ## Witness gate (locked)
 

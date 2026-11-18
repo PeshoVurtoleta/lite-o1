@@ -22,6 +22,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   every word boundary +/- 1 at 32769), the partly used last word inside an op stream, and bulk op then single-bit
   edits; 4 must-fail subclass controls (H1-H4).
 - devDependency added: `@zakkster/lite-fastbit32` `^1.6.1` (`dependencies` stays empty; `files[]` unchanged).
+- torture allocation gate (A4): the `allocLane` verdict fails closed. A lane is ok only if `bytesPerCall` is
+  non-null AND finite, the measurement settled, and at least 2 of the 8 batches measured (and the round result
+  is `<= 0`); a null / non-finite `bytesPerCall`, an unsettled run, or fewer than 2 measured batches fails the
+  run, and the failing lane prints its `measuredBatches`.
+- torture `--scav-child` scavenge lane: a child process with a 1 MB semi-space counts minor GCs; the gate is the
+  MAX over TWO back-to-back windows `<= 2` minor GCs, with a box control that must read `>= 2`. It catches
+  transient per-op allocation that the retained-bytes term cannot see. WindowFold's scav term is REPORTED, not
+  gated (KNOWN A6-WF: about 15-16 minor GCs per 1e6 calls at steady state with a megamorphic driver; an open
+  engine item).
+- torture: `maxPauseMs` is REPORTED, not gated (maintainer ruling 2026-11-18: a wall-clock pause on a shared
+  host is a timing); `maxMajor: 0` stays gated. New control arms for `LITE_O1_TORTURE_BREAK`: `scav`,
+  `null-bpc`, `major` and `d8` must fail; `pause` must still exit 0 (a forged 50 ms pause does NOT fail the run).
+- New `npm run torture:d8` (`test/d8/`, run in `verify` after `torture:controls`): inlined windows are gated
+  `<= 2` scavenges per 1e6 calls (d8 15.7.37, pointer-compressed), with a per-op box control;
+  `--no-turbo-inlining` windows are REPORTED only. With no pointer-compressed d8 it prints `D8 SKIP <reason>` and
+  exits 0 (`LITE_O1_D8` overrides the d8 path).
+- PerfGate: the BucketQueue extract-drain scenario warms `hot()` in setup (F1b: a cold first window boxed
+  >= 64 KB in 4/5 fresh processes at gate flags, A4 probe 2026-11-18); the CoarseTimerWheel forEach-drain comment is scoped to a monomorphic hoisted callback.
+- torture drivers for WindowFold / WindowFoldUint32: two harness boxes the new scavenge lane caught in the
+  drivers themselves are removed (a closure-captured double sink moved to a Float64Array slot; the
+  WindowFoldUint32 driver's value counter `wfuv` went from `>>> 0` to `| 0`, same low 32 bits). The values passed
+  to O1.js and the sink results are unchanged.
+- New `test/D8Seeds.test.js` (5): checks the d8 lane's seed choice on Node -- the CuckooMap PC seed `0x40000001`
+  stores `_seed` / `_seed2` outside the pointer-compressed Smi band [-2^30, 2^30), the SMI seed `0` inside it, the
+  RandomSet / AliasTable / Reservoir seeds in [2^30, 2^31), plus a must-fail control on the band predicate. New
+  `test/A4Gates.test.js` (13): the forged `measuredBatches: 1` lane fails, the d8 SKIP / fail-closed matrix
+  (missing binary, non-pointer-compressed / missing / malformed config, a fake binary that never prints a real
+  RESULT), and the BucketQueue extract-drain warm-up leaves an empty queue (with a one-op-short must-fail
+  control). `npm test`: 853 tests (was 835).
 
 ## [1.12.0] - 2026-11-18
 

@@ -7,13 +7,15 @@
  *   - @zakkster/lite-leak      -- retention: do SparseSet instances outlive
  *                                 their owner? tracker.size() -> 0 is the proof.
  *   - @zakkster/lite-gc-profiler -- budget: does V8 collect where it must not,
- *                                   and does the hot path allocate? 0 B/op,
- *                                   maxMajor 0, maxPauseMs <= 2 is the gate.
+ *                                   and does the hot path allocate? 0 B/op
+ *                                   (retained bytes AND a scavenge-count child),
+ *                                   maxMajor 0 is the gate; maxPauseMs is REPORTED.
  *
  * Proves falsifiable assertion 4: 0 B/op on the hot path (add/has/delete),
- * maxMajor 0, maxPauseMs <= 2, and 100 fill/clear cycles leaving tracker.size()
- * at 0 with an arrayBuffers delta of exactly 0 (clear() zeroes no store, and the
- * single reused SparseSet allocates no new backing buffers).
+ * maxMajor 0 (maxPauseMs is printed as REPORTED, not gated), and 100
+ * fill/clear cycles leaving tracker.size() at 0 with an arrayBuffers delta of
+ * exactly 0 (clear() zeroes no store, and the single reused SparseSet allocates
+ * no new backing buffers).
  *
  * ENTRY CONTRACT: --expose-gc is mandatory (the GC gate is meaningless without
  * it); the two devDeps are imported AFTER the guard so a fresh clone that skipped
@@ -57,6 +59,38 @@ async function main() {
     // A2 (DQ-2): LITE_O1_TORTURE_BREAK=uf-bad arms the UnionFind bad-id lane ONLY
     // (a retained per-op alloc inside ufBadStep); every other lane runs clean.
     const BREAK_UF_BAD = process.env.LITE_O1_TORTURE_BREAK === 'uf-bad';
+    // SPEC-A4 S4 / A-6 arms (each proves one gate can fail -- or, for pause, that it is
+    // REPORT-ONLY): null-bpc forges SparseSet's measurement to {bytesPerCall: null,
+    // measuredBatches: 0} (null is not zero -> the lane fails).
+    const BREAK_NULL_BPC = process.env.LITE_O1_TORTURE_BREAK === 'null-bpc';
+    // scav: a TRANSIENT {v} per op in the SparseSet step (it escapes into a 1-slot holder, so it is
+    // really allocated, and dies young) -- invisible to the retained-bytes lane (still 0 B/op), it
+    // must trip the scavenge-count lane. major: one gc() inside the phase-2b window (maxMajor 0).
+    // pause: the 2b summary's maxMs forged to 50 ms -- maxPauseMs is REPORT-ONLY (D8), so this run
+    // must still exit 0.
+    const BREAK_SCAV = process.env.LITE_O1_TORTURE_BREAK === 'scav';
+    const BREAK_MAJOR = process.env.LITE_O1_TORTURE_BREAK === 'major';
+    const BREAK_PAUSE = process.env.LITE_O1_TORTURE_BREAK === 'pause';
+    const scavHold = [null]; // the scav arm's transient: overwritten every op, never accumulated
+    // `node --expose-gc ... test/torture.mjs --scav-child`: the scavenge-count child (S2),
+    // spawned by this same file; it runs only the allocLane steps (phase 2a-scav).
+    const SCAV_CHILD = process.argv.includes('--scav-child');
+    const SCAV_FLAGS = ['--expose-gc', '--min-semi-space-size=1', '--max-semi-space-size=1'];
+    const SCAV_WARM_CALLS = 200;   // warm-up: 200 drive calls ...
+    const SCAV_WARM_OPS = 1000;    // ... x 1000 steps each (tier-up before the window)
+    const SCAV_WINDOW_X = 10;      // window = 10 x the lane's measureAllocs iterations
+    const SCAV_LIMIT = 2;          // <= 2 minor GCs per window (a tier-up transient, not a per-op box)
+    const SCAV_BOX_MIN = 2;        // the box control must read >= 2 (else the counter is blind)
+    const SCAV_TIMEOUT_MS = 180000;
+    if (SCAV_CHILD) {
+        // Fail closed: without BOTH pinned semi-space flags the scavenge scale drifts.
+        for (const fl of SCAV_FLAGS) {
+            if (!process.execArgv.includes(fl)) {
+                process.stderr.write('torture --scav-child: FAIL -- missing node flag ' + fl + '\n');
+                process.exit(1);
+            }
+        }
+    }
     const brkSink = []; // retains the injected allocations so the gate can see them
 
     const leaks = [];
@@ -331,7 +365,7 @@ async function main() {
 
     // Non-vacuous: the tracker must actually be holding the instances now, so
     // that "size()===0 after gc" is a real reclaim, not an empty tracker.
-    const trackedMid = fillTracker();
+    const trackedMid = SCAV_CHILD ? 0 : fillTracker(); // the scav child skips phase 1
     const trackedOk = trackedMid > 0;
 
     // Drain: FinalizationRegistry callbacks run on their own task, so a single
@@ -346,6 +380,47 @@ async function main() {
     const findings = tracker.audit();
 
     // ---- phase 2a: per-call allocation on the hot path (0 B/op) ------------
+    // F2 (SPEC-A4 S1 + A-2): ONE allocation lane per member surface. A lane is ok only when
+    // the measurement is VERIFIED -- null is not zero:
+    //   bytesPerCall !== null && finite      (a null / non-finite figure measured nothing)
+    //   settled === true                     (every batch got both forced settles + a reading)
+    //   measuredBatches >= 2 (of 8)          (a4-probes.log b census: clean runs measure 4..8 of 8;
+    //                                         inverted batches are +/-16 B heap jitter, so 2 is
+    //                                         margin, not a tuned edge. The transient-allocation
+    //                                         teeth are the scav lane, not the batch count.)
+    //   Math.round(bytesPerCall) <= 0        ("0 B/op" at the sampling floor: a truly
+    //                                         non-allocating op reads a sub-byte figure; any per-op
+    //                                         allocation is an object of >= 16 B and rounds to >= 16)
+    // A failing lane names itself + its reason on stderr; the GATE prints the lanes in call order.
+    const LANES = [];
+    function allocLane(name, laneStep, iters) {
+        const lane = { name, step: laneStep, iters, res: null, bytes: null, ok: false, reason: '' };
+        LANES.push(lane);
+        if (SCAV_CHILD) return lane; // the scav child counts minor GCs instead (phase 2a-scav)
+        let res = measureAllocs(laneStep, { iterations: iters, batches: 8 });
+        if (BREAK_NULL_BPC && name === 'SparseSet') {
+            res = Object.assign({}, res, { bytesPerCall: null, measuredBatches: 0 }); // forged: nothing measured
+        }
+        lane.res = res;
+        const bpc = res.bytesPerCall;
+        if (bpc === null) lane.reason = 'bytesPerCall null (no batch measured)';
+        else if (!Number.isFinite(bpc)) lane.reason = 'bytesPerCall non-finite';
+        else {
+            lane.bytes = Math.max(0, Math.round(bpc));
+            if (res.settled !== true) lane.reason = 'measurement not settled';
+            else if (!(res.measuredBatches >= 2)) lane.reason = 'measuredBatches ' + res.measuredBatches + ' < 2';
+            else if (!(Math.round(bpc) <= 0)) lane.reason = 'allocates on the hot path';
+            else lane.ok = true;
+        }
+        return lane;
+    }
+    function laneLine(l) {
+        const r = l.res;
+        return (l.bytes === null ? 'null' : l.bytes) + ' B/op ' + l.name + ' -- ' + l.reason +
+            (r === null ? '' : ' (raw bytesPerCall ' + r.bytesPerCall + ', measuredBatches ' + r.measuredBatches +
+                '/' + r.batches + ', inverted ' + r.invertedBatches + ', settled ' + r.settled + ')');
+    }
+
     // One SparseSet, reused. The churn keeps size bounded (add -> has -> delete).
     const inst = new SparseSet(U, CAP);
     let key = 0;
@@ -355,9 +430,9 @@ async function main() {
         inst.has(key);
         inst.delete(key);
         if (BREAK) brkSink.push({ v: key }); // F3: retained per-op alloc when armed
+        if (BREAK_SCAV) scavHold[0] = { v: key }; // A4 scav arm: transient per-op alloc (dies young)
     };
-    const allocRes = measureAllocs(step, { iterations: 100000, batches: 8 });
-    const bpc = allocRes.bytesPerCall === null ? 0 : allocRes.bytesPerCall;
+    const allocRes = allocLane('SparseSet', step, 100000);
 
     // RingDeque hot path: a both-ends interleave that keeps the ring bounded.
     // pushBack + popFront (FIFO) then pushFront + popBack (LIFO) -- every op is
@@ -372,10 +447,7 @@ async function main() {
         ring.pushFront(rv);
         ring.popBack();
     };
-    const ringAllocRes = measureAllocs(ringStep, { iterations: 100000, batches: 8 });
-    const ringBpc = ringAllocRes.bytesPerCall === null ? 0 : ringAllocRes.bytesPerCall;
-    const ringAllocBytes = Math.max(0, Math.round(ringBpc));
-    const ringAllocOk = ringAllocBytes === 0;
+    const ringAllocRes = allocLane('RingDeque', ringStep, 100000);
 
     // UnionFind hot path: a fully-coalesced, path-halving-flattened forest, then
     // find / union(already-connected) / connected / componentSize over a walking
@@ -393,10 +465,7 @@ async function main() {
         uf.connected(ufKey, 0);
         uf.componentSize(ufKey);
     };
-    const ufAllocRes = measureAllocs(ufStep, { iterations: 100000, batches: 8 });
-    const ufBpc = ufAllocRes.bytesPerCall === null ? 0 : ufAllocRes.bytesPerCall;
-    const ufAllocBytes = Math.max(0, Math.round(ufBpc));
-    const ufAllocOk = ufAllocBytes === 0;
+    const ufAllocRes = allocLane('UnionFind', ufStep, 100000);
 
     // UnionFind bad-id lane (A2): the sentinel contract on the hot path. B is
     // HOISTED (built once, outside the measured window) and covers every bad
@@ -422,10 +491,8 @@ async function main() {
         if (BREAK_UF_BAD) brkSink.push({ v: ufBadIdx }); // DQ-2: retained per-op alloc when armed
     };
     for (let k = 0; k < 20000; k++) ufBadStep(); // warm-up: every B class reaches optimized code
-    const ufBadAllocRes = measureAllocs(ufBadStep, { iterations: 100000, batches: 8 });
-    const ufBadBpc = ufBadAllocRes.bytesPerCall === null ? 0 : ufBadAllocRes.bytesPerCall;
-    const ufBadAllocBytes = Math.max(0, Math.round(ufBadBpc));
-    const ufBadAllocOk = ufBadAllocRes.bytesPerCall !== null && ufBadAllocBytes === 0 && ufBadMiss === 0 && ufBadHit > 0;
+    const ufBadAllocRes = allocLane('UnionFind bad-id', ufBadStep, 100000);
+    const ufBadBranchOk = ufBadMiss === 0 && ufBadHit > 0; // every bad id answered -1 / 0 / false
 
     // MonoDeque hot path: a bounded sliding window. Each step pushes one value,
     // slides by one (evictOlderThan) and reads value() + frontSeq() -- every op is
@@ -442,10 +509,7 @@ async function main() {
         mono.value();
         mono.frontSeq();
     };
-    const monoAllocRes = measureAllocs(monoStep, { iterations: 100000, batches: 8 });
-    const monoBpc = monoAllocRes.bytesPerCall === null ? 0 : monoAllocRes.bytesPerCall;
-    const monoAllocBytes = Math.max(0, Math.round(monoBpc));
-    const monoAllocOk = monoAllocBytes === 0;
+    const monoAllocRes = allocLane('MonoDeque', monoStep, 100000);
 
     // MinStack hot path: a bounded resident stack. Each step pushes one value, then
     // peeks + reads the extreme + pops it -- every op is O(1) WORST-CASE, zero-alloc,
@@ -461,10 +525,7 @@ async function main() {
         minStack.extreme();
         minStack.pop();
     };
-    const minAllocRes = measureAllocs(minStep, { iterations: 100000, batches: 8 });
-    const minBpc = minAllocRes.bytesPerCall === null ? 0 : minAllocRes.bytesPerCall;
-    const minAllocBytes = Math.max(0, Math.round(minBpc));
-    const minAllocOk = minAllocBytes === 0;
+    const minAllocRes = allocLane('MinStack', minStep, 100000);
 
     // RandomSet hot path: a bounded resident set. Each step peeks a uniform member
     // (sample), removes a uniform member (removeRandom) then re-adds the SAME key --
@@ -478,10 +539,7 @@ async function main() {
         const v = rand.removeRandom(); // removes a uniform member (size RAND_W-1)
         rand.add(v);                   // re-append the just-removed key (size RAND_W)
     };
-    const randAllocRes = measureAllocs(randStep, { iterations: 100000, batches: 8 });
-    const randBpc = randAllocRes.bytesPerCall === null ? 0 : randAllocRes.bytesPerCall;
-    const randAllocBytes = Math.max(0, Math.round(randBpc));
-    const randAllocOk = randAllocBytes === 0;
+    const randAllocRes = allocLane('RandomSet', randStep, 100000);
 
     // FreqO1 hot path: a bounded resident LFU structure. Each step increments a
     // walking key (bucket-forest surgery: unlink + find/create target + relink +
@@ -499,10 +557,7 @@ async function main() {
         const k = freq.popMin();       // remove the LFU key (size FREQ_W-1)
         freq.add(k);                   // re-add it at frequency 1 (size FREQ_W)
     };
-    const freqAllocRes = measureAllocs(freqStep, { iterations: 100000, batches: 8 });
-    const freqBpc = freqAllocRes.bytesPerCall === null ? 0 : freqAllocRes.bytesPerCall;
-    const freqAllocBytes = Math.max(0, Math.round(freqBpc));
-    const freqAllocOk = freqAllocBytes === 0;
+    const freqAllocRes = allocLane('FreqO1', freqStep, 100000);
 
     // BucketQueue hot path: a bounded resident monotone priority queue drained in a
     // rolling window. Each step extractMin-removes the min-priority key (the bucket
@@ -522,10 +577,7 @@ async function main() {
         const k = buck.extractMin();     // drain the min key (cursor advances when a bucket empties)
         buck.insert(k, buck.cursor + 1); // re-insert one bucket ahead -> rolling window
     };
-    const buckAllocRes = measureAllocs(buckStep, { iterations: 100000, batches: 8 });
-    const buckBpc = buckAllocRes.bytesPerCall === null ? 0 : buckAllocRes.bytesPerCall;
-    const buckAllocBytes = Math.max(0, Math.round(buckBpc));
-    const buckAllocOk = buckAllocBytes === 0;
+    const buckAllocRes = allocLane('BucketQueue', buckStep, 100000);
 
     // TimerWheel hot path: a bounded resident timer wheel churned in a rolling drain.
     // TW_W timers are primed across TW_SLOTS slots; each step drains the current due
@@ -546,10 +598,7 @@ async function main() {
         tw.drainDue(twReschedule); // fire+remove the due slot, re-arm each drained timer
         tw.advance(1);             // the current slot is drained -> legal O(1) advance
     };
-    const twAllocRes = measureAllocs(twStep, { iterations: 100000, batches: 8 });
-    const twBpc = twAllocRes.bytesPerCall === null ? 0 : twAllocRes.bytesPerCall;
-    const twAllocBytes = Math.max(0, Math.round(twBpc));
-    const twAllocOk = twAllocBytes === 0;
+    const twAllocRes = allocLane('TimerWheel', twStep, 100000);
     const twNoop = () => {};
 
     // HierarchicalTimerWheel hot path: a bounded resident cascading wheel churned in a
@@ -574,10 +623,7 @@ async function main() {
         htw.drainDue(htwRearm); // fire+remove the due slot, re-arm each drained timer into level 1
         htw.advance(1);         // the current slot is drained -> legal O(1) advance (cascade on a wrap)
     };
-    const htwAllocRes = measureAllocs(htwStep, { iterations: 100000, batches: 8 });
-    const htwBpc = htwAllocRes.bytesPerCall === null ? 0 : htwAllocRes.bytesPerCall;
-    const htwAllocBytes = Math.max(0, Math.round(htwBpc));
-    const htwAllocOk = htwAllocBytes === 0;
+    const htwAllocRes = allocLane('HierarchicalTimerWheel', htwStep, 100000);
     const htwNoop = () => {};
 
     // RingLog hot path: a bounded resident log at STEADY FULL state -- each step pushes
@@ -600,10 +646,7 @@ async function main() {
         ringLog.newest();
         ringLog.get(rlv & (RL_CAP - 1));
     };
-    const ringLogAllocRes = measureAllocs(ringLogStep, { iterations: 100000, batches: 8 });
-    const ringLogBpc = ringLogAllocRes.bytesPerCall === null ? 0 : ringLogAllocRes.bytesPerCall;
-    const ringLogAllocBytes = Math.max(0, Math.round(ringLogBpc));
-    const ringLogAllocOk = ringLogAllocBytes === 0;
+    const ringLogAllocRes = allocLane('RingLog', ringLogStep, 100000);
 
     // CuckooMap hot path: a bounded resident map at a MODERATE steady load (~0.5, well under
     // the 0.90 ceiling and far from any re-seed), churned in place. Each step deletes a
@@ -625,10 +668,7 @@ async function main() {
         cuSink = (cuSink + (cuck.get(cuk) | 0)) | 0;
         cuSink = (cuSink + (cuck.has(cuk ^ 1) ? 1 : 0)) | 0;
     };
-    const cuckAllocRes = measureAllocs(cuckStep, { iterations: 100000, batches: 8 });
-    const cuckBpc = cuckAllocRes.bytesPerCall === null ? 0 : cuckAllocRes.bytesPerCall;
-    const cuckAllocBytes = Math.max(0, Math.round(cuckBpc));
-    const cuckAllocOk = cuckAllocBytes === 0;
+    const cuckAllocRes = allocLane('CuckooMap', cuckStep, 100000);
 
     // SparseTable hot path: a STATIC build-once table, BUILT ONCE OUTSIDE the measured window
     // (the O(n log n) build is the disclosed co-headline, EXCLUDED from the per-op claim -- like
@@ -650,10 +690,7 @@ async function main() {
         stSink = (stSink + (sparseTable.query(stl, stl + ST_W - 1) | 0)) | 0; // O(1) wide-range query
         stSink = (stSink + (sparseTable.at(stl) | 0)) | 0;                    // O(1) source read
     };
-    const stAllocRes = measureAllocs(stStep, { iterations: 100000, batches: 8 });
-    const stBpc = stAllocRes.bytesPerCall === null ? 0 : stAllocRes.bytesPerCall;
-    const stAllocBytes = Math.max(0, Math.round(stBpc));
-    const stAllocOk = stAllocBytes === 0;
+    const stAllocRes = allocLane('SparseTable', stStep, 100000);
 
     // BitSet PER-BIT hot path: a walking bit toggled (set/clear via the summary-maintaining
     // transition path) + a membership probe + the O(1) frontier read (firstSet). Every op is
@@ -671,10 +708,7 @@ async function main() {
         bitset.unset(bsk);
         bsSink = (bsSink + (bitset.firstSet() | 0)) | 0;
     };
-    const bitAllocRes = measureAllocs(bitStep, { iterations: 100000, batches: 8 });
-    const bitBpc = bitAllocRes.bytesPerCall === null ? 0 : bitAllocRes.bytesPerCall;
-    const bitAllocBytes = Math.max(0, Math.round(bitBpc));
-    const bitAllocOk = bitAllocBytes === 0;
+    const bitAllocRes = allocLane('BitSet per-bit', bitStep, 100000);
 
     // BitSet HIGH-BIT hot path (closes the reviewer nit on the per-bit gate above): a DEDICATED
     // bitset primed with bit 31 of word 0 set, PLUS the top bit of the LAST word set -- the raw
@@ -694,10 +728,7 @@ async function main() {
         bhSink = (bhSink + (bitHigh.firstSet() | 0)) | 0;   // reads word 0 directly: value >= 2^31
         bhSink = (bhSink + (bitHigh.nextSet(32) | 0)) | 0;  // summary descent to the LAST word: also >= 2^31
     };
-    const bitHighAllocRes = measureAllocs(bitHighStep, { iterations: 100000, batches: 8 });
-    const bitHighBpc = bitHighAllocRes.bytesPerCall === null ? 0 : bitHighAllocRes.bytesPerCall;
-    const bitHighAllocBytes = Math.max(0, Math.round(bitHighBpc));
-    const bitHighAllocOk = bitHighAllocBytes === 0;
+    const bitHighAllocRes = allocLane('BitSet firstSet/nextSet >=2^31 word', bitHighStep, 100000);
 
     // BitSet BULK hot path: an in-place `or` between two SAME-capacity bitsets. This is O(words)
     // (a disclosed co-headline, NOT the per-bit O(1) claim) but STILL 0 B/op -- it writes into the
@@ -707,14 +738,11 @@ async function main() {
     const bitB = new BitSet(BS_BITS);
     for (let k = 0; k < BS_BITS; k += 3) bitB.set(k); // a fixed operand mask
     const bitOrStep = () => { bitA.or(bitB); };
-    const bitOrAllocRes = measureAllocs(bitOrStep, { iterations: 2000, batches: 8 });
-    const bitOrBpc = bitOrAllocRes.bytesPerCall === null ? 0 : bitOrAllocRes.bytesPerCall;
-    const bitOrAllocBytes = Math.max(0, Math.round(bitOrBpc));
-    const bitOrAllocOk = bitOrAllocBytes === 0;
+    const bitOrAllocRes = allocLane('BitSet or', bitOrStep, 2000);
 
     // BitSet firstSet RETENTION gate (closes the blind spot that let a 1.4.0 probe ship: it
     // pushed String(_w[j]) into a module-level array whenever firstSet read a word >= 2^31).
-    // The bitHighAllocOk bytes/op gate above MISSED that probe -- `raw` was a CONSTANT
+    // The BitSet >=2^31-word bytes/op lane above MISSED that probe -- `raw` was a CONSTANT
     // (0x80000000 every call), so String(raw) interned to a single string and the growing array
     // amortized to a sub-byte per-call figure that rounded to 0. Unbounded RETENTION, not per-op
     // allocation, is the true signal: pound firstSet on a bit-31 bitset and assert the live JS
@@ -746,10 +774,7 @@ async function main() {
     const aliasTable = new AliasTable(atW, 0x9e3779b1); // built once, outside the measured loop
     let atSink = 0;
     const aliasStep = () => { atSink = (atSink + aliasTable.sample()) | 0; };
-    const aliasAllocRes = measureAllocs(aliasStep, { iterations: 100000, batches: 8 });
-    const aliasBpc = aliasAllocRes.bytesPerCall === null ? 0 : aliasAllocRes.bytesPerCall;
-    const aliasAllocBytes = Math.max(0, Math.round(aliasBpc));
-    const aliasAllocOk = aliasAllocBytes === 0;
+    const aliasAllocRes = allocLane('AliasTable sample', aliasStep, 100000);
 
     // CoarseTimerWheel hot path: a bounded resident NON-CASCADING coarse wheel churned in a rolling
     // drain. CTW_W timers are primed spread across fine (L0) + coarse (L1+) buckets; each step drains
@@ -768,10 +793,7 @@ async function main() {
         ctw.drainDue(ctwRearm); // fire+remove the due bucket(s), re-arm each drained timer far ahead
         ctw.advance(1);         // the current tick is drained -> legal worst-case-O(1) advance
     };
-    const ctwAllocRes = measureAllocs(ctwStep, { iterations: 100000, batches: 8 });
-    const ctwBpc = ctwAllocRes.bytesPerCall === null ? 0 : ctwAllocRes.bytesPerCall;
-    const ctwAllocBytes = Math.max(0, Math.round(ctwBpc));
-    const ctwAllocOk = ctwAllocBytes === 0;
+    const ctwAllocRes = allocLane('CoarseTimerWheel', ctwStep, 100000);
     const ctwNoop = () => {};
 
     // WindowFold hot path: a bounded resident sliding window (DABA-Lite) churned by push + evict +
@@ -783,17 +805,18 @@ async function main() {
     const WF_W = 1 << 11;                   // 2048 resident elements, < cap so never full
     const wf = new WindowFold(WF_CAP, 'SUM');
     for (let k = 0; k < WF_W; k++) wf.push((k * 2654435761) & 0x7fffffff); // bounded resident window
-    let wfv = 0, wfSink = 0;
+    // The sink lives in a Float64Array slot: a running double sum held in a closure-context `let`
+    // boxes a HeapNumber on EVERY write once it leaves the Smi range (zero-box law) -- the scav
+    // child caught that harness box (A4: 18 minor GCs / 1e6-call window -> 2 with this slot).
+    let wfv = 0;
+    const wfSinkF = new Float64Array(1);
     const wfStep = () => {
         wfv = (wfv + 1) | 0;
         wf.push(wfv);
         wf.evict();
-        wfSink += wf.query() | 0;
+        wfSinkF[0] += wf.query() | 0;
     };
-    const wfAllocRes = measureAllocs(wfStep, { iterations: 100000, batches: 8 });
-    const wfBpc = wfAllocRes.bytesPerCall === null ? 0 : wfAllocRes.bytesPerCall;
-    const wfAllocBytes = Math.max(0, Math.round(wfBpc));
-    const wfAllocOk = wfAllocBytes === 0;
+    const wfAllocRes = allocLane('WindowFold', wfStep, 100000);
 
     // RankSelect hot path: a STATIC build-once cs-poppy index, BUILT ONCE OUTSIDE the measured window
     // (the O(n) build + the ~3.2% index space are the disclosed co-headline, EXCLUDED from the per-op
@@ -811,10 +834,7 @@ async function main() {
         rsRankKey = (rsRankKey + 1) & (RS_BITS - 1);
         rsRankSink = (rsRankSink + rankSelect.rank1(rsRankKey)) | 0; // O(1) worst-case rank
     };
-    const rsRankAllocRes = measureAllocs(rsRankStep, { iterations: 100000, batches: 8 });
-    const rsRankBpc = rsRankAllocRes.bytesPerCall === null ? 0 : rsRankAllocRes.bytesPerCall;
-    const rsRankAllocBytes = Math.max(0, Math.round(rsRankBpc));
-    const rsRankAllocOk = rsRankAllocBytes === 0;
+    const rsRankAllocRes = allocLane('RankSelect rank1', rsRankStep, 100000);
 
     const rsSize = rankSelect.size;
     let rsSelKey = 0, rsSelSink = 0;
@@ -823,10 +843,7 @@ async function main() {
         // select1: sample-bracketed hybrid linear/binary L1 search, worst-case O(log(nbits/2048)).
         rsSelSink = (rsSelSink + rankSelect.select1(rsSelKey)) | 0;
     };
-    const rsSelAllocRes = measureAllocs(rsSelStep, { iterations: 100000, batches: 8 });
-    const rsSelBpc = rsSelAllocRes.bytesPerCall === null ? 0 : rsSelAllocRes.bytesPerCall;
-    const rsSelAllocBytes = Math.max(0, Math.round(rsSelBpc));
-    const rsSelAllocOk = rsSelAllocBytes === 0;
+    const rsSelAllocRes = allocLane('RankSelect select1', rsSelStep, 100000);
 
     // RankSelect select gappy (binary branch): the dense lane above only ever lands in the LINEAR
     // branch (a sample bracket spans ~1 lower block). Here a 2^25-bit vector with only bits {0,
@@ -852,10 +869,7 @@ async function main() {
         rsGapKey = (rsGapKey + 1) | 0;
         rsGapSink = (rsGapSink + rsGap1.select1(rsGapKey & 1) + rsGap0.select0(rsGapKey & 1)) | 0;
     };
-    const rsGapAllocRes = measureAllocs(rsGapStep, { iterations: 100000, batches: 8 });
-    const rsGapBpc = rsGapAllocRes.bytesPerCall === null ? 0 : rsGapAllocRes.bytesPerCall;
-    const rsGapAllocBytes = Math.max(0, Math.round(rsGapBpc));
-    const rsGapAllocOk = rsGapAllocRes.bytesPerCall !== null && rsGapAllocBytes === 0 && rsGapBranchOk;
+    const rsGapAllocRes = allocLane('RankSelect select gappy (binary branch)', rsGapStep, 100000);
 
     // EliasFano hot path: a STATIC build-once succinct codec, BUILT ONCE OUTSIDE the measured window
     // (the O(n) build + succinct space are the disclosed co-headline). access(i) is O(1)-typical /
@@ -872,20 +886,14 @@ async function main() {
         efAccKey = (efAccKey + 1) & (EF_N - 1);
         efAccSink = (efAccSink + efHot.access(efAccKey)) | 0; // O(1)-typical / O(log n)-worst access
     };
-    const efAccAllocRes = measureAllocs(efAccStep, { iterations: 100000, batches: 8 });
-    const efAccBpc = efAccAllocRes.bytesPerCall === null ? 0 : efAccAllocRes.bytesPerCall;
-    const efAccAllocBytes = Math.max(0, Math.round(efAccBpc));
-    const efAccAllocOk = efAccAllocBytes === 0;
+    const efAccAllocRes = allocLane('EliasFano access', efAccStep, 100000);
 
     let efNextKey = 0, efNextSink = 0;
     const efNextStep = () => {
         efNextKey = (efNextKey + 2654435761) % efHotMax;
         efNextSink = (efNextSink + efHot.nextGEQ(efNextKey)) | 0; // O(1)-typical / O(log n)-worst, zero-alloc
     };
-    const efNextAllocRes = measureAllocs(efNextStep, { iterations: 100000, batches: 8 });
-    const efNextBpc = efNextAllocRes.bytesPerCall === null ? 0 : efNextAllocRes.bytesPerCall;
-    const efNextAllocBytes = Math.max(0, Math.round(efNextBpc));
-    const efNextAllocOk = efNextAllocBytes === 0;
+    const efNextAllocRes = allocLane('EliasFano nextGEQ', efNextStep, 100000);
 
     // Reservoir hot path: a fixed-k reservoir FILLED to capacity OUTSIDE the measured window, so every
     // measured add() takes the Algorithm R sampling branch (one NR-LCG advance + one compare + a
@@ -900,20 +908,14 @@ async function main() {
         rvHot.add(rvVal);
         rvAddSink = (rvAddSink + rvHot.seen) | 0; // observe the sampling mutation
     };
-    const rvAddAllocRes = measureAllocs(rvAddStep, { iterations: 100000, batches: 8 });
-    const rvAddBpc = rvAddAllocRes.bytesPerCall === null ? 0 : rvAddAllocRes.bytesPerCall;
-    const rvAddAllocBytes = Math.max(0, Math.round(rvAddBpc));
-    const rvAddAllocOk = rvAddAllocBytes === 0;
+    const rvAddAllocRes = allocLane('Reservoir add', rvAddStep, 100000);
 
     let rvGetKey = 0, rvGetSink = 0;
     const rvGetStep = () => {
         rvGetKey = (rvGetKey + 1) & (RV_K - 1);
         rvGetSink = (rvGetSink + (rvHot.get(rvGetKey) | 0)) | 0; // O(1) positional read, zero-alloc
     };
-    const rvGetAllocRes = measureAllocs(rvGetStep, { iterations: 100000, batches: 8 });
-    const rvGetBpc = rvGetAllocRes.bytesPerCall === null ? 0 : rvGetAllocRes.bytesPerCall;
-    const rvGetAllocBytes = Math.max(0, Math.round(rvGetBpc));
-    const rvGetAllocOk = rvGetAllocBytes === 0;
+    const rvGetAllocRes = allocLane('Reservoir get', rvGetStep, 100000);
 
     // WindowFoldUint32 hot path: a bounded resident sliding window (DABA-Lite, bitwise OR) churned by
     // push + evict + query each step. WFU_W masks are primed (< cap so never full); each step pushes one
@@ -925,23 +927,77 @@ async function main() {
     for (let k = 0; k < WFU_W; k++) wfu.push((k * 2654435761) >>> 0 & 0xffff); // bounded resident window
     let wfuv = 0, wfuSink = 0;
     const wfuStep = () => {
-        wfuv = (wfuv + 0x9e3779b1) >>> 0;
+        // `| 0`, not `>>> 0`: a uint32 >= 2^31 in a closure-context `let` is a non-Smi that boxes on
+        // every write (A4 scav child: 7 minor GCs / window -> 0). Same low 32 bits, so the pushed
+        // `wfuv & 0xffff` stream -- and the sink -- are identical.
+        wfuv = (wfuv + 0x9e3779b1) | 0;
         wfu.push(wfuv & 0xffff);
         wfu.evict();
         wfuSink = (wfuSink + wfu.query()) | 0;
     };
-    const wfuAllocRes = measureAllocs(wfuStep, { iterations: 100000, batches: 8 });
-    const wfuBpc = wfuAllocRes.bytesPerCall === null ? 0 : wfuAllocRes.bytesPerCall;
-    const wfuAllocBytes = Math.max(0, Math.round(wfuBpc));
-    const wfuAllocOk = wfuAllocBytes === 0;
+    const wfuAllocRes = allocLane('WindowFoldUint32', wfuStep, 100000);
 
-    // "0 B/op" resolved at the sampling floor: heapUsed deltas are quantized and
-    // noisy, so a truly non-allocating op reads a sub-byte figure (a lone blip
-    // in one batch / iterations). Round to the nearest byte -- any per-op
-    // allocation is an object of >= 16 B and rounds to >= 16, so the gate keeps
-    // its teeth; sub-byte noise rounds to 0.
-    const allocBytes = Math.max(0, Math.round(bpc));
-    const allocOk = allocBytes === 0;
+    // ---- phase 2a-scav: the scavenge-count child (SPEC-A4 S2, F3) -----------
+    // measureAllocs reads RETAINED bytes after two forced collections, so a TRANSIENT
+    // per-op object (one that dies young) reads 0 B/op there. This child sees it: with a
+    // 1 MB semi-space every ~1 MiB of young allocation costs one minor GC, so each lane
+    // runs a warm-up (SCAV_WARM_CALLS x SCAV_WARM_OPS steps), then TWO back-to-back windows of
+    // 10 x the lane's measureAllocs iterations each, with NO gc() between warm-up, window 1 and
+    // window 2 (A-8: the parent gates the MAX of the two -- one window can sit before steady
+    // state; WindowFold read 2 in window 1 vs ~15 in window 2). The child counts the minor GCs
+    // whose start falls inside each window (PerformanceObserver 'gc', kind scavenge or minor
+    // mark-sweep; read after a settle, never inside a window). One line per lane,
+    // `SCAV <lane> <w1> <w2>`, then the box control (5e5 HeapNumbers -- must read >= 2, or the
+    // counter is blind), then `SCAVDONE`. The parent (phase 2e) gates every count.
+    if (SCAV_CHILD) {
+        const { PerformanceObserver, performance } = await import('node:perf_hooks');
+        const minorAt = []; // minor-GC start times, appended by the observer task (outside every window)
+        const obs = new PerformanceObserver((list) => {
+            for (const e of list.getEntries()) {
+                const k = e.detail ? e.detail.kind : e.kind;
+                if (k === 1 || k === 2) minorAt.push(e.startTime); // 1 scavenge, 2 minor mark-sweep
+            }
+        });
+        obs.observe({ entryTypes: ['gc'] });
+        const settle = () => new Promise((r) => setTimeout(() => setImmediate(r), 40));
+        const T = new Float64Array(4); // window bounds live in typed slots, never boxed locals
+        const countIn = (a, b) => {
+            let n = 0;
+            for (let j = 0; j < minorAt.length; j++) if (minorAt[j] >= T[a] && minorAt[j] <= T[b]) n++;
+            return n;
+        };
+        const scavDrive = (f, n) => { for (let i = 0; i < n; i++) f(i); };
+        for (let li = 0; li < LANES.length; li++) {
+            const l = LANES[li];
+            for (let w = 0; w < SCAV_WARM_CALLS; w++) scavDrive(l.step, SCAV_WARM_OPS);
+            await settle();
+            T[0] = performance.now();
+            scavDrive(l.step, l.iters * SCAV_WINDOW_X); // window 1
+            T[1] = performance.now();
+            T[2] = performance.now();
+            scavDrive(l.step, l.iters * SCAV_WINDOW_X); // window 2, back-to-back
+            T[3] = performance.now();
+            await settle();
+            process.stdout.write('SCAV ' + l.name + ' ' + countIn(0, 1) + ' ' + countIn(2, 3) + '\n');
+        }
+        // Box control: one 16 B HeapNumber per op (a double stored into a generic-elements
+        // slot), 5e5 ops ~= 8 MB of young allocation -> several minor GCs. Must read >= 2.
+        const BOX = [{}];
+        const boxSink = new Int32Array(1);
+        const boxes = (n) => {
+            for (let i = 0; i < n; i++) { BOX[0] = i + 0.5; boxSink[0] = (boxSink[0] + (BOX[0] | 0)) | 0; }
+        };
+        boxes(2000);
+        await settle();
+        T[0] = performance.now();
+        boxes(500000);
+        T[1] = performance.now();
+        await settle();
+        process.stdout.write('SCAVBOX ' + countIn(0, 1) + '\n');
+        obs.disconnect();
+        process.stdout.write('SCAVDONE\n');
+        return;
+    }
 
     // ---- phase 2b: GC budget over a long hot run --------------------------
     const gc = new GcProfiler().start();
@@ -972,6 +1028,7 @@ async function main() {
             gc.sampleHeap(performance.now(), process.memoryUsage().heapUsed);
         }
     }
+    if (BREAK_MAJOR) globalThis.gc(); // A4 major arm: one forced full GC inside the 2b window
     // Exercise the iteration + O(1) clear hot surface too.
     for (let f = 0; f < 1024; f++) {
         for (let k = 0; k < 512; k++) inst.add(k);
@@ -1127,7 +1184,10 @@ async function main() {
     }
     await new Promise((r) => setTimeout(r, 50));
     const s2 = gc.summary();
-    const report = checkNoGc(s2, { maxMajor: 0, maxPauseMs: 2 });
+    // D8 ruling: maxPauseMs is REPORT-ONLY (a wall-clock pause on a shared host is a timing,
+    // not a deterministic count) -- the GATE prints maxMs as REPORTED; maxMajor 0 stays gated.
+    if (BREAK_PAUSE) s2.gc.maxMs = 50; // A4 pause arm: a forged 50 ms pause must NOT fail the run
+    const report = checkNoGc(s2, { maxMajor: 0 });
     gc.stop();
 
     // ---- phase 2c: 100 fill/clear cycles -- arrayBuffers must not grow -------
@@ -1260,45 +1320,115 @@ async function main() {
     const rsReseedOk = rsReseedForced && rsReseedBytes > 0 &&
         rsReseedBytes <= rsReseedBound && rsReseedIntegrity;
 
+    // ---- phase 2e: scavenge-count lanes (SPEC-A4 S2, F3) --------------------
+    // Spawn this file as `--scav-child` under a pinned 1 MB semi-space (see phase 2a-scav) and
+    // gate the MAX of each lane's two window counts (A-8). Fail closed on EVERY unverified state: timeout, spawn error, non-zero exit
+    // or signal, a missing SCAVDONE, a non-integer count, a duplicate / missing / unknown lane
+    // (the child's lane set must equal this run's allocLane set), or a blind box control.
+    // Resolution: one minor GC ~= 1 MiB of young allocation, so a 1e6-call window resolves
+    // ~1 B/op per GC; BitSet or (2e3 iterations -> a 2e4-call window) is COARSE, ~52 B/op per GC.
+    // SCAV_KNOWN (S6): a lane that reads > SCAV_LIMIT on UNMODIFIED library code is a possible
+    // library / engine bug -- never patched here, never a raised limit. It ships REPORTED with its
+    // KNOWN brief id (printed on stdout + stderr every run) until the engine unit closes it.
+    const SCAV_KNOWN = {
+        // WindowFold: push + evict + query on one 'SUM' instance boxes ~1 HeapNumber per op once the
+        // aggregate leaves the Smi range (15 / 1e6-call window after a 2e6-call warm-up, 109 / 8e6;
+        // a standalone single-'SUM'-instance script reads 0 with a monomorphic driver and 15 / 1e6
+        // with a megamorphic one (step compiled as its own unit); the child runs no other
+        // WindowFold (phase 1 skipped); the old single 2e5-warm window read 2 (pre-steady-state)).
+        // Harness sink boxes already removed. Not gated until the engine brief resolves it.
+        'WindowFold': 'A6-WF',
+    };
+    const { spawnSync } = await import('node:child_process');
+    const { fileURLToPath } = await import('node:url');
+    const scavFail = [];
+    const scavCount = new Map();
+    let scavBox = -1;
+    let scavDone = false;
+    const scavT0 = Date.now();
+    const scavRun = spawnSync(process.execPath, SCAV_FLAGS.concat([fileURLToPath(import.meta.url), '--scav-child']),
+        { env: process.env, encoding: 'utf8', timeout: SCAV_TIMEOUT_MS, maxBuffer: 1 << 24 });
+    const scavSecs = (Date.now() - scavT0) / 1000;
+    if (scavRun.error) {
+        scavFail.push('scav child did not complete: ' + (scavRun.error.code === 'ETIMEDOUT'
+            ? 'timeout after ' + (SCAV_TIMEOUT_MS / 1000) + ' s' : String(scavRun.error.message)));
+    } else if (scavRun.status !== 0) {
+        scavFail.push('scav child exited ' + scavRun.status + (scavRun.signal ? ' (signal ' + scavRun.signal + ')' : '') +
+            ' -- ' + String(scavRun.stderr || '').trim().split('\n').slice(-3).join(' / '));
+    }
+    for (const line of String(scavRun.stdout || '').split('\n')) {
+        if (line === 'SCAVDONE') { scavDone = true; continue; }
+        let m = /^SCAVBOX (.*)$/.exec(line);
+        if (m) {
+            if (!/^\d+$/.test(m[1])) scavFail.push('scav box control count not an integer: ' + JSON.stringify(m[1]));
+            else scavBox = Number(m[1]);
+            continue;
+        }
+        m = /^SCAV (.+) (\S+) (\S+)$/.exec(line); // name may contain spaces; two counts
+        if (!m) continue;
+        if (!/^\d+$/.test(m[2]) || !/^\d+$/.test(m[3])) {
+            scavFail.push('scav ' + m[1] + ' window counts not integers: ' + JSON.stringify(m[2]) + ' ' + JSON.stringify(m[3]));
+            continue;
+        }
+        if (scavCount.has(m[1])) scavFail.push('scav ' + m[1] + ' reported twice');
+        scavCount.set(m[1], [Number(m[2]), Number(m[3])]);
+    }
+    if (!scavDone) scavFail.push('scav child never printed SCAVDONE');
+    const laneNames = new Set(LANES.map((l) => l.name));
+    let scavMax = -1;
+    let scavMaxLane = '';
+    let scavPer = '';
+    for (const l of LANES) {
+        const win = l.iters * SCAV_WINDOW_X;
+        const known = SCAV_KNOWN[l.name];
+        if (!scavCount.has(l.name)) { scavFail.push('scav ' + l.name + ': missing count'); continue; }
+        const w = scavCount.get(l.name);
+        const n = w[0] > w[1] ? w[0] : w[1];
+        const nWin = w[0] > w[1] ? 'window 1' : 'window 2';
+        scavPer += (scavPer === '' ? '' : ' | ') + l.name + '=' + w[0] + ',' + w[1] + '/' + win +
+            ' (~' + (1048576 / win).toFixed(win < 100000 ? 0 : 1) + ' B/op per GC' + (win < 100000 ? ', coarse' : '') + ')' +
+            (known ? ' REPORTED KNOWN ' + known : '');
+        if (known) continue;
+        if (n > scavMax) { scavMax = n; scavMaxLane = l.name; }
+        if (n > SCAV_LIMIT) {
+            scavFail.push('scav ' + l.name + ' ' + n + ' minor GCs in ' + nWin + ' (windows ' + w[0] + ', ' + w[1] + '; ' + win +
+                ' calls each; limit ' + SCAV_LIMIT + ' on the max) -- transient allocation on the hot path');
+        }
+    }
+    for (const name of scavCount.keys()) if (!laneNames.has(name)) scavFail.push('scav unknown lane ' + JSON.stringify(name));
+    if (scavBox < 0) scavFail.push('scav box control missing');
+    else if (scavBox < SCAV_BOX_MIN) scavFail.push('scav box control ' + scavBox + ' < ' + SCAV_BOX_MIN + ' -- the minor-GC counter is blind');
+    const scavOk = scavFail.length === 0;
+    console.log('SCAV per-lane minor GCs, window 1,2 / calls each (1 MB semi-space, child ' + scavSecs.toFixed(1) + ' s): ' + scavPer +
+        ' | box=' + scavBox + '/500000');
+    for (const k of Object.keys(SCAV_KNOWN)) {
+        console.error('  scav ' + k + ' REPORTED (KNOWN ' + SCAV_KNOWN[k] + ', not gated): ' +
+            (scavCount.has(k) ? scavCount.get(k).join(', ') : 'missing') + ' minor GCs in windows 1, 2');
+    }
+
     // ---- verdict + GATE line ----------------------------------------------
+    let lanesOk = LANES.length === 28;
+    let laneGate = '';
+    for (let li = 0; li < LANES.length; li++) {
+        const l = LANES[li];
+        if (!l.ok) lanesOk = false;
+        laneGate += (li === 0 ? '' : ' ') + (l.bytes === null ? 'null' : l.bytes) + ' B/op (' + l.name + ')';
+    }
+    if (LANES.length !== 28) console.error('  alloc lane count ' + LANES.length + ' (expected 28)');
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
-        findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && ufBadAllocOk && monoAllocOk &&
-        minAllocOk && randAllocOk && freqAllocOk && buckAllocOk && twAllocOk && htwAllocOk &&
-        ringLogAllocOk && cuckAllocOk && stAllocOk && bitAllocOk && bitHighAllocOk && bitOrAllocOk && bitRetOk && aliasAllocOk && ctwAllocOk && wfAllocOk && rsRankAllocOk && rsSelAllocOk && rsGapAllocOk && efAccAllocOk && efNextAllocOk && rvAddAllocOk && rvGetAllocOk && wfuAllocOk && rsReseedOk && abOk;
+        findings.length === 0 && lanesOk && scavOk && ufBadBranchOk && rsGapBranchOk && bitRetOk && rsReseedOk && abOk;
 
     console.log(
         'GATE leak=size ' + live + '/0 findings=' + findings.length +
         ' warnings=' + warns.length +
         ' | gc major=' + s2.gc.major + ' minor=' + s2.gc.minor +
-        ' maxMs=' + s2.gc.maxMs.toFixed(2) +
-        ' | alloc=' + allocBytes + ' B/op (SparseSet) ' + ringAllocBytes + ' B/op (RingDeque) ' +
-        ufAllocBytes + ' B/op (UnionFind) ' +
-        ufBadAllocBytes + ' B/op (UnionFind bad-id) ' + monoAllocBytes + ' B/op (MonoDeque) ' +
-        minAllocBytes + ' B/op (MinStack) ' + randAllocBytes + ' B/op (RandomSet) ' +
-        freqAllocBytes + ' B/op (FreqO1) ' + buckAllocBytes + ' B/op (BucketQueue) ' +
-        twAllocBytes + ' B/op (TimerWheel) ' +
-        htwAllocBytes + ' B/op (HierarchicalTimerWheel) ' +
-        ringLogAllocBytes + ' B/op (RingLog) ' +
-        cuckAllocBytes + ' B/op (CuckooMap) ' +
-        stAllocBytes + ' B/op (SparseTable) ' +
-        bitAllocBytes + ' B/op (BitSet per-bit) ' +
-        bitHighAllocBytes + ' B/op (BitSet firstSet/nextSet >=2^31 word) ' +
-        bitOrAllocBytes + ' B/op (BitSet or) ' +
-        aliasAllocBytes + ' B/op (AliasTable sample) ' +
-        ctwAllocBytes + ' B/op (CoarseTimerWheel) ' +
-        wfAllocBytes + ' B/op (WindowFold) ' +
-        rsRankAllocBytes + ' B/op (RankSelect rank1) ' +
-        rsSelAllocBytes + ' B/op (RankSelect select1) ' +
-        rsGapAllocBytes + ' B/op (RankSelect select gappy (binary branch)) ' +
-        efAccAllocBytes + ' B/op (EliasFano access) ' +
-        efNextAllocBytes + ' B/op (EliasFano nextGEQ) ' +
-        rvAddAllocBytes + ' B/op (Reservoir add) ' +
-        rvGetAllocBytes + ' B/op (Reservoir get) ' +
-        wfuAllocBytes + ' B/op (WindowFoldUint32)' +
+        ' maxMs=' + s2.gc.maxMs.toFixed(2) + ' (REPORTED)' +
+        ' | alloc=' + laneGate +
+        ' | scav max=' + scavMax + ' (' + scavMaxLane + ') limit<=' + SCAV_LIMIT + ' box=' + scavBox + '>=' + SCAV_BOX_MIN +
         ' | reseed=' + rsReseedBytes + '/' + rsReseedBound + ' B allocs=' + rsReseedAllocs + ' (CuckooMap forced re-seed)' +
         ' | bitRetGrowth=' + bitRetGrowth + ' B' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
-        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' bsSink=' + bsSink + ' bhSink=' + bhSink + ' brSink=' + brSink + ' atSink=' + atSink + ' wfSink=' + wfSink + ' rsRankSink=' + rsRankSink + ' rsSelSink=' + rsSelSink + ' rsGapSink=' + rsGapSink + ' efAccSink=' + efAccSink + ' efNextSink=' + efNextSink + ' rvAddSink=' + rvAddSink + ' rvGetSink=' + rvGetSink + ' wfuSink=' + wfuSink + ' ufBadHit=' + ufBadHit + ' ufBadMiss=' + ufBadMiss + ' abGrowth=' + abDelta + ')');
+        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' bsSink=' + bsSink + ' bhSink=' + bhSink + ' brSink=' + brSink + ' atSink=' + atSink + ' wfSink=' + wfSinkF[0] + ' rsRankSink=' + rsRankSink + ' rsSelSink=' + rsSelSink + ' rsGapSink=' + rsGapSink + ' efAccSink=' + efAccSink + ' efNextSink=' + efNextSink + ' rvAddSink=' + rvAddSink + ' rvGetSink=' + rvGetSink + ' wfuSink=' + wfuSink + ' ufBadHit=' + ufBadHit + ' ufBadMiss=' + ufBadMiss + ' abGrowth=' + abDelta + ')');
 
     if (!ok) {
         if (!trackedOk) console.error('  vacuous: tracker held ' + trackedMid + ' instances (expected > 0)');
@@ -1307,35 +1437,11 @@ async function main() {
         }
         for (const f of findings) console.error('  finding ' + f.kind + ':' + f.reason);
         for (const l of leaks) console.error('  leak ' + l);
-        if (!allocOk) console.error('  alloc ' + allocBytes + ' B/op SparseSet (raw bytesPerCall ' + bpc + ')');
-        if (!ringAllocOk) console.error('  alloc ' + ringAllocBytes + ' B/op RingDeque (raw bytesPerCall ' + ringBpc + ')');
-        if (!ufAllocOk) console.error('  alloc ' + ufAllocBytes + ' B/op UnionFind (raw bytesPerCall ' + ufBpc + ')');
-        if (!ufBadAllocOk) console.error('  alloc ' + ufBadAllocBytes + ' B/op UnionFind bad-id (raw bytesPerCall ' + ufBadAllocRes.bytesPerCall + ') hit=' + ufBadHit + ' miss=' + ufBadMiss + ' -- every bad id must answer -1 / 0 / false at 0 B/op');
-        if (!monoAllocOk) console.error('  alloc ' + monoAllocBytes + ' B/op MonoDeque (raw bytesPerCall ' + monoBpc + ')');
-        if (!minAllocOk) console.error('  alloc ' + minAllocBytes + ' B/op MinStack (raw bytesPerCall ' + minBpc + ')');
-        if (!randAllocOk) console.error('  alloc ' + randAllocBytes + ' B/op RandomSet (raw bytesPerCall ' + randBpc + ')');
-        if (!freqAllocOk) console.error('  alloc ' + freqAllocBytes + ' B/op FreqO1 (raw bytesPerCall ' + freqBpc + ')');
-        if (!buckAllocOk) console.error('  alloc ' + buckAllocBytes + ' B/op BucketQueue (raw bytesPerCall ' + buckBpc + ')');
-        if (!twAllocOk) console.error('  alloc ' + twAllocBytes + ' B/op TimerWheel (raw bytesPerCall ' + twBpc + ')');
-        if (!htwAllocOk) console.error('  alloc ' + htwAllocBytes + ' B/op HierarchicalTimerWheel (raw bytesPerCall ' + htwBpc + ')');
-        if (!ringLogAllocOk) console.error('  alloc ' + ringLogAllocBytes + ' B/op RingLog (raw bytesPerCall ' + ringLogBpc + ')');
-        if (!cuckAllocOk) console.error('  alloc ' + cuckAllocBytes + ' B/op CuckooMap (raw bytesPerCall ' + cuckBpc + ')');
-        if (!stAllocOk) console.error('  alloc ' + stAllocBytes + ' B/op SparseTable (raw bytesPerCall ' + stBpc + ')');
-        if (!bitAllocOk) console.error('  alloc ' + bitAllocBytes + ' B/op BitSet per-bit (raw bytesPerCall ' + bitBpc + ')');
-        if (!bitHighAllocOk) console.error('  alloc ' + bitHighAllocBytes + ' B/op BitSet firstSet/nextSet >=2^31 word (raw bytesPerCall ' + bitHighBpc + ')');
-        if (!bitOrAllocOk) console.error('  alloc ' + bitOrAllocBytes + ' B/op BitSet or (raw bytesPerCall ' + bitOrBpc + ')');
+        for (const l of LANES) if (!l.ok) console.error('  alloc ' + laneLine(l));
+        for (const sf of scavFail) console.error('  ' + sf);
+        if (!ufBadBranchOk) console.error('  UnionFind bad-id branch hit=' + ufBadHit + ' miss=' + ufBadMiss + ' -- every bad id must answer -1 / 0 / false at 0 B/op');
+        if (!rsGapBranchOk) console.error('  RankSelect select gappy (binary branch) branchOk=' + rsGapBranchOk + ' bracket1=' + rsGapBracket1 + ' bracket0=' + rsGapBracket0);
         if (!bitRetOk) console.error('  retain ' + bitRetGrowth + ' B heap growth over 2e6 BitSet firstSet calls (>= 2^31 word); limit ' + (1 << 20) + ' B -- a firstSet must retain nothing');
-        if (!aliasAllocOk) console.error('  alloc ' + aliasAllocBytes + ' B/op AliasTable sample (raw bytesPerCall ' + aliasBpc + ')');
-        if (!ctwAllocOk) console.error('  alloc ' + ctwAllocBytes + ' B/op CoarseTimerWheel (raw bytesPerCall ' + ctwBpc + ')');
-        if (!wfAllocOk) console.error('  alloc ' + wfAllocBytes + ' B/op WindowFold (raw bytesPerCall ' + wfBpc + ')');
-        if (!rsRankAllocOk) console.error('  alloc ' + rsRankAllocBytes + ' B/op RankSelect rank1 (raw bytesPerCall ' + rsRankBpc + ')');
-        if (!rsSelAllocOk) console.error('  alloc ' + rsSelAllocBytes + ' B/op RankSelect select1 (raw bytesPerCall ' + rsSelBpc + ')');
-        if (!rsGapAllocOk) console.error('  alloc ' + rsGapAllocBytes + ' B/op RankSelect select gappy (binary branch) (raw bytesPerCall ' + rsGapAllocRes.bytesPerCall + ') branchOk=' + rsGapBranchOk + ' bracket1=' + rsGapBracket1 + ' bracket0=' + rsGapBracket0);
-        if (!efAccAllocOk) console.error('  alloc ' + efAccAllocBytes + ' B/op EliasFano access (raw bytesPerCall ' + efAccBpc + ')');
-        if (!efNextAllocOk) console.error('  alloc ' + efNextAllocBytes + ' B/op EliasFano nextGEQ (raw bytesPerCall ' + efNextBpc + ')');
-        if (!rvAddAllocOk) console.error('  alloc ' + rvAddAllocBytes + ' B/op Reservoir add (raw bytesPerCall ' + rvAddBpc + ')');
-        if (!rvGetAllocOk) console.error('  alloc ' + rvGetAllocBytes + ' B/op Reservoir get (raw bytesPerCall ' + rvGetBpc + ')');
-        if (!wfuAllocOk) console.error('  alloc ' + wfuAllocBytes + ' B/op WindowFoldUint32 (raw bytesPerCall ' + wfuBpc + ')');
         if (!rsReseedOk) console.error('  reseed forced=' + rsReseedForced + ' bytes=' + rsReseedBytes + ' bound=' + rsReseedBound + ' allocs=' + rsReseedAllocs + ' integrity=' + rsReseedIntegrity + ' -- the forced CuckooMap re-seed must fire, allocate > 0, stay bounded (<= 2 x (cap+1) x 8), and keep every key');
         if (!abOk) console.error('  arrayBuffers growth ' + abDelta + ' (expected <= 0)');
         process.exitCode = 1;

@@ -802,10 +802,13 @@ const bqInsertChurn = {
  * the monotone cursor advancing as a bucket empties). The queue oscillates
  * 0 -> BQ_W (< BQ_CAP), never full, and every op is zero-alloc. clear() resets the
  * cursor to 0 each cycle so the refill's low priorities never trip the rewind guard.
+ * setup() warms hot() (warmHot: 320 whole BQ_W cycles, queue left empty): cold, the interpreted
+ * refill hash boxes 30.5-485.5 KB into the N window (>= 64 KB in 4/5 runs at gate flags); warm,
+ * 3.4 KB in 20/20 at N and 8N, bq.size 0, bucketGrows delta 0 (probe 2026-11-18, 5 processes/cell).
  */
 const bqExtractDrain = {
     name: 'BucketQueue extract-drain (bulk fill then drain)',
-    setup() { return { bq: new BucketQueue(BQ_U, BQ_CEIL, BQ_CAP) }; },
+    setup() { return warmHot(bqExtractDrain.hot, { bq: new BucketQueue(BQ_U, BQ_CEIL, BQ_CAP) }); },
     hot(s, n) {
         const q = s.bq;
         for (let i = 0; i < n; i++) {
@@ -1806,6 +1809,9 @@ const ctwAdvanceTick = {
  * CoarseTimerWheel forEach-drain: a primed wheel scanned each op through a HOISTED module-scope
  * callback (never re-created per op). Proves forEach itself (the alloc-free dense-order scan; the
  * ONE per-protocol allocator is [Symbol.iterator], gated separately) allocates nothing.
+ * Gated scope: a monomorphic hoisted callback, Smi-range fireAt. A non-inlined (polymorphic) callback
+ * boxes one HeapNumber per call once fireAt >= 2^31 (Node) / >= 2^30 (d8), and a library-free twin
+ * boxes identically -> engine boxing, by design (probe 2026-11-18, Node + d8, counts 1:8:64).
  */
 let ctwForEachAcc = 0;
 function ctwForEachInto(id, fireAt) { ctwForEachAcc = (ctwForEachAcc + id + (fireAt | 0)) | 0; }
