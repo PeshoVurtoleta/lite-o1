@@ -376,11 +376,14 @@ const MAX_NODES = 0xFFFFFFFF; // 2^32 - 1
  * staying flat while a no-compression / no-union-by-size foil degrades.
  *
  * Elements are [0, n); `count` is the live component count, maintained in O(1)
- * (decremented once per real merge -- NO scan). Fail closed, mirroring the other
- * members: a non-integer / out-of-range / non-number element throws a
- * [lite-o1]-tagged error via _oob (typeof-guarded BEFORE the coercing `>>>`, so a
- * Symbol / BigInt never reaches arithmetic). `null` is not zero --
- * `(null >>> 0) === null` is false, so null is rejected.
+ * (decremented once per real merge -- NO scan). A bad element is a
+ * non-integer / out-of-range / non-number value (typeof-guarded BEFORE the
+ * coercing `>>>`, so a Symbol / BigInt never reaches arithmetic); `null` is not
+ * zero -- `(null >>> 0) === null` is false, so null is bad. The QUERIES answer a
+ * bad element with a sentinel and never throw, matching the sibling queries:
+ * find -> -1, connected -> false (if either element is bad), componentSize -> 0.
+ * The MUTATOR union() fails closed: a bad element throws a [lite-o1]-tagged
+ * RangeError via _oob before any write.
  *
  * `reset()` and `forEachRoots(fn)` are the documented O(n) full-scan exceptions
  * (a single bulk pass over the existing arrays -- they still allocate NOTHING but
@@ -417,16 +420,17 @@ export class UnionFind {
 
     /**
      * Return the root of x's component. O(1)-AMORTIZED. Path-halving flattens the
-     * walk in place (no recursion, no stack array -- zero allocation). Fails
-     * closed: a bad element throws via _oob. The `typeof` short-circuits BEFORE
-     * `>>>` runs, because `>>>` coerces its operand first and that coercion THROWS
-     * on a Symbol or BigInt; `(x >>> 0) !== x` then rejects every non-uint32
-     * number, and `x >= n` rejects an in-range uint32 past the universe.
+     * walk in place (no recursion, no stack array -- zero allocation). A bad
+     * element returns -1 (never a root: roots are [0, n)) and never throws. The
+     * `typeof` short-circuits BEFORE `>>>` runs, because `>>>` coerces its operand
+     * first and that coercion THROWS on a Symbol or BigInt; `(x >>> 0) !== x` then
+     * rejects every non-uint32 number, and `x >= n` rejects an in-range uint32
+     * past the universe. -0 is element 0.
      * @param {number} x
-     * @returns {number} the component root
+     * @returns {number} the component root, or -1 for a bad element
      */
     find(x) {
-        if (typeof x !== 'number' || (x >>> 0) !== x || x >= this._n) return this._oob(x);
+        if (typeof x !== 'number' || (x >>> 0) !== x || x >= this._n) return -1;
         const parent = this._parent;
         while (parent[x] !== x) {
             parent[x] = parent[parent[x]]; // path halving: point x at its grandparent
@@ -460,22 +464,27 @@ export class UnionFind {
 
     /**
      * True iff a and b are in the same component. O(1)-AMORTIZED. Both elements
-     * are guarded via find (a bad element throws [lite-o1]).
+     * are guarded via find: false if either is bad, never a throw. The `ra >= 0`
+     * test keeps two bad elements (-1 === -1) from reading as connected.
      * @param {number} a
      * @param {number} b
      * @returns {boolean}
      */
     connected(a, b) {
-        return this.find(a) === this.find(b);
+        const ra = this.find(a);
+        return ra >= 0 && ra === this.find(b);
     }
 
     /**
-     * Size of the component containing x. O(1)-AMORTIZED. x is guarded via find.
+     * Size of the component containing x. O(1)-AMORTIZED. x is guarded via find:
+     * a bad element returns 0 (a real size is >= 1), never a throw, and never
+     * reads _size[-1].
      * @param {number} x
-     * @returns {number}
+     * @returns {number} the component size, or 0 for a bad element
      */
     componentSize(x) {
-        return this._size[this.find(x)];
+        const r = this.find(x);
+        return r < 0 ? 0 : this._size[r];
     }
 
     /**
@@ -515,7 +524,7 @@ export class UnionFind {
         for (let i = 0; i < n; i++) if (parent[i] === i) yield i;
     }
 
-    // ---- cold path only: throw builder (string concat lives here, off the hot body) ----
+    // ---- cold path only: throw builder for union() (string concat lives here, off the hot body) ----
 
     /** @private */
     _oob(x) {

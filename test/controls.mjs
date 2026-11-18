@@ -15,6 +15,10 @@
  *     injects a retained per-op allocation into the SparseSet phase-2a hot loop,
  *     so the 0-B/op gate rejects the window, the run exits NON-zero, and it never
  *     prints "ok".
+ *   - ARMED uf-bad (`LITE_O1_TORTURE_BREAK=uf-bad ...`) injects a retained per-op
+ *     allocation into the UnionFind bad-id lane ONLY (A2): the run must exit
+ *     NON-zero, never print "ok", and name "UnionFind bad-id" on stderr -- proof
+ *     that lane's own 0-B/op gate can fail.
  *
  * A suite that always fails is as useless as one that never does; both arms are
  * required. CONVENTION (mirrors ../LiteLru/test/controls.mjs): this entry prints
@@ -32,10 +36,10 @@ import { spawnSync } from 'node:child_process';
 
 const ENTRY = new URL('./torture.mjs', import.meta.url).pathname;
 
-/** Run the torture entry with an optional BREAK arm. Returns code + output. */
-function runWith(breakOn) {
+/** Run the torture entry with an optional BREAK mode ('1' | 'uf-bad'; null = clean). */
+function runWith(mode) {
     const env = Object.assign({}, process.env);
-    if (breakOn) env.LITE_O1_TORTURE_BREAK = '1';
+    if (mode) env.LITE_O1_TORTURE_BREAK = mode;
     else delete env.LITE_O1_TORTURE_BREAK;
     const res = spawnSync(process.execPath, ['--expose-gc', ENTRY], { env, encoding: 'utf8' });
     return { code: res.status, stdout: res.stdout || '', stderr: res.stderr || '' };
@@ -49,7 +53,7 @@ function fail(msg) {
 // Pass-through: an ambient LITE_O1_TORTURE_BREAK=1 surfaces the armed (failing)
 // run directly, so the arm can be exercised from the shell.
 if (process.env.LITE_O1_TORTURE_BREAK === '1') {
-    const r = runWith(true);
+    const r = runWith('1');
     process.stdout.write(r.stdout);
     process.stderr.write(r.stderr);
     if (r.code === 0) fail('LITE_O1_TORTURE_BREAK=1 armed torture still exited 0 -- the alloc gate is decorative');
@@ -58,16 +62,25 @@ if (process.env.LITE_O1_TORTURE_BREAK === '1') {
 
 // 1. The clean run must pass. If it does not, the ARMED arm is meaningless.
 {
-    const r = runWith(false);
+    const r = runWith(null);
     if (r.code !== 0) fail('clean torture exited ' + r.code + ' (expected 0)\n' + r.stderr);
     if (!/\bok\b/.test(r.stdout)) fail('clean torture did not print an "ok" GATE line\n' + r.stdout);
 }
 
 // 2. The armed run must exit non-zero and must NOT print an "ok" verdict.
 {
-    const r = runWith(true);
+    const r = runWith('1');
     if (r.code === 0) fail('LITE_O1_TORTURE_BREAK=1 still exited 0 -- the torture alloc gate is decorative');
     if (/\| ok \(/.test(r.stdout)) fail('LITE_O1_TORTURE_BREAK=1 printed an "ok" verdict on a failing run');
+}
+
+// 3. The uf-bad arm (A2): only the UnionFind bad-id lane is armed. It must exit
+//    non-zero, must NOT print an "ok" verdict, and must name its own lane.
+{
+    const r = runWith('uf-bad');
+    if (r.code === 0) fail('LITE_O1_TORTURE_BREAK=uf-bad still exited 0 -- the UnionFind bad-id alloc gate is decorative');
+    if (/\| ok \(/.test(r.stdout)) fail('LITE_O1_TORTURE_BREAK=uf-bad printed an "ok" verdict on a failing run');
+    if (!/UnionFind bad-id/.test(r.stderr)) fail('LITE_O1_TORTURE_BREAK=uf-bad failed without naming "UnionFind bad-id" on stderr\n' + r.stderr);
 }
 
 process.stdout.write('ok\n');

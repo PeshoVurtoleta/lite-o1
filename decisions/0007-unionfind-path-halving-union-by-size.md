@@ -94,3 +94,19 @@ the live component count is `count`.
 - A future rank-based or splitting variant would revisit the size column and the
   merge-only boundary on its own terms; union-by-size + path halving is what makes
   the v0.3.0 contract this clean while still serving `componentSize` for free.
+
+## Amendment (2026-11-18, planned 1.12.0): queries return sentinels
+
+The ceiling text above stands. What changed is the bad-element contract of the three
+QUERIES, to follow the sibling-query convention (booleans -> `false`, ids -> `-1`,
+counts -> `0`): `find(x)` returns `-1`, `componentSize(x)`
+returns `0`, `connected(a, b)` returns `false` if either element is bad (two bad elements
+are never connected). None of them throws. The `_oob` throw builder now serves `union`
+only (the mutator still fails closed, before any write, message unchanged).
+
+- The element guard is the same typeof-first check (`typeof x !== 'number' || (x >>> 0) !== x || x >= n`).
+- `connected` and `componentSize` guard `ra >= 0` after `find`, so the `-1 === -1` trap
+  (two bad elements comparing equal as sentinels) cannot make `connected(bad, bad)` true.
+- `connected(valid, bad)` still path-halves a's own walk before returning `false`, the same
+  as before; halving never changes a component, so it is not observable.
+- Valid-element behavior is byte-identical to 1.11.3 (parity-checked); `-0` is element 0.

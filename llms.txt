@@ -255,13 +255,15 @@ The typeof guard runs FIRST so a Symbol / BigInt never reaches arithmetic.
 Hot surface (all O(1)-AMORTIZED, zero allocation):
 
 - find(x) -> number      Root of x's component. Path halving flattens the walk in
-                         place (no recursion, no stack array). Throws [lite-o1] on
-                         a bad element (typeof-guarded before the coercing >>>).
+                         place (no recursion, no stack array). Returns -1 on a bad
+                         element (never throws; typeof-guarded before the coercing >>>).
 - union(a,b) -> boolean  Merge a and b. true iff a real merge happened (they were
                          separate); false if already joined. Union by size. Guards
-                         both endpoints. count-- exactly once per true merge.
-- connected(a,b) -> boolean  find(a) === find(b). Both guarded via find.
-- componentSize(x) -> number size[find(x)]. Guarded via find.
+                         both endpoints; THROWS [lite-o1] on a bad element,
+                         before any write. count-- exactly once per true merge.
+- connected(a,b) -> boolean  find(a) === find(b). false if either element is bad
+                         (never throws; two bad elements are never connected).
+- componentSize(x) -> number size[find(x)]. 0 on a bad element (never throws).
 - count (getter)         Live component count. O(1), maintained (never scanned).
 - capacity (getter)      Fixed element universe n. (No `size` getter -- it would
                          collide with the live-count meaning size has elsewhere.)
@@ -1388,7 +1390,7 @@ one. For arbitrary-index / out-of-order range aggregation use @zakkster/lite-log
   (fail closed); pop/peek on empty returns undefined. Numeric values only.
 - RingDeque value: typeof 'number' and not NaN (+/-Infinity accepted).
 - UnionFind element: integer in [0, n); fixed n, no growth. Fail closed on a bad
-  element (throws [lite-o1]); reset() and forEachRoots() are the O(n) exceptions.
+  element (find -> -1, componentSize -> 0, connected -> false; union throws [lite-o1]); reset() and forEachRoots() are the O(n) exceptions.
 - MonoDeque capacity (power-of-two, rounded up): max simultaneously-live entries;
   push past full throws (fail closed). Value: typeof 'number' and not NaN
   (+/-Infinity accepted). kind frozen at construction. seq ceiling 2^53.
@@ -1530,7 +1532,7 @@ one. For arbitrary-index / out-of-order range aggregation use @zakkster/lite-log
 
 ## Scripts
 
-- npm test           -- 542 node:test cases (contract + boundary + differential fuzz).
+- npm test           -- 800 node:test cases (contract + boundary + differential fuzz).
 - npm run test:types -- tsc --noEmit against O1.d.ts.
 - npm run torture    -- lite-leak + lite-gc-profiler: 0 B/op, 0 major GC, leak-free.
 - npm run witness    -- O(1) throughput-invariance harness + foils + flatness gate.

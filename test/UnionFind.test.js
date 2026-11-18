@@ -4,8 +4,10 @@
  * Proves the UnionFind contract:
  *   1. Contract: find / union / connected / componentSize / count / reset /
  *      forEachRoots / roots on hand-built forests.
- *   2. Boundary: reject Symbol / BigInt / NaN / null / undefined / -1 / n / 1.5 /
- *      non-integer elements (never a raw TypeError); ctor rejects a bad n.
+ *   2. Boundary: Symbol / BigInt / NaN / null / undefined / -1 / n / 1.5 /
+ *      non-integer elements -> the queries answer a sentinel (find -1,
+ *      connected false, componentSize 0), union() throws [lite-o1] (never a raw
+ *      TypeError); ctor rejects a bad n.
  *   3. count decrements EXACTLY once per true merge, never on a redundant union.
  *   4. Path halving actually shrinks depth (TEST-ONLY peek at _parent internals).
  *   5. A LARGE (>= 1e5) mixed union/find/connected differential fuzz vs a trivial
@@ -174,42 +176,52 @@ test('forEachRoots on a fully merged forest visits exactly one root', () => {
     assert.equal(uf.count, 1);
 });
 
-// --- boundary: fail-closed element rejection -------------------------------
+// --- boundary: bad elements -- queries answer a sentinel, union() throws -----
+// Sibling-query contract (A2): find(bad) === -1, componentSize(bad) === 0,
+// connected(...) === false if either element is bad; nothing on the query side
+// throws. union() is a mutator and keeps failing closed with [lite-o1].
 
-test('find / union / connected / componentSize reject bad elements with [lite-o1]', () => {
+test('find / connected / componentSize answer a sentinel on bad elements; union rejects with [lite-o1]', () => {
     const uf = new UnionFind(10);
+    uf.union(0, 1);
     for (const bad of [-1, 10, 11, 1.5, NaN, null, undefined, '3', {}, [], true]) {
-        assert.throws(() => uf.find(bad), litO1, 'find(' + String(bad) + ')');
-        assert.throws(() => uf.union(0, bad), litO1, 'union(0,' + String(bad) + ')');
-        assert.throws(() => uf.union(bad, 0), litO1, 'union(' + String(bad) + ',0)');
-        assert.throws(() => uf.connected(0, bad), litO1, 'connected(0,' + String(bad) + ')');
-        assert.throws(() => uf.componentSize(bad), litO1, 'componentSize(' + String(bad) + ')');
+        const tag = String(bad);
+        assert.equal(uf.find(bad), -1, 'find(' + tag + ')');
+        assert.equal(uf.componentSize(bad), 0, 'componentSize(' + tag + ')');
+        assert.equal(uf.connected(0, bad), false, 'connected(0,' + tag + ')');
+        assert.equal(uf.connected(bad, 0), false, 'connected(' + tag + ',0)');
+        assert.equal(uf.connected(bad, bad), false, 'connected(' + tag + ',' + tag + ') -- no -1 === -1 trap');
+        assert.throws(() => uf.union(0, bad), litO1, 'union(0,' + tag + ')');
+        assert.throws(() => uf.union(bad, 0), litO1, 'union(' + tag + ',0)');
     }
+    assert.equal(uf.count, 9, 'no bad call merged or split anything');
+    assert.equal(uf.componentSize(0), 2);
 });
 
-test('ADVERSARIAL: element ops must not throw a raw TypeError on a Symbol / BigInt', () => {
+test('ADVERSARIAL: a Symbol / BigInt element is a sentinel on queries, a [lite-o1] throw on union (never a raw TypeError)', () => {
     const uf = new UnionFind(10);
-    // A [lite-o1] throw is the contract; a raw TypeError from coercing the Symbol
-    // (via >>> or a message template) would be a different, wrong crash.
-    assert.throws(() => uf.find(Symbol('x')), litO1, 'find(Symbol)');
-    assert.throws(() => uf.find(5n), litO1, 'find(BigInt)');
+    // The typeof guard runs BEFORE `>>>`, whose coercion would THROW a raw
+    // TypeError on a Symbol / BigInt.
+    assert.equal(uf.find(Symbol('x')), -1, 'find(Symbol)');
+    assert.equal(uf.find(5n), -1, 'find(BigInt)');
     assert.throws(() => uf.union(0, Symbol('x')), litO1, 'union(0,Symbol)');
     assert.throws(() => uf.union(5n, 0), litO1, 'union(BigInt,0)');
-    assert.throws(() => uf.connected(Symbol('x'), 0), litO1, 'connected(Symbol,0)');
-    assert.throws(() => uf.componentSize(5n), litO1, 'componentSize(BigInt)');
+    assert.equal(uf.connected(Symbol('x'), 0), false, 'connected(Symbol,0)');
+    assert.equal(uf.componentSize(5n), 0, 'componentSize(BigInt)');
 });
 
-test('ADVERSARIAL: an object with a numeric valueOf/toString is REJECTED, not silently coerced', () => {
+test('ADVERSARIAL: an object with a numeric valueOf/toString is a bad element, not silently coerced', () => {
     // A guard that used `+x` or a template literal (implicit ToNumber/ToString)
     // would call valueOf/toString and accept this as element 5. The typeof
     // check must reject it BEFORE any coercion is attempted.
     const uf = new UnionFind(10);
+    uf.union(5, 6);
     const fakeFive = { valueOf: () => 5, toString: () => '5' };
-    assert.throws(() => uf.find(fakeFive), litO1, 'find(object-with-valueOf)');
+    assert.equal(uf.find(fakeFive), -1, 'find(object-with-valueOf)');
     assert.throws(() => uf.union(0, fakeFive), litO1, 'union(0,object-with-valueOf)');
     assert.throws(() => uf.union(fakeFive, 0), litO1, 'union(object-with-valueOf,0)');
-    assert.throws(() => uf.connected(0, fakeFive), litO1, 'connected(0,object-with-valueOf)');
-    assert.throws(() => uf.componentSize(fakeFive), litO1, 'componentSize(object-with-valueOf)');
+    assert.equal(uf.connected(5, fakeFive), false, 'connected(5,object-with-valueOf)');
+    assert.equal(uf.componentSize(fakeFive), 0, 'componentSize(object-with-valueOf)');
 });
 
 test('-0 aliases element 0 (uint32 coercion), not a distinct or rejected element', () => {

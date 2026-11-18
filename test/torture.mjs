@@ -54,6 +54,9 @@ async function main() {
     // alloc gate, `ok` flips to false, and the run exits non-zero -- proving the
     // torture gate is self-verifying (it can fail). UNSET, the run is unchanged.
     const BREAK = process.env.LITE_O1_TORTURE_BREAK === '1';
+    // A2 (DQ-2): LITE_O1_TORTURE_BREAK=uf-bad arms the UnionFind bad-id lane ONLY
+    // (a retained per-op alloc inside ufBadStep); every other lane runs clean.
+    const BREAK_UF_BAD = process.env.LITE_O1_TORTURE_BREAK === 'uf-bad';
     const brkSink = []; // retains the injected allocations so the gate can see them
 
     const leaks = [];
@@ -102,6 +105,12 @@ async function main() {
             u.find(i & 255);
             u.connected(i & 255, (i + 1) & 255);
             u.componentSize(i & 255);
+            // A2: Smi bad ids -- the queries answer a sentinel (-1 / false / 0)
+            // and never throw, so the churn exercises the bad-id branch too.
+            u.find(256 + (i & 255));
+            u.connected(i & 255, -1 - (i & 7));
+            u.connected(-1, -1);
+            u.componentSize(256 + (i & 255));
             tracker.track(u, noop, 'unionfind', { audit: true });
             // MonoDeque owns only its two Float64Arrays; nothing external to
             // release. Its columns hold numbers, so a reclaimed instance is the
@@ -388,6 +397,35 @@ async function main() {
     const ufBpc = ufAllocRes.bytesPerCall === null ? 0 : ufAllocRes.bytesPerCall;
     const ufAllocBytes = Math.max(0, Math.round(ufBpc));
     const ufAllocOk = ufAllocBytes === 0;
+
+    // UnionFind bad-id lane (A2): the sentinel contract on the hot path. B is
+    // HOISTED (built once, outside the measured window) and covers every bad
+    // class -- negative / past-n / 2^32 / fractional / NaN / +-Infinity / null /
+    // undefined / string / object / array / boolean / Symbol / BigInt / an object
+    // with a numeric valueOf. Each step cycles one b through find / componentSize
+    // / connected (both orders + (b, b)) on the coalesced forest above; the
+    // answers must be the sentinels (-1 / 0 / false) and the step must allocate
+    // 0 B/op. hit / miss are Smi counters (bounded far below 2^30).
+    const UF_BAD = [-1, CAP, CAP + 1, 2 ** 32, 2 ** 32 - 1, 2 ** 31, 1.5, NaN, Infinity, -Infinity, null, undefined,
+        '3', {}, [], true, Symbol('x'), 5n, { valueOf: () => 5, toString: () => '5' }];
+    const UF_BAD_N = UF_BAD.length;
+    let ufBadIdx = 0;
+    let ufBadHit = 0;
+    let ufBadMiss = 0;
+    const ufBadStep = () => {
+        ufBadIdx = ufBadIdx + 1 === UF_BAD_N ? 0 : ufBadIdx + 1;
+        const b = UF_BAD[ufBadIdx];
+        ufKey = (ufKey + 1) & (CAP - 1);
+        if (uf.find(b) === -1 && uf.componentSize(b) === 0 && uf.connected(b, ufKey) === false &&
+            uf.connected(ufKey, b) === false && uf.connected(b, b) === false) ufBadHit = (ufBadHit + 1) | 0;
+        else ufBadMiss = (ufBadMiss + 1) | 0;
+        if (BREAK_UF_BAD) brkSink.push({ v: ufBadIdx }); // DQ-2: retained per-op alloc when armed
+    };
+    for (let k = 0; k < 20000; k++) ufBadStep(); // warm-up: every B class reaches optimized code
+    const ufBadAllocRes = measureAllocs(ufBadStep, { iterations: 100000, batches: 8 });
+    const ufBadBpc = ufBadAllocRes.bytesPerCall === null ? 0 : ufBadAllocRes.bytesPerCall;
+    const ufBadAllocBytes = Math.max(0, Math.round(ufBadBpc));
+    const ufBadAllocOk = ufBadAllocRes.bytesPerCall !== null && ufBadAllocBytes === 0 && ufBadMiss === 0 && ufBadHit > 0;
 
     // MonoDeque hot path: a bounded sliding window. Each step pushes one value,
     // slides by one (evictOlderThan) and reads value() + frontSeq() -- every op is
@@ -1224,7 +1262,7 @@ async function main() {
 
     // ---- verdict + GATE line ----------------------------------------------
     const ok = report.ok && trackedOk && live === 0 && leaks.length === 0 &&
-        findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && monoAllocOk &&
+        findings.length === 0 && allocOk && ringAllocOk && ufAllocOk && ufBadAllocOk && monoAllocOk &&
         minAllocOk && randAllocOk && freqAllocOk && buckAllocOk && twAllocOk && htwAllocOk &&
         ringLogAllocOk && cuckAllocOk && stAllocOk && bitAllocOk && bitHighAllocOk && bitOrAllocOk && bitRetOk && aliasAllocOk && ctwAllocOk && wfAllocOk && rsRankAllocOk && rsSelAllocOk && rsGapAllocOk && efAccAllocOk && efNextAllocOk && rvAddAllocOk && rvGetAllocOk && wfuAllocOk && rsReseedOk && abOk;
 
@@ -1234,7 +1272,8 @@ async function main() {
         ' | gc major=' + s2.gc.major + ' minor=' + s2.gc.minor +
         ' maxMs=' + s2.gc.maxMs.toFixed(2) +
         ' | alloc=' + allocBytes + ' B/op (SparseSet) ' + ringAllocBytes + ' B/op (RingDeque) ' +
-        ufAllocBytes + ' B/op (UnionFind) ' + monoAllocBytes + ' B/op (MonoDeque) ' +
+        ufAllocBytes + ' B/op (UnionFind) ' +
+        ufBadAllocBytes + ' B/op (UnionFind bad-id) ' + monoAllocBytes + ' B/op (MonoDeque) ' +
         minAllocBytes + ' B/op (MinStack) ' + randAllocBytes + ' B/op (RandomSet) ' +
         freqAllocBytes + ' B/op (FreqO1) ' + buckAllocBytes + ' B/op (BucketQueue) ' +
         twAllocBytes + ' B/op (TimerWheel) ' +
@@ -1259,7 +1298,7 @@ async function main() {
         ' | reseed=' + rsReseedBytes + '/' + rsReseedBound + ' B allocs=' + rsReseedAllocs + ' (CuckooMap forced re-seed)' +
         ' | bitRetGrowth=' + bitRetGrowth + ' B' +
         ' | ' + (ok ? 'ok' : 'FAIL') +
-        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' bsSink=' + bsSink + ' bhSink=' + bhSink + ' brSink=' + brSink + ' atSink=' + atSink + ' wfSink=' + wfSink + ' rsRankSink=' + rsRankSink + ' rsSelSink=' + rsSelSink + ' rsGapSink=' + rsGapSink + ' efAccSink=' + efAccSink + ' efNextSink=' + efNextSink + ' rvAddSink=' + rvAddSink + ' rvGetSink=' + rvGetSink + ' wfuSink=' + wfuSink + ' abGrowth=' + abDelta + ')');
+        ' (tracked=' + trackedMid + ' sink=' + SINK + ' rlSink=' + rlSink + ' cuSink=' + cuSink + ' stSink=' + stSink + ' bsSink=' + bsSink + ' bhSink=' + bhSink + ' brSink=' + brSink + ' atSink=' + atSink + ' wfSink=' + wfSink + ' rsRankSink=' + rsRankSink + ' rsSelSink=' + rsSelSink + ' rsGapSink=' + rsGapSink + ' efAccSink=' + efAccSink + ' efNextSink=' + efNextSink + ' rvAddSink=' + rvAddSink + ' rvGetSink=' + rvGetSink + ' wfuSink=' + wfuSink + ' ufBadHit=' + ufBadHit + ' ufBadMiss=' + ufBadMiss + ' abGrowth=' + abDelta + ')');
 
     if (!ok) {
         if (!trackedOk) console.error('  vacuous: tracker held ' + trackedMid + ' instances (expected > 0)');
@@ -1271,6 +1310,7 @@ async function main() {
         if (!allocOk) console.error('  alloc ' + allocBytes + ' B/op SparseSet (raw bytesPerCall ' + bpc + ')');
         if (!ringAllocOk) console.error('  alloc ' + ringAllocBytes + ' B/op RingDeque (raw bytesPerCall ' + ringBpc + ')');
         if (!ufAllocOk) console.error('  alloc ' + ufAllocBytes + ' B/op UnionFind (raw bytesPerCall ' + ufBpc + ')');
+        if (!ufBadAllocOk) console.error('  alloc ' + ufBadAllocBytes + ' B/op UnionFind bad-id (raw bytesPerCall ' + ufBadAllocRes.bytesPerCall + ') hit=' + ufBadHit + ' miss=' + ufBadMiss + ' -- every bad id must answer -1 / 0 / false at 0 B/op');
         if (!monoAllocOk) console.error('  alloc ' + monoAllocBytes + ' B/op MonoDeque (raw bytesPerCall ' + monoBpc + ')');
         if (!minAllocOk) console.error('  alloc ' + minAllocBytes + ' B/op MinStack (raw bytesPerCall ' + minBpc + ')');
         if (!randAllocOk) console.error('  alloc ' + randAllocBytes + ' B/op RandomSet (raw bytesPerCall ' + randBpc + ')');

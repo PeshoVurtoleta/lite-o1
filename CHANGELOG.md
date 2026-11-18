@@ -6,7 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-_Nothing yet._
+### Changed
+
+- **UnionFind: the three queries no longer throw on a bad element (MINOR, planned 1.12.0).**
+  `find(x)` returns `-1`, `componentSize(x)` returns `0`, and `connected(a, b)` returns `false` if either
+  element is bad (two bad elements are never connected). This follows the sibling convention (booleans -> `false`;
+  id / position numbers where `0` is legal -> `-1`; counts -> `0`). A bad element is anything that is not a
+  uint32 below `n`: `-1`, `1.5`, `NaN`, `+/-Infinity`, `null`, `undefined`, strings, objects, booleans, a Symbol,
+  a BigInt, or `>= n`. `union(a, b)` still throws the `[lite-o1]` `RangeError` "node out of range [0, n): ..."
+  on a bad element, before any write, message unchanged. Valid-element behavior is byte-identical to 1.11.3
+  (`-0` is still element `0`). Code that caught the old throw from `find` / `connected` / `componentSize`
+  must now test the sentinel. See ADR 0007 (amendment) and ADR 0028 point 5.
+
+### Tests
+
+- `npm test`: 800 tests (was 782): the rewritten bad-element cases in `test/UnionFind.test.js` /
+  `test/QaAudit.test.js`, plus `test/UnionFindSentinel.test.js` (8) and `test/UnionFindQa.test.js` (10:
+  integer-wrap ids, spy / Proxy args with 0 coercions, a seeded mixed stream vs a naive oracle). torture gained a "UnionFind bad-id" 0 B/op lane (19 bad values incl. a
+  Symbol, a BigInt and a `valueOf` object; hit/miss counted; fails closed on an unmeasured run) with a
+  must-fail control arm `LITE_O1_TORTURE_BREAK=uf-bad`. A seeded parity harness compared 300000 valid ops over
+  n in {1, 2, 3, 10, 257, 4096} plus 16830 replayed bad calls against the 1.11.3 build: 0 mismatches.
 
 ## [1.11.3] - 2026-10-20
 

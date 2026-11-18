@@ -294,12 +294,17 @@ test('UnionFind element boundary matrix -1 / 0 / n-1 / n / n+1 on n=10', () => {
     // 0 and n-1: the extreme legal elements.
     assert.equal(uf.find(0), 0);
     assert.equal(uf.find(n - 1), n - 1);
-    // -1: below the range -> [lite-o1] (also proves null-is-not-zero style reject).
-    assert.throws(() => uf.find(-1), litO1);
-    // n and n+1: at and past the ceiling -> [lite-o1].
-    assert.throws(() => uf.find(n), litO1);
-    assert.throws(() => uf.find(n + 1), litO1);
-    // union with either endpoint bad also throws.
+    // -1: below the range -> the -1 sentinel (a query never throws).
+    assert.equal(uf.find(-1), -1);
+    assert.equal(uf.componentSize(-1), 0);
+    assert.equal(uf.connected(-1, 0), false);
+    // n and n+1: at and past the ceiling -> the same sentinels.
+    assert.equal(uf.find(n), -1);
+    assert.equal(uf.find(n + 1), -1);
+    assert.equal(uf.componentSize(n), 0);
+    assert.equal(uf.connected(n, n), false);
+    assert.equal(uf.connected(0, n + 1), false);
+    // union with either endpoint bad still throws (a mutator fails closed).
     assert.throws(() => uf.union(0, n), litO1);
     assert.throws(() => uf.union(n, 0), litO1);
 });
@@ -364,16 +369,18 @@ test('union() from inside forEachRoots does not corrupt state or throw', () => {
 
 test('ADVERSARIAL: UnionFind ops must not throw a raw TypeError on a Symbol element', () => {
     const uf = new UnionFind(8);
-    assert.throws(() => uf.find(Symbol('x')), litO1, 'find(Symbol) must be [lite-o1]');
+    assert.equal(uf.find(Symbol('x')), -1, 'find(Symbol) must be the -1 sentinel');
     assert.throws(() => uf.union(0, Symbol('x')), litO1, 'union(0,Symbol) must be [lite-o1]');
-    assert.throws(() => uf.componentSize(Symbol('x')), litO1, 'componentSize(Symbol) must be [lite-o1]');
+    assert.equal(uf.componentSize(Symbol('x')), 0, 'componentSize(Symbol) must be the 0 sentinel');
+    assert.equal(uf.connected(Symbol('x'), 0), false, 'connected(Symbol,0) must be false');
 });
 
 test('ADVERSARIAL: UnionFind ops must not throw a raw TypeError on a BigInt element', () => {
     const uf = new UnionFind(8);
-    assert.throws(() => uf.find(5n), litO1, 'find(BigInt) must be [lite-o1]');
+    assert.equal(uf.find(5n), -1, 'find(BigInt) must be the -1 sentinel');
     assert.throws(() => uf.union(5n, 0), litO1, 'union(BigInt,0) must be [lite-o1]');
-    assert.throws(() => uf.connected(0, 5n), litO1, 'connected(0,BigInt) must be [lite-o1]');
+    assert.equal(uf.connected(0, 5n), false, 'connected(0,BigInt) must be false');
+    assert.equal(uf.componentSize(5n), 0, 'componentSize(BigInt) must be the 0 sentinel');
 });
 
 // ===========================================================================

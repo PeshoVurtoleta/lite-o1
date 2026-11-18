@@ -110,7 +110,9 @@ export class RingDeque {
  * `reset()` and `forEachRoots(fn)` are O(n) full-scan primitives (alloc-free but
  * NOT per-op hot paths); `roots()` allocates a generator per protocol. Fail
  * closed: a bad element (non-integer, NaN, null, negative, >= n, Symbol, BigInt)
- * throws a [lite-o1] error.
+ * makes the queries return a sentinel -- find -> -1, componentSize -> 0,
+ * connected -> false (never throws) -- and makes union throw a [lite-o1] error
+ * before any write.
  */
 export class UnionFind {
     /**
@@ -125,16 +127,16 @@ export class UnionFind {
      *  the live-count meaning `size` has on SparseSet / RingDeque.) */
     readonly capacity: number;
 
-    /** Return the root of x's component. O(1)-amortized. Throws on a bad element. */
+    /** Return the root of x's component. O(1)-amortized. Returns -1 on a bad element (never throws). */
     find(x: number): number;
 
-    /** Merge a and b. Returns true iff they were merged this call. Throws on a bad element. */
+    /** Merge a and b. Returns true iff they were merged this call. Throws a [lite-o1] error on a bad element, before any write. */
     union(a: number, b: number): boolean;
 
-    /** True iff a and b share a component. O(1)-amortized. Throws on a bad element. */
+    /** True iff a and b share a component. O(1)-amortized. False if either element is bad (never throws). */
     connected(a: number, b: number): boolean;
 
-    /** Size of x's component. O(1)-amortized. Throws on a bad element. */
+    /** Size of x's component. O(1)-amortized. Returns 0 on a bad element (never throws). */
     componentSize(x: number): number;
 
     /** Re-singleton every element (O(n) bulk pass; allocates nothing). */
